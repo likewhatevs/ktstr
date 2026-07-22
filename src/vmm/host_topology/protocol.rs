@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v20
+//! Every ktstr process sharing a lock directory participates in one v21
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -1797,6 +1797,12 @@ pub(crate) fn exercise_work_conserving_backfill_for_tests()
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_coordinator_heartbeat_deadline_for_tests()
+-> Result<registry::CoordinatorHeartbeatDeadlineOutcome> {
+    registry::exercise_coordinator_heartbeat_deadline_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn expire_coordinator_lease_for_tests() -> Result<()> {
     registry::expire_coordinator_lease_for_tests()
 }
@@ -1926,10 +1932,21 @@ pub(crate) fn exercise_replan_token_wave_for_tests(
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_changed_replan_batch_for_tests(
+pub(crate) fn exercise_changed_replan_wave_completions_for_tests(
     callbacks: usize,
-) -> Result<registry::ReplanChangedBatchOutcome> {
-    registry::exercise_changed_replan_batch_for_tests(callbacks)
+) -> Result<registry::ReplanChangedWaveOutcome> {
+    registry::exercise_changed_replan_wave_completions_for_tests(callbacks)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_replan_straggler_progress_for_tests()
+-> Result<registry::ReplanStragglerProgressOutcome> {
+    registry::exercise_replan_straggler_progress_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_replan_completion_election_for_tests() -> Result<bool> {
+    registry::exercise_replan_completion_election_for_tests()
 }
 
 #[cfg(test)]
@@ -1940,12 +1957,6 @@ pub(crate) fn exercise_replan_wave_expiry_for_tests() -> Result<registry::Replan
 #[cfg(test)]
 pub(crate) fn exercise_replan_expiry_publication_crash_for_tests() -> Result<bool> {
     registry::exercise_replan_expiry_publication_crash_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_replan_batch_barriers_for_tests()
--> Result<registry::ReplanBatchBarrierOutcome> {
-    registry::exercise_replan_batch_barriers_for_tests()
 }
 
 #[cfg(test)]
@@ -2040,6 +2051,12 @@ pub(crate) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
 pub(crate) fn exercise_stale_acquired_release_order_for_tests()
 -> Result<(bool, bool, bool, bool, bool, bool)> {
     registry::exercise_stale_acquired_release_order_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_acknowledgement_payload_notify_order_for_tests()
+-> Result<(bool, bool, bool, bool, bool, bool)> {
+    registry::exercise_acknowledgement_payload_notify_order_for_tests()
 }
 
 #[cfg(test)]
@@ -2214,13 +2231,30 @@ pub(crate) fn prepare_zeroed_uninitialized_header_for_tests() -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) fn hold_registry_shared_for_tests() -> Result<OwnedFd> {
+pub(crate) fn hold_registry_shared_for_tests() -> Result<registry::RegistryLock> {
     registry::hold_registry_shared_for_tests()
 }
 
 #[cfg(test)]
-pub(crate) fn hold_registry_exclusive_for_tests() -> Result<OwnedFd> {
+pub(crate) fn hold_registry_exclusive_for_tests() -> Result<registry::RegistryLock> {
     registry::hold_registry_exclusive_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn hold_registry_exclusive_after_intent_for_tests(
+    on_intent: impl FnOnce() -> Result<()>,
+) -> Result<registry::RegistryLock> {
+    registry::hold_registry_exclusive_after_intent_for_tests(on_intent)
+}
+
+#[cfg(test)]
+pub(crate) fn try_hold_registry_shared_for_tests() -> Result<Option<registry::RegistryLock>> {
+    registry::try_hold_registry_shared_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn try_hold_registry_exclusive_for_tests() -> Result<Option<registry::RegistryLock>> {
+    registry::try_hold_registry_exclusive_for_tests()
 }
 
 #[cfg(test)]
@@ -3116,6 +3150,7 @@ fn acquire_as_coordinator_impl<T>(
         )?;
         retry_due = false;
         let mut liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
+        let mut heartbeat_deadline = std::time::Instant::now() + snapshot.heartbeat_due_in;
         watched_resources = event_watch(snapshot.watch.clone());
         let mut should_step = first || force_step || snapshot.should_step;
         force_step = false;
@@ -3131,8 +3166,27 @@ fn acquire_as_coordinator_impl<T>(
                 cancelled,
             )?;
             liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
+            heartbeat_deadline = std::time::Instant::now() + snapshot.heartbeat_due_in;
             watched_resources = event_watch(snapshot.watch.clone());
             should_step |= snapshot.should_step;
+        }
+        if heartbeat_deadline <= std::time::Instant::now() {
+            // A stream of known-free close events can keep the coordinator
+            // out of the blocking wait indefinitely. Renew here as well as in
+            // the timeout branch so event backlog cannot make an actively
+            // draining coordinator appear stalled.
+            let heartbeat = check_result(coordinator.ticket.heartbeat(cancelled), cancelled)?;
+            heartbeat_deadline =
+                std::time::Instant::now() + registry::COORDINATOR_HEARTBEAT_INTERVAL;
+            if heartbeat.parked {
+                first = false;
+                force_step = true;
+                continue;
+            }
+            if heartbeat.rescan_pending {
+                first = false;
+                continue;
+            }
         }
         held.install_schedule_snapshot(&snapshot);
         let observation_pending = snapshot.observation.is_some();
@@ -3189,16 +3243,6 @@ fn acquire_as_coordinator_impl<T>(
                             force_step = true;
                             continue;
                         }
-                        registry::FinishAcquireResult::BatchDeferred => {
-                            // An older finite REPLAN wave published a choice
-                            // after this physical attempt began. Drop the
-                            // attempt, keep the coordinator parked, and fall
-                            // through to the event wait; the last callback
-                            // publishes exactly one rescan edge.
-                            drop(value);
-                            drop(contention);
-                            drop(preparation_contention);
-                        }
                     }
                 }
                 CoordinatorStep::Prepare {
@@ -3240,11 +3284,6 @@ fn acquire_as_coordinator_impl<T>(
                             first = false;
                             force_step = true;
                             continue;
-                        }
-                        registry::FinishPreparationResult::BatchDeferred => {
-                            drop(preparation);
-                            drop(contention);
-                            drop(preparation_contention);
                         }
                     }
                 }
@@ -3303,6 +3342,7 @@ fn acquire_as_coordinator_impl<T>(
                         observe_before_sleep,
                     );
                     liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
+                    heartbeat_deadline = std::time::Instant::now() + snapshot.heartbeat_due_in;
                     watched_resources = event_watch(snapshot.watch);
                     if retry_before_sleep {
                         // A predecessor can release after this coordinator's
@@ -3332,8 +3372,10 @@ fn acquire_as_coordinator_impl<T>(
         let retry_interval = watch.semantic_retry_interval(observation_pending);
         let now = std::time::Instant::now();
         retry_deadline = retry_deadline.min(now + retry_interval);
-        let wake_deadline = retry_deadline.min(liveness_deadline);
         loop {
+            let wake_deadline = retry_deadline
+                .min(liveness_deadline)
+                .min(heartbeat_deadline);
             let wait_now = std::time::Instant::now();
             let semantic_wait = wake_deadline.saturating_duration_since(wait_now);
             let syscall_wait = super::reservation_wait_progress_poll()
@@ -3345,10 +3387,33 @@ fn acquire_as_coordinator_impl<T>(
                 }
                 None => {
                     super::tick_reservation_wait_progress();
-                    if std::time::Instant::now() < wake_deadline {
+                    let now = std::time::Instant::now();
+                    if now < wake_deadline {
                         // This was only a synchronous progress slice. Remain
                         // inside the same semantic watch wait: do not take the
                         // registry lock or run another schedule pass.
+                        continue;
+                    }
+                    if heartbeat_deadline <= now && retry_deadline > now && liveness_deadline > now
+                    {
+                        // An idle healthy coordinator renews only one header
+                        // word. Do not turn this progress deadline into a
+                        // semantic retry, resource re-observation, grant scan,
+                        // or planner callback. If the ticket was displaced
+                        // while asleep, heartbeat() parks it until a later
+                        // election; then refresh the complete schedule before
+                        // invoking the planner again.
+                        let heartbeat =
+                            check_result(coordinator.ticket.heartbeat(cancelled), cancelled)?;
+                        heartbeat_deadline =
+                            std::time::Instant::now() + registry::COORDINATOR_HEARTBEAT_INTERVAL;
+                        if heartbeat.parked {
+                            force_step = true;
+                            break;
+                        }
+                        if heartbeat.rescan_pending {
+                            break;
+                        }
                         continue;
                     }
                     // A global liveness deadline is persisted in the registry,

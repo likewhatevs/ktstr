@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ20");
-const VERSION: u32 = 20;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ21");
+const VERSION: u32 = 21;
 #[cfg(test)]
 const RETAINED_FUTEX_WAIT_MARKER_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 const HEADER_FIXED: usize = 256;
@@ -35,8 +35,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v20-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v20-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v21-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v21-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 const WAIT_DIAGNOSTIC_BUCKET_SECS: u64 = 30;
@@ -165,8 +165,8 @@ const H_REPLAN_CURSOR: usize = 200;
 /// active-list snapshot is scanned.
 const H_REPLAN_HORIZON: usize = 208;
 /// Number of published speculative callbacks which have not yet returned to
-/// WAITING.  The last completion promotes the batch's deferred claim changes
-/// into one authoritative rescan and one global wake.
+/// WAITING. This is quarantine and finite-wave accounting only: each callback
+/// completion independently publishes a coalesced coordinator rescan edge.
 const H_REPLAN_OUTSTANDING: usize = 216;
 /// Monotonic start and deadline of the currently published finite REPLAN
 /// wave. A callback which survives past the bounded lease is quarantined so
@@ -271,11 +271,6 @@ const BLOCK_PERMIT: u32 = 3;
 
 const PENDING_RESCAN: u64 = 1 << 0;
 const PENDING_OBSERVATION: u64 = 1 << 1;
-/// One or more non-acquiring callbacks published a replacement during the
-/// current finite REPLAN wave.  This is deliberately not a coordinator scan
-/// request until the wave drains; an unrelated real event may consume it
-/// earlier as part of its own authoritative scan.
-const PENDING_REPLAN_BATCH: u64 = 1 << 2;
 
 const B_CLAIM_CPUS: usize = 0;
 const B_CLAIM_CPU_EXCLUSIVE: usize = 1;
@@ -322,19 +317,30 @@ const Q_LLC_SH: usize = 2;
 const Q_LLC_EX: usize = 3;
 const REQUEST_ARRAYS: usize = 4;
 const LIVENESS_SWEEP_INTERVAL_NS: u64 = 30_000_000_000;
-const COORDINATOR_HEARTBEAT_REFRESH_NS: u64 = 30_000_000_000;
-/// Four normal coordinator fallback periods. This is deliberately long enough
-/// to survive severe host oversubscription while still bounding a live process
-/// that stopped advancing the shared queue.
-const COORDINATOR_LEASE_NS: u64 = 120_000_000_000;
+/// The elected coordinator alone wakes at this cadence and renews one header
+/// word. No planner, observation, grant scan, or liveness sweep is coupled to
+/// this tick.
+const COORDINATOR_HEARTBEAT_INTERVAL_NS: u64 = 1_000_000_000;
+pub(super) const COORDINATOR_HEARTBEAT_INTERVAL: Duration =
+    Duration::from_nanos(COORDINATOR_HEARTBEAT_INTERVAL_NS);
+/// Eight missed one-second heartbeats are enough to transfer progress to the
+/// oldest waiter. The displaced live coordinator is parked, so a false
+/// positive under extreme descheduling is safe and does not weaken physical
+/// or logical allocation fences.
+const COORDINATOR_HEARTBEAT_LEASE_NS: u64 = 8_000_000_000;
 /// Keep a physically blocked exact head work-conserving for one coordinator
-/// lease while bounding starvation. During this interval the backfill capacity
-/// limits *currently outstanding* bypass work, so a completed small cell can
-/// be replaced instead of manufacturing a low-utilization drain bubble. Once
-/// the interval expires, no replacement conflicts are issued and at most one
-/// capacity wave remains to drain before the head runs.
-const BACKFILL_MAX_AGE_NS: u64 = COORDINATOR_LEASE_NS;
-const REPLAN_WAVE_LEASE_NS: u64 = COORDINATOR_LEASE_NS;
+/// backfill window while bounding starvation. This semantic allocation window
+/// remains independent of the much shorter coordinator progress heartbeat.
+/// During this interval the backfill capacity limits *currently outstanding*
+/// bypass work, so a completed small cell can be replaced instead of
+/// manufacturing a low-utilization drain bubble. Once the interval expires,
+/// no replacement conflicts are issued and at most one capacity wave remains
+/// to drain before the head runs.
+const BACKFILL_MAX_AGE_NS: u64 = 120_000_000_000;
+/// A speculative callback is user code and may legitimately take much longer
+/// than a coordinator heartbeat. Keep its bounded recovery window explicit
+/// and independent of coordinator takeover.
+const REPLAN_WAVE_LEASE_NS: u64 = 120_000_000_000;
 
 #[cfg(test)]
 thread_local! {
@@ -396,6 +402,30 @@ pub(super) struct ScheduleSnapshot {
     pub should_step: bool,
     pub observation: Option<ObservationRequest>,
     pub liveness_due_in: Duration,
+    /// Time until the active coordinator must renew its lightweight progress
+    /// heartbeat. This is deliberately independent of semantic retries and
+    /// full liveness reconciliation: an idle healthy coordinator only updates
+    /// one header word at this deadline.
+    pub heartbeat_due_in: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HeartbeatStatus {
+    pub(super) parked: bool,
+    pub(super) rescan_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AcknowledgeResult {
+    acknowledged: bool,
+    notify: bool,
+}
+
+impl AcknowledgeResult {
+    const UNCHANGED: Self = Self {
+        acknowledged: false,
+        notify: false,
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -407,18 +437,22 @@ pub(super) struct CoordinatorCommitToken {
 pub(super) enum FinishAcquireResult {
     Committed(HeldClaim),
     Stale,
-    BatchDeferred,
 }
 
 pub(super) enum FinishPreparationResult {
     Committed(ClaimSet),
     Stale,
-    BatchDeferred,
 }
 
 enum PendingTransition {
     Committed(ClaimSet),
     Contended(ContentionMarker),
+}
+
+#[derive(Clone, Copy)]
+enum ReplacementFenceEffect {
+    ChangesPredecessorPrefix,
+    NonFencing,
 }
 
 #[derive(Debug)]
@@ -454,6 +488,22 @@ impl Drop for DropProbe {
                 .is_some(),
         );
     }
+}
+
+#[cfg(test)]
+fn arm_drop_before_notify_probe(
+    payload_dropped: std::rc::Rc<std::cell::Cell<bool>>,
+    dropped_at_notify: std::rc::Rc<std::cell::Cell<bool>>,
+) {
+    NOTIFY_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "a coordinator-notify hook is already installed on this test thread"
+        );
+        *slot.borrow_mut() = Some(Box::new(move || {
+            dropped_at_notify.set(payload_dropped.get());
+        }));
+    });
 }
 
 pub(super) enum GrantResult<T> {
@@ -1871,14 +1921,14 @@ impl Ticket {
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
             .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
-        let acknowledged = match record.state {
+        let acknowledgement = match record.state {
             STATE_REVOKED => table.acknowledge_revoked(self.slot, self.ticket, None)?,
             STATE_REPLAN_EXPIRED => {
                 table.acknowledge_expired_replan(self.slot, self.ticket, None)?
             }
-            _ => false,
+            _ => AcknowledgeResult::UNCHANGED,
         };
-        if acknowledged {
+        if acknowledgement.acknowledged {
             record = table
                 .record(self.slot)?
                 .filter(|record| record.ticket == self.ticket)
@@ -1894,7 +1944,7 @@ impl Ticket {
         };
         drop(table);
         drop(_lock);
-        if acknowledged {
+        if acknowledgement.notify {
             notify_coordinator();
         }
         Ok(state)
@@ -2046,74 +2096,50 @@ impl Ticket {
             if table.expire_replan_wave_if_due()? {
                 notify_coordinator();
             }
-            let mut record = table
+            let record = table
                 .record(self.slot)?
                 .filter(|record| record.ticket == self.ticket)
                 .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
             if record.state == STATE_REVOKED {
-                table.acknowledge_revoked(self.slot, self.ticket, None)?;
+                let acknowledgement = table.acknowledge_revoked(self.slot, self.ticket, None)?;
                 drop(table);
                 drop(_lock);
-                notify_coordinator();
+                if acknowledgement.notify {
+                    notify_coordinator();
+                }
                 return Ok(GrantResult::LostGrant);
             }
             if record.state == STATE_REPLAN_EXPIRED {
-                table.acknowledge_expired_replan(self.slot, self.ticket, None)?;
+                let acknowledgement =
+                    table.acknowledge_expired_replan(self.slot, self.ticket, None)?;
                 drop(table);
                 drop(_lock);
-                notify_coordinator();
+                if acknowledgement.notify {
+                    notify_coordinator();
+                }
                 return Ok(GrantResult::LostGrant);
             }
             if !matches!(record.state, STATE_GRANTED | STATE_REPLAN) {
                 return Ok(GrantResult::LostGrant);
             }
-            let published_epoch = if record.state == STATE_GRANTED {
-                record.grant_epoch
-            } else {
-                record.replan_claim_epoch
-            };
-            if record.state == STATE_GRANTED
-                && table.min_changed_ticket() < record.ticket
-                && published_epoch != table.claim_epoch()
-            {
-                if table.pending_flags() & PENDING_REPLAN_BATCH != 0
-                    && table.pending_flags() & PENDING_RESCAN == 0
-                {
-                    // An older speculative callback selected a new exact
-                    // intent, but the finite wave has not finished. Park this
-                    // unentered physical grant in O(1); the final batch scan
-                    // will regrant it iff the complete older prefix permits.
-                    table.begin_transaction()?;
-                    table.set_record_state(self.slot, STATE_WAITING)?;
-                    table.clear_record_blocked(self.slot)?;
-                    table.finish_transaction()?;
-                    return Ok(GrantResult::LostGrant);
-                }
-                // The callback raced a dirty predecessor suffix. Let the first
-                // observer perform the one authoritative O(N) scan; it clears
-                // the shared dirty minimum, so every later callback reuses the
-                // result. Exact cached-prefix comparison in that scan preserves
-                // this token when the global epoch did not change its inputs.
-                table.grant_compatible()?;
-                record = table
-                    .record(self.slot)?
-                    .filter(|record| record.ticket == self.ticket)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("live queue ticket {} disappeared", self.ticket)
-                    })?;
-                if record.state == STATE_REVOKED {
-                    table.acknowledge_revoked(self.slot, self.ticket, None)?;
-                    drop(table);
-                    drop(_lock);
+            if record.state == STATE_GRANTED && table.min_changed_ticket() < record.ticket {
+                // Never run the O(N) authoritative scan from a callback
+                // entrant. An earlier non-fencing REPLAN replacement can
+                // dirty this suffix without advancing the global claim epoch,
+                // so the exact suffix watermark is the complete admission
+                // fence. Park this unentered token and publish one coalesced
+                // edge; the coordinator consumes it in its normal scan turn.
+                table.begin_transaction()?;
+                table.set_record_state(self.slot, STATE_WAITING)?;
+                table.clear_record_blocked(self.slot)?;
+                let notify = table.schedule_rescan_edge_in_transaction()?;
+                table.finish_transaction()?;
+                drop(table);
+                drop(_lock);
+                if notify {
                     notify_coordinator();
-                    return Ok(GrantResult::LostGrant);
                 }
-                if !matches!(record.state, STATE_GRANTED | STATE_REPLAN) {
-                    drop(table);
-                    drop(_lock);
-                    notify_coordinator();
-                    return Ok(GrantResult::LostGrant);
-                }
+                return Ok(GrantResult::LostGrant);
             }
             let state_epoch = if record.state == STATE_GRANTED {
                 record.grant_epoch
@@ -2123,15 +2149,18 @@ impl Ticket {
             let (prefix_epoch, predecessors) = table.cached_prefix(record.slot)?;
             if prefix_epoch == 0 || prefix_epoch != state_epoch {
                 table.begin_transaction()?;
+                if record.state == STATE_REPLAN {
+                    table.mark_suffix_dirty(record.ticket);
+                }
                 table.set_record_state(self.slot, STATE_WAITING)?;
                 table.clear_record_blocked(self.slot)?;
-                table.set_pending_flag(PENDING_RESCAN);
-                table.bump_generation()?;
-                table.elect_coordinator_in_transaction()?;
+                let notify = table.schedule_rescan_edge_in_transaction()?;
                 table.finish_transaction()?;
                 drop(table);
                 drop(_lock);
-                notify_coordinator();
+                if notify {
+                    notify_coordinator();
+                }
                 return Ok(GrantResult::LostGrant);
             }
             let availability = table.availability_snapshot();
@@ -2189,7 +2218,7 @@ impl Ticket {
         if table.expire_replan_wave_if_due()? {
             notify_coordinator();
         }
-        let mut record = table
+        let record = table
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
             .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
@@ -2224,7 +2253,6 @@ impl Ticket {
                     &released_claim.llcs,
                     &released_claim.permits,
                 )?;
-                table.bump_generation()?;
                 table.finish_transaction()?;
                 drop(table);
                 drop(lock);
@@ -2233,50 +2261,32 @@ impl Ticket {
                 let ack_lock = lock_registry_existing(FlockMode::Exclusive)?;
                 let mut table = Table::open_existing()?;
                 table.repair_consistency_if_needed()?;
-                let acknowledged =
+                let _acknowledgement =
                     table.acknowledge_expired_replan(self.slot, self.ticket, None)?;
                 drop(table);
                 drop(ack_lock);
-                if acknowledged {
-                    notify_coordinator();
-                }
+                // The acknowledgement is ordered after the opaque payload
+                // closes. Always target the coordinator here: an already-set
+                // RESCAN edge may have been notified while these OFDs were
+                // still physically busy.
+                notify_coordinator();
             } else {
                 // Publish the negative witness before dropping it. The ticket
                 // becomes WAITING only after this late callback is known to be
                 // unable to publish its stale replacement.
-                let acknowledged =
+                let acknowledgement =
                     table.acknowledge_expired_replan(self.slot, self.ticket, blocked)?;
                 drop(table);
                 drop(lock);
                 drop(result);
-                if acknowledged {
+                if acknowledgement.notify {
                     notify_coordinator();
                 }
             }
             return Ok(GrantResult::LostGrant);
         }
-        let batch_deferred_grant = acquisition_allowed
-            && table.min_changed_ticket() < record.ticket
-            && callback_epoch != table.claim_epoch()
-            && table.pending_flags() & PENDING_REPLAN_BATCH != 0
-            && table.pending_flags() & PENDING_RESCAN == 0;
-        if acquisition_allowed
-            && table.min_changed_ticket() < record.ticket
-            && callback_epoch != table.claim_epoch()
-            && !batch_deferred_grant
-        {
-            // As at callback entry, reconcile one dirty predecessor suffix
-            // before judging the publication token. The scan preserves an
-            // identical prefix/watch token and refreshes it only for an actual
-            // input change, so unrelated transitions do not discard completed
-            // expensive work.
-            table.grant_compatible()?;
-            record = table
-                .record(self.slot)?
-                .filter(|record| record.ticket == self.ticket)
-                .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
-        }
-        if batch_deferred_grant && record.state == STATE_GRANTED && record.claim == designated {
+        let dirty_grant = acquisition_allowed && table.min_changed_ticket() < record.ticket;
+        if dirty_grant && record.state == STATE_GRANTED && record.claim == designated {
             let released_acquired = result.acquired.is_some();
             let blocked = if released_acquired {
                 None
@@ -2311,10 +2321,17 @@ impl Ticket {
                 table.set_record_issue_serial(self.slot, consumed_serial)?;
                 table.mark_blocker_unknown(marker)?;
             }
+            let notify = table.schedule_rescan_edge_in_transaction()?;
             table.finish_transaction()?;
             drop(table);
             drop(lock);
             drop(result);
+            // UNKNOWN cannot be observed as physically free until the opaque
+            // payload closes. Preserve that drop-before-targeted-notify edge
+            // even when RESCAN was already coalesced by another callback.
+            if notify || released_acquired {
+                notify_coordinator();
+            }
             return Ok(GrantResult::LostGrant);
         }
         if record.state == STATE_REVOKED {
@@ -2323,7 +2340,8 @@ impl Ticket {
             // UNKNOWN observation before releasing its OFDs. Only after the
             // opaque payload is gone may acknowledgement remove that fence
             // and request the successor scan.
-            let blocked = if result.acquired.is_none() {
+            let released_acquired = result.acquired.is_some();
+            let blocked = if !released_acquired {
                 if let Some(evidence) = result.contention.as_ref() {
                     validate_contention_within_watch(&[evidence.marker()], &watch)?;
                 }
@@ -2341,7 +2359,7 @@ impl Ticket {
             } else {
                 None
             };
-            if result.acquired.is_some() {
+            if released_acquired {
                 let released_claim = result.preparation_claim.as_ref().unwrap_or(&designated);
                 table.begin_transaction()?;
                 table.mark_unknown(
@@ -2349,7 +2367,6 @@ impl Ticket {
                     &released_claim.llcs,
                     &released_claim.permits,
                 )?;
-                table.bump_generation()?;
                 table.finish_transaction()?;
             }
             drop(table);
@@ -2359,10 +2376,10 @@ impl Ticket {
             let ack_lock = lock_registry_existing(FlockMode::Exclusive)?;
             let mut table = Table::open_existing()?;
             table.repair_consistency_if_needed()?;
-            let acknowledged = table.acknowledge_revoked(self.slot, self.ticket, blocked)?;
+            let acknowledgement = table.acknowledge_revoked(self.slot, self.ticket, blocked)?;
             drop(table);
             drop(ack_lock);
-            if acknowledged {
+            if acknowledgement.notify || released_acquired {
                 notify_coordinator();
             }
             return Ok(GrantResult::LostGrant);
@@ -2387,10 +2404,6 @@ impl Ticket {
             .map(|bytes| read_u32(bytes, R_WAKE))
             .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
         let same_replan_issuance = acquisition_allowed || current_wake == callback_wake;
-        let replan_inputs_changed = !acquisition_allowed
-            && (stale
-                || (table.min_changed_ticket() < record.ticket
-                    && callback_epoch != table.claim_epoch()));
         let current_designated_contention =
             result
                 .contention
@@ -2444,29 +2457,28 @@ impl Ticket {
             let invalidate_regrant =
                 released_acquired && record.state == STATE_GRANTED && record.claim == designated;
             let return_to_waiting = invalidate_regrant;
-            if return_to_waiting || released_acquired {
+            let mut notify_now = false;
+            if released_acquired {
                 table.begin_transaction()?;
             }
             if return_to_waiting {
                 table.set_record_state(self.slot, STATE_WAITING)?;
                 table.clear_record_blocked(self.slot)?;
-                table.set_pending_flag(PENDING_RESCAN);
-                table.bump_generation()?;
-                table.elect_coordinator_in_transaction()?;
             }
             if released_acquired {
                 // The optimistic availability snapshot predates this physical
                 // acquisition. Revoke it before releasing the payload so no
-                // waiter can be regranted from the stale free snapshot.
+                // waiter can be regranted from the stale free snapshot. The
+                // coordinator's observation turn publishes the eventual
+                // availability/global wake after the payload closes; the
+                // callback itself only needs one coalesced rescan edge.
                 let released_claim = result.preparation_claim.as_ref().unwrap_or(&designated);
                 table.mark_unknown(
                     &released_claim.cpus,
                     &released_claim.llcs,
                     &released_claim.permits,
                 )?;
-                table.bump_generation()?;
-            }
-            if return_to_waiting || released_acquired {
+                notify_now = table.schedule_rescan_edge_in_transaction()?;
                 table.finish_transaction()?;
             }
             // Keep the resource unavailable across the registry unlock, then
@@ -2476,7 +2488,11 @@ impl Ticket {
             drop(table);
             drop(lock);
             drop(result);
-            if stale || released_acquired {
+            // A targeted coordinator notification after the payload closes is
+            // required even when this completion coalesced into an existing
+            // RESCAN edge: the earlier notifier could otherwise probe while
+            // these physical OFDs were still held.
+            if notify_now || released_acquired {
                 notify_coordinator();
             }
             return Ok(GrantResult::LostGrant);
@@ -2522,13 +2538,15 @@ impl Ticket {
                             &preparation_claim.llcs,
                             &preparation_claim.permits,
                         )?;
-                        table.set_pending_flag(PENDING_RESCAN);
-                        table.bump_generation()?;
-                        table.elect_coordinator_in_transaction()?;
+                        table.schedule_rescan_edge_in_transaction()?;
                         table.finish_transaction()?;
                         drop(table);
                         drop(lock);
                         drop(acquired);
+                        // Notify after the physical preparation payload closes.
+                        // This is targeted transport, not a generation-futex
+                        // broadcast, and remains necessary when RESCAN was
+                        // already pending before this transaction.
                         notify_coordinator();
                         return Ok(GrantResult::Requeued);
                     }
@@ -2576,23 +2594,15 @@ impl Ticket {
         let consumed_serial = blocked.map_or(callback_snapshot_serial, |(_, serial)| {
             callback_snapshot_serial.max(serial)
         });
-        let unseen_replan_improvement = !acquisition_allowed
-            && table.global_serial() > callback_snapshot_serial
-            && table.max_watch_serial(&watch)? > callback_snapshot_serial;
-        let needs_revalidation = changed
-            || blocked_evidence.is_some()
-            || record.blocked_on.is_some()
-            || unseen_replan_improvement
-            || replan_inputs_changed;
-        // A speculative callback cannot acquire, and WAITING cannot run
-        // before an authoritative scan. Even current negative evidence and
-        // unseen improvements may therefore join the finite batch. Exact
-        // GRANTED work and coordinator loss remain immediate.
-        let urgent_rescan = acquisition_allowed || table.coordinator_ticket() == 0;
-        let batch_notify;
+        // Every callback completion publishes a coalesced rescan edge in the
+        // same transaction as REPLAN -> WAITING. Other live REPLAN callbacks
+        // remain private planner work; they neither fence this replacement nor
+        // delay its next authoritative viability scan.
+        let notify_now;
         if changed {
             if acquisition_allowed {
                 table.begin_transaction()?;
+                let rescan_was_pending = table.pending_flags() & PENDING_RESCAN != 0;
                 table.replace_claim_in_transaction(
                     self.slot,
                     record.ticket,
@@ -2602,15 +2612,13 @@ impl Ticket {
                     consumed_serial,
                     blocked,
                     false,
-                    false,
+                    ReplacementFenceEffect::ChangesPredecessorPrefix,
                 )?;
-                table.set_pending_flag(PENDING_RESCAN);
-                table.elect_coordinator_in_transaction()?;
-                table.bump_generation()?;
+                let schedule_notify = table.schedule_rescan_edge_in_transaction()?;
+                notify_now = !rescan_was_pending || schedule_notify;
                 table.finish_transaction()?;
-                batch_notify = true;
             } else {
-                batch_notify = table.replace_replan_claim_deferred(
+                notify_now = table.replace_replan_claim_and_schedule(
                     self.slot,
                     record.ticket,
                     &designated,
@@ -2618,11 +2626,16 @@ impl Ticket {
                     consumed_serial,
                     blocked,
                     false,
-                    urgent_rescan,
                 )?;
             }
         } else {
             table.begin_transaction()?;
+            if !acquisition_allowed {
+                // Completing an unchanged speculative callback can still turn
+                // this previously non-fencing ticket into a predecessor fence
+                // when the pending scan grants it.
+                table.mark_suffix_dirty(record.ticket);
+            }
             if let Some(evidence) = blocked_evidence {
                 let marker = evidence.marker();
                 let blocked_at = table.blocker_serial(marker.blocker, marker.mode)?;
@@ -2637,27 +2650,44 @@ impl Ticket {
             }
             table.set_record_state(self.slot, STATE_WAITING)?;
             table.set_record_issue_serial(self.slot, consumed_serial)?;
-            if urgent_rescan {
-                table.set_pending_flag(PENDING_RESCAN);
-                table.elect_coordinator_in_transaction()?;
-                table.bump_generation()?;
-                batch_notify = true;
-            } else {
-                if needs_revalidation {
-                    table.set_pending_flag(PENDING_REPLAN_BATCH);
-                }
-                batch_notify = table.promote_replan_batch_if_drained_in_transaction()?;
-            }
+            notify_now = table.schedule_rescan_edge_in_transaction()?;
             table.finish_transaction()?;
         }
 
-        let notify_now = urgent_rescan || batch_notify;
         drop(table);
         drop(lock);
         if notify_now {
             notify_coordinator();
         }
         Ok(GrantResult::Requeued)
+    }
+
+    /// Renew only the coordinator progress heartbeat. Unlike [`Self::schedule`],
+    /// this path never observes resources, scans grants, refreshes prefixes,
+    /// or changes allocation. If another waiter already displaced this ticket,
+    /// `open_coordinator_table` parks it until a later election before the
+    /// heartbeat can be renewed.
+    pub(super) fn heartbeat(&self, cancelled: Option<&AtomicBool>) -> Result<HeartbeatStatus> {
+        self.heartbeat_at(None, cancelled)
+    }
+
+    fn heartbeat_at(
+        &self,
+        now: Option<u64>,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<HeartbeatStatus> {
+        let _namespace = self.namespace.enter();
+        let mut parked = false;
+        let mut on_park = || parked = true;
+        let (_lock, mut table) = self.open_coordinator_table(cancelled, &mut on_park)?;
+        table.touch_coordinator_heartbeat_at(match now {
+            Some(now) => now,
+            None => monotonic_now_ns()?,
+        });
+        Ok(HeartbeatStatus {
+            parked,
+            rescan_pending: table.pending_flags() & PENDING_RESCAN != 0,
+        })
     }
 
     #[expect(
@@ -2763,7 +2793,7 @@ impl Ticket {
                     0,
                     None,
                     false,
-                    false,
+                    ReplacementFenceEffect::ChangesPredecessorPrefix,
                 )?;
             }
             table.apply_possible_release(&release_plan)?;
@@ -2781,6 +2811,7 @@ impl Ticket {
         let availability = table.availability_snapshot();
         let observation = table.observation_request()?;
         table.touch_coordinator_heartbeat()?;
+        let heartbeat_due_in = table.coordinator_heartbeat_due_in()?;
         Ok(ScheduleSnapshot {
             watch,
             candidate_claim,
@@ -2794,6 +2825,7 @@ impl Ticket {
             should_step: coordinator_prefix_changed,
             observation,
             liveness_due_in: table.liveness_due_in()?,
+            heartbeat_due_in,
         })
     }
 
@@ -2840,7 +2872,7 @@ impl Ticket {
         &self,
         cancelled: Option<&AtomicBool>,
         on_park: &mut impl FnMut(),
-    ) -> Result<(OwnedFd, Table)> {
+    ) -> Result<(RegistryLock, Table)> {
         let _namespace = self.namespace.enter();
         loop {
             let lock = lock_registry_interruptible_existing(cancelled)?;
@@ -2897,15 +2929,12 @@ impl Ticket {
         let layout = shared.validate_header(self.slot, self.ticket)?;
         let header = &shared.header;
         let now = monotonic_now_ns()?;
-        let heartbeat = read_u64(header, H_COORDINATOR_HEARTBEAT_NS);
         if atomic_u64(header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0
             || read_u64(header, H_PENDING_FLAGS) != 0
             || replan_wave_requires_recovery_from_header(header, now)
             || read_u64(header, H_COORDINATOR) != self.ticket
             || read_u64(header, H_COORDINATOR_SLOT) != self.slot
-            || heartbeat == 0
-            || heartbeat > now
-            || now - heartbeat >= COORDINATOR_HEARTBEAT_REFRESH_NS
+            || !coordinator_activity_is_fresh(header, now)
         {
             return Ok(None);
         }
@@ -3026,6 +3055,7 @@ impl Ticket {
             should_step: false,
             observation: None,
             liveness_due_in: liveness_due_in_from_header(header, now),
+            heartbeat_due_in: coordinator_heartbeat_due_in_from_header(header, now),
         }))
     }
 
@@ -3077,6 +3107,7 @@ impl Ticket {
         let observation = table.observation_request()?;
         let liveness_due_in = table.liveness_due_in()?;
         table.touch_coordinator_heartbeat()?;
+        let heartbeat_due_in = table.coordinator_heartbeat_due_in()?;
         Ok(ScheduleSnapshot {
             watch,
             candidate_claim: record.claim,
@@ -3090,6 +3121,7 @@ impl Ticket {
             should_step: planner_serial_after > planner_serial_before || coordinator_prefix_changed,
             observation,
             liveness_due_in,
+            heartbeat_due_in,
         })
     }
 
@@ -3201,35 +3233,31 @@ impl Ticket {
             notify_coordinator();
             anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
         }
-        if table.min_changed_ticket() < record.ticket
-            && commit_token.prefix_epoch != table.claim_epoch()
-        {
-            if table.pending_flags() & PENDING_REPLAN_BATCH != 0
-                && table.pending_flags() & PENDING_RESCAN == 0
-            {
-                // The selected physical payload raced an older speculative
-                // choice. Keep the coordinator parked and let the caller drop
-                // this attempt before sleeping for the final batch edge.
-                table.begin_transaction()?;
-                table.mark_unknown(&exact.cpus, &exact.llcs, &exact.permits)?;
-                table.mark_blockers_unknown(contention)?;
-                table.finish_transaction()?;
-                return Ok(FinishAcquireResult::BatchDeferred);
-            }
-            // Reconcile one dirty predecessor suffix before judging the
-            // coordinator's planner snapshot. The scan preserves the cached
-            // prefix epoch when aggregate inputs are byte-for-byte identical,
-            // but publishes a new token for every real prefix change.
+        let reconciled_dirty_suffix = table.min_changed_ticket() < record.ticket;
+        if reconciled_dirty_suffix {
+            // This is the elected coordinator's authoritative commit path, so
+            // reconcile the dirty predecessor suffix here. Exact cached-prefix
+            // comparison preserves a disjoint expensive success while still
+            // rejecting a genuinely stale payload below.
             table.grant_compatible()?;
             record = table
                 .record(self.slot)?
                 .filter(|record| record.ticket == self.ticket)
                 .ok_or_else(|| anyhow::anyhow!("coordinator ticket {} disappeared", self.ticket))?;
         }
+        let refreshed_prefix_compatible = if reconciled_dirty_suffix
+            && record.prefix_epoch != 0
+            && record.prefix_epoch != commit_token.prefix_epoch
+        {
+            !table.cached_prefix(record.slot)?.1.conflicts(exact)?
+        } else {
+            false
+        };
         let stale = commit_token.prefix_epoch == 0
+            || record.prefix_epoch == 0
             || table.coordinator_epoch() != commit_token.coordinator_epoch
             || record.state != STATE_COORDINATOR
-            || record.prefix_epoch != commit_token.prefix_epoch;
+            || (record.prefix_epoch != commit_token.prefix_epoch && !refreshed_prefix_compatible);
         if stale {
             // The physical probe raced an earlier callback that changed or
             // removed its reservation. Preserve this coordinator ticket,
@@ -3309,28 +3337,27 @@ impl Ticket {
             notify_coordinator();
             anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
         }
-        if table.min_changed_ticket() < record.ticket
-            && commit_token.prefix_epoch != table.claim_epoch()
-        {
-            if table.pending_flags() & PENDING_REPLAN_BATCH != 0
-                && table.pending_flags() & PENDING_RESCAN == 0
-            {
-                table.begin_transaction()?;
-                table.mark_unknown(&preparation.cpus, &preparation.llcs, &preparation.permits)?;
-                table.mark_blockers_unknown(contention)?;
-                table.finish_transaction()?;
-                return Ok(FinishPreparationResult::BatchDeferred);
-            }
+        let reconciled_dirty_suffix = table.min_changed_ticket() < record.ticket;
+        if reconciled_dirty_suffix {
             table.grant_compatible()?;
             record = table
                 .record(self.slot)?
                 .filter(|record| record.ticket == self.ticket)
                 .ok_or_else(|| anyhow::anyhow!("coordinator ticket {} disappeared", self.ticket))?;
         }
+        let refreshed_prefix_compatible = if reconciled_dirty_suffix
+            && record.prefix_epoch != 0
+            && record.prefix_epoch != commit_token.prefix_epoch
+        {
+            !table.cached_prefix(record.slot)?.1.conflicts(preparation)?
+        } else {
+            false
+        };
         let stale = commit_token.prefix_epoch == 0
+            || record.prefix_epoch == 0
             || table.coordinator_epoch() != commit_token.coordinator_epoch
             || record.state != STATE_COORDINATOR
-            || record.prefix_epoch != commit_token.prefix_epoch;
+            || (record.prefix_epoch != commit_token.prefix_epoch && !refreshed_prefix_compatible);
         if stale {
             table.begin_transaction()?;
             table.mark_unknown(&preparation.cpus, &preparation.llcs, &preparation.permits)?;
@@ -4192,6 +4219,113 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
 }
 
 #[cfg(test)]
+pub(crate) struct CoordinatorHeartbeatDeadlineOutcome {
+    pub(crate) healthy_retained_before_deadline: bool,
+    pub(crate) takeover_at_deadline: bool,
+    pub(crate) displaced_coordinator_parked: bool,
+    pub(crate) heartbeat_advanced: bool,
+    pub(crate) heartbeat_tick_preserved_protocol_state: bool,
+}
+
+#[cfg(test)]
+pub(super) fn exercise_coordinator_heartbeat_deadline_for_tests()
+-> Result<CoordinatorHeartbeatDeadlineOutcome> {
+    let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(claim.clone(), claim.clone(), None)?;
+    let mut successor = Ticket::register(claim.clone(), claim, None)?;
+
+    let protocol_image = |table: &mut Table| -> Result<_> {
+        let mut header = table.header.to_vec();
+        header[H_COORDINATOR_HEARTBEAT_NS..H_COORDINATOR_HEARTBEAT_NS + 8].fill(0);
+        let mut records = Vec::new();
+        for slot in 0..table.next_slot()? {
+            records.push(
+                table
+                    .record_bytes(slot)?
+                    .ok_or_else(|| anyhow::anyhow!("heartbeat test slot {slot} disappeared"))?
+                    .to_vec(),
+            );
+        }
+        Ok((header, records))
+    };
+
+    let (signature_before_tick, heartbeat_before, first_tick_at) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        anyhow::ensure!(
+            table.coordinator_ticket() == coordinator.ticket
+                && table.coordinator_slot()? == coordinator.slot,
+            "heartbeat-deadline fixture did not elect its first ticket",
+        );
+        (
+            protocol_image(&mut table)?,
+            read_u64(&table.header, H_COORDINATOR_HEARTBEAT_NS),
+            monotonic_now_ns()?.saturating_add(1_000_000).max(1),
+        )
+    };
+    let second_tick_at = first_tick_at.saturating_add(COORDINATOR_HEARTBEAT_INTERVAL_NS);
+    let first_tick = coordinator.heartbeat_at(Some(first_tick_at), None)?;
+    let second_tick = coordinator.heartbeat_at(Some(second_tick_at), None)?;
+    let (signature_after_tick, heartbeat_after) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        (
+            protocol_image(&mut table)?,
+            read_u64(&table.header, H_COORDINATOR_HEARTBEAT_NS),
+        )
+    };
+
+    let deadline = second_tick_at.saturating_add(COORDINATOR_HEARTBEAT_LEASE_NS);
+    let (healthy_retained_before_deadline, takeover_at_deadline, displaced_coordinator_parked) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        // Prove that generic queue progress cannot mask a missed coordinator
+        // heartbeat. At the exact heartbeat boundary this progress stamp is
+        // still fresh, but the coordinator must nevertheless transfer.
+        write_u64(
+            &mut table.header,
+            H_LAST_PROGRESS_NS,
+            deadline.saturating_sub(1),
+        );
+        table.recover_coordinator_if_dead_at(deadline.saturating_sub(1))?;
+        let healthy = table.coordinator_ticket() == coordinator.ticket
+            && table.coordinator_slot()? == coordinator.slot
+            && table.record(coordinator.slot)?.is_some_and(|record| {
+                record.ticket == coordinator.ticket && record.state == STATE_COORDINATOR
+            });
+
+        table.recover_coordinator_if_dead_at(deadline)?;
+        let takeover = table.coordinator_ticket() == successor.ticket
+            && table.coordinator_slot()? == successor.slot
+            && table.record(successor.slot)?.is_some_and(|record| {
+                record.ticket == successor.ticket && record.state == STATE_COORDINATOR
+            });
+        let parked = table.record(coordinator.slot)?.is_some_and(|record| {
+            record.ticket == coordinator.ticket && record.state == STATE_COORDINATOR_STANDBY
+        });
+        (healthy, takeover, parked)
+    };
+
+    successor.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(CoordinatorHeartbeatDeadlineOutcome {
+        healthy_retained_before_deadline,
+        takeover_at_deadline,
+        displaced_coordinator_parked,
+        heartbeat_advanced: !first_tick.parked
+            && !second_tick.parked
+            && !first_tick.rescan_pending
+            && !second_tick.rescan_pending
+            && heartbeat_after == second_tick_at
+            && heartbeat_after != heartbeat_before,
+        heartbeat_tick_preserved_protocol_state: signature_after_tick == signature_before_tick,
+    })
+}
+
+#[cfg(test)]
 pub(super) fn expire_coordinator_lease_for_tests() -> Result<()> {
     let _lock = lock_registry_existing(FlockMode::Exclusive)?;
     let mut table = Table::open_existing()?;
@@ -4388,13 +4522,32 @@ pub(super) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(super) fn hold_registry_shared_for_tests() -> Result<OwnedFd> {
+pub(super) fn hold_registry_shared_for_tests() -> Result<RegistryLock> {
     lock_registry_existing(FlockMode::Shared)
 }
 
 #[cfg(test)]
-pub(super) fn hold_registry_exclusive_for_tests() -> Result<OwnedFd> {
+pub(super) fn hold_registry_exclusive_for_tests() -> Result<RegistryLock> {
     lock_registry_interruptible(None)
+}
+
+#[cfg(test)]
+pub(super) fn hold_registry_exclusive_after_intent_for_tests(
+    on_intent: impl FnOnce() -> Result<()>,
+) -> Result<RegistryLock> {
+    try_lock_registry_existing_with_writer_intent_hook(FlockMode::Exclusive, on_intent)?.ok_or_else(
+        || anyhow::anyhow!("existing admission registry disappeared after test initialization"),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn try_hold_registry_shared_for_tests() -> Result<Option<RegistryLock>> {
+    try_lock_registry_existing_nonblocking(FlockMode::Shared)
+}
+
+#[cfg(test)]
+pub(super) fn try_hold_registry_exclusive_for_tests() -> Result<Option<RegistryLock>> {
+    try_lock_registry_existing_nonblocking(FlockMode::Exclusive)
 }
 
 #[cfg(test)]
@@ -5948,11 +6101,11 @@ pub(crate) struct ReplanTokenWaveOutcome {
 }
 
 #[cfg(test)]
-pub(crate) struct ReplanChangedBatchOutcome {
+pub(crate) struct ReplanChangedWaveOutcome {
     pub(crate) callbacks: usize,
     pub(crate) intermediate_scan_delta: u64,
     pub(crate) intermediate_generation_wake_delta: u32,
-    pub(crate) intermediate_batch_only: bool,
+    pub(crate) intermediate_rescan_coalesced: bool,
     pub(crate) final_scan_delta_before_authoritative: u64,
     pub(crate) final_generation_wake_delta: u32,
     pub(crate) final_rescan_edge: bool,
@@ -5962,12 +6115,25 @@ pub(crate) struct ReplanChangedBatchOutcome {
 }
 
 #[cfg(test)]
+pub(crate) struct ReplanStragglerProgressOutcome {
+    pub(crate) completion_requeued: bool,
+    pub(crate) callback_scan_delta: u64,
+    pub(crate) callback_generation_wake_delta: u32,
+    pub(crate) edge_coalesced_with_straggler: bool,
+    pub(crate) later_disjoint_grant_remained_current: bool,
+    pub(crate) authoritative_scan_delta: u64,
+    pub(crate) completed_replacement_granted: bool,
+    pub(crate) straggler_still_replan: bool,
+    pub(crate) wave_deadline_not_reached: bool,
+}
+
+#[cfg(test)]
 pub(crate) struct ReplanWaveExpiryOutcome {
     pub(crate) ordinary_wave_not_expired_early: bool,
     pub(crate) completed_replacement_preserved: bool,
     pub(crate) stragglers_quarantined: bool,
     pub(crate) wave_drained_and_clock_cleared: bool,
-    pub(crate) expiration_single_generation_edge: bool,
+    pub(crate) expiration_avoids_global_generation_wake: bool,
     pub(crate) completed_replacement_granted: bool,
     pub(crate) expired_tickets_not_reissued: bool,
     pub(crate) late_completion_rejected: bool,
@@ -5976,23 +6142,6 @@ pub(crate) struct ReplanWaveExpiryOutcome {
     pub(crate) entry_callback_suppressed: bool,
     pub(crate) entry_acknowledged_waiting: bool,
     pub(crate) acknowledgement_rescan_edge: bool,
-}
-
-#[cfg(test)]
-pub(crate) struct ReplanBatchBarrierOutcome {
-    pub(crate) granted_entry_callback_suppressed: bool,
-    pub(crate) granted_completion_payload_dropped: bool,
-    pub(crate) granted_completion_payload_dropped_unlocked: bool,
-    pub(crate) granted_contention_serials_preserved: bool,
-    pub(crate) granted_contention_unknown_before_witness_drop: bool,
-    pub(crate) granted_records_parked: bool,
-    pub(crate) granted_scan_delta: u64,
-    pub(crate) coordinator_acquire_deferred: bool,
-    pub(crate) coordinator_preparation_deferred: bool,
-    pub(crate) coordinator_acquire_evidence_unknown: bool,
-    pub(crate) coordinator_preparation_evidence_unknown: bool,
-    pub(crate) coordinator_preserved: bool,
-    pub(crate) coordinator_scan_delta: u64,
 }
 
 #[cfg(test)]
@@ -6653,8 +6802,9 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         GRANT_PREFIX_RECORD_READS.with(std::cell::Cell::get) - prefix_reads_before;
 
     // The completed callback is older than the newly registered flexible
-    // ticket. While the first frozen wave still has live callbacks, neither
-    // age may extend it: both remain WAITING for the next batch.
+    // ticket. While the finite publication wave still has live callbacks,
+    // neither may join another speculative wave. Ordinary authoritative scans
+    // remain free to grant either ticket if its exact claim becomes viable.
     let late_cpu = fixed_cpu + 1;
     {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
@@ -6725,10 +6875,10 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         (repeated_replans, repeated_wakes)
     };
 
-    // Return every remaining callback from the frozen first wave. The final
-    // completion must publish one rescan edge; that one scan must then admit
-    // both the older returned callback and post-horizon arrival which the
-    // live wave deliberately deferred above.
+    // Return every remaining callback from the finite first wave. Every
+    // completion coalesces the same rescan edge; after the wave drains, one
+    // scan may publish the next speculative wave for both the older returned
+    // callback and the post-horizon arrival deferred above.
     let (next_wave_scans_before, next_wave_old_wake_before, next_wave_late_wake_before) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
@@ -6777,7 +6927,6 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let table = Table::open_existing()?;
         table.replan_outstanding() == 0
-            && table.pending_flags() & PENDING_REPLAN_BATCH == 0
             && table.pending_flags() & PENDING_RESCAN != 0
             && read_u64(&table.header, H_GRANT_SCANS) == next_wave_scans_before
     };
@@ -6876,15 +7025,15 @@ pub(super) fn exercise_replan_token_wave_for_tests(
     })
 }
 
-/// Complete a host-sized speculative wave with a distinct replacement from
-/// every callback.  No completion may run the authoritative queue scan; the
-/// final callback publishes one edge which a coordinator consumes once.
+/// Complete a large finite REPLAN wave. Every callback publishes the same
+/// coalesced rescan edge; none performs the authoritative O(N) scan or a
+/// global generation wake while the coordinator remains live.
 #[cfg(test)]
-pub(super) fn exercise_changed_replan_batch_for_tests(
+pub(super) fn exercise_changed_replan_wave_completions_for_tests(
     callback_count: usize,
-) -> Result<ReplanChangedBatchOutcome> {
+) -> Result<ReplanChangedWaveOutcome> {
     if callback_count < 2 {
-        anyhow::bail!("changed REPLAN batch exercise needs at least two callbacks");
+        anyhow::bail!("changed REPLAN wave exercise needs at least two callbacks");
     }
     let coordinator_cpu = 900usize;
     let designated_base = 1_000usize;
@@ -6935,7 +7084,7 @@ pub(super) fn exercise_changed_replan_batch_for_tests(
                         .flatten()
                         .is_some_and(|record| record.state == STATE_REPLAN)
                 }),
-            "changed REPLAN batch did not publish every callback",
+            "changed REPLAN wave did not publish every callback",
         );
         (
             read_u64(&table.header, H_GRANT_SCANS),
@@ -6968,15 +7117,17 @@ pub(super) fn exercise_changed_replan_batch_for_tests(
         );
     }
 
-    let (intermediate_scan_delta, intermediate_generation_wake_delta, intermediate_batch_only) = {
+    let (
+        intermediate_scan_delta,
+        intermediate_generation_wake_delta,
+        intermediate_rescan_coalesced,
+    ) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let table = Table::open_existing()?;
         (
             read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before),
             table.generation_wake().wrapping_sub(generation_wake_before),
-            table.replan_outstanding() == 1
-                && table.pending_flags() & PENDING_REPLAN_BATCH != 0
-                && table.pending_flags() & PENDING_RESCAN == 0,
+            table.replan_outstanding() == 1 && table.pending_flags() & PENDING_RESCAN != 0,
         )
     };
 
@@ -7018,14 +7169,12 @@ pub(super) fn exercise_changed_replan_batch_for_tests(
             read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
         let final_generation_wake_delta =
             table.generation_wake().wrapping_sub(generation_wake_before);
-        let final_rescan_edge = table.replan_outstanding() == 0
-            && table.pending_flags() & PENDING_REPLAN_BATCH == 0
-            && table.pending_flags() & PENDING_RESCAN != 0;
+        let final_rescan_edge =
+            table.replan_outstanding() == 0 && table.pending_flags() & PENDING_RESCAN != 0;
         table.grant_compatible()?;
         let authoritative_scan_delta =
             read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
-        let authoritative_flags_clear =
-            table.pending_flags() & (PENDING_REPLAN_BATCH | PENDING_RESCAN) == 0;
+        let authoritative_flags_clear = table.pending_flags() & PENDING_RESCAN == 0;
         let replacements_preserved = callbacks.iter().all(|(ticket, _, replacement)| {
             table
                 .record(ticket.slot)
@@ -7047,11 +7196,11 @@ pub(super) fn exercise_changed_replan_batch_for_tests(
         ticket.finish(None)?;
     }
     coordinator.finish(None)?;
-    Ok(ReplanChangedBatchOutcome {
+    Ok(ReplanChangedWaveOutcome {
         callbacks: callback_count,
         intermediate_scan_delta,
         intermediate_generation_wake_delta,
-        intermediate_batch_only,
+        intermediate_rescan_coalesced,
         final_scan_delta_before_authoritative,
         final_generation_wake_delta,
         final_rescan_edge,
@@ -7059,6 +7208,257 @@ pub(super) fn exercise_changed_replan_batch_for_tests(
         authoritative_flags_clear,
         replacements_preserved,
     })
+}
+
+/// Prove that an unrelated straggler is accounting/quarantine state, not a
+/// grant barrier. The first callback's replacement must become runnable in a
+/// normal coordinator scan while the second callback is still in REPLAN and
+/// the finite-wave deadline remains in the future.
+#[cfg(test)]
+pub(super) fn exercise_replan_straggler_progress_for_tests()
+-> Result<ReplanStragglerProgressOutcome> {
+    let coordinator_cpu = 1_200usize;
+    let first_designated_cpu = 1_201usize;
+    let first_replacement_cpu = 1_202usize;
+    let straggler_designated_cpu = 1_203usize;
+    let straggler_replacement_cpu = 1_204usize;
+    let later_grant_cpu = 1_205usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let first_designated = ClaimSet::new(
+        std::iter::empty(),
+        [first_designated_cpu],
+        FlockMode::Exclusive,
+    );
+    let first_replacement = ClaimSet::new(
+        std::iter::empty(),
+        [first_replacement_cpu],
+        FlockMode::Exclusive,
+    );
+    let first_watch = ClaimSet::new(
+        std::iter::empty(),
+        [first_designated_cpu, first_replacement_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut first = Ticket::register(first_designated.clone(), first_watch, None)?;
+    let straggler_designated = ClaimSet::new(
+        std::iter::empty(),
+        [straggler_designated_cpu],
+        FlockMode::Exclusive,
+    );
+    let straggler_watch = ClaimSet::new(
+        std::iter::empty(),
+        [straggler_designated_cpu, straggler_replacement_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut straggler = Ticket::register(straggler_designated.clone(), straggler_watch, None)?;
+    let later_grant_claim =
+        ClaimSet::new(std::iter::empty(), [later_grant_cpu], FlockMode::Exclusive);
+    let mut later_grant =
+        Ticket::register(later_grant_claim.clone(), later_grant_claim.clone(), None)?;
+
+    let (scans_before, generation_wake_before, wave_deadline_ns) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        for cpu in [
+            coordinator_cpu,
+            first_designated_cpu,
+            first_replacement_cpu,
+            straggler_designated_cpu,
+            straggler_replacement_cpu,
+        ] {
+            set_cpu_free_for_tests(&mut table, cpu, false)?;
+        }
+        set_cpu_free_for_tests(&mut table, later_grant_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1))?;
+        anyhow::ensure!(
+            table.replan_outstanding() == 2
+                && table
+                    .record(first.slot)?
+                    .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(straggler.slot)?
+                    .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(later_grant.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            "straggler progress fixture did not publish both callbacks and its disjoint later grant",
+        );
+        (
+            read_u64(&table.header, H_GRANT_SCANS),
+            table.generation_wake(),
+            table.replan_wave_deadline_ns(),
+        )
+    };
+
+    let callback_result = first.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &first_designated,
+                "completed straggler fixture callback received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: first_replacement.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let completion_requeued = matches!(callback_result, GrantResult::Requeued);
+
+    let mut later_callback_ran = false;
+    let later_result = later_grant.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            later_callback_ran = true;
+            anyhow::ensure!(
+                acquisition_allowed && current == &later_grant_claim,
+                "later disjoint grant received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: later_grant_claim.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let later_disjoint_grant_remained_current =
+        later_callback_ran && matches!(later_result, GrantResult::Requeued);
+
+    let (
+        callback_scan_delta,
+        callback_generation_wake_delta,
+        edge_coalesced_with_straggler,
+        authoritative_scan_delta,
+        completed_replacement_granted,
+        straggler_still_replan,
+        wave_deadline_not_reached,
+    ) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let callback_scan_delta = read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
+        let callback_generation_wake_delta =
+            table.generation_wake().wrapping_sub(generation_wake_before);
+        let edge_coalesced_with_straggler = table.replan_outstanding() == 1
+            && table.pending_flags() & PENDING_RESCAN != 0
+            && table
+                .record(straggler.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN);
+        set_cpu_free_for_tests(&mut table, first_replacement_cpu, true)?;
+        let before_deadline = wave_deadline_ns.saturating_sub(1).max(1);
+        table.grant_compatible_at(before_deadline)?;
+        let authoritative_scan_delta =
+            read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
+        let completed_replacement_granted = table.record(first.slot)?.is_some_and(|record| {
+            record.state == STATE_GRANTED && record.claim == first_replacement
+        });
+        let straggler_still_replan = table
+            .record(straggler.slot)?
+            .is_some_and(|record| record.state == STATE_REPLAN)
+            && table.replan_outstanding() == 1;
+        let wave_deadline_not_reached = table.replan_wave_deadline_ns() == wave_deadline_ns
+            && before_deadline < wave_deadline_ns;
+        (
+            callback_scan_delta,
+            callback_generation_wake_delta,
+            edge_coalesced_with_straggler,
+            authoritative_scan_delta,
+            completed_replacement_granted,
+            straggler_still_replan,
+            wave_deadline_not_reached,
+        )
+    };
+
+    later_grant.finish(None)?;
+    straggler.finish(None)?;
+    first.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(ReplanStragglerProgressOutcome {
+        completion_requeued,
+        callback_scan_delta,
+        callback_generation_wake_delta,
+        edge_coalesced_with_straggler,
+        later_disjoint_grant_remained_current,
+        authoritative_scan_delta,
+        completed_replacement_granted,
+        straggler_still_replan,
+        wave_deadline_not_reached,
+    })
+}
+
+/// Complete the last live callback after its coordinator disappeared while a
+/// RESCAN edge was already pending. Election must run after REPLAN -> WAITING
+/// publication even though no new transport edge is needed.
+#[cfg(test)]
+pub(super) fn exercise_replan_completion_election_for_tests() -> Result<bool> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [1_250usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let designated = ClaimSet::new(std::iter::empty(), [1_251usize], FlockMode::Exclusive);
+    let replacement = ClaimSet::new(std::iter::empty(), [1_252usize], FlockMode::Exclusive);
+    let watch = ClaimSet::new(
+        std::iter::empty(),
+        [1_251usize, 1_252usize],
+        FlockMode::Exclusive,
+    );
+    let mut callback = Ticket::register(designated.clone(), watch, None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        for cpu in [1_250usize, 1_251, 1_252] {
+            set_cpu_free_for_tests(&mut table, cpu, false)?;
+        }
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        anyhow::ensure!(
+            table
+                .record(callback.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN),
+            "completion-election fixture did not publish REPLAN",
+        );
+    }
+    coordinator.finish(None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        anyhow::ensure!(
+            table.coordinator_ticket() == 0 && table.pending_flags() & PENDING_RESCAN != 0,
+            "completion-election fixture retained a coordinator or lost its pending edge",
+        );
+    }
+    let result = callback.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &designated,
+                "completion-election fixture received the wrong callback",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: replacement.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let elected = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        matches!(result, GrantResult::Requeued)
+            && table.coordinator_ticket() == callback.ticket
+            && table.record(callback.slot)?.is_some_and(|record| {
+                record.state == STATE_COORDINATOR && record.claim == replacement
+            })
+    };
+    callback.finish(None)?;
+    Ok(elected)
 }
 
 /// Drive a finite wave across its lease boundary without sleeping. One
@@ -7143,7 +7543,7 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
     let mut completed_replacement_preserved = false;
     let mut stragglers_quarantined = false;
     let mut wave_drained_and_clock_cleared = false;
-    let mut expiration_single_generation_edge = false;
+    let mut expiration_avoids_global_generation_wake = false;
     let mut completed_replacement_granted = false;
     let mut expired_tickets_not_reissued = false;
     let mut generation_after_expiration_scan = 0u32;
@@ -7195,12 +7595,11 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
             wave_drained_and_clock_cleared = table.replan_outstanding() == 0
                 && table.replan_wave_started_ns() == 0
                 && table.replan_wave_deadline_ns() == 0
-                && table.pending_flags() & PENDING_REPLAN_BATCH == 0
                 && table.pending_flags() & PENDING_RESCAN != 0;
-            expiration_single_generation_edge = table
+            expiration_avoids_global_generation_wake = table
                 .generation_wake()
                 .wrapping_sub(generation_before_expiration)
-                == 1;
+                == 0;
 
             set_cpu_free_for_tests(&mut table, replacement_cpus[0], true)?;
             table.grant_compatible_at(wave_deadline_ns)?;
@@ -7265,7 +7664,7 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
                 && table
                     .generation_wake()
                     .wrapping_sub(generation_after_expiration_scan)
-                    == 2,
+                    == 0,
         )
     };
 
@@ -7278,7 +7677,7 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
         completed_replacement_preserved,
         stragglers_quarantined,
         wave_drained_and_clock_cleared,
-        expiration_single_generation_edge,
+        expiration_avoids_global_generation_wake,
         completed_replacement_granted,
         expired_tickets_not_reissued,
         late_completion_rejected,
@@ -7353,478 +7752,6 @@ pub(super) fn exercise_replan_expiry_publication_crash_for_tests() -> Result<boo
     callback.finish(None)?;
     coordinator.finish(None)?;
     Ok(publication_torn_with_deadline && repaired_to_expired)
-}
-
-/// Exercise both sides of the batch-only priority barrier.  A later GRANTED
-/// callback is tested once before entry and once after its physical callback
-/// has returned; a later coordinator token is tested for both final and
-/// preparation commits.
-#[cfg(test)]
-pub(super) fn exercise_replan_batch_barriers_for_tests() -> Result<ReplanBatchBarrierOutcome> {
-    let coordinator_claim = ClaimSet::new(std::iter::empty(), [10usize], FlockMode::Exclusive);
-    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
-    let old_entry_designated = ClaimSet::new(std::iter::empty(), [11usize], FlockMode::Exclusive);
-    let entry_claim = ClaimSet::new(std::iter::empty(), [12usize], FlockMode::Exclusive);
-    let old_entry_watch =
-        ClaimSet::new(std::iter::empty(), [11usize, 12usize], FlockMode::Exclusive);
-    let mut old_entry = Ticket::register(old_entry_designated.clone(), old_entry_watch, None)?;
-    let old_completion_designated =
-        ClaimSet::new(std::iter::empty(), [13usize], FlockMode::Exclusive);
-    let completion_claim = ClaimSet::new(std::iter::empty(), [14usize], FlockMode::Exclusive);
-    let old_completion_watch =
-        ClaimSet::new(std::iter::empty(), [13usize, 14usize], FlockMode::Exclusive);
-    let mut old_completion = Ticket::register(
-        old_completion_designated.clone(),
-        old_completion_watch,
-        None,
-    )?;
-    let old_contention_designated =
-        ClaimSet::new(std::iter::empty(), [17usize], FlockMode::Exclusive);
-    let contention_claim = ClaimSet::new(std::iter::empty(), [18usize], FlockMode::Exclusive);
-    let old_contention_watch =
-        ClaimSet::new(std::iter::empty(), [17usize, 18usize], FlockMode::Exclusive);
-    let mut old_contention = Ticket::register(
-        old_contention_designated.clone(),
-        old_contention_watch,
-        None,
-    )?;
-    let final_designated = ClaimSet::new(std::iter::empty(), [15usize], FlockMode::Exclusive);
-    let final_watch = ClaimSet::new(std::iter::empty(), [15usize, 16usize], FlockMode::Exclusive);
-    let mut final_replan = Ticket::register(final_designated.clone(), final_watch, None)?;
-    let mut entry_grant = Ticket::register(entry_claim.clone(), entry_claim.clone(), None)?;
-    let mut completion_grant =
-        Ticket::register(completion_claim.clone(), completion_claim.clone(), None)?;
-    let mut contention_grant =
-        Ticket::register(contention_claim.clone(), contention_claim.clone(), None)?;
-
-    let granted_scans_before = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        for cpu in [10usize, 11, 13, 15, 16, 17] {
-            set_cpu_free_for_tests(&mut table, cpu, false)?;
-        }
-        for cpu in [12usize, 14, 18] {
-            set_cpu_free_for_tests(&mut table, cpu, true)?;
-        }
-        table.stamp_resource_improvement(S_CPU_EX, 18)?;
-        table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible()?;
-        anyhow::ensure!(
-            [
-                old_entry.slot,
-                old_completion.slot,
-                old_contention.slot,
-                final_replan.slot,
-            ]
-            .into_iter()
-            .all(|slot| table
-                .record(slot)
-                .ok()
-                .flatten()
-                .is_some_and(|record| record.state == STATE_REPLAN)),
-            "batch barrier setup did not publish every speculative callback",
-        );
-        anyhow::ensure!(
-            [
-                entry_grant.slot,
-                completion_grant.slot,
-                contention_grant.slot,
-            ]
-            .into_iter()
-            .all(|slot| table
-                .record(slot)
-                .ok()
-                .flatten()
-                .is_some_and(|record| record.state == STATE_GRANTED)),
-            "batch barrier setup did not publish every later grant",
-        );
-        read_u64(&table.header, H_GRANT_SCANS)
-    };
-
-    let mut granted_entry_callback_ran = false;
-    let payload_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
-    let payload_dropped_unlocked = std::rc::Rc::new(std::cell::Cell::new(false));
-    let payload_drop_flag = std::rc::Rc::clone(&payload_dropped);
-    let payload_unlock_flag = std::rc::Rc::clone(&payload_dropped_unlocked);
-    let (mut witness_observer, contention_witness) = std::os::unix::net::UnixStream::pair()?;
-    let contention_observer_namespace = contention_grant.namespace.clone();
-    let witness_drop_observer = std::thread::spawn(move || -> Result<bool> {
-        let mut byte = [0u8; 1];
-        let bytes = std::io::Read::read(&mut witness_observer, &mut byte)?;
-        anyhow::ensure!(bytes == 0, "contention witness unexpectedly wrote data");
-        let _namespace = contention_observer_namespace.enter();
-        let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Shared)? else {
-            return Ok(false);
-        };
-        let table = Table::open_existing()?;
-        Ok(table.bitmap_bit(B_PENDING_CPU_EX, 18)? && !table.bitmap_bit(B_CPU_EX_AVAILABLE, 18)?)
-    });
-    let mut completion_result = None;
-    let contention_result = contention_grant.run_granted(
-        None,
-        |current, _watch, acquisition_allowed, _predecessors, _availability| {
-            anyhow::ensure!(
-                acquisition_allowed && current == &contention_claim,
-                "contention barrier grant entered with the wrong publication",
-            );
-            let completed = completion_grant.run_granted(
-                None,
-                |current, _watch, acquisition_allowed, _predecessors, _availability| {
-                    anyhow::ensure!(
-                        acquisition_allowed && current == &completion_claim,
-                        "completion barrier grant entered with the wrong publication",
-                    );
-                    let entry_result = old_entry.run_granted(
-                        None,
-                        |current, _watch, acquisition_allowed, _predecessors, _availability| {
-                            anyhow::ensure!(
-                                !acquisition_allowed && current == &old_entry_designated,
-                                "entry-barrier predecessor received the wrong publication",
-                            );
-                            Ok(GrantAttempt::<()> {
-                                acquired: None,
-                                preparation_claim: None,
-                                preparation_contention: None,
-                                next_claim: entry_claim.clone(),
-                                contention: None,
-                            })
-                        },
-                    )?;
-                    anyhow::ensure!(matches!(entry_result, GrantResult::Requeued));
-
-                    let parked = entry_grant.run_granted(
-                        None,
-                        |_current, _watch, _allowed, _predecessors, _availability| {
-                            granted_entry_callback_ran = true;
-                            Ok(GrantAttempt::<()> {
-                                acquired: None,
-                                preparation_claim: None,
-                                preparation_contention: None,
-                                next_claim: entry_claim.clone(),
-                                contention: None,
-                            })
-                        },
-                    )?;
-                    anyhow::ensure!(matches!(parked, GrantResult::LostGrant));
-
-                    let changed = old_completion.run_granted(
-                        None,
-                        |current, _watch, acquisition_allowed, _predecessors, _availability| {
-                            anyhow::ensure!(
-                                !acquisition_allowed && current == &old_completion_designated,
-                                "completion-barrier predecessor received the wrong publication",
-                            );
-                            Ok(GrantAttempt::<()> {
-                                acquired: None,
-                                preparation_claim: None,
-                                preparation_contention: None,
-                                next_claim: completion_claim.clone(),
-                                contention: None,
-                            })
-                        },
-                    )?;
-                    anyhow::ensure!(matches!(changed, GrantResult::Requeued));
-                    Ok(GrantAttempt {
-                        acquired: Some(DropProbe {
-                            dropped: payload_drop_flag,
-                            registry_unlocked: payload_unlock_flag,
-                        }),
-                        preparation_claim: None,
-                        preparation_contention: None,
-                        next_claim: current.clone(),
-                        contention: None,
-                    })
-                },
-            )?;
-            completion_result = Some(completed);
-            let changed = old_contention.run_granted(
-                None,
-                |current, _watch, acquisition_allowed, _predecessors, _availability| {
-                    anyhow::ensure!(
-                        !acquisition_allowed && current == &old_contention_designated,
-                        "contention-barrier predecessor received the wrong publication",
-                    );
-                    Ok(GrantAttempt::<()> {
-                        acquired: None,
-                        preparation_claim: None,
-                        preparation_contention: None,
-                        next_claim: contention_claim.clone(),
-                        contention: None,
-                    })
-                },
-            )?;
-            anyhow::ensure!(matches!(changed, GrantResult::Requeued));
-            Ok(GrantAttempt::<()> {
-                acquired: None,
-                preparation_claim: None,
-                preparation_contention: None,
-                next_claim: current.clone(),
-                contention: Some(ContentionEvidence {
-                    blocker: ResourceKey::Cpu(18),
-                    mode: FlockMode::Exclusive,
-                    _witness: contention_witness.into(),
-                }),
-            })
-        },
-    )?;
-    let completion_result = completion_result
-        .ok_or_else(|| anyhow::anyhow!("completion barrier callback was not entered"))?;
-    let granted_contention_unknown_before_witness_drop = witness_drop_observer
-        .join()
-        .map_err(|_| anyhow::anyhow!("contention witness observer panicked"))??;
-    let granted_entry_callback_suppressed = !granted_entry_callback_ran;
-    let granted_completion_payload_dropped = payload_dropped.get();
-    let granted_completion_payload_dropped_unlocked = payload_dropped_unlocked.get();
-    let (granted_contention_serials_preserved, granted_records_parked, granted_scan_delta) = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        let contention_record = table
-            .record(contention_grant.slot)?
-            .ok_or_else(|| anyhow::anyhow!("contention barrier grant disappeared"))?;
-        let blocker_serial = table.blocker_serial(ResourceKey::Cpu(18), FlockMode::Exclusive)?;
-        (
-            contention_record.blocked_on.is_some_and(|blocked| {
-                blocked.key == ResourceKey::Cpu(18)
-                    && blocked.mode == FlockMode::Exclusive
-                    && blocked.serial == blocker_serial
-            }) && blocker_serial > 0
-                && contention_record.issue_serial >= blocker_serial,
-            matches!(completion_result, GrantResult::LostGrant)
-                && matches!(contention_result, GrantResult::LostGrant)
-                && table
-                    .record(entry_grant.slot)?
-                    .is_some_and(|record| record.state == STATE_WAITING)
-                && table
-                    .record(completion_grant.slot)?
-                    .is_some_and(|record| record.state == STATE_WAITING)
-                && contention_record.state == STATE_WAITING
-                && table.replan_outstanding() == 1
-                && table.pending_flags() & PENDING_REPLAN_BATCH != 0
-                && table.pending_flags() & PENDING_RESCAN == 0,
-            read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(granted_scans_before),
-        )
-    };
-
-    let final_result = final_replan.run_granted(
-        None,
-        |current, _watch, acquisition_allowed, _predecessors, _availability| {
-            anyhow::ensure!(
-                !acquisition_allowed && current == &final_designated,
-                "final batch-barrier callback received the wrong publication",
-            );
-            Ok(GrantAttempt::<()> {
-                acquired: None,
-                preparation_claim: None,
-                preparation_contention: None,
-                next_claim: current.clone(),
-                contention: None,
-            })
-        },
-    )?;
-    anyhow::ensure!(matches!(final_result, GrantResult::Requeued));
-    {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        table.grant_compatible()?;
-    }
-    contention_grant.finish(None)?;
-    completion_grant.finish(None)?;
-    entry_grant.finish(None)?;
-    final_replan.finish(None)?;
-    old_contention.finish(None)?;
-    old_completion.finish(None)?;
-    old_entry.finish(None)?;
-    coordinator.finish(None)?;
-
-    let initial_coordinator_claim =
-        ClaimSet::new(std::iter::empty(), [30usize], FlockMode::Exclusive);
-    let mut initial_coordinator = Ticket::register(
-        initial_coordinator_claim.clone(),
-        initial_coordinator_claim,
-        None,
-    )?;
-    let coordinator_old_designated =
-        ClaimSet::new(std::iter::empty(), [31usize], FlockMode::Exclusive);
-    let coordinator_target = ClaimSet::new(std::iter::empty(), [34usize], FlockMode::Exclusive);
-    let coordinator_old_watch =
-        ClaimSet::new(std::iter::empty(), [31usize, 34usize], FlockMode::Exclusive);
-    let mut coordinator_old = Ticket::register(
-        coordinator_old_designated.clone(),
-        coordinator_old_watch,
-        None,
-    )?;
-    let coordinator_final_designated =
-        ClaimSet::new(std::iter::empty(), [32usize], FlockMode::Exclusive);
-    let coordinator_final_watch =
-        ClaimSet::new(std::iter::empty(), [32usize, 35usize], FlockMode::Exclusive);
-    let mut coordinator_final = Ticket::register(
-        coordinator_final_designated.clone(),
-        coordinator_final_watch,
-        None,
-    )?;
-    let coordinator_contention = ContentionMarker {
-        blocker: ResourceKey::Cpu(36),
-        mode: FlockMode::Exclusive,
-    };
-    let coordinator_preparation =
-        ClaimSet::new(std::iter::empty(), [37usize], FlockMode::Exclusive);
-    let coordinator_watch =
-        ClaimSet::new(std::iter::empty(), [34usize, 36, 37], FlockMode::Exclusive);
-    let mut later_coordinator =
-        Ticket::register(coordinator_watch.clone(), coordinator_watch, None)?;
-    {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        for cpu in [30usize, 31, 32, 34, 35, 36, 37] {
-            set_cpu_free_for_tests(&mut table, cpu, false)?;
-        }
-        table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible()?;
-        anyhow::ensure!(
-            [coordinator_old.slot, coordinator_final.slot]
-                .into_iter()
-                .all(|slot| table
-                    .record(slot)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|record| record.state == STATE_REPLAN)),
-            "coordinator barrier setup did not publish both speculative callbacks",
-        );
-    }
-    initial_coordinator.finish(None)?;
-    let commit_token = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        table.grant_compatible()?;
-        anyhow::ensure!(
-            table
-                .record(later_coordinator.slot)?
-                .is_some_and(|record| record.state == STATE_COORDINATOR),
-            "later coordinator was not elected behind the live speculative wave",
-        );
-        drop(table);
-        drop(_lock);
-        later_coordinator.commit_token_for_tests()?
-    };
-    let changed = coordinator_old.run_granted(
-        None,
-        |current, _watch, acquisition_allowed, _predecessors, _availability| {
-            anyhow::ensure!(
-                !acquisition_allowed && current == &coordinator_old_designated,
-                "coordinator-barrier predecessor received the wrong publication",
-            );
-            Ok(GrantAttempt::<()> {
-                acquired: None,
-                preparation_claim: None,
-                preparation_contention: None,
-                next_claim: coordinator_target.clone(),
-                contention: None,
-            })
-        },
-    )?;
-    anyhow::ensure!(matches!(changed, GrantResult::Requeued));
-    {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        for cpu in [34usize, 36, 37] {
-            set_cpu_free_for_tests(&mut table, cpu, true)?;
-        }
-    }
-    let coordinator_scans_before = diagnostic_counter_for_tests(H_GRANT_SCANS)?;
-    let acquire_result = later_coordinator.finish_acquired(
-        &coordinator_target,
-        commit_token,
-        &[coordinator_contention],
-        None,
-    )?;
-    let coordinator_acquire_evidence_unknown = {
-        let _lock = lock_registry_existing(FlockMode::Shared)?;
-        let table = Table::open_existing()?;
-        [34usize, 36].into_iter().all(|cpu| {
-            table
-                .bitmap_bit(B_PENDING_CPU_EX, cpu)
-                .is_ok_and(|pending| pending)
-                && table
-                    .bitmap_bit(B_CPU_EX_AVAILABLE, cpu)
-                    .is_ok_and(|available| !available)
-        })
-    };
-    let preparation_result = later_coordinator.finish_preparation(
-        &coordinator_target,
-        &coordinator_preparation,
-        commit_token,
-        &[coordinator_contention],
-        None,
-    )?;
-    let coordinator_preparation_evidence_unknown = {
-        let _lock = lock_registry_existing(FlockMode::Shared)?;
-        let table = Table::open_existing()?;
-        [36usize, 37].into_iter().all(|cpu| {
-            table
-                .bitmap_bit(B_PENDING_CPU_EX, cpu)
-                .is_ok_and(|pending| pending)
-                && table
-                    .bitmap_bit(B_CPU_EX_AVAILABLE, cpu)
-                    .is_ok_and(|available| !available)
-        })
-    };
-    let coordinator_scan_delta =
-        diagnostic_counter_for_tests(H_GRANT_SCANS)?.wrapping_sub(coordinator_scans_before);
-    let coordinator_preserved = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        table
-            .record(later_coordinator.slot)?
-            .is_some_and(|record| record.state == STATE_COORDINATOR)
-            && table.replan_outstanding() == 1
-            && table.pending_flags() & PENDING_REPLAN_BATCH != 0
-            && table.pending_flags() & PENDING_RESCAN == 0
-    };
-    let coordinator_acquire_deferred = matches!(acquire_result, FinishAcquireResult::BatchDeferred);
-    let coordinator_preparation_deferred =
-        matches!(preparation_result, FinishPreparationResult::BatchDeferred);
-
-    let final_result = coordinator_final.run_granted(
-        None,
-        |current, _watch, acquisition_allowed, _predecessors, _availability| {
-            anyhow::ensure!(
-                !acquisition_allowed && current == &coordinator_final_designated,
-                "final coordinator-barrier callback received the wrong publication",
-            );
-            Ok(GrantAttempt::<()> {
-                acquired: None,
-                preparation_claim: None,
-                preparation_contention: None,
-                next_claim: current.clone(),
-                contention: None,
-            })
-        },
-    )?;
-    anyhow::ensure!(matches!(final_result, GrantResult::Requeued));
-    {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        table.grant_compatible()?;
-    }
-    coordinator_final.finish(None)?;
-    coordinator_old.finish(None)?;
-    later_coordinator.finish(None)?;
-
-    Ok(ReplanBatchBarrierOutcome {
-        granted_entry_callback_suppressed,
-        granted_completion_payload_dropped,
-        granted_completion_payload_dropped_unlocked,
-        granted_contention_serials_preserved,
-        granted_contention_unknown_before_witness_drop,
-        granted_records_parked,
-        granted_scan_delta,
-        coordinator_acquire_deferred,
-        coordinator_preparation_deferred,
-        coordinator_acquire_evidence_unknown,
-        coordinator_preparation_evidence_unknown,
-        coordinator_preserved,
-        coordinator_scan_delta,
-    })
 }
 
 #[cfg(test)]
@@ -8293,10 +8220,6 @@ fn exercise_coordinator_suffix_reconciliation_case(
             false
         }
         FinishAcquireResult::Stale => {
-            target.finish(None)?;
-            false
-        }
-        FinishAcquireResult::BatchDeferred => {
             target.finish(None)?;
             false
         }
@@ -9350,11 +9273,6 @@ pub(super) fn exercise_waiting_publication_release_progress_for_tests()
         FinishAcquireResult::Stale => {
             anyhow::bail!("release-progress predecessor acquisition unexpectedly became stale")
         }
-        FinishAcquireResult::BatchDeferred => {
-            anyhow::bail!(
-                "release-progress predecessor acquisition unexpectedly hit a live speculative batch"
-            )
-        }
     };
 
     let stale_prefix = {
@@ -9634,6 +9552,121 @@ pub(super) fn exercise_stale_acquired_release_order_for_tests()
 }
 
 #[cfg(test)]
+fn exercise_acknowledgement_payload_notify_case(
+    expired_replan: bool,
+) -> Result<(bool, bool, bool)> {
+    let base = if expired_replan { 100usize } else { 110usize };
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [base], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let designated = ClaimSet::new(std::iter::empty(), [base + 1], FlockMode::Exclusive);
+    let watch = if expired_replan {
+        ClaimSet::new(
+            std::iter::empty(),
+            [base + 1, base + 2],
+            FlockMode::Exclusive,
+        )
+    } else {
+        designated.clone()
+    };
+    let mut callback = Ticket::register(designated.clone(), watch, None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, base, false)?;
+        set_cpu_free_for_tests(&mut table, base + 1, !expired_replan)?;
+        if expired_replan {
+            set_cpu_free_for_tests(&mut table, base + 2, false)?;
+        }
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        let expected = if expired_replan {
+            STATE_REPLAN
+        } else {
+            STATE_GRANTED
+        };
+        anyhow::ensure!(
+            table
+                .record(callback.slot)?
+                .is_some_and(|record| record.state == expected),
+            "acknowledgement payload fixture did not publish {}",
+            record_state_name(expected),
+        );
+    }
+
+    let payload_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+    let registry_unlocked = std::rc::Rc::new(std::cell::Cell::new(false));
+    let dropped_at_notify = std::rc::Rc::new(std::cell::Cell::new(false));
+    arm_drop_before_notify_probe(
+        std::rc::Rc::clone(&payload_dropped),
+        std::rc::Rc::clone(&dropped_at_notify),
+    );
+    let callback_slot = callback.slot;
+    let callback_ticket = callback.ticket;
+    let result = callback.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                acquisition_allowed != expired_replan && current == &designated,
+                "acknowledgement payload fixture received the wrong callback",
+            );
+            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+            let mut table = Table::open_existing()?;
+            let old_state = if expired_replan {
+                STATE_REPLAN
+            } else {
+                STATE_GRANTED
+            };
+            let new_state = if expired_replan {
+                STATE_REPLAN_EXPIRED
+            } else {
+                STATE_REVOKED
+            };
+            table.begin_transaction()?;
+            let record = table
+                .record(callback_slot)?
+                .filter(|record| record.ticket == callback_ticket && record.state == old_state)
+                .ok_or_else(|| anyhow::anyhow!("acknowledgement payload callback changed"))?;
+            table.set_record_state(record.slot, new_state)?;
+            // Force acknowledgement to coalesce with an existing edge. The
+            // physical-drop path must still issue its targeted notification.
+            table.set_pending_flag(PENDING_RESCAN);
+            table.finish_transaction()?;
+            Ok(GrantAttempt {
+                acquired: Some(DropProbe {
+                    dropped: std::rc::Rc::clone(&payload_dropped),
+                    registry_unlocked: std::rc::Rc::clone(&registry_unlocked),
+                }),
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: current.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let ordered = matches!(result, GrantResult::LostGrant)
+        && payload_dropped.get()
+        && registry_unlocked.get()
+        && dropped_at_notify.get();
+    let payload_dropped = payload_dropped.get();
+    let registry_unlocked = registry_unlocked.get();
+    callback.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((ordered, payload_dropped, registry_unlocked))
+}
+
+/// Both late acknowledgement shapes must preserve opaque destruction before
+/// targeted coordinator notification even when RESCAN was already pending.
+#[cfg(test)]
+pub(super) fn exercise_acknowledgement_payload_notify_order_for_tests()
+-> Result<(bool, bool, bool, bool, bool, bool)> {
+    let expired = exercise_acknowledgement_payload_notify_case(true)?;
+    let revoked = exercise_acknowledgement_payload_notify_case(false)?;
+    Ok((
+        expired.0, expired.1, expired.2, revoked.0, revoked.1, revoked.2,
+    ))
+}
+
+#[cfg(test)]
 pub(super) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let coordinator_next = ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
@@ -9795,6 +9828,7 @@ pub(super) fn initializer_temp_count_for_tests() -> Result<usize> {
 pub(super) fn observer_preserves_uninitialized_header_for_tests() -> Result<bool> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
+    crate::flock::materialize(registry_writer_intent_path())?;
     crate::flock::materialize(registry_lock_path())?;
     let missing_snapshot = snapshot()?;
     let missing_preserved = !header_path().exists();
@@ -9825,6 +9859,7 @@ pub(super) fn observer_preserves_uninitialized_header_for_tests() -> Result<bool
 pub(super) fn prepare_zeroed_uninitialized_header_for_tests() -> Result<()> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
+    crate::flock::materialize(registry_writer_intent_path())?;
     crate::flock::materialize(registry_lock_path())?;
     let header = OpenOptions::new()
         .write(true)
@@ -10056,7 +10091,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .saturating_add(1)
         })
         .unwrap_or(0);
-    // The v20 mapping is deliberately overprovisioned once. It never needs a
+    // The v21 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
     // a disjoint internal bit range immediately after possible host CPUs.
@@ -10138,6 +10173,10 @@ fn registry_lock_path() -> PathBuf {
     registry_data_dir().join("registry.lock")
 }
 
+fn registry_writer_intent_path() -> PathBuf {
+    registry_data_dir().join("registry.turnstile")
+}
+
 fn header_path() -> PathBuf {
     registry_data_dir().join("registry.map")
 }
@@ -10147,11 +10186,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-registry-v20")
+    active_protocol_dir().join("ktstr-acquire-registry-v21")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-events-v20")
+    active_protocol_dir().join("ktstr-acquire-events-v21")
 }
 
 #[cfg(test)]
@@ -10228,13 +10267,116 @@ pub(super) fn wait_for_generation_change(expected: u32, timeout: Duration) -> Re
     }
 }
 
-fn lock_registry_for_initialization() -> Result<OwnedFd> {
-    std::fs::create_dir_all(registry_data_dir())?;
-    std::fs::create_dir_all(event_dir())?;
-    block_flock(registry_lock_path(), FlockMode::Exclusive)
+/// RAII ownership of the authoritative registry flock.
+///
+/// An exclusive registry owner also retains one shared lock on the writer-
+/// intent sidecar. Readers take that sidecar exclusively only while acquiring
+/// their shared registry lock, so ordinary readers still overlap after
+/// admission while any announced writer closes the reader-barge window.
+pub(crate) struct RegistryLock {
+    target: Option<OwnedFd>,
+    writer_intent: Option<OwnedFd>,
 }
 
-fn lock_registry_existing(mode: FlockMode) -> Result<OwnedFd> {
+impl RegistryLock {
+    fn new(target: OwnedFd, writer_intent: Option<OwnedFd>) -> Self {
+        Self {
+            target: Some(target),
+            writer_intent,
+        }
+    }
+}
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        // The target must unlock before writer intent. Otherwise a reader can
+        // pass the sidecar while this writer still owns registry.lock EX.
+        drop(self.target.take());
+        drop(self.writer_intent.take());
+    }
+}
+
+fn writer_intent_mode(mode: FlockMode) -> FlockMode {
+    match mode {
+        FlockMode::Exclusive => FlockMode::Shared,
+        FlockMode::Shared => FlockMode::Exclusive,
+    }
+}
+
+fn finish_registry_lock(
+    registry: OwnedFd,
+    writer_intent: OwnedFd,
+    mode: FlockMode,
+) -> RegistryLock {
+    let writer_intent = if mode == FlockMode::Exclusive {
+        Some(writer_intent)
+    } else {
+        drop(writer_intent);
+        None
+    };
+    RegistryLock::new(registry, writer_intent)
+}
+
+fn note_registry_ex_acquisition(_mode: FlockMode) {
+    #[cfg(test)]
+    if _mode == FlockMode::Exclusive {
+        REGISTRY_EX_ACQUISITIONS.with(|count| count.set(count.get().saturating_add(1)));
+    }
+}
+
+fn open_existing_lock(path: &Path, what: &str) -> Result<Option<File>> {
+    match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("open existing {what} {}", path.display()))
+        }
+    }
+}
+
+fn open_existing_writer_intent() -> Result<Option<File>> {
+    let path = registry_writer_intent_path();
+    let writer_intent = open_existing_lock(&path, "admission registry writer-intent gate")?;
+    if writer_intent.is_none() && registry_lock_path().exists() {
+        anyhow::bail!(
+            "admission registry lock {} exists without its v{VERSION} writer-intent gate {}",
+            registry_lock_path().display(),
+            path.display(),
+        );
+    }
+    Ok(writer_intent)
+}
+
+fn flock_open_file(file: &File, path: &Path, mode: FlockMode, nonblocking: bool) -> Result<bool> {
+    use rustix::fs::{FlockOperation, flock};
+
+    let operation = match (mode, nonblocking) {
+        (FlockMode::Exclusive, false) => FlockOperation::LockExclusive,
+        (FlockMode::Shared, false) => FlockOperation::LockShared,
+        (FlockMode::Exclusive, true) => FlockOperation::NonBlockingLockExclusive,
+        (FlockMode::Shared, true) => FlockOperation::NonBlockingLockShared,
+    };
+    match flock(file, operation) {
+        Ok(()) => Ok(true),
+        Err(error) if nonblocking && error == rustix::io::Errno::WOULDBLOCK => Ok(false),
+        Err(errno) => Err(std::io::Error::from_raw_os_error(errno.raw_os_error()))
+            .with_context(|| format!("lock admission registry file {}", path.display())),
+    }
+}
+
+fn lock_registry_for_initialization() -> Result<RegistryLock> {
+    std::fs::create_dir_all(registry_data_dir())?;
+    std::fs::create_dir_all(event_dir())?;
+    // Materialization order is protocol: once registry.lock is nameable, every
+    // v21 entrant must also be able to join the writer-intent gate ahead of it.
+    let writer_intent = block_flock(registry_writer_intent_path(), FlockMode::Shared)?;
+    let registry = block_flock(registry_lock_path(), FlockMode::Exclusive)?;
+    let lock = finish_registry_lock(registry, writer_intent, FlockMode::Exclusive);
+    note_registry_ex_acquisition(FlockMode::Exclusive);
+    Ok(lock)
+}
+
+fn lock_registry_existing(mode: FlockMode) -> Result<RegistryLock> {
     try_lock_registry_existing(mode)?.ok_or_else(|| {
         anyhow::anyhow!(
             "existing admission registry lock {} disappeared",
@@ -10243,85 +10385,93 @@ fn lock_registry_existing(mode: FlockMode) -> Result<OwnedFd> {
     })
 }
 
-fn try_lock_registry_existing(mode: FlockMode) -> Result<Option<OwnedFd>> {
-    use rustix::fs::{FlockOperation, flock};
+fn try_lock_registry_existing(mode: FlockMode) -> Result<Option<RegistryLock>> {
+    try_lock_registry_existing_with_writer_intent_hook(mode, || Ok(()))
+}
 
-    let path = registry_lock_path();
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("open existing admission registry lock {}", path.display())
-            });
-        }
+fn try_lock_registry_existing_with_writer_intent_hook(
+    mode: FlockMode,
+    on_writer_intent: impl FnOnce() -> Result<()>,
+) -> Result<Option<RegistryLock>> {
+    let Some(writer_intent) = open_existing_writer_intent()? else {
+        return Ok(None);
     };
-    let operation = match mode {
-        FlockMode::Exclusive => FlockOperation::LockExclusive,
-        FlockMode::Shared => FlockOperation::LockShared,
+    let writer_intent_path = registry_writer_intent_path();
+    flock_open_file(
+        &writer_intent,
+        &writer_intent_path,
+        writer_intent_mode(mode),
+        false,
+    )?;
+    on_writer_intent()?;
+
+    let registry_path = registry_lock_path();
+    let Some(registry) = open_existing_lock(&registry_path, "admission registry lock")? else {
+        return Ok(None);
     };
-    flock(&file, operation)
-        .map_err(|errno| std::io::Error::from_raw_os_error(errno.raw_os_error()))
-        .with_context(|| format!("lock existing admission registry {}", path.display()))?;
-    #[cfg(test)]
-    if mode == FlockMode::Exclusive {
-        REGISTRY_EX_ACQUISITIONS.with(|count| count.set(count.get().saturating_add(1)));
-    }
-    Ok(Some(file.into()))
+    flock_open_file(&registry, &registry_path, mode, false)?;
+    let lock = finish_registry_lock(registry.into(), writer_intent.into(), mode);
+    note_registry_ex_acquisition(mode);
+    // A writer announces intent with sidecar SH before waiting for target EX
+    // and retains both locks. Every later reader needs sidecar EX before target
+    // SH, so it cannot pass any announced writer. Multiple writers may announce
+    // concurrently, which also leaves no reader admission gap between queued
+    // writers. This does not claim strict arrival FIFO: the kernel may choose
+    // either entrant during the initial transition before intent is held.
+    Ok(Some(lock))
 }
 
 enum NonblockingRegistryLock {
-    Acquired(OwnedFd),
+    Acquired(RegistryLock),
     Missing,
     Contended,
 }
 
 fn probe_lock_registry_existing_nonblocking(mode: FlockMode) -> Result<NonblockingRegistryLock> {
-    use rustix::fs::{FlockOperation, flock};
-
-    let path = registry_lock_path();
-    let file = match OpenOptions::new().read(true).write(true).open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(NonblockingRegistryLock::Missing);
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("open existing admission registry lock {}", path.display())
-            });
-        }
+    let Some(writer_intent) = open_existing_writer_intent()? else {
+        return Ok(NonblockingRegistryLock::Missing);
     };
-    let operation = match mode {
-        FlockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
-        FlockMode::Shared => FlockOperation::NonBlockingLockShared,
-    };
-    match flock(&file, operation) {
-        Ok(()) => {
-            #[cfg(test)]
-            if mode == FlockMode::Exclusive {
-                REGISTRY_EX_ACQUISITIONS.with(|count| count.set(count.get().saturating_add(1)));
-            }
-            Ok(NonblockingRegistryLock::Acquired(file.into()))
-        }
-        Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-            Ok(NonblockingRegistryLock::Contended)
-        }
-        Err(errno) => Err(std::io::Error::from_raw_os_error(errno.raw_os_error()))
-            .with_context(|| format!("lock existing admission registry {}", path.display())),
+    let writer_intent_path = registry_writer_intent_path();
+    if !flock_open_file(
+        &writer_intent,
+        &writer_intent_path,
+        writer_intent_mode(mode),
+        true,
+    )? {
+        return Ok(NonblockingRegistryLock::Contended);
     }
+
+    let registry_path = registry_lock_path();
+    let Some(registry) = open_existing_lock(&registry_path, "admission registry lock")? else {
+        return Ok(NonblockingRegistryLock::Missing);
+    };
+    if !flock_open_file(&registry, &registry_path, mode, true)? {
+        return Ok(NonblockingRegistryLock::Contended);
+    }
+    let lock = finish_registry_lock(registry.into(), writer_intent.into(), mode);
+    note_registry_ex_acquisition(mode);
+    Ok(NonblockingRegistryLock::Acquired(lock))
 }
 
-fn try_lock_registry_existing_nonblocking(mode: FlockMode) -> Result<Option<OwnedFd>> {
+fn try_lock_registry_existing_nonblocking(mode: FlockMode) -> Result<Option<RegistryLock>> {
     Ok(match probe_lock_registry_existing_nonblocking(mode)? {
         NonblockingRegistryLock::Acquired(lock) => Some(lock),
         NonblockingRegistryLock::Missing | NonblockingRegistryLock::Contended => None,
     })
 }
 
-fn try_lock_registry_for_initialization() -> Result<Option<OwnedFd>> {
+fn try_lock_registry_for_initialization() -> Result<Option<RegistryLock>> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
-    try_flock(registry_lock_path(), FlockMode::Exclusive)
+    let Some(writer_intent) = try_flock(registry_writer_intent_path(), FlockMode::Shared)? else {
+        return Ok(None);
+    };
+    let Some(registry) = try_flock(registry_lock_path(), FlockMode::Exclusive)? else {
+        return Ok(None);
+    };
+    let lock = finish_registry_lock(registry, writer_intent, FlockMode::Exclusive);
+    note_registry_ex_acquisition(FlockMode::Exclusive);
+    Ok(Some(lock))
 }
 
 fn check_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
@@ -10345,7 +10495,7 @@ fn normalize_cancellation<T>(result: Result<T>, cancelled: Option<&AtomicBool>) 
     }
 }
 
-fn lock_registry_interruptible(cancelled: Option<&AtomicBool>) -> Result<OwnedFd> {
+fn lock_registry_interruptible(cancelled: Option<&AtomicBool>) -> Result<RegistryLock> {
     check_cancelled(cancelled)?;
     let lock = match try_lock_registry_existing(FlockMode::Exclusive)? {
         Some(lock) => lock,
@@ -10354,7 +10504,7 @@ fn lock_registry_interruptible(cancelled: Option<&AtomicBool>) -> Result<OwnedFd
     normalize_cancellation(Ok(lock), cancelled)
 }
 
-fn lock_registry_interruptible_existing(cancelled: Option<&AtomicBool>) -> Result<OwnedFd> {
+fn lock_registry_interruptible_existing(cancelled: Option<&AtomicBool>) -> Result<RegistryLock> {
     check_cancelled(cancelled)?;
     normalize_cancellation(lock_registry_existing(FlockMode::Exclusive), cancelled)
 }
@@ -10784,32 +10934,11 @@ impl Table {
         }
     }
 
-    /// Complete the finite speculative batch while its final state transition
-    /// is still covered by the same dirty transaction. This closes the crash
-    /// gap where the last callback could otherwise publish outstanding=0 and
-    /// die before making the deferred authoritative scan visible.
-    fn promote_replan_batch_if_drained_in_transaction(&mut self) -> Result<bool> {
-        if self.replan_outstanding() != 0 {
-            return Ok(false);
-        }
-        // State transitions normally clear this pair. Keep the drained path
-        // self-healing if a torn transaction left only stale bookkeeping.
-        self.clear_replan_wave_clock();
-        if self.pending_flags() & PENDING_REPLAN_BATCH == 0 {
-            return Ok(false);
-        }
-        self.clear_pending_flag(PENDING_REPLAN_BATCH);
-        self.set_pending_flag(PENDING_RESCAN);
-        self.elect_coordinator_in_transaction()?;
-        self.bump_generation()?;
-        Ok(true)
-    }
-
     /// Quarantine every callback which survived past the finite wave lease.
     /// Completed WAITING replacements are deliberately untouched. The single
-    /// transaction drains the derived count, converts the private batch bit
-    /// into one public rescan edge, and wakes each stale callback owner so it
-    /// can acknowledge before this ticket is eligible again.
+    /// transaction drains the derived count, preserves one coalesced public
+    /// rescan edge, and wakes each stale callback owner so it can acknowledge
+    /// before this ticket is eligible again.
     fn expire_replan_wave_if_due_at(&mut self, now: u64) -> Result<bool> {
         let now = now.max(1);
         if self.replan_outstanding() == 0 {
@@ -10859,13 +10988,7 @@ impl Table {
             "queue registry REPLAN wave count mismatch during expiration: header={expected}, records={expired}",
         );
         self.clear_replan_wave_clock();
-        self.clear_pending_flag(PENDING_REPLAN_BATCH);
-        self.set_pending_flag(PENDING_RESCAN);
-        let generation = self.generation();
-        self.elect_coordinator_in_transaction()?;
-        if self.generation() == generation {
-            self.bump_generation()?;
-        }
+        self.schedule_rescan_edge_in_transaction()?;
         self.note_queue_progress()?;
         self.finish_transaction()?;
         Ok(true)
@@ -10889,6 +11012,29 @@ impl Table {
     fn clear_pending_flag(&mut self, flag: u64) {
         let flags = self.pending_flags() & !flag;
         write_u64(&mut self.header, H_PENDING_FLAGS, flags);
+    }
+
+    /// Publish one coordinator-consumed rescan edge while registry EX and a
+    /// dirty transaction are held. Concurrent callback completions serialize
+    /// here: only the first clear -> set transition requests a new transport
+    /// notification, while later completions join the same pending scan. A
+    /// missing coordinator is independently elected and target-woken even if
+    /// the edge was already set. A completion which arrives after the scan
+    /// clears the bit publishes the next transport edge.
+    fn schedule_rescan_edge_in_transaction(&mut self) -> Result<bool> {
+        let new_edge = self.pending_flags() & PENDING_RESCAN == 0;
+        if new_edge {
+            self.set_pending_flag(PENDING_RESCAN);
+        }
+        let coordinator_before = self.coordinator_ticket();
+        if self.coordinator_ticket() == 0 {
+            // Election targets and wakes exactly one waiter, and publishes the
+            // structural generation itself. A live coordinator instead wakes
+            // through the single post-commit notify edge below.
+            self.elect_coordinator_in_transaction()?;
+        }
+        let coordinator_elected = coordinator_before == 0 && self.coordinator_ticket() != 0;
+        Ok(new_edge || coordinator_elected)
     }
 
     fn observation_request_serial(&self) -> u64 {
@@ -10949,19 +11095,15 @@ impl Table {
         read_u64(&self.header, H_MIN_CHANGED_TICKET)
     }
 
-    fn mark_claim_changed(&mut self, ticket: u64) -> Result<()> {
-        self.mark_claim_changed_with_flag(ticket, PENDING_RESCAN)
-    }
-
-    fn mark_claim_changed_deferred(&mut self, ticket: u64) -> Result<()> {
-        self.mark_claim_changed_with_flag(ticket, PENDING_REPLAN_BATCH)
-    }
-
-    fn mark_claim_changed_with_flag(&mut self, ticket: u64, pending: u64) -> Result<()> {
-        self.advance_claim_epoch()?;
+    fn mark_suffix_dirty(&mut self, ticket: u64) {
         let minimum = self.min_changed_ticket().min(ticket);
         write_u64(&mut self.header, H_MIN_CHANGED_TICKET, minimum);
-        self.set_pending_flag(pending);
+    }
+
+    fn mark_claim_changed(&mut self, ticket: u64) -> Result<()> {
+        self.advance_claim_epoch()?;
+        self.mark_suffix_dirty(ticket);
+        self.set_pending_flag(PENDING_RESCAN);
         Ok(())
     }
 
@@ -11041,12 +11183,19 @@ impl Table {
     }
 
     fn touch_coordinator_heartbeat(&mut self) -> Result<()> {
-        write_u64(
-            &mut self.header,
-            H_COORDINATOR_HEARTBEAT_NS,
-            monotonic_now_ns()?,
-        );
+        self.touch_coordinator_heartbeat_at(monotonic_now_ns()?);
         Ok(())
+    }
+
+    fn touch_coordinator_heartbeat_at(&mut self, now: u64) {
+        write_u64(&mut self.header, H_COORDINATOR_HEARTBEAT_NS, now.max(1));
+    }
+
+    fn coordinator_heartbeat_due_in(&self) -> Result<Duration> {
+        Ok(coordinator_heartbeat_due_in_from_header(
+            &self.header,
+            monotonic_now_ns()?,
+        ))
     }
 
     fn set_coordinator(&mut self, ticket: u64, slot: u64) -> Result<()> {
@@ -11749,22 +11898,21 @@ impl Table {
             issue_serial,
             blocked,
             persist_blocker,
-            false,
+            ReplacementFenceEffect::ChangesPredecessorPrefix,
         )?;
         self.finish_transaction()?;
         Ok(())
     }
 
     /// Publish a replacement selected by one non-acquiring REPLAN callback.
-    /// Both the old REPLAN and new WAITING record are non-fencing, so the
-    /// replacement changes aggregate intent counts but cannot invalidate any
-    /// predecessor prefix.  Defer the one authoritative viability scan until
-    /// the finite callback wave drains.
+    /// Both the old REPLAN and new WAITING record are non-fencing. Publish a
+    /// coalesced rescan edge immediately so this completed replacement can run
+    /// while unrelated planner callbacks remain outstanding.
     #[expect(
         clippy::too_many_arguments,
         reason = "speculative replacement carries the complete record transition"
     )]
-    fn replace_replan_claim_deferred(
+    fn replace_replan_claim_and_schedule(
         &mut self,
         slot: u64,
         ticket: u64,
@@ -11773,7 +11921,6 @@ impl Table {
         issue_serial: u64,
         blocked: Option<(ContentionMarker, u64)>,
         persist_blocker: bool,
-        urgent_rescan: bool,
     ) -> Result<bool> {
         self.begin_transaction()?;
         self.replace_claim_in_transaction(
@@ -11785,16 +11932,11 @@ impl Table {
             issue_serial,
             blocked,
             persist_blocker,
-            true,
+            ReplacementFenceEffect::NonFencing,
         )?;
-        let notify = if urgent_rescan {
-            self.set_pending_flag(PENDING_RESCAN);
-            self.elect_coordinator_in_transaction()?;
-            self.bump_generation()?;
-            true
-        } else {
-            self.promote_replan_batch_if_drained_in_transaction()?
-        };
+        // Publish WAITING before election so a completion which outlived its
+        // coordinator is itself eligible to take over immediately.
+        let notify = self.schedule_rescan_edge_in_transaction()?;
         self.finish_transaction()?;
         Ok(notify)
     }
@@ -11813,12 +11955,20 @@ impl Table {
         issue_serial: u64,
         blocked: Option<(ContentionMarker, u64)>,
         persist_blocker: bool,
-        defer_non_fencing_rescan: bool,
+        fence_effect: ReplacementFenceEffect,
     ) -> Result<()> {
         let prior = self
             .record(slot)?
             .filter(|record| record.ticket == ticket)
             .ok_or_else(|| anyhow::anyhow!("queue slot {slot} disappeared during replacement"))?;
+        if matches!(fence_effect, ReplacementFenceEffect::NonFencing) {
+            anyhow::ensure!(
+                prior.state == STATE_REPLAN && publish_state == STATE_WAITING,
+                "non-fencing replacement requires REPLAN -> WAITING, got {} -> {} for ticket {ticket}",
+                record_state_name(prior.state),
+                record_state_name(publish_state),
+            );
+        }
         let replan_claim_epoch = prior.replan_claim_epoch;
         self.clear_record_blocked(slot)?;
         self.adjust_claim_counts(old, false)?;
@@ -11868,14 +12018,19 @@ impl Table {
             self.mark_blocker_unknown(evidence)?;
         }
         self.transition_replan_state(prior.state, publish_state)?;
-        if defer_non_fencing_rescan {
-            anyhow::ensure!(
-                prior.state == STATE_REPLAN && publish_state == STATE_WAITING,
-                "only REPLAN-to-WAITING replacements may defer authoritative rescans",
-            );
-            self.mark_claim_changed_deferred(ticket)?;
-        } else {
-            self.mark_claim_changed(ticket)?;
+        match fence_effect {
+            ReplacementFenceEffect::ChangesPredecessorPrefix => {
+                self.mark_claim_changed(ticket)?;
+            }
+            ReplacementFenceEffect::NonFencing => {
+                // REPLAN and WAITING are both non-fencing, so this replacement
+                // must not invalidate every live callback through the global
+                // claim epoch. It can become a new predecessor fence in the
+                // next authoritative scan, though: dirty precisely the later
+                // ticket suffix so no old GRANTED callback can enter or commit
+                // across that scan edge.
+                self.mark_suffix_dirty(ticket);
+            }
         }
         crash_at_for_tests("replace_record_before_state_publish");
         let bytes = self
@@ -11883,9 +12038,11 @@ impl Table {
             .ok_or_else(|| anyhow::anyhow!("queue slot {slot} disappeared"))?;
         write_u32(bytes, R_STATE, publish_state);
         self.finish_replan_state_publication(prior.state, publish_state);
-        // Existing-ticket claim changes invalidate only grants at or after
-        // this ticket. The coordinator's next O(N) pass revalidates that
-        // suffix; earlier granted waiters refresh their epoch in O(1).
+        // Replacing a publication which participates in predecessor prefixes
+        // advances the suffix watermark even though its new state is WAITING.
+        // REPLAN and its completed WAITING replacement are both non-fencing;
+        // their next authoritative scan introduces any new fence and revokes
+        // conflicting later grants atomically.
         Ok(())
     }
 
@@ -12165,12 +12322,12 @@ impl Table {
         slot: u64,
         ticket: u64,
         blocked: Option<(ContentionMarker, u64, u64)>,
-    ) -> Result<bool> {
+    ) -> Result<AcknowledgeResult> {
         let Some(record) = self.record(slot)?.filter(|record| record.ticket == ticket) else {
-            return Ok(false);
+            return Ok(AcknowledgeResult::UNCHANGED);
         };
         if record.state != STATE_REVOKED {
-            return Ok(false);
+            return Ok(AcknowledgeResult::UNCHANGED);
         }
         self.begin_transaction()?;
         let record = self
@@ -12197,31 +12354,33 @@ impl Table {
         // predecessor prefix. Give the successor scan a new publication epoch
         // so an already-running callback cannot mistake a refreshed, different
         // prefix for its original token.
+        let notify = self.schedule_rescan_edge_in_transaction()?;
         self.mark_claim_changed(record.ticket)?;
-        self.set_pending_flag(PENDING_RESCAN);
-        self.bump_generation()?;
-        self.elect_coordinator_in_transaction()?;
         self.finish_transaction()?;
-        Ok(true)
+        Ok(AcknowledgeResult {
+            acknowledged: true,
+            notify,
+        })
     }
 
     /// Make one expired speculative ticket eligible only after its owner has
     /// observed the quarantine. Expiration is non-fencing, so unlike REVOKED
     /// acknowledgement this does not publish a claim change. Invalidating the
-    /// ticket's own callback token plus one rescan edge is sufficient to make
-    /// it reconsider the complete immutable watch without perturbing later
-    /// predecessor prefixes.
+    /// ticket's own callback token plus one rescan edge makes it reconsider
+    /// the complete immutable watch. The pending scan can turn this ticket
+    /// into a new predecessor fence, so later callbacks are fenced by the
+    /// non-epoch suffix watermark until that scan completes.
     fn acknowledge_expired_replan(
         &mut self,
         slot: u64,
         ticket: u64,
         blocked: Option<(ContentionMarker, u64, u64)>,
-    ) -> Result<bool> {
+    ) -> Result<AcknowledgeResult> {
         let Some(record) = self.record(slot)?.filter(|record| record.ticket == ticket) else {
-            return Ok(false);
+            return Ok(AcknowledgeResult::UNCHANGED);
         };
         if record.state != STATE_REPLAN_EXPIRED {
-            return Ok(false);
+            return Ok(AcknowledgeResult::UNCHANGED);
         }
         self.begin_transaction()?;
         let record = self
@@ -12230,6 +12389,7 @@ impl Table {
             .ok_or_else(|| {
                 anyhow::anyhow!("expired REPLAN queue ticket {ticket} changed during ack")
             })?;
+        self.mark_suffix_dirty(record.ticket);
         self.set_record_state(record.slot, STATE_WAITING)?;
         self.clear_record_blocked(record.slot)?;
         self.invalidate_record_prefix(record.slot)?;
@@ -12238,14 +12398,12 @@ impl Table {
             self.set_record_issue_serial(record.slot, consumed_serial)?;
             self.mark_blocker_unknown(marker)?;
         }
-        self.set_pending_flag(PENDING_RESCAN);
-        let generation = self.generation();
-        self.elect_coordinator_in_transaction()?;
-        if self.generation() == generation {
-            self.bump_generation()?;
-        }
+        let notify = self.schedule_rescan_edge_in_transaction()?;
         self.finish_transaction()?;
-        Ok(true)
+        Ok(AcknowledgeResult {
+            acknowledged: true,
+            notify,
+        })
     }
 
     fn clear_record_blocked(&mut self, slot: u64) -> Result<()> {
@@ -12459,7 +12617,6 @@ impl Table {
         let next_round_horizon = read_u64(&self.header, H_NEXT_TICKET).saturating_sub(1);
         let replan_wave_in_flight = self.replan_outstanding() != 0;
         let mut replan_wave_started = false;
-        let mut deferred_replan_candidates = false;
         let mut replan_wake_slots = Vec::new();
         let mut changed = false;
         let mut coordinator_prefix_changed = false;
@@ -12710,39 +12867,37 @@ impl Table {
                 } else {
                     true
                 };
-                if relevant_resource_change || prefix_invalid || !waiting_prefix_matches {
-                    if replan_wave_in_flight {
-                        // Keep the publication snapshot finite. This waiter
-                        // joins the next wave after all already-issued planner
-                        // callbacks have returned, rather than extending the
-                        // current batch indefinitely under continuous arrival.
-                        deferred_replan_candidates = true;
-                    } else {
-                        if !replan_wave_started {
-                            // Freeze the diagnostic high-water before the first
-                            // callback publication. Dirty repair invalidates all
-                            // flexible waiters after any torn point in this wave.
-                            write_u64(&mut self.header, H_REPLAN_HORIZON, next_round_horizon);
-                            self.arm_replan_wave_at(backfill_now_ns);
-                            replan_wave_started = true;
-                        }
-                        self.publish_prefix_words(
-                            record.slot,
-                            &cpu_any,
-                            &cpu_exclusive,
-                            &llc_any,
-                            &llc_exclusive,
-                            R_REPLAN_CLAIM_EPOCH,
-                            scan_publication_epoch,
-                            waiting_serial,
-                        )?;
-                        self.set_record_state(record.slot, STATE_REPLAN)?;
-                        self.clear_record_blocked_known(record.slot, record.external_blocker)?;
-                        write_u64(&mut self.header, H_REPLAN_CURSOR, record.ticket);
-                        crash_at_for_tests("replan_state_and_cursor_before_wake");
-                        replan_wake_slots.push(record.slot);
-                        changed = true;
+                if (relevant_resource_change || prefix_invalid || !waiting_prefix_matches)
+                    && !replan_wave_in_flight
+                {
+                    // Keep each publication snapshot finite. A waiter which
+                    // still needs speculative planning joins a later wave;
+                    // every callback exit publishes the rescan edge which
+                    // eventually starts that wave.
+                    if !replan_wave_started {
+                        // Freeze the diagnostic high-water before the first
+                        // callback publication. Dirty repair invalidates all
+                        // flexible waiters after any torn point in this wave.
+                        write_u64(&mut self.header, H_REPLAN_HORIZON, next_round_horizon);
+                        self.arm_replan_wave_at(backfill_now_ns);
+                        replan_wave_started = true;
                     }
+                    self.publish_prefix_words(
+                        record.slot,
+                        &cpu_any,
+                        &cpu_exclusive,
+                        &llc_any,
+                        &llc_exclusive,
+                        R_REPLAN_CLAIM_EPOCH,
+                        scan_publication_epoch,
+                        waiting_serial,
+                    )?;
+                    self.set_record_state(record.slot, STATE_REPLAN)?;
+                    self.clear_record_blocked_known(record.slot, record.external_blocker)?;
+                    write_u64(&mut self.header, H_REPLAN_CURSOR, record.ticket);
+                    crash_at_for_tests("replan_state_and_cursor_before_wake");
+                    replan_wake_slots.push(record.slot);
+                    changed = true;
                 }
             } else if record.state == STATE_GRANTED && (prefix_invalid || !published_prefix_matches)
             {
@@ -12840,13 +12995,6 @@ impl Table {
         }
         self.finish_claim_scan();
         self.clear_pending_flag(PENDING_RESCAN);
-        // This authoritative snapshot consumed every speculative replacement
-        // published before it acquired registry EX. Later completions re-set
-        // the private batch bit and the final one schedules another scan.
-        self.clear_pending_flag(PENDING_REPLAN_BATCH);
-        if deferred_replan_candidates {
-            self.set_pending_flag(PENDING_REPLAN_BATCH);
-        }
         let watch = self.aggregate_watch()?;
         self.finish_transaction()?;
         Ok((watch, coordinator_prefix_changed))
@@ -12928,7 +13076,11 @@ impl Table {
     }
 
     fn recover_coordinator_if_dead(&mut self) -> Result<()> {
-        if self.expire_replan_wave_if_due()? {
+        self.recover_coordinator_if_dead_at(monotonic_now_ns()?)
+    }
+
+    fn recover_coordinator_if_dead_at(&mut self, now: u64) -> Result<()> {
+        if self.expire_replan_wave_if_due_at(now)? {
             // Fallback recovery may run in an ordinary ticket after a timed
             // futex wait. Wake the coordinator's real inotify transport as
             // well as the registry futexes published by expiration.
@@ -12958,7 +13110,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v20 publication validates
+            // and record states together. Current v21 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();
@@ -12985,7 +13137,6 @@ impl Table {
             return self.elect_coordinator();
         }
 
-        let now = monotonic_now_ns()?;
         if coordinator_activity_is_fresh(&self.header, now) {
             return Ok(());
         }
@@ -13020,7 +13171,7 @@ impl Table {
                 candidate.ticket == successor.ticket && candidate.state == STATE_WAITING
             })
             .ok_or_else(|| anyhow::anyhow!("queue takeover successor changed during recovery"))?;
-        if coordinator_activity_is_fresh(&self.header, monotonic_now_ns()?) {
+        if coordinator_activity_is_fresh(&self.header, now) {
             self.finish_transaction()?;
             return Ok(());
         }
@@ -15488,9 +15639,16 @@ fn monotonic_now_ns() -> Result<u64> {
 }
 
 fn coordinator_activity_is_fresh(header: &[u8], now: u64) -> bool {
-    let last =
-        read_u64(header, H_COORDINATOR_HEARTBEAT_NS).max(read_u64(header, H_LAST_PROGRESS_NS));
-    last != 0 && last <= now && now - last < COORDINATOR_LEASE_NS
+    let heartbeat = read_u64(header, H_COORDINATOR_HEARTBEAT_NS);
+    heartbeat != 0 && heartbeat <= now && now - heartbeat < COORDINATOR_HEARTBEAT_LEASE_NS
+}
+
+fn coordinator_heartbeat_due_in_from_header(header: &[u8], now: u64) -> Duration {
+    let heartbeat = read_u64(header, H_COORDINATOR_HEARTBEAT_NS);
+    if heartbeat == 0 || heartbeat > now {
+        return Duration::ZERO;
+    }
+    Duration::from_nanos(COORDINATOR_HEARTBEAT_INTERVAL_NS.saturating_sub(now - heartbeat))
 }
 
 fn liveness_due_in_from_last(last: u64, now: u64) -> Duration {

@@ -1066,8 +1066,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v20");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v20");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v21");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v21");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1239,8 +1239,10 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v20");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v21");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
+    crate::flock::materialize(wrong_registry.join("registry.turnstile"))
+        .expect("materialize wrong registry writer-intent gate");
     let wrong_registry_lock =
         crate::flock::try_flock(wrong_registry.join("registry.lock"), FlockMode::Exclusive)
             .expect("open wrong registry lock")
@@ -1539,6 +1541,33 @@ fn coordinator_watch_wakes_for_registry_notification() {
         "ticket publication must wake the coordinator watch",
     );
     drop(coordinator);
+}
+
+#[test]
+fn coordinator_heartbeat_has_an_exact_lightweight_takeover_deadline() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_coordinator_heartbeat_deadline_for_tests()
+        .expect("exercise coordinator heartbeat deadline");
+    assert!(
+        outcome.healthy_retained_before_deadline,
+        "a healthy coordinator must retain ownership immediately before the heartbeat deadline",
+    );
+    assert!(
+        outcome.takeover_at_deadline,
+        "the exact heartbeat deadline must transfer ownership to the oldest waiter",
+    );
+    assert!(
+        outcome.displaced_coordinator_parked,
+        "takeover must park the displaced live coordinator instead of leaving two active heads",
+    );
+    assert!(
+        outcome.heartbeat_advanced,
+        "the lightweight tick must renew the coordinator heartbeat",
+    );
+    assert!(
+        outcome.heartbeat_tick_preserved_protocol_state,
+        "a heartbeat tick must not scan, reobserve, advance epochs, or alter queue allocation",
+    );
 }
 
 #[test]
@@ -2153,6 +2182,291 @@ fn ordinary_state_reads_overlap_registry_shared_readers() {
     );
     drop(held_reader);
     reader.join().expect("shared state reader");
+}
+
+fn registry_thread_lock_prefixes() -> (Option<String>, Option<String>) {
+    (
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone()),
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone()),
+    )
+}
+
+fn install_registry_thread_lock_prefixes(prefixes: (Option<String>, Option<String>)) {
+    let (llc_prefix, cpu_prefix) = prefixes;
+    LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
+    CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+}
+
+#[test]
+fn announced_writer_intent_blocks_new_readers_while_target_ex_waits() {
+    use std::sync::mpsc;
+
+    let _prefixes = LockPrefixesGuard::new();
+    drop(protocol::hold_registry_exclusive_for_tests().expect("initialize writer-intent registry"));
+    let initial_reader =
+        protocol::hold_registry_shared_for_tests().expect("hold initial registry reader");
+    let thread_prefixes = registry_thread_lock_prefixes();
+    let (intent_tx, intent_rx) = mpsc::sync_channel(1);
+    let (acquired_tx, acquired_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let writer = TestServiceThread::spawn(move || {
+        install_registry_thread_lock_prefixes(thread_prefixes);
+        let lock = protocol::hold_registry_exclusive_after_intent_for_tests(|| {
+            intent_tx.send(()).expect("publish writer intent");
+            Ok(())
+        })
+        .expect("wait for registry EX after announcing writer intent");
+        acquired_tx
+            .send(())
+            .expect("publish registry EX acquisition");
+        release_rx.recv().expect("receive writer release");
+        drop(lock);
+    });
+
+    recv_from_service_thread(&intent_rx, "writer-intent publication", &writer)
+        .expect("writer must hold writer-intent SH before reader probe");
+    assert!(
+        protocol::try_hold_registry_shared_for_tests()
+            .expect("probe reader behind announced writer")
+            .is_none(),
+        "a new reader must not pass a writer waiting for registry EX",
+    );
+    drop(initial_reader);
+    recv_from_service_thread(&acquired_rx, "writer registry-EX acquisition", &writer)
+        .expect("writer must acquire after the old reader leaves");
+    release_tx.send(()).expect("release writer");
+    writer.join().expect("writer-intent worker");
+}
+
+#[test]
+fn queued_writer_intents_leave_no_reader_admission_gap() {
+    use std::sync::mpsc;
+
+    let _prefixes = LockPrefixesGuard::new();
+    drop(protocol::hold_registry_exclusive_for_tests().expect("initialize queued-writer registry"));
+
+    let writer_one_prefixes = registry_thread_lock_prefixes();
+    let (one_intent_tx, one_intent_rx) = mpsc::sync_channel(1);
+    let (one_acquired_tx, one_acquired_rx) = mpsc::sync_channel(1);
+    let (one_release_tx, one_release_rx) = mpsc::sync_channel(1);
+    let (one_released_tx, one_released_rx) = mpsc::sync_channel(1);
+    let writer_one = TestServiceThread::spawn(move || {
+        install_registry_thread_lock_prefixes(writer_one_prefixes);
+        let lock = protocol::hold_registry_exclusive_after_intent_for_tests(|| {
+            one_intent_tx.send(()).expect("publish first writer intent");
+            Ok(())
+        })
+        .expect("acquire first registry EX");
+        one_acquired_tx
+            .send(())
+            .expect("publish first registry EX acquisition");
+        one_release_rx.recv().expect("receive first writer release");
+        drop(lock);
+        one_released_tx
+            .send(())
+            .expect("publish first registry EX release");
+    });
+    recv_from_service_thread(
+        &one_intent_rx,
+        "first writer-intent publication",
+        &writer_one,
+    )
+    .expect("first writer must announce intent");
+    recv_from_service_thread(
+        &one_acquired_rx,
+        "first registry-EX acquisition",
+        &writer_one,
+    )
+    .expect("first writer must own registry EX");
+
+    let writer_two_prefixes = registry_thread_lock_prefixes();
+    let (two_intent_tx, two_intent_rx) = mpsc::sync_channel(1);
+    let (two_acquired_tx, two_acquired_rx) = mpsc::sync_channel(1);
+    let (two_release_tx, two_release_rx) = mpsc::sync_channel(1);
+    let writer_two = TestServiceThread::spawn(move || {
+        install_registry_thread_lock_prefixes(writer_two_prefixes);
+        let lock = protocol::hold_registry_exclusive_after_intent_for_tests(|| {
+            two_intent_tx
+                .send(())
+                .expect("publish second writer intent");
+            Ok(())
+        })
+        .expect("wait for second registry EX");
+        two_acquired_tx
+            .send(())
+            .expect("publish second registry EX acquisition");
+        two_release_rx
+            .recv()
+            .expect("receive second writer release");
+        drop(lock);
+    });
+    recv_from_service_thread(
+        &two_intent_rx,
+        "second writer-intent publication",
+        &writer_two,
+    )
+    .expect("second writer must announce before first writer releases");
+
+    one_release_tx.send(()).expect("release first writer");
+    recv_from_service_thread(&one_released_rx, "first registry-EX release", &writer_one)
+        .expect("first writer must release its target lock");
+    assert!(
+        protocol::try_hold_registry_shared_for_tests()
+            .expect("probe reader between queued writers")
+            .is_none(),
+        "second writer intent must close the reader gap after first target release",
+    );
+    recv_from_service_thread(
+        &two_acquired_rx,
+        "second registry-EX acquisition",
+        &writer_two,
+    )
+    .expect("second writer must acquire after first writer releases");
+    writer_one.join().expect("first writer-intent worker");
+    two_release_tx.send(()).expect("release second writer");
+    writer_two.join().expect("second writer-intent worker");
+
+    let final_reader = protocol::try_hold_registry_shared_for_tests()
+        .expect("probe reader after queued writers")
+        .expect("reader must enter after every writer intent is gone");
+    drop(final_reader);
+}
+
+#[test]
+fn failed_nonblocking_writer_probe_releases_its_intent() {
+    let _prefixes = LockPrefixesGuard::new();
+    drop(
+        protocol::hold_registry_exclusive_for_tests()
+            .expect("initialize nonblocking writer-intent registry"),
+    );
+    let initial_reader =
+        protocol::hold_registry_shared_for_tests().expect("hold initial registry reader");
+    assert!(
+        protocol::try_hold_registry_exclusive_for_tests()
+            .expect("probe contended registry EX")
+            .is_none(),
+        "nonblocking registry EX must report contention behind a live reader",
+    );
+    let overlapping_reader = protocol::try_hold_registry_shared_for_tests()
+        .expect("probe reader after failed writer")
+        .expect("failed writer probe must release its writer-intent SH");
+    drop(overlapping_reader);
+    drop(initial_reader);
+}
+
+const WRITER_INTENT_HELPER_LLC_PREFIX: &str = "KTSTR_TEST_WRITER_INTENT_LLC_PREFIX";
+const WRITER_INTENT_HELPER_CPU_PREFIX: &str = "KTSTR_TEST_WRITER_INTENT_CPU_PREFIX";
+const WRITER_INTENT_HELPER_READY: &str = "KTSTR_TEST_WRITER_INTENT_READY";
+
+#[test]
+#[ignore]
+fn registry_writer_intent_crash_process_helper() {
+    let Some(llc_prefix) = std::env::var_os(WRITER_INTENT_HELPER_LLC_PREFIX) else {
+        return;
+    };
+    let cpu_prefix =
+        std::env::var(WRITER_INTENT_HELPER_CPU_PREFIX).expect("writer-intent helper CPU prefix");
+    LLC_LOCK_PREFIX_OVERRIDE
+        .with(|slot| *slot.borrow_mut() = Some(llc_prefix.to_string_lossy().into_owned()));
+    CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(cpu_prefix));
+
+    let _lock = protocol::hold_registry_exclusive_for_tests()
+        .expect("helper must hold registry EX and retained writer intent");
+    std::fs::write(
+        std::env::var_os(WRITER_INTENT_HELPER_READY).expect("writer-intent helper ready marker"),
+        b"ready",
+    )
+    .expect("publish retained writer-intent ownership");
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+fn process_death_releases_registry_target_and_writer_intent() {
+    struct KillOnDrop(Option<std::process::Child>);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .expect("parent LLC prefix");
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .expect("parent CPU prefix");
+    let temp = tempfile::tempdir().expect("writer-intent crash test directory");
+    let ready = temp.path().join("ready");
+    let stdout = temp.path().join("stdout");
+    let stderr = temp.path().join("stderr");
+    let child =
+        std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--ignored",
+                "--exact",
+                "vmm::host_topology::tests::protocol::registry_writer_intent_crash_process_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(WRITER_INTENT_HELPER_LLC_PREFIX, llc_prefix)
+            .env(WRITER_INTENT_HELPER_CPU_PREFIX, cpu_prefix)
+            .env(WRITER_INTENT_HELPER_READY, &ready)
+            .stdout(std::process::Stdio::from(
+                std::fs::File::create(&stdout).expect("create helper stdout"),
+            ))
+            .stderr(std::process::Stdio::from(
+                std::fs::File::create(&stderr).expect("create helper stderr"),
+            ))
+            .spawn()
+            .expect("spawn writer-intent crash helper");
+    let service = TestTaskService::Process { pid: child.id() };
+    let mut child = KillOnDrop(Some(child));
+    wait_with_external_task_service(
+        "writer-intent helper ownership publication",
+        std::slice::from_ref(&service),
+        || {
+            if ready.exists() {
+                return Ok(Some(()));
+            }
+            if let Some(status) = child.0.as_mut().expect("live helper child").try_wait()? {
+                anyhow::bail!(
+                    "writer-intent helper exited before publication: status={status} stdout={} stderr={}",
+                    String::from_utf8_lossy(&std::fs::read(&stdout).unwrap_or_default()),
+                    String::from_utf8_lossy(&std::fs::read(&stderr).unwrap_or_default()),
+                );
+            }
+            Ok(None)
+        },
+    )
+    .expect("helper must publish ownership of both kernel flocks");
+
+    child
+        .0
+        .as_mut()
+        .expect("live helper child")
+        .kill()
+        .expect("kill writer-intent helper");
+    let status = child
+        .0
+        .take()
+        .expect("live helper child")
+        .wait()
+        .expect("reap writer-intent helper");
+    assert!(
+        !status.success(),
+        "killed helper unexpectedly exited cleanly"
+    );
+    let reader = protocol::try_hold_registry_shared_for_tests()
+        .expect("probe registry after writer process death")
+        .expect("kernel must release both target EX and retained writer-intent SH on death");
+    drop(reader);
 }
 
 #[test]
@@ -3986,7 +4300,7 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
             && !outcome.mixed_age_old_woken
             && !outcome.mixed_age_late_replanned
             && !outcome.mixed_age_late_woken,
-        "a live finite wave must leave both an older returned callback and a later arrival for the next batch",
+        "a live finite wave must leave both an older returned callback and a later arrival for the next speculative wave",
     );
     assert_eq!(
         (
@@ -3998,7 +4312,7 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
     );
     assert!(
         outcome.next_wave_edge_published,
-        "the final original callback must publish one deferred next-wave rescan without running it",
+        "all original callback completions must coalesce one pending next-wave rescan without running it",
     );
     assert_eq!(
         outcome.next_wave_scan_delta, 1,
@@ -4022,11 +4336,11 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
 }
 
 #[test]
-fn changed_replan_wave_defers_one_authoritative_scan_until_every_callback_returns() {
+fn changed_replan_completions_coalesce_one_authoritative_scan() {
     let _prefixes = LockPrefixesGuard::new();
     let callbacks = 1_000usize;
-    let outcome = protocol::exercise_changed_replan_batch_for_tests(callbacks)
-        .expect("exercise changed speculative callback batch");
+    let outcome = protocol::exercise_changed_replan_wave_completions_for_tests(callbacks)
+        .expect("exercise changed speculative callback wave");
     assert_eq!(outcome.callbacks, callbacks);
     assert_eq!(
         (
@@ -4034,31 +4348,71 @@ fn changed_replan_wave_defers_one_authoritative_scan_until_every_callback_return
             outcome.intermediate_generation_wake_delta,
         ),
         (0, 0),
-        "the first N-1 changed callbacks must do O(1) publication work without scanning or waking the queue",
+        "the first N-1 changed callbacks must do O(1) publication work without scanning or globally waking the queue",
     );
     assert!(
-        outcome.intermediate_batch_only,
-        "the unfinished wave must retain one batch-only dirty edge and one outstanding callback",
+        outcome.intermediate_rescan_coalesced,
+        "the unfinished wave must retain one coalesced rescan edge and one outstanding callback",
     );
     assert_eq!(
         outcome.final_scan_delta_before_authoritative, 0,
         "the final callback must publish, but must not execute, the authoritative scan",
     );
     assert_eq!(
-        outcome.final_generation_wake_delta, 1,
-        "the complete changed wave must publish exactly one queue wake",
+        outcome.final_generation_wake_delta, 0,
+        "a live coordinator must avoid global generation wakes for the complete callback wave",
     );
     assert!(
         outcome.final_rescan_edge,
-        "the final callback must atomically promote the batch to one pending rescan",
+        "every completion must leave the same pending rescan edge until the coordinator consumes it",
     );
     assert_eq!(
         outcome.authoritative_scan_delta, 1,
-        "one coordinator scan must consume the complete changed batch",
+        "one coordinator scan must consume the complete changed wave",
     );
     assert!(
         outcome.authoritative_flags_clear && outcome.replacements_preserved,
-        "the authoritative scan must clear both dirty flags without losing any callback replacement",
+        "the authoritative scan must clear the rescan edge without losing any callback replacement",
+    );
+}
+
+#[test]
+fn completed_replan_replacement_grants_before_straggler_wave_drains() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_replan_straggler_progress_for_tests()
+        .expect("exercise progress past an outstanding speculative callback");
+    assert!(outcome.completion_requeued);
+    assert_eq!(
+        (
+            outcome.callback_scan_delta,
+            outcome.callback_generation_wake_delta,
+        ),
+        (0, 0),
+        "a callback completion must publish O(1) state without scanning or globally waking a live coordinator",
+    );
+    assert!(
+        outcome.edge_coalesced_with_straggler && outcome.later_disjoint_grant_remained_current,
+        "the completion must publish one rescan edge without invalidating a later disjoint grant while its peer remains outstanding",
+    );
+    assert_eq!(
+        outcome.authoritative_scan_delta, 1,
+        "one ordinary coordinator scan must consume the completion edge",
+    );
+    assert!(
+        outcome.completed_replacement_granted
+            && outcome.straggler_still_replan
+            && outcome.wave_deadline_not_reached,
+        "completed compatible work must grant before the unrelated callback returns or its finite-wave lease expires",
+    );
+}
+
+#[test]
+fn replan_completion_elects_after_waiting_publication_with_preexisting_edge() {
+    let _prefixes = LockPrefixesGuard::new();
+    assert!(
+        protocol::exercise_replan_completion_election_for_tests()
+            .expect("exercise coordinator election from completed speculative callback"),
+        "a completed callback must become coordinator when its predecessor disappeared while RESCAN was already pending",
     );
 }
 
@@ -4078,8 +4432,8 @@ fn expired_replan_wave_quarantines_stragglers_without_blocking_completed_work() 
         "deadline recovery must preserve completed replacements while atomically quarantining and draining only live stragglers",
     );
     assert!(
-        outcome.expiration_single_generation_edge,
-        "one expired wave must publish exactly one global generation edge",
+        outcome.expiration_avoids_global_generation_wake,
+        "one expired wave must use targeted slot/coordinator wakes without broadcasting on the generation futex",
     );
     assert!(
         outcome.completed_replacement_granted && outcome.expired_tickets_not_reissued,
@@ -4097,7 +4451,7 @@ fn expired_replan_wave_quarantines_stragglers_without_blocking_completed_work() 
     );
     assert!(
         outcome.acknowledgement_rescan_edge,
-        "each expired owner acknowledgement must publish one bounded rescan/generation edge",
+        "expired owner acknowledgements must coalesce one rescan edge without global generation wakes",
     );
 }
 
@@ -4108,52 +4462,6 @@ fn replan_expiry_repair_preserves_deadline_across_count_to_state_crash() {
         protocol::exercise_replan_expiry_publication_crash_for_tests()
             .expect("repair torn final REPLAN expiration publication"),
         "dirty repair must retain the due wave deadline across the final count decrement and quarantine the record whose state publication was torn",
-    );
-}
-
-#[test]
-fn changed_replan_batch_parks_later_grants_and_coordinator_commits_without_scanning() {
-    let _prefixes = LockPrefixesGuard::new();
-    let outcome = protocol::exercise_replan_batch_barriers_for_tests()
-        .expect("exercise changed speculative batch priority barriers");
-    assert!(
-        outcome.granted_entry_callback_suppressed,
-        "a later grant must park before entering its physical callback",
-    );
-    assert!(
-        outcome.granted_completion_payload_dropped
-            && outcome.granted_completion_payload_dropped_unlocked,
-        "a later physical success must be released outside the registry lock when an older choice changed",
-    );
-    assert!(
-        outcome.granted_contention_serials_preserved
-            && outcome.granted_contention_unknown_before_witness_drop,
-        "a deferred negative probe must retain its blocker/issue serial and publish UNKNOWN before releasing its witness",
-    );
-    assert!(
-        outcome.granted_records_parked,
-        "both later grants must return to WAITING behind the unfinished speculative batch",
-    );
-    assert_eq!(
-        outcome.granted_scan_delta, 0,
-        "entry and completion barriers must remain O(1)",
-    );
-    assert!(
-        outcome.coordinator_acquire_deferred && outcome.coordinator_preparation_deferred,
-        "both coordinator commit shapes must defer behind an older changed choice",
-    );
-    assert!(
-        outcome.coordinator_acquire_evidence_unknown
-            && outcome.coordinator_preparation_evidence_unknown,
-        "coordinator deferral must publish the exact acquire, accumulated blockers, and distinct preparation footprint as UNKNOWN",
-    );
-    assert!(
-        outcome.coordinator_preserved,
-        "batch deferral must retain the coordinator license until the final rescan edge",
-    );
-    assert_eq!(
-        outcome.coordinator_scan_delta, 0,
-        "coordinator batch deferral must not reconcile the queue eagerly",
     );
 }
 
@@ -4206,7 +4514,7 @@ fn intrascan_fence_activation_refreshes_live_replan_epoch() {
     );
     assert!(
         completion_accepted_for_revalidation,
-        "the same live non-acquiring callback must publish WAITING once and defer exact validation to the batch scan",
+        "the same live non-acquiring callback must publish WAITING once and defer exact validation to the authoritative scan",
     );
 }
 
@@ -4472,6 +4780,28 @@ fn stale_positive_probe_releases_payload_before_coordinator_notification() {
     assert!(
         observation_requested,
         "discarding a stale positive probe must invalidate optimistic availability",
+    );
+}
+
+#[test]
+fn expired_and_revoked_payloads_notify_after_drop_when_rescan_is_already_pending() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (
+        expired_ordered,
+        expired_dropped,
+        expired_unlocked,
+        revoked_ordered,
+        revoked_dropped,
+        revoked_unlocked,
+    ) = protocol::exercise_acknowledgement_payload_notify_order_for_tests()
+        .expect("exercise acknowledgement payload notification ordering");
+    assert!(
+        expired_ordered && expired_dropped && expired_unlocked,
+        "expired REPLAN acknowledgement must target the coordinator after dropping its payload outside registry EX even when RESCAN was already set",
+    );
+    assert!(
+        revoked_ordered && revoked_dropped && revoked_unlocked,
+        "revoked grant acknowledgement must target the coordinator after dropping its payload outside registry EX even when RESCAN was already set",
     );
 }
 
@@ -6265,8 +6595,15 @@ fn coordinator_retries_physical_success_if_an_earlier_replan_claims_its_target()
     wait_for_ticket_pids(&[first.pid]);
 
     let replan_gate = markers.path().join("publish-earlier-replan");
-    let earlier =
-        TicketChild::spawn_before_probe_gate(markers.path(), "earlier-replan", "2;3", &replan_gate);
+    // After rotating 2 -> 3, keep exact 3 while the later coordinator's gated
+    // physical payload blocks it. Otherwise the helper may legitimately wrap
+    // to free 2 and let the later disjoint 3 acquisition commit.
+    let earlier = TicketChild::spawn_before_probe_gate_retain_final(
+        markers.path(),
+        "earlier-replan",
+        "2;3",
+        &replan_gate,
+    );
     earlier.wait_for_probe();
     wait_for_ticket_claim(&earlier, &ticket_claim(&[2]));
 
@@ -6610,7 +6947,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v20
+    // Leave the replacement as an external, unregistered flock. A current-v21
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -6858,7 +7195,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v20 HELD lifecycle removes its registry record only after the
+    // The v21 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");
