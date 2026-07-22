@@ -9021,10 +9021,17 @@ fn exercise_callback_suffix_reconciliation_case(
     // one WAITING replacement exactly once; the deferred authoritative scan,
     // not callback discard/retry, reconciles either aggregate-equivalent or
     // genuinely changed predecessor input.
+    let target_waiting = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table
+            .record(target.slot)?
+            .is_some_and(|record| record.ticket == target.ticket && record.state == STATE_WAITING)
+    };
     let expected = callback_ran
         && !callback_saw_changed_prefix
         && matches!(result, GrantResult::Requeued)
-        && target.state(None)? == State::Waiting;
+        && target_waiting;
 
     target.finish(None)?;
     duplicate_b.finish(None)?;
