@@ -2780,12 +2780,13 @@ impl IdentityPlan {
                 &cache_root.join("nextest-materialized-v1"),
                 progress_label,
                 || Ok(true),
-                || {
-                    Ok(
-                        recompute_source_identity(&self.source).map_err(anyhow::Error::msg)?
-                            == self.source.identity,
-                    )
-                },
+                // `stable_source` was captured from the live checkout and
+                // publication-validated before the producer started. Cargo
+                // consumes only that immutable tree, so a later edit to the
+                // writable checkout cannot change this build's inputs. A
+                // second live-tree scan here both wastes the cold-build tail
+                // and incorrectly rejects the coherent snapshot Cargo used.
+                || Ok(true),
                 || crate::interrupt::INTERRUPTED.load(Ordering::Acquire),
                 |stable_build| build(&stable_source, stable_build).map_err(anyhow::Error::msg),
             )
@@ -3228,6 +3229,85 @@ mod tests {
         assert_ne!(
             first_digest,
             source_tree_digest(&second, &changed_paths, &BTreeMap::new()).unwrap()
+        );
+    }
+
+    #[test]
+    fn nextest_publish_keeps_verified_stable_snapshot_when_live_source_changes() {
+        let _environment = lock_env();
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let _cache = EnvVarGuard::set(ktstr::KTSTR_CACHE_DIR_ENV, &cache);
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            b"[package]\nname='stable-snapshot'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let live_source = workspace.join("src/lib.rs");
+        std::fs::write(&live_source, b"pub fn value() -> u8 { 1 }\n").unwrap();
+
+        let input_paths =
+            BTreeSet::from([PathBuf::from("Cargo.toml"), PathBuf::from("src/lib.rs")]);
+        let digest = source_tree_digest(&workspace, &input_paths, &BTreeMap::new()).unwrap();
+        let mut source = SourceLayout {
+            workspace: workspace.clone(),
+            invocation: workspace.clone(),
+            invocation_relation: (0, Vec::new()),
+            workspace_virtual: PathBuf::from("source/primary"),
+            invocation_virtual: PathBuf::from("source/primary"),
+            roots: vec![SourceRootPlan {
+                source: workspace.clone(),
+                virtual_path: PathBuf::from("source/primary"),
+                semantic_name: "source/primary".to_string(),
+                is_git: false,
+                input_paths,
+                git_head: None,
+                git_status_semantics: BTreeSet::new(),
+                git_metadata: None,
+                digest,
+            }],
+            cargo_configs: Vec::new(),
+            target_specs: Vec::new(),
+            declared_package_inputs: BTreeSet::new(),
+            outputs: vec![workspace.join("target"), cache.clone()],
+            identity: 0,
+        };
+        source.identity = recompute_source_identity(&source).unwrap();
+        let plan = IdentityPlan {
+            identity: 0x51ab_1e5a,
+            components: serde_json::json!({"fixture": "stable-snapshot-publication"}),
+            source,
+        };
+
+        let materialized = plan
+            .load_or_build("stable snapshot publication fixture", |stable, build| {
+                let captured = stable.workspace_root.join("src/lib.rs");
+                assert_eq!(
+                    std::fs::read(&captured).unwrap(),
+                    b"pub fn value() -> u8 { 1 }\n",
+                );
+                std::fs::write(&live_source, b"pub fn value() -> u8 { 2 }\n").unwrap();
+                std::fs::create_dir_all(&build.target_directory).unwrap();
+                let metadata = serde_json::json!({
+                    "rust-build-meta": {
+                        "target-directory": build.target_directory,
+                    },
+                    "rust-binaries": {},
+                });
+                capture_source(&serde_json::to_vec(&metadata).unwrap(), b"{}")
+            })
+            .expect("a verified immutable snapshot remains publishable");
+
+        assert!(!materialized.cache_hit());
+        assert_eq!(
+            std::fs::read(materialized.stable_workspace_root.join("src/lib.rs")).unwrap(),
+            b"pub fn value() -> u8 { 1 }\n",
+        );
+        assert_eq!(
+            std::fs::read(live_source).unwrap(),
+            b"pub fn value() -> u8 { 2 }\n",
         );
     }
 
