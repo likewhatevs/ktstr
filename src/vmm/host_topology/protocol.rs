@@ -1809,6 +1809,12 @@ pub(crate) fn exercise_repeated_coordinator_takeover_for_tests()
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
+-> Result<registry::FreshWaitingCoordinatorTakeoverOutcome> {
+    registry::exercise_fresh_waiting_coordinator_takeover_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn expire_coordinator_lease_for_tests() -> Result<()> {
     registry::expire_coordinator_lease_for_tests()
 }

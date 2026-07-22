@@ -4245,6 +4245,18 @@ pub(crate) struct RepeatedCoordinatorTakeoverOutcome {
 }
 
 #[cfg(test)]
+pub(crate) struct FreshWaitingCoordinatorTakeoverOutcome {
+    pub(crate) first_transfer_to_b: bool,
+    pub(crate) first_states_coherent: bool,
+    pub(crate) first_epoch_advanced: bool,
+    pub(crate) first_wakes_target_only_a_and_b: bool,
+    pub(crate) second_transfer_to_c: bool,
+    pub(crate) second_states_coherent: bool,
+    pub(crate) second_epoch_advanced: bool,
+    pub(crate) second_wakes_target_only_b_and_c: bool,
+}
+
+#[cfg(test)]
 pub(super) fn exercise_coordinator_heartbeat_deadline_for_tests()
 -> Result<CoordinatorHeartbeatDeadlineOutcome> {
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
@@ -4342,6 +4354,150 @@ pub(super) fn exercise_coordinator_heartbeat_deadline_for_tests()
     })
 }
 
+/// Prefer a fresh WAITING successor over recycling an older live standby.
+/// This is the forward-drain policy paired with the standby fallback exercised
+/// below: A -> B parks A, then stale B must promote waiting C rather than
+/// immediately returning the lease to A.
+#[cfg(test)]
+pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
+-> Result<FreshWaitingCoordinatorTakeoverOutcome> {
+    let claim_a = ClaimSet::new(std::iter::empty(), [11usize], FlockMode::Exclusive);
+    let mut coordinator_a = Ticket::register(claim_a.clone(), claim_a, None)?;
+    let claim_b = ClaimSet::new(std::iter::empty(), [12usize], FlockMode::Exclusive);
+    let mut coordinator_b = Ticket::register(claim_b.clone(), claim_b, None)?;
+    let claim_c = ClaimSet::new(std::iter::empty(), [13usize], FlockMode::Exclusive);
+    let mut coordinator_c = Ticket::register(claim_c.clone(), claim_c, None)?;
+
+    let (initial_epoch, wakes_before) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        anyhow::ensure!(
+            table.coordinator_ticket() == coordinator_a.ticket
+                && table.coordinator_slot()? == coordinator_a.slot
+                && table.record(coordinator_a.slot)?.is_some_and(|record| {
+                    record.ticket == coordinator_a.ticket && record.state == STATE_COORDINATOR
+                })
+                && table.record(coordinator_b.slot)?.is_some_and(|record| {
+                    record.ticket == coordinator_b.ticket && record.state == STATE_WAITING
+                })
+                && table.record(coordinator_c.slot)?.is_some_and(|record| {
+                    record.ticket == coordinator_c.ticket && record.state == STATE_WAITING
+                }),
+            "fresh-waiter takeover fixture did not stage A coordinator before B and C waiters",
+        );
+        let wake = |ticket: &Ticket, label: &str| -> Result<u32> {
+            Ok(ticket
+                .shared
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("coordinator {label} wake mapping disappeared"))?
+                .expected())
+        };
+        (
+            table.coordinator_epoch(),
+            (
+                wake(&coordinator_a, "A")?,
+                wake(&coordinator_b, "B")?,
+                wake(&coordinator_c, "C")?,
+            ),
+        )
+    };
+
+    let first_now = monotonic_now_ns()?.max(COORDINATOR_HEARTBEAT_LEASE_NS);
+    let (first_transfer_to_b, first_states_coherent, first_epoch) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+        write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
+        table.recover_coordinator_if_dead_at(first_now)?;
+        (
+            table.coordinator_ticket() == coordinator_b.ticket
+                && table.coordinator_slot()? == coordinator_b.slot,
+            table.record(coordinator_a.slot)?.is_some_and(|record| {
+                record.ticket == coordinator_a.ticket && record.state == STATE_COORDINATOR_STANDBY
+            }) && table.record(coordinator_b.slot)?.is_some_and(|record| {
+                record.ticket == coordinator_b.ticket && record.state == STATE_COORDINATOR
+            }) && table.record(coordinator_c.slot)?.is_some_and(|record| {
+                record.ticket == coordinator_c.ticket && record.state == STATE_WAITING
+            }),
+            table.coordinator_epoch(),
+        )
+    };
+    let wakes_after_first = (
+        coordinator_a
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("parked coordinator A wake mapping disappeared"))?
+            .expected(),
+        coordinator_b
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("promoted coordinator B wake mapping disappeared"))?
+            .expected(),
+        coordinator_c
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("waiting coordinator C wake mapping disappeared"))?
+            .expected(),
+    );
+
+    let second_now = first_now.saturating_add(COORDINATOR_HEARTBEAT_LEASE_NS);
+    let (second_transfer_to_c, second_states_coherent, second_epoch) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+        write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
+        table.recover_coordinator_if_dead_at(second_now)?;
+        (
+            table.coordinator_ticket() == coordinator_c.ticket
+                && table.coordinator_slot()? == coordinator_c.slot,
+            table.record(coordinator_a.slot)?.is_some_and(|record| {
+                record.ticket == coordinator_a.ticket && record.state == STATE_COORDINATOR_STANDBY
+            }) && table.record(coordinator_b.slot)?.is_some_and(|record| {
+                record.ticket == coordinator_b.ticket && record.state == STATE_COORDINATOR_STANDBY
+            }) && table.record(coordinator_c.slot)?.is_some_and(|record| {
+                record.ticket == coordinator_c.ticket && record.state == STATE_COORDINATOR
+            }),
+            table.coordinator_epoch(),
+        )
+    };
+    let wakes_after_second = (
+        coordinator_a
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("standby coordinator A wake mapping disappeared"))?
+            .expected(),
+        coordinator_b
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("parked coordinator B wake mapping disappeared"))?
+            .expected(),
+        coordinator_c
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("promoted coordinator C wake mapping disappeared"))?
+            .expected(),
+    );
+
+    coordinator_c.finish(None)?;
+    coordinator_b.finish(None)?;
+    coordinator_a.finish(None)?;
+    Ok(FreshWaitingCoordinatorTakeoverOutcome {
+        first_transfer_to_b,
+        first_states_coherent,
+        first_epoch_advanced: first_epoch > initial_epoch,
+        first_wakes_target_only_a_and_b: wakes_after_first.0 != wakes_before.0
+            && wakes_after_first.1 != wakes_before.1
+            && wakes_after_first.2 == wakes_before.2,
+        second_transfer_to_c,
+        second_states_coherent,
+        second_epoch_advanced: second_epoch > first_epoch,
+        second_wakes_target_only_b_and_c: wakes_after_second.0 == wakes_after_first.0
+            && wakes_after_second.1 != wakes_after_first.1
+            && wakes_after_second.2 != wakes_after_first.2,
+    })
+}
+
 /// Exercise two consecutive live-coordinator lease transfers. Ticket C is
 /// deliberately registered between A and B and kept GRANTED: B -> A must
 /// dirty the suffix from the older successor A, not merely from the displaced
@@ -4349,24 +4505,15 @@ pub(super) fn exercise_coordinator_heartbeat_deadline_for_tests()
 #[cfg(test)]
 pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
 -> Result<RepeatedCoordinatorTakeoverOutcome> {
-    let coordinator_a_claim =
-        ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
-    let mut coordinator_a = Ticket::register(
-        coordinator_a_claim.clone(),
-        coordinator_a_claim,
-        None,
-    )?;
-    let intervening_claim =
-        ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
+    let coordinator_a_claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut coordinator_a =
+        Ticket::register(coordinator_a_claim.clone(), coordinator_a_claim, None)?;
+    let intervening_claim = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
     let mut intervening =
         Ticket::register(intervening_claim.clone(), intervening_claim.clone(), None)?;
-    let coordinator_b_claim =
-        ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
-    let mut coordinator_b = Ticket::register(
-        coordinator_b_claim.clone(),
-        coordinator_b_claim,
-        None,
-    )?;
+    let coordinator_b_claim = ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
+    let mut coordinator_b =
+        Ticket::register(coordinator_b_claim.clone(), coordinator_b_claim, None)?;
 
     let (initial_epoch, wake_a_before, wake_b_before) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
@@ -4467,8 +4614,7 @@ pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
             table.record(coordinator_a.slot)?.is_some_and(|record| {
                 record.ticket == coordinator_a.ticket && record.state == STATE_COORDINATOR
             }) && table.record(coordinator_b.slot)?.is_some_and(|record| {
-                record.ticket == coordinator_b.ticket
-                    && record.state == STATE_COORDINATOR_STANDBY
+                record.ticket == coordinator_b.ticket && record.state == STATE_COORDINATOR_STANDBY
             }) && table.record(intervening.slot)?.is_some_and(|record| {
                 record.ticket == intervening.ticket && record.state == STATE_GRANTED
             }),
@@ -13735,18 +13881,13 @@ impl Table {
         }
         let mut candidates = self.records()?;
         candidates.retain(|candidate| {
-            matches!(
-                candidate.state,
-                STATE_WAITING | STATE_COORDINATOR_STANDBY
-            )
+            matches!(candidate.state, STATE_WAITING | STATE_COORDINATOR_STANDBY)
         });
         // Drain never-tried waiters before recycling a coordinator which
         // already missed its lease. Once no WAITING ticket remains, the
         // oldest standby is the progress fallback instead of a terminal
         // two-ticket wedge.
-        candidates.sort_by_key(|candidate| {
-            (candidate.state != STATE_WAITING, candidate.ticket)
-        });
+        candidates.sort_by_key(|candidate| (candidate.state != STATE_WAITING, candidate.ticket));
         let mut successor = None;
         for candidate in candidates {
             // Do not spend another bounded lease and repair turn transferring
@@ -13782,10 +13923,7 @@ impl Table {
             .record(successor.slot)?
             .filter(|candidate| {
                 candidate.ticket == successor.ticket
-                    && matches!(
-                        candidate.state,
-                        STATE_WAITING | STATE_COORDINATOR_STANDBY
-                    )
+                    && matches!(candidate.state, STATE_WAITING | STATE_COORDINATOR_STANDBY)
             })
             .ok_or_else(|| anyhow::anyhow!("queue takeover successor changed during recovery"))?;
         if coordinator_activity_is_fresh(&self.header, now) {

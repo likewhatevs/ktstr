@@ -1604,6 +1604,33 @@ fn repeated_coordinator_lease_takeover_fences_the_complete_older_suffix() {
 }
 
 #[test]
+fn repeated_coordinator_lease_takeover_prefers_a_fresh_waiter_before_standby() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_fresh_waiting_coordinator_takeover_for_tests()
+        .expect("exercise coordinator takeover with a fresh waiting successor");
+    assert!(
+        outcome.first_transfer_to_b
+            && outcome.first_states_coherent
+            && outcome.first_epoch_advanced,
+        "the first expired lease must transfer A to standby and promote oldest fresh waiter B",
+    );
+    assert!(
+        outcome.first_wakes_target_only_a_and_b,
+        "the first transfer must target A and B without waking untouched waiter C",
+    );
+    assert!(
+        outcome.second_transfer_to_c
+            && outcome.second_states_coherent
+            && outcome.second_epoch_advanced,
+        "stale B must promote fresh waiter C while leaving older standby A parked",
+    );
+    assert!(
+        outcome.second_wakes_target_only_b_and_c,
+        "the second transfer must target B and C without recycling or waking standby A",
+    );
+}
+
+#[test]
 fn stalled_takeover_wakes_and_parks_the_displaced_coordinator() {
     let _prefixes = LockPrefixesGuard::new();
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
