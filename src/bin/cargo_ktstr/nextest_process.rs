@@ -8,10 +8,89 @@
 //! unrelated commands retain their original limits.
 
 use std::ffi::{OsStr, OsString};
-use std::io;
+use std::io::{self, IsTerminal as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
+
+const NEXTEST_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Keep the terminal tail of a nextest run visibly alive without interposing
+/// on its stdout or stderr.
+///
+/// Nextest already streams every completed test directly to the inherited
+/// terminal. A large VM run can nevertheless go quiet after the fast tests
+/// finish because every remaining attempt is still running or waiting for
+/// admission. Piping nextest through cargo-ktstr to detect that silence would
+/// duplicate and retain a potentially huge log, so the existing child-owner
+/// loop emits a low-frequency phase heartbeat instead.
+struct NextestRunProgress {
+    started: Instant,
+    next_heartbeat: Instant,
+    heartbeat_interval: Duration,
+}
+
+impl NextestRunProgress {
+    fn new(heartbeat_interval: Duration) -> Self {
+        Self::new_at(Instant::now(), heartbeat_interval)
+    }
+
+    fn new_at(started: Instant, heartbeat_interval: Duration) -> Self {
+        assert!(
+            !heartbeat_interval.is_zero(),
+            "nextest heartbeat interval must be non-zero"
+        );
+        Self {
+            started,
+            next_heartbeat: started + heartbeat_interval,
+            heartbeat_interval,
+        }
+    }
+
+    fn tick_at(&mut self, now: Instant) -> Option<String> {
+        if now >= self.next_heartbeat {
+            self.next_heartbeat = now + self.heartbeat_interval;
+            Some(nextest_heartbeat_line(
+                now.saturating_duration_since(self.started),
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn next_tick_in_at(&self, now: Instant) -> Duration {
+        self.next_heartbeat.saturating_duration_since(now)
+    }
+}
+
+impl crate::interrupt::StdoutObserver for NextestRunProgress {
+    fn observe_stdout(&mut self, _bytes: &[u8]) {}
+
+    fn tick(&mut self) {
+        if let Some(line) = self.tick_at(Instant::now()) {
+            eprintln!("{line}");
+        }
+    }
+
+    fn next_tick_in(&self) -> Duration {
+        self.next_tick_in_at(Instant::now())
+    }
+
+    fn finished(&mut self, _status: &ExitStatus) {}
+
+    fn failed(&mut self, _error: &io::Error) {}
+}
+
+fn nextest_heartbeat_line(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    let elapsed = if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    };
+    format!("cargo ktstr: nextest run still active; elapsed={elapsed}")
+}
 
 /// Whether one inherited variable describes nextest's current test process.
 ///
@@ -78,7 +157,17 @@ pub(crate) fn prepare(command: &mut Command) {
 /// Run one nextest frontend through the shared signal-aware process owner.
 pub(crate) fn run_status(mut command: Command) -> io::Result<ExitStatus> {
     prepare(&mut command);
-    crate::interrupt::run_status(command)
+    // Nextest already owns an interactive progress bar. Adding periodic lines
+    // underneath it would only make the terminal flicker; the heartbeat is
+    // for line-buffered CI logs where that bar is absent.
+    if io::stderr().is_terminal() {
+        crate::interrupt::run_status(command)
+    } else {
+        crate::interrupt::run_status_observed(
+            command,
+            NextestRunProgress::new(NEXTEST_PROGRESS_INTERVAL),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +284,36 @@ mod tests {
         let after = nofile_limit();
         assert_eq!(after.rlim_cur, before.rlim_cur, "parent soft limit changed");
         assert_eq!(after.rlim_max, before.rlim_max, "parent hard limit changed");
+    }
+
+    #[test]
+    fn nextest_progress_ticks_only_at_heartbeat_deadlines() {
+        let started = Instant::now();
+        let mut progress = NextestRunProgress::new_at(started, Duration::from_secs(10));
+
+        assert_eq!(progress.next_tick_in_at(started), Duration::from_secs(10));
+        assert_eq!(progress.tick_at(started + Duration::from_secs(9)), None);
+        assert_eq!(
+            progress.tick_at(started + Duration::from_secs(10)),
+            Some("cargo ktstr: nextest run still active; elapsed=10.0s".to_string())
+        );
+        assert_eq!(
+            progress.next_tick_in_at(started + Duration::from_secs(10)),
+            Duration::from_secs(10),
+        );
+
+        assert_eq!(progress.tick_at(started + Duration::from_secs(19)), None);
+        assert_eq!(
+            progress.tick_at(started + Duration::from_secs(20)),
+            Some("cargo ktstr: nextest run still active; elapsed=20.0s".to_string())
+        );
+    }
+
+    #[test]
+    fn nextest_progress_formats_minute_elapsed_time() {
+        assert_eq!(
+            nextest_heartbeat_line(Duration::from_secs(75)),
+            "cargo ktstr: nextest run still active; elapsed=1m 15s",
+        );
     }
 }

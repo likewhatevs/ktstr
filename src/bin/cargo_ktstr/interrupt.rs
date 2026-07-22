@@ -2434,6 +2434,29 @@ pub(crate) fn run_status(mut command: Command) -> io::Result<ExitStatus> {
     run_status_with_handoff(command, || {})
 }
 
+/// Run a single-use command with inherited stdio and periodic owner-loop
+/// observation.
+///
+/// Unlike [`run_output_observed`], this does not replace or retain either
+/// child stream. The first observer tick happens only after the child has
+/// spawned and, when cleanup supervision is active, its process-group
+/// ownership handoff has completed.
+pub(crate) fn run_status_observed<O>(command: Command, mut observer: O) -> io::Result<ExitStatus>
+where
+    O: StdoutObserver,
+{
+    let result = if runner_enabled() {
+        run_status_with_handoff_observed(command, || {}, &mut observer)
+    } else {
+        run_status_observed_direct(command, &mut observer)
+    };
+    match &result {
+        Ok(status) => observer.finished(status),
+        Err(error) => observer.failed(error),
+    }
+    result
+}
+
 /// Run a single-use command, capturing stdout and stderr.
 pub(crate) fn run_output(mut command: Command) -> io::Result<Output> {
     if !runner_enabled() {
@@ -2442,13 +2465,15 @@ pub(crate) fn run_output(mut command: Command) -> io::Result<Output> {
     run_capture(command, true)
 }
 
-/// Observe captured child pipes while retaining their exact byte streams.
+/// Observe a child from the synchronous process-owner loop.
 ///
 /// The observer runs synchronously on the child-owning thread. Its periodic
 /// tick remains live while the command is silent, after the command leader
 /// closes its pipes, and while any owned descendant finishes. No
 /// drain thread outlives this call, and every error path kills/reaps the
-/// published child subtree before returning.
+/// published child subtree before returning. Capture runners deliver retained
+/// bytes through `observe_*`; inherited-stream runners call only the lifecycle
+/// and time-based methods.
 pub(crate) trait StdoutObserver {
     /// Inspect newly read bytes. The runner appends them to its returned
     /// [`Output::stdout`] before making this call.
@@ -3751,9 +3776,21 @@ fn run_status_with_handoff<F>(command: Command, handoff: F) -> io::Result<ExitSt
 where
     F: FnOnce(),
 {
-    let mut group = spawn_group(command, handoff)?;
     let mut observer = SilentObserver;
-    let status = match drain_group_capture(&mut group, CaptureStreams::empty(), &mut observer) {
+    run_status_with_handoff_observed(command, handoff, &mut observer)
+}
+
+fn run_status_with_handoff_observed<F, O>(
+    command: Command,
+    handoff: F,
+    observer: &mut O,
+) -> io::Result<ExitStatus>
+where
+    F: FnOnce(),
+    O: StdoutObserver,
+{
+    let mut group = spawn_group(command, handoff)?;
+    let status = match drain_group_capture(&mut group, CaptureStreams::empty(), observer) {
         Ok(capture) => capture.status,
         Err(error) => {
             terminate_group(&mut group);
@@ -3762,6 +3799,16 @@ where
     };
     finish_group(&mut group)?;
     Ok(status)
+}
+
+fn run_status_observed_direct<O>(mut command: Command, observer: &mut O) -> io::Result<ExitStatus>
+where
+    O: StdoutObserver,
+{
+    let mut owner = ArmedChild::new(command.spawn()?);
+    let output = drain_direct_capture(owner.child_mut(), CaptureStreams::empty(), observer)?;
+    owner.disarm_reaped();
+    Ok(output.status)
 }
 
 struct SilentObserver;
@@ -6943,6 +6990,37 @@ mod tests {
             "an eighty-millisecond silent interval must trigger periodic ticks: {}",
             state.heartbeats,
         );
+        assert_eq!(state.finished, [Some(0)]);
+        assert!(state.failures.is_empty());
+        assert_eq!(active_group_for_test(), IDLE);
+        drop(state);
+        drop(guard);
+    }
+
+    #[test]
+    fn status_observer_keeps_configured_streams_inherited_and_reports_finish() {
+        let _serial = test_serial_guard();
+        let guard = install_cleanup_guard();
+        let root = tempfile::tempdir().expect("status observer tempdir");
+        let stdout_path = root.path().join("stdout");
+        let stderr_path = root.path().join("stderr");
+        let (observer, state) = RecordingObserver::new(Duration::from_secs(3_600));
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf stdout-direct; printf stderr-direct >&2")
+            .stdout(std::fs::File::create(&stdout_path).expect("create inherited stdout"))
+            .stderr(std::fs::File::create(&stderr_path).expect("create inherited stderr"));
+
+        let status = run_status_observed(command, observer).expect("observed status command");
+        assert!(status.success());
+        assert_eq!(std::fs::read(&stdout_path).unwrap(), b"stdout-direct");
+        assert_eq!(std::fs::read(&stderr_path).unwrap(), b"stderr-direct");
+
+        let state = state.lock().expect("observer state");
+        assert!(state.stdout.is_empty(), "stdout must remain uncaptured");
+        assert!(state.stderr.is_empty(), "stderr must remain uncaptured");
+        assert_eq!(state.heartbeats, 0);
         assert_eq!(state.finished, [Some(0)]);
         assert!(state.failures.is_empty());
         assert_eq!(active_group_for_test(), IDLE);
