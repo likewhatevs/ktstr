@@ -61,10 +61,8 @@ kernel-build version="":
 # the #[ktstr_test(wprof)] tests require — when itself built with the
 # feature. E.g. `just test 6.14 wprof` → cargo-ktstr built `--features
 # wprof`; tests run `--features integration,wprof`.
-# `nextest-filter` is an optional filterset used by CI to avoid repeating
-# kernel-independent host work in every kernel-version lane.
-test kernel extra-features="" nextest-filter="":
-    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --no-fail-fast {{ if nextest-filter != "" { "-E '" + nextest-filter + "'" } else { "" } }}
+test kernel extra-features="":
+    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --no-fail-fast
 
 # Run trybuild compile_fail fixtures.
 #
