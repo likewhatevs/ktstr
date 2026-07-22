@@ -1611,7 +1611,8 @@ pub(crate) fn register_intent_for_preparation(
                             super::PreparationProbe::Contended(evidence) => {
                                 (None, None, Some(evidence))
                             }
-                            super::PreparationProbe::Unavailable => (None, None, None),
+                            super::PreparationProbe::RegistryContended(_)
+                            | super::PreparationProbe::Unavailable => (None, None, None),
                         };
                         Ok(registry::GrantAttempt {
                             acquired,
@@ -1676,7 +1677,8 @@ pub(crate) fn register_intent_for_preparation(
                             held.record_external_contention(evidence);
                             CoordinatorStep::Waiting { claim: selected }
                         }
-                        super::PreparationProbe::Unavailable => {
+                        super::PreparationProbe::RegistryContended(_)
+                        | super::PreparationProbe::Unavailable => {
                             CoordinatorStep::Waiting { claim: selected }
                         }
                     })
@@ -1737,27 +1739,56 @@ pub(crate) fn try_register_pending_admission(
         )
     })? {
         super::PreparationProbe::Acquired(pending) => Ok(Some(pending)),
-        super::PreparationProbe::Contended(_) | super::PreparationProbe::Unavailable => Ok(None),
+        super::PreparationProbe::Contended(_)
+        | super::PreparationProbe::RegistryContended(_)
+        | super::PreparationProbe::Unavailable => Ok(None),
     }
 }
 
 pub(crate) fn register_pending_admission(max_permit_index: usize) -> Result<PendingAdmission> {
     let required = registry::required_bits_for_permit_index(max_permit_index);
+    let allowed = super::host_allowed_cpus();
+    anyhow::ensure!(
+        !allowed.is_empty(),
+        "could not determine allowed CPU set for preparation admission",
+    );
     let mut rotation_bias = 0usize;
     loop {
-        // Scan every preparation slot before waiting.  Publication occurs
-        // under the registry EX lock; if an older READY claim appeared after
-        // the physical probe, registration returns None and all flocks are
-        // dropped before the next rotated scan.
-        let (preparation, claim) = super::acquire_preparation_permit(rotation_bias)?;
-        match registry::Ticket::register_pending(required, claim.clone())? {
-            registry::PendingRegistration::Registered(ticket) => {
-                return pending_admission_from_parts(*ticket, preparation, claim);
+        // Physical probing and registry publication form one complete sweep.
+        // A logically fenced tuple drops every OFD and advances to the next
+        // immediately available tuple; only a fully exhausted sweep may park.
+        // The first sampled generation is retained so an improvement racing
+        // any later probe makes the subsequent futex check return EAGAIN.
+        let probe =
+            super::try_preparation_candidates_once_waiting(
+                rotation_bias,
+                &allowed,
+                |preparation, claim| {
+                    let pending_claim = claim.clone();
+                    Ok(match registry::Ticket::register_pending(required, claim)? {
+                        registry::PendingRegistration::Registered(ticket) => {
+                            super::PreparationCandidateDecision::Accepted(
+                                pending_admission_from_parts(*ticket, preparation, pending_claim)?,
+                            )
+                        }
+                        registry::PendingRegistration::Contended(generation) => {
+                            drop(preparation);
+                            super::PreparationCandidateDecision::RegistryContended(generation)
+                        }
+                    })
+                },
+            )?;
+        match probe {
+            super::PreparationProbe::Acquired(pending) => return Ok(pending),
+            super::PreparationProbe::Contended(evidence) => {
+                super::wait_for_preparation_contention(evidence, Duration::from_secs(2))?;
             }
-            registry::PendingRegistration::Contended(generation) => {
-                drop(preparation);
+            super::PreparationProbe::RegistryContended(generation) => {
                 registry::wait_for_generation_change(generation, Duration::from_secs(2))?;
             }
+            super::PreparationProbe::Unavailable => anyhow::bail!(
+                "preparation candidate sweep found neither a runnable tuple nor a waitable blocker"
+            ),
         }
         rotation_bias = rotation_bias.wrapping_add(1);
     }
@@ -1908,6 +1939,16 @@ pub(crate) fn register_pending_claim_for_tests(claim: ClaimSet) -> Result<Pendin
 #[cfg(test)]
 pub(crate) fn registry_ex_acquisition_count_for_tests() -> u64 {
     registry::registry_ex_acquisition_count_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_generation_wait_calls_for_tests() {
+    registry::reset_generation_wait_calls_for_tests();
+}
+
+#[cfg(test)]
+pub(crate) fn generation_wait_calls_for_tests() -> usize {
+    registry::generation_wait_calls_for_tests()
 }
 
 #[cfg(test)]

@@ -3790,6 +3790,183 @@ fn interactive_preparation_tries_a_second_tuple_after_candidate_rejection() {
     assert_ne!(attempted_tokens[0], selected);
 }
 
+fn preparation_token_claim(token: usize) -> protocol::ClaimSet {
+    protocol::ClaimSet::with_permits(
+        std::iter::empty(),
+        std::iter::empty(),
+        [token],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Exclusive,
+    )
+}
+
+fn pending_preparation_token(
+    pending: &protocol::PendingAdmission,
+    tokens: &std::ops::Range<usize>,
+) -> usize {
+    pending
+        .preparation_handoff_parts()
+        .expect("inspect pending preparation descriptors")
+        .1
+        .into_iter()
+        .map(|(permit, _)| permit)
+        .find(|permit| tokens.contains(permit))
+        .expect("pending preparation omitted its unique token permit")
+}
+
+#[test]
+fn blocking_preparation_skips_an_aggregate_conflicted_first_tuple_without_sleeping() {
+    let _prefixes = LockPrefixesGuard::new();
+    let tokens = preparation_token_range().expect("resolve preparation tokens");
+    assert!(
+        tokens.len() >= 2,
+        "test host must fund two preparation candidates",
+    );
+    let allowed = host_allowed_cpus();
+    let first = try_preparation_candidates_once(0, &allowed, |preparation, _claim| {
+        Ok(PreparationCandidateDecision::Accepted(
+            preparation.token_permit,
+        ))
+    })
+    .expect("discover first preparation candidate");
+    let PreparationProbe::Acquired(first_token) = first else {
+        panic!("fresh preparation pool did not expose its first candidate");
+    };
+    let _aggregate_blocker =
+        protocol::register_pending_claim_for_tests(preparation_token_claim(first_token))
+            .expect("publish first-token aggregate blocker");
+
+    protocol::reset_generation_wait_calls_for_tests();
+    let mut pending = protocol::register_pending_admission(
+        admission_resource_capacity_hint().expect("resolve preparation capacity"),
+    )
+    .expect("blocking admission must continue past the fenced first tuple");
+    let selected_token = pending_preparation_token(&pending, &tokens);
+    let generation_waits = protocol::generation_wait_calls_for_tests();
+    pending
+        .restore_preparation_affinity()
+        .expect("restore preparation affinity");
+    drop(pending);
+
+    assert_ne!(
+        selected_token, first_token,
+        "blocking admission must not republish the aggregate-conflicted tuple",
+    );
+    assert_eq!(
+        generation_waits, 0,
+        "an immediately available compatible tuple must be found in the same sweep",
+    );
+}
+
+#[test]
+fn blocking_preparation_rotates_to_a_later_physical_candidate_when_it_wakes() {
+    let _prefixes = LockPrefixesGuard::new();
+    let tokens = preparation_token_range().expect("resolve preparation tokens");
+    assert!(
+        tokens.len() >= 2,
+        "test host must fund two preparation candidates",
+    );
+    let start = pid_window_offset(std::process::id(), tokens.len()) % tokens.len();
+    let first_token = tokens.start + start;
+    let later_token = tokens.start + (start + 1) % tokens.len();
+    let _aggregate_blocker =
+        protocol::register_pending_claim_for_tests(preparation_token_claim(first_token))
+            .expect("publish first-token aggregate blocker");
+
+    let mut physical_blockers = tokens
+        .clone()
+        .filter(|token| *token != first_token)
+        .map(|token| {
+            let fd = crate::flock::try_flock(
+                permit_lock_path(token),
+                crate::flock::FlockMode::Exclusive,
+            )
+            .expect("probe preparation token")
+            .expect("hold later preparation token");
+            (token, fd)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let token_range = tokens.clone();
+    let max_permit = admission_resource_capacity_hint().expect("resolve preparation capacity");
+    let (wait_tx, wait_rx) = std::sync::mpsc::sync_channel(1);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = TestServiceThread::spawn(move || {
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc_prefix);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu_prefix);
+        set_preparation_contention_wait_hook_for_tests(move || {
+            wait_tx
+                .send(())
+                .expect("publish entry into concrete physical wait");
+        });
+        protocol::reset_generation_wait_calls_for_tests();
+        let result = (|| {
+            let mut pending = protocol::register_pending_admission(max_permit)?;
+            let selected = pending_preparation_token(&pending, &token_range);
+            let generation_waits = protocol::generation_wait_calls_for_tests();
+            pending.restore_preparation_affinity()?;
+            drop(pending);
+            Ok::<_, anyhow::Error>((selected, generation_waits))
+        })();
+        LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let _ = result_tx.send(result);
+    });
+
+    recv_from_service_thread(
+        &wait_rx,
+        "blocking admission reaches its concrete physical wait",
+        &worker,
+    )
+    .expect("observe entry into concrete physical wait");
+
+    wait_with_task_service(
+        "blocking admission parks after exhausting logical and physical alternatives",
+        std::slice::from_ref(&worker.service),
+        || {
+            let snapshot = worker.service.snapshot();
+            let parked =
+                !snapshot.pending && snapshot.tasks.values().any(|sample| sample.state == b'S');
+            match result_rx.try_recv() {
+                Ok(_) => anyhow::bail!(
+                    "blocking admission returned while every compatible token was held"
+                ),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("blocking admission worker exited before physical release")
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            Ok(parked.then_some(()))
+        },
+    )
+    .expect("observe blocking admission parked on a concrete token");
+
+    drop(
+        physical_blockers
+            .remove(&later_token)
+            .expect("later token blocker disappeared"),
+    );
+    let outcome = recv_from_service_thread(
+        &result_rx,
+        "blocking admission rotates to released later token",
+        &worker,
+    )
+    .expect("receive blocking admission outcome after physical release");
+    drop(physical_blockers);
+    worker.join().expect("blocking preparation worker");
+    let (selected, generation_waits) = outcome.expect("blocking admission after physical release");
+    assert_eq!(
+        selected, later_token,
+        "the concrete physical wake must become the next rotated candidate",
+    );
+    assert_eq!(
+        generation_waits, 0,
+        "physical availability must not wait for unrelated registry generation churn",
+    );
+}
+
 #[test]
 fn preparation_sweep_stops_after_one_global_cpu_shortage() {
     let _prefixes = LockPrefixesGuard::new();

@@ -27,6 +27,10 @@ const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ23");
 const VERSION: u32 = 23;
 #[cfg(test)]
 const RETAINED_FUTEX_WAIT_MARKER_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
+#[cfg(test)]
+thread_local! {
+    static GENERATION_WAIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 192;
@@ -12161,6 +12165,8 @@ pub(super) fn parse_liveness_basename(name: &std::ffi::OsStr) -> Option<(u64, u6
 /// closes the unlock-to-wait race without polling or repeatedly rebuilding
 /// heavyweight preparation state.
 pub(super) fn wait_for_generation_change(expected: u32, timeout: Duration) -> Result<()> {
+    #[cfg(test)]
+    GENERATION_WAIT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     let lock = lock_registry_existing(FlockMode::Shared)?;
     let file = File::open(header_path()).context("open admission generation futex")?;
     let map = unsafe { Mmap::map(&file) }.context("map admission generation futex")?;
@@ -12211,6 +12217,16 @@ pub(super) fn wait_for_generation_change(expected: u32, timeout: Duration) -> Re
         }
         _ => Err(error).context("wait for admission registry generation change"),
     }
+}
+
+#[cfg(test)]
+pub(super) fn reset_generation_wait_calls_for_tests() {
+    GENERATION_WAIT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn generation_wait_calls_for_tests() -> usize {
+    GENERATION_WAIT_CALLS.with(std::cell::Cell::get)
 }
 
 /// RAII ownership of the authoritative registry flock.

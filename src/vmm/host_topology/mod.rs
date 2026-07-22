@@ -4261,13 +4261,35 @@ fn try_acquire_preparation_permit_sweep(
 pub(super) enum PreparationCandidateDecision<T> {
     Accepted(T),
     Retry,
+    /// This complete physical tuple is fenced by a live registry claim.
+    /// Keep scanning immediately available tuples before sleeping; if none
+    /// succeeds, the first sampled wake epoch closes every improvement race
+    /// which occurred during the sweep.
+    RegistryContended(u32),
     Contended,
 }
 
 pub(super) enum PreparationProbe<T> {
     Acquired(T),
     Contended(protocol::ContentionEvidence),
+    RegistryContended(u32),
     Unavailable,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREPARATION_CONTENTION_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_preparation_contention_wait_hook_for_tests(hook: impl FnOnce() + 'static) {
+    PREPARATION_CONTENTION_WAIT_HOOK.with(|slot| {
+        assert!(
+            slot.replace(Some(Box::new(hook))).is_none(),
+            "preparation contention wait hook was already installed",
+        );
+    });
 }
 
 /// Visit each immediately available preparation tuple once without sleeping.
@@ -4276,6 +4298,26 @@ pub(super) enum PreparationProbe<T> {
 pub(super) fn try_preparation_candidates_once<T>(
     rotation_bias: usize,
     affinity_candidates: &[usize],
+    decide: impl FnMut(PreparationPermit, protocol::ClaimSet) -> Result<PreparationCandidateDecision<T>>,
+) -> Result<PreparationProbe<T>> {
+    try_preparation_candidates_once_impl(rotation_bias, affinity_candidates, false, decide)
+}
+
+/// Blocking counterpart of [`try_preparation_candidates_once`]. Physical
+/// probing and candidate ordering are identical; only registry snapshot
+/// acquisition may wait, matching the blocking admission contract.
+pub(super) fn try_preparation_candidates_once_waiting<T>(
+    rotation_bias: usize,
+    affinity_candidates: &[usize],
+    decide: impl FnMut(PreparationPermit, protocol::ClaimSet) -> Result<PreparationCandidateDecision<T>>,
+) -> Result<PreparationProbe<T>> {
+    try_preparation_candidates_once_impl(rotation_bias, affinity_candidates, true, decide)
+}
+
+fn try_preparation_candidates_once_impl<T>(
+    rotation_bias: usize,
+    affinity_candidates: &[usize],
+    wait_for_registry: bool,
     mut decide: impl FnMut(
         PreparationPermit,
         protocol::ClaimSet,
@@ -4285,6 +4327,7 @@ pub(super) fn try_preparation_candidates_once<T>(
     let count = tokens.len();
     let start = (pid_window_offset(std::process::id(), count) + rotation_bias) % count;
     let mut first_contention = None;
+    let mut first_registry_contention = None;
     for offset in 0..count {
         let index = (start + offset) % count;
         match try_acquire_preparation_permit_at(
@@ -4292,7 +4335,7 @@ pub(super) fn try_preparation_candidates_once<T>(
             tokens.start + index,
             start.wrapping_add(offset).wrapping_add(rotation_bias),
             None,
-            false,
+            wait_for_registry,
             Some(affinity_candidates),
         )? {
             PreparationPermitAttempt::Acquired(preparation, claim) => {
@@ -4301,6 +4344,9 @@ pub(super) fn try_preparation_candidates_once<T>(
                         return Ok(PreparationProbe::Acquired(value));
                     }
                     PreparationCandidateDecision::Retry => {}
+                    PreparationCandidateDecision::RegistryContended(generation) => {
+                        first_registry_contention.get_or_insert(generation);
+                    }
                     PreparationCandidateDecision::Contended => {
                         return Ok(PreparationProbe::Unavailable);
                     }
@@ -4316,7 +4362,44 @@ pub(super) fn try_preparation_candidates_once<T>(
             }
         }
     }
-    Ok(first_contention.map_or(PreparationProbe::Unavailable, PreparationProbe::Contended))
+    Ok(if let Some(evidence) = first_contention {
+        PreparationProbe::Contended(evidence)
+    } else if let Some(generation) = first_registry_contention {
+        PreparationProbe::RegistryContended(generation)
+    } else {
+        PreparationProbe::Unavailable
+    })
+}
+
+/// Park on one concrete physical blocker selected by the complete candidate
+/// sweep. The deadline is a recovery bound: after it expires, the caller
+/// rotates and scans the whole pool again rather than remaining attached to a
+/// stale token/resource queue.
+pub(super) fn wait_for_preparation_contention(
+    evidence: protocol::ContentionEvidence,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let path = match evidence.blocker {
+        protocol::ResourceKey::Llc(llc) => llc_lock_path(llc),
+        protocol::ResourceKey::Cpu(cpu) => cpu_lock_path(cpu),
+        protocol::ResourceKey::Permit(permit) => permit_lock_path(permit),
+    };
+    let mode = evidence.mode;
+    // The writable witness has served its ordering purpose. Close it before
+    // entering the real flock wait so no synthetic close remains behind the
+    // physical availability edge consumed below.
+    drop(evidence);
+    #[cfg(test)]
+    PREPARATION_CONTENTION_WAIT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+    drop(
+        block_flock_deadline(path, mode, std::time::Instant::now() + timeout)?
+            .map(protocol::AdmissionFlock::from_acquired),
+    );
+    Ok(())
 }
 
 pub(super) fn acquire_preparation_permit(
