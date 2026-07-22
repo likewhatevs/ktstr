@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v19
+//! Every ktstr process sharing a lock directory participates in one v20
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -1926,6 +1926,19 @@ pub(crate) fn exercise_replan_token_wave_for_tests(
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_changed_replan_batch_for_tests(
+    callbacks: usize,
+) -> Result<registry::ReplanChangedBatchOutcome> {
+    registry::exercise_changed_replan_batch_for_tests(callbacks)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_replan_batch_barriers_for_tests()
+-> Result<registry::ReplanBatchBarrierOutcome> {
+    registry::exercise_replan_batch_barriers_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_replan_crash_repair_for_tests() -> Result<registry::ReplanCrashRepairOutcome>
 {
     registry::exercise_replan_crash_repair_for_tests()
@@ -3166,6 +3179,16 @@ fn acquire_as_coordinator_impl<T>(
                             force_step = true;
                             continue;
                         }
+                        registry::FinishAcquireResult::BatchDeferred => {
+                            // An older finite REPLAN wave published a choice
+                            // after this physical attempt began. Drop the
+                            // attempt, keep the coordinator parked, and fall
+                            // through to the event wait; the last callback
+                            // publishes exactly one rescan edge.
+                            drop(value);
+                            drop(contention);
+                            drop(preparation_contention);
+                        }
                     }
                 }
                 CoordinatorStep::Prepare {
@@ -3179,15 +3202,18 @@ fn acquire_as_coordinator_impl<T>(
                         preparation_contention.is_empty(),
                         "coordinator prepared while retaining preparation contention",
                     );
+                    let contention = held.take_contention();
+                    let markers = contention.marker_vec();
                     let commit_token = held.commit_token()?;
                     match coordinator.ticket.finish_preparation(
                         &final_claim,
                         &preparation_claim,
                         commit_token,
+                        &markers,
                         cancelled,
                     )? {
                         registry::FinishPreparationResult::Committed(pending_claim) => {
-                            drop(held.take_contention());
+                            drop(contention);
                             drop(preparation_contention);
                             drop(held.preparation.take());
                             let pending = pending_admission_from_parts(
@@ -3199,11 +3225,16 @@ fn acquire_as_coordinator_impl<T>(
                         }
                         registry::FinishPreparationResult::Stale => {
                             drop(preparation);
-                            drop(held.take_contention());
+                            drop(contention);
                             drop(preparation_contention);
                             first = false;
                             force_step = true;
                             continue;
+                        }
+                        registry::FinishPreparationResult::BatchDeferred => {
+                            drop(preparation);
+                            drop(contention);
+                            drop(preparation_contention);
                         }
                     }
                 }

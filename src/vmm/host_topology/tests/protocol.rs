@@ -1066,8 +1066,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v19");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v19");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v20");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v20");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1239,7 +1239,7 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v19");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v20");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
     let wrong_registry_lock =
         crate::flock::try_flock(wrong_registry.join("registry.lock"), FlockMode::Exclusive)
@@ -3982,19 +3982,129 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
         "callback admission must remain independent of active queue depth",
     );
     assert!(
-        outcome.mixed_age_old_replanned
-            && outcome.mixed_age_old_woken
-            && outcome.mixed_age_late_replanned
-            && outcome.mixed_age_late_woken,
-        "one scan must publish and wake all eligible callbacks regardless of registration age",
+        !outcome.mixed_age_old_replanned
+            && !outcome.mixed_age_old_woken
+            && !outcome.mixed_age_late_replanned
+            && !outcome.mixed_age_late_woken,
+        "a live finite wave must leave both an older returned callback and a later arrival for the next batch",
     );
     assert_eq!(
         (
             outcome.mixed_age_repeated_replans,
             outcome.mixed_age_repeated_wakes,
         ),
+        (0, 0),
+        "repeated scans must not extend or wake a live finite wave",
+    );
+    assert!(
+        outcome.next_wave_edge_published,
+        "the final original callback must publish one deferred next-wave rescan without running it",
+    );
+    assert_eq!(
+        outcome.next_wave_scan_delta, 1,
+        "one authoritative scan must consume the completed finite-wave edge",
+    );
+    assert!(
+        outcome.next_wave_old_replanned
+            && outcome.next_wave_old_woken
+            && outcome.next_wave_late_replanned
+            && outcome.next_wave_late_woken,
+        "the next wave must publish and wake both the older returned callback and post-horizon arrival exactly once",
+    );
+    assert_eq!(
+        (
+            outcome.next_wave_repeated_replans,
+            outcome.next_wave_repeated_wakes,
+        ),
         (2, 0),
-        "the mixed-age wave must remain live without a duplicate wake on a repeated scan",
+        "a repeated scan must preserve both next-wave callbacks without duplicate wakes",
+    );
+}
+
+#[test]
+fn changed_replan_wave_defers_one_authoritative_scan_until_every_callback_returns() {
+    let _prefixes = LockPrefixesGuard::new();
+    let callbacks = 1_000usize;
+    let outcome = protocol::exercise_changed_replan_batch_for_tests(callbacks)
+        .expect("exercise changed speculative callback batch");
+    assert_eq!(outcome.callbacks, callbacks);
+    assert_eq!(
+        (
+            outcome.intermediate_scan_delta,
+            outcome.intermediate_generation_wake_delta,
+        ),
+        (0, 0),
+        "the first N-1 changed callbacks must do O(1) publication work without scanning or waking the queue",
+    );
+    assert!(
+        outcome.intermediate_batch_only,
+        "the unfinished wave must retain one batch-only dirty edge and one outstanding callback",
+    );
+    assert_eq!(
+        outcome.final_scan_delta_before_authoritative, 0,
+        "the final callback must publish, but must not execute, the authoritative scan",
+    );
+    assert_eq!(
+        outcome.final_generation_wake_delta, 1,
+        "the complete changed wave must publish exactly one queue wake",
+    );
+    assert!(
+        outcome.final_rescan_edge,
+        "the final callback must atomically promote the batch to one pending rescan",
+    );
+    assert_eq!(
+        outcome.authoritative_scan_delta, 1,
+        "one coordinator scan must consume the complete changed batch",
+    );
+    assert!(
+        outcome.authoritative_flags_clear && outcome.replacements_preserved,
+        "the authoritative scan must clear both dirty flags without losing any callback replacement",
+    );
+}
+
+#[test]
+fn changed_replan_batch_parks_later_grants_and_coordinator_commits_without_scanning() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_replan_batch_barriers_for_tests()
+        .expect("exercise changed speculative batch priority barriers");
+    assert!(
+        outcome.granted_entry_callback_suppressed,
+        "a later grant must park before entering its physical callback",
+    );
+    assert!(
+        outcome.granted_completion_payload_dropped
+            && outcome.granted_completion_payload_dropped_unlocked,
+        "a later physical success must be released outside the registry lock when an older choice changed",
+    );
+    assert!(
+        outcome.granted_contention_serials_preserved
+            && outcome.granted_contention_unknown_before_witness_drop,
+        "a deferred negative probe must retain its blocker/issue serial and publish UNKNOWN before releasing its witness",
+    );
+    assert!(
+        outcome.granted_records_parked,
+        "both later grants must return to WAITING behind the unfinished speculative batch",
+    );
+    assert_eq!(
+        outcome.granted_scan_delta, 0,
+        "entry and completion barriers must remain O(1)",
+    );
+    assert!(
+        outcome.coordinator_acquire_deferred && outcome.coordinator_preparation_deferred,
+        "both coordinator commit shapes must defer behind an older changed choice",
+    );
+    assert!(
+        outcome.coordinator_acquire_evidence_unknown
+            && outcome.coordinator_preparation_evidence_unknown,
+        "coordinator deferral must publish the exact acquire, accumulated blockers, and distinct preparation footprint as UNKNOWN",
+    );
+    assert!(
+        outcome.coordinator_preserved,
+        "batch deferral must retain the coordinator license until the final rescan edge",
+    );
+    assert_eq!(
+        outcome.coordinator_scan_delta, 0,
+        "coordinator batch deferral must not reconcile the queue eagerly",
     );
 }
 
@@ -4034,7 +4144,7 @@ fn replan_wave_crash_repair_recovers_every_eligible_callback_once() {
 #[test]
 fn intrascan_fence_activation_refreshes_live_replan_epoch() {
     let _prefixes = LockPrefixesGuard::new();
-    let (earlier_granted, publication_changed, stale_completion_rejected) =
+    let (earlier_granted, publication_changed, completion_accepted_for_revalidation) =
         protocol::exercise_intrascan_fence_epoch_for_tests()
             .expect("exercise intra-scan predecessor-fence activation");
     assert!(
@@ -4046,8 +4156,8 @@ fn intrascan_fence_activation_refreshes_live_replan_epoch() {
         "activating its fence must refresh the later live REPLAN with a fresh epoch",
     );
     assert!(
-        stale_completion_rejected,
-        "the already-running REPLAN callback must not commit from its stale predecessor snapshot",
+        completion_accepted_for_revalidation,
+        "the same live non-acquiring callback must publish WAITING once and defer exact validation to the batch scan",
     );
 }
 
@@ -4090,14 +4200,12 @@ fn callback_tokens_change_only_when_their_exact_prefix_or_watch_changes() {
         "a real newly-added predecessor bit must refresh or replan every affected callback state",
     );
     assert!(
-        outcome.entry_unchanged_reconciled && outcome.entry_changed_refreshed,
-        "callback entry must run one authoritative dirty-suffix scan, preserving identical tokens \
-         and exposing a real changed prefix before planner code runs",
+        outcome.entry_unchanged_deferred && outcome.entry_changed_deferred,
+        "a coherent non-acquiring callback must keep its one planner turn and defer both equivalent and changed predecessor reconciliation",
     );
     assert!(
-        outcome.completion_unchanged_kept && outcome.completion_changed_rejected,
-        "callback completion must keep expensive work across an identical reconciled prefix but \
-         reject work whose predecessor inputs really changed",
+        outcome.completion_unchanged_kept && outcome.completion_changed_deferred,
+        "callback completion must retain its one speculative result while exact validation remains deferred to the authoritative scan",
     );
     assert!(
         outcome.coordinator_completion_unchanged_kept
@@ -6453,7 +6561,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v19
+    // Leave the replacement as an external, unregistered flock. A current-v20
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -6701,7 +6809,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v19 HELD lifecycle removes its registry record only after the
+    // The v20 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");
