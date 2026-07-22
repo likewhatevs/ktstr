@@ -1543,6 +1543,7 @@ fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
         "NO_COLOR",
         "NUM_JOBS",
         "OLDPWD",
+        "OUT_DIR",
         "PAGER",
         "PWD",
         "RAYON_NUM_THREADS",
@@ -1671,6 +1672,11 @@ fn sanitize_scheduler_build_child_environment(command: &mut Command) {
         command.env_remove(name);
     }
     command.env_remove("LLVM_PROFILE_FILE");
+    // OUT_DIR belongs to the Cargo invocation which built/launched
+    // cargo-ktstr. The scheduler Cargo child supplies its own build-script
+    // OUT_DIR and must not inherit or key on the parent's feature-specific
+    // target path.
+    command.env_remove("OUT_DIR");
     crate::nextest_process::remove_runtime_environment(command);
     for (name, _) in std::env::vars_os() {
         if name
@@ -3292,6 +3298,66 @@ mod tests {
             identity("7", "91", "ktstr::nested_retry/retry", "semantic-b"),
             first,
             "an arbitrary inherited build-script input must still split the Cargo cache",
+        );
+    }
+
+    #[test]
+    fn scheduler_parent_out_dir_is_nonsemantic() {
+        let workspace = Path::new("/runner/work/ktstr");
+        let identity = |out_dir: &str, fixture: &str| {
+            scheduler_build_environment_from(
+                workspace,
+                vec![
+                    ("OUT_DIR".into(), out_dir.into()),
+                    ("SCHEDULER_FIXTURE_MODE".into(), fixture.into()),
+                ],
+                &|| false,
+            )
+            .expect("scheduler environment identity")
+        };
+
+        let base = identity(
+            "/runner/work/ktstr/target/debug/build/ktstr-base/out",
+            "semantic-a",
+        );
+        let wprof = identity(
+            "/runner/work/ktstr/target/debug/build/ktstr-wprof/out",
+            "semantic-a",
+        );
+        assert_eq!(
+            wprof, base,
+            "the parent cargo-ktstr feature build must not split scheduler artifacts",
+        );
+        assert_ne!(
+            identity(
+                "/runner/work/ktstr/target/debug/build/ktstr-wprof/out",
+                "semantic-b",
+            ),
+            base,
+            "real inherited build-script inputs must still split scheduler artifacts",
+        );
+
+        let mut command = Command::new("cargo");
+        command
+            .env(
+                "OUT_DIR",
+                "/runner/work/ktstr/target/debug/build/ktstr-wprof/out",
+            )
+            .env("SCHEDULER_FIXTURE_MODE", "semantic-a");
+        sanitize_scheduler_build_child_environment(&mut command);
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("OUT_DIR")),
+            Some(&None),
+            "the scheduler Cargo child must not inherit cargo-ktstr's OUT_DIR",
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("SCHEDULER_FIXTURE_MODE")),
+            Some(&Some("semantic-a".into())),
+            "real inherited build-script inputs must remain available to the scheduler build",
         );
     }
 
