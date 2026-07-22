@@ -5092,6 +5092,23 @@ pub(super) fn hold_registry_exclusive_after_intent_for_tests(
 }
 
 #[cfg(test)]
+pub(super) fn exercise_writer_intent_initialization_race_for_tests() -> Result<bool> {
+    std::fs::create_dir_all(registry_data_dir())?;
+    std::fs::create_dir_all(event_dir())?;
+    anyhow::ensure!(
+        !registry_writer_intent_path().exists() && !registry_lock_path().exists(),
+        "writer-intent initialization-race fixture did not start empty",
+    );
+    let observed = open_existing_writer_intent_after_initial_miss(|| {
+        // Model the winning initializer completing after this observer's first
+        // sidecar open but before its registry.lock existence check.
+        crate::flock::materialize(registry_writer_intent_path())?;
+        crate::flock::materialize(registry_lock_path())
+    })?;
+    Ok(observed.is_some())
+}
+
+#[cfg(test)]
 pub(super) fn try_hold_registry_shared_for_tests() -> Result<Option<RegistryLock>> {
     try_lock_registry_existing_nonblocking(FlockMode::Shared)
 }
@@ -11384,17 +11401,39 @@ fn open_existing_lock(path: &Path, what: &str) -> Result<Option<File>> {
     }
 }
 
-fn open_existing_writer_intent() -> Result<Option<File>> {
+fn open_existing_writer_intent_after_initial_miss(
+    after_initial_miss: impl FnOnce() -> Result<()>,
+) -> Result<Option<File>> {
     let path = registry_writer_intent_path();
     let writer_intent = open_existing_lock(&path, "admission registry writer-intent gate")?;
-    if writer_intent.is_none() && registry_lock_path().exists() {
-        anyhow::bail!(
-            "admission registry lock {} exists without its v{VERSION} writer-intent gate {}",
-            registry_lock_path().display(),
-            path.display(),
-        );
+    if writer_intent.is_some() {
+        return Ok(writer_intent);
     }
-    Ok(writer_intent)
+    after_initial_miss()?;
+    if !registry_lock_path().exists() {
+        return Ok(None);
+    }
+    // A correct initializer materializes and locks the sidecar before it
+    // creates registry.lock. The first open and the registry existence test
+    // are not atomic, though: an observer can miss the sidecar immediately
+    // before a concurrent initializer publishes both paths. Reopen once after
+    // observing registry.lock so that valid transition does not masquerade as
+    // an incompatible protocol instance. A second miss is genuinely invalid;
+    // recreating the sidecar here could split live participants across inodes.
+    open_existing_lock(&path, "admission registry writer-intent gate")?.map_or_else(
+        || {
+            anyhow::bail!(
+                "admission registry lock {} exists without its v{VERSION} writer-intent gate {}",
+                registry_lock_path().display(),
+                path.display(),
+            )
+        },
+        |writer_intent| Ok(Some(writer_intent)),
+    )
+}
+
+fn open_existing_writer_intent() -> Result<Option<File>> {
+    open_existing_writer_intent_after_initial_miss(|| Ok(()))
 }
 
 fn flock_open_file(file: &File, path: &Path, mode: FlockMode, nonblocking: bool) -> Result<bool> {

@@ -2274,6 +2274,16 @@ fn install_registry_thread_lock_prefixes(prefixes: (Option<String>, Option<Strin
 }
 
 #[test]
+fn observer_reopens_writer_intent_published_during_initialization() {
+    let _prefixes = LockPrefixesGuard::new();
+    assert!(
+        protocol::exercise_writer_intent_initialization_race_for_tests()
+            .expect("exercise concurrent writer-intent initialization"),
+        "an observer that initially missed the sidecar must join it when a correct initializer publishes both protocol paths before the registry check",
+    );
+}
+
+#[test]
 fn announced_writer_intent_blocks_new_readers_while_target_ex_waits() {
     use std::sync::mpsc;
 

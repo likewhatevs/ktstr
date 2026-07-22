@@ -2603,6 +2603,11 @@ pub(crate) fn hold_registry_exclusive_after_intent_for_tests(
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_writer_intent_initialization_race_for_tests() -> Result<bool> {
+    registry::exercise_writer_intent_initialization_race_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn try_hold_registry_shared_for_tests() -> Result<Option<registry::RegistryLock>> {
     registry::try_hold_registry_shared_for_tests()
 }
