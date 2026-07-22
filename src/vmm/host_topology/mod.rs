@@ -2000,24 +2000,21 @@ const NEXTEST_TEST_NAME_ENV: &str = "NEXTEST_TEST_NAME";
 /// `*_lock_prefix` caller before it runs.
 fn production_lock_dir() -> std::path::PathBuf {
     let resolved = crate::cache::resolve_lock_dir();
-    if let Ok(group) = std::env::var(NEXTEST_TEST_GROUP_ENV) {
-        if group == crate::NEXTEST_HOST_TESTS_GROUP {
-            if let Some(reference) = std::env::var_os(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV) {
-                if std::path::Path::new(&reference) == resolved.as_path() {
-                    let test = std::env::var(NEXTEST_TEST_NAME_ENV)
-                        .unwrap_or_else(|_| "<unknown>".to_string());
-                    panic!(
-                        "test `{test}` takes production host-resource admission but was \
-                         classified into the CPU-bounded `{group}` nextest group. \
-                         Resource users must run in `@global` so ktstr's cross-process \
-                         registry admits them; running here boots a second scheduler \
-                         outside admission. Add this test to the resource selector in \
-                         .config/nextest.toml (the profile.default `@global` override, \
-                         mirrored as its `host-tests` complement)."
-                    );
-                }
-            }
-        }
+    if let Ok(group) = std::env::var(NEXTEST_TEST_GROUP_ENV)
+        && group == crate::NEXTEST_HOST_TESTS_GROUP
+        && let Some(reference) = std::env::var_os(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV)
+        && std::path::Path::new(&reference) == resolved.as_path()
+    {
+        let test = std::env::var(NEXTEST_TEST_NAME_ENV).unwrap_or_else(|_| "<unknown>".to_string());
+        panic!(
+            "test `{test}` takes production host-resource admission but was \
+             classified into the CPU-bounded `{group}` nextest group. \
+             Resource users must run in `@global` so ktstr's cross-process \
+             registry admits them; running here boots a second scheduler \
+             outside admission. Add this test to the resource selector in \
+             .config/nextest.toml (the profile.default `@global` override, \
+             mirrored as its `host-tests` complement)."
+        );
     }
     resolved
 }

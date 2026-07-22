@@ -8627,13 +8627,14 @@ fn run_herd_benchmark(cells: usize, hold: std::time::Duration, contended: bool) 
     // path — this isolates the registry's publish/release throughput under the
     // global registry lock (the coordinator queue is architected for one
     // waiter per process and cannot be driven concurrently in-process).
-    let shapes: Vec<(
+    type HerdShape = (
         Vec<usize>,
         LlcLockMode,
         Vec<usize>,
         FlockMode,
         HerdCellShape,
-    )> = (0..cells)
+    );
+    let shapes: Vec<HerdShape> = (0..cells)
         .map(|i| {
             if contended {
                 herd_cell_claim(i)
@@ -8706,18 +8707,18 @@ fn run_herd_benchmark(cells: usize, hold: std::time::Duration, contended: bool) 
                 // while cells still wait: a candidate work-conservation gap.
                 // (Legitimate when the only waiters are wide heads that cannot
                 // fit; reported as an upper bound, not a proof of a bug.)
-                if not_acquired > 0 && held + 1 <= HERD_CAPACITY_CPUS {
+                if not_acquired > 0 && held < HERD_CAPACITY_CPUS {
                     gap_samples.fetch_add(1, Ordering::Relaxed);
                 }
                 // Sample the registry counters less often (rendering is O(n)).
-                if ticks % 25 == 0 {
-                    if let Ok(diag) = protocol::ticket_registry_diagnostics_for_tests() {
-                        if let Some(v) = herd_diag_field(&diag, "active_records") {
-                            peak_active_records.fetch_max(v, Ordering::Relaxed);
-                        }
-                        if let Some(v) = herd_diag_field(&diag, "replan_outstanding") {
-                            peak_replan.fetch_max(v, Ordering::Relaxed);
-                        }
+                if ticks.is_multiple_of(25)
+                    && let Ok(diag) = protocol::ticket_registry_diagnostics_for_tests()
+                {
+                    if let Some(v) = herd_diag_field(&diag, "active_records") {
+                        peak_active_records.fetch_max(v, Ordering::Relaxed);
+                    }
+                    if let Some(v) = herd_diag_field(&diag, "replan_outstanding") {
+                        peak_replan.fetch_max(v, Ordering::Relaxed);
                     }
                 }
                 ticks += 1;
