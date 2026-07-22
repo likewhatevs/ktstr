@@ -8921,6 +8921,10 @@ fn exercise_callback_suffix_reconciliation_case(
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
+        // As above, ticket construction may outlive the real coordinator
+        // lease on a descheduled runner. Rebuild the intended synthetic
+        // coordinator and predecessor states as one coherent publication.
+        table.begin_transaction()?;
         for ticket in [&changing, &duplicate_a, &duplicate_b] {
             table.set_record_state(ticket.slot, STATE_PENDING)?;
             table.clear_record_blocked(ticket.slot)?;
@@ -8930,7 +8934,12 @@ fn exercise_callback_suffix_reconciliation_case(
         set_cpu_free_for_tests(&mut table, offset + 21, false)?;
         table.set_record_state(target.slot, STATE_REPLAN)?;
         table.clear_record_blocked(target.slot)?;
+        table.set_record_state(coordinator.slot, STATE_WAITING)?;
+        table.clear_record_blocked(coordinator.slot)?;
+        table.set_coordinator(0, NONE_SLOT)?;
+        table.elect_coordinator_in_transaction()?;
         table.set_pending_flag(PENDING_RESCAN);
+        table.finish_transaction()?;
         table.grant_compatible()?;
         anyhow::ensure!(
             table
