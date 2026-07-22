@@ -1533,8 +1533,14 @@ fn stable_cargo_sealing_is_recursive_and_does_not_follow_symlinks() {
         "sealing must never chmod through a symlink",
     );
     assert_eq!(
-        std::fs::read_to_string(root.join(STABLE_BUILD_MARKER)).unwrap(),
-        "00000000005ea1ed\n",
+        std::fs::metadata(root.join(STABLE_BUILD_MARKER))
+            .unwrap()
+            .len(),
+        STABLE_ROOT_MARKER_LEN as u64,
+    );
+    assert!(
+        stable_root_marker_matches(&root, StableRootDomain::CargoBuild, 0x5e_a1_ed, true,).unwrap(),
+        "the recursive Cargo seal must validate its complete listing",
     );
     std::fs::remove_dir_all(&root)
         .expect("ordinary same-user recursive removal must delete a sealed stable Cargo tree");
@@ -1595,6 +1601,246 @@ fn stable_tree_survives_owner_drop_and_is_immutable_on_reuse() {
     drop(second);
     std::fs::remove_dir_all(&root)
         .expect("ordinary same-user recursive removal must delete a stable source tree");
+}
+
+#[test]
+fn stable_source_direct_hit_survives_deleted_record_and_cas_without_opening_either() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let cache_root = temp.path().join("cas");
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, &cache_root);
+    let input = temp.path().join("input");
+    std::fs::write(&input, b"independent-stable-source").unwrap();
+    let records = temp.path().join("records");
+    let stable = temp.path().join("stable");
+    let identity = 0x0057_ab1e_ca5d_1ec7;
+    let cache = ArtifactTreeCache::new(&records);
+    let first = cache
+        .load_or_build_stable(
+            identity,
+            &stable,
+            "stable-source-record-free-hit",
+            || Ok(true),
+            || false,
+            || {
+                let mut source = ArtifactTreeSource::new();
+                source.insert_immutable_path("source/file", &input)?;
+                Ok(source)
+            },
+        )
+        .unwrap();
+    drop(first);
+
+    let (record, _, _) = cache_paths(&records, identity);
+    assert!(record.is_file());
+    std::fs::remove_file(&record).unwrap();
+    assert!(cache_root.is_dir());
+    std::fs::remove_dir_all(&cache_root).unwrap();
+
+    reset_stable_root_test_counters();
+    let second = cache
+        .load_or_build_stable(
+            identity,
+            &stable,
+            "stable-source-record-free-hit",
+            || Ok(true),
+            || false,
+            || -> Result<ArtifactTreeSource> {
+                panic!("an intact stable-source seal must not invoke the builder")
+            },
+        )
+        .expect("the stable FICLONE tree must outlive its record and CAS objects");
+    assert!(second.cache_hit());
+    assert_eq!(
+        std::fs::read(second.root().join("source/file")).unwrap(),
+        b"independent-stable-source",
+    );
+    let counters = stable_root_test_counters();
+    assert_eq!(counters.record_reads, 0);
+    assert_eq!(counters.cas_object_opens, 0);
+    assert_eq!(counters.listing_directories, 2);
+    assert_eq!(counters.listing_entries, 2);
+}
+
+#[test]
+fn stable_source_direct_hit_listing_scales_with_directories_not_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("stable");
+    let files = root.join("source/files");
+    std::fs::create_dir_all(&files).unwrap();
+    let first = files.join("file-0000");
+    std::fs::write(&first, b"shared-inode").unwrap();
+    for index in 1..4096 {
+        std::fs::hard_link(&first, files.join(format!("file-{index:04}"))).unwrap();
+    }
+    std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let identity = 0x0057_ab1e_1a26_e000;
+    publish_stable_root_marker(&root, StableRootDomain::Source, identity).unwrap();
+
+    reset_stable_root_test_counters();
+    assert!(stable_tree_is_complete(&root, identity).unwrap());
+    let counters = stable_root_test_counters();
+    assert_eq!(counters.record_reads, 0);
+    assert_eq!(counters.cas_object_opens, 0);
+    assert_eq!(counters.listing_directories, 3);
+    assert_eq!(counters.listing_entries, 4098);
+    assert!(counters.listing_fallback_stats <= counters.listing_entries);
+}
+
+#[test]
+fn stable_root_v2_seal_rejects_inode_and_symlink_target_substitution() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("stable");
+    let source = root.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let file = source.join("file");
+    std::fs::write(&file, b"same-bytes").unwrap();
+    std::fs::write(source.join("target-a"), b"a").unwrap();
+    std::fs::write(source.join("target-b"), b"b").unwrap();
+    let link = source.join("link");
+    std::os::unix::fs::symlink("target-a", &link).unwrap();
+    let identity = 0x0057_ab1e_1a0d_e002;
+    publish_stable_root_marker(&root, StableRootDomain::Source, identity).unwrap();
+    assert!(stable_tree_is_complete(&root, identity).unwrap());
+
+    let old_file = std::fs::File::open(&file).unwrap();
+    let old_ino = old_file.metadata().unwrap().ino();
+    std::fs::remove_file(&file).unwrap();
+    std::fs::write(&file, b"same-bytes").unwrap();
+    assert_ne!(std::fs::metadata(&file).unwrap().ino(), old_ino);
+    assert!(
+        !stable_tree_is_complete(&root, identity).unwrap(),
+        "same-name, same-kind, same-byte replacement must fail the d_ino seal",
+    );
+    drop(old_file);
+
+    publish_stable_root_marker(&root, StableRootDomain::Source, identity).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink("target-b", &link).unwrap();
+    assert!(
+        !stable_tree_is_complete(&root, identity).unwrap(),
+        "a symlink target substitution must fail the listing seal",
+    );
+}
+
+#[test]
+fn stable_root_v2_publication_rejects_mutation_between_scan_and_marker_rename() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("stable");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("original"), b"original").unwrap();
+    let identity = 0x0057_ab1e_1ace_0002;
+    let raced_root = root.clone();
+    set_stable_root_pre_publish_hook(move || {
+        std::fs::write(raced_root.join("late-entry"), b"late").unwrap();
+    });
+
+    let error = publish_stable_root_marker(&root, StableRootDomain::Source, identity)
+        .expect_err("post-publication listing validation must catch the injected race");
+    assert!(
+        error
+            .to_string()
+            .contains("stable-root listing changed during marker publication"),
+        "unexpected publication error: {error:#}",
+    );
+    assert!(
+        !stable_tree_is_complete(&root, identity).unwrap(),
+        "the stale marker left by a failed publication must remain a cache miss",
+    );
+}
+
+#[test]
+fn stable_root_v2_marker_requires_exact_schema_domain_identity_and_root_inode() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("stable");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("file"), b"file").unwrap();
+    let identity = 0x0057_ab1e_5c4e_a002;
+    publish_stable_root_marker(&root, StableRootDomain::Source, identity).unwrap();
+    let marker = root.join(STABLE_TREE_MARKER);
+    let original = std::fs::read(&marker).unwrap();
+    assert_eq!(original.len(), STABLE_ROOT_MARKER_LEN);
+
+    assert!(!stable_tree_is_complete(&root, identity ^ 1).unwrap());
+
+    let cargo_marker = root.join(STABLE_BUILD_MARKER);
+    std::fs::write(&cargo_marker, &original).unwrap();
+    std::fs::set_permissions(&cargo_marker, std::fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(
+        !stable_root_marker_matches(&root, StableRootDomain::CargoBuild, identity, false,).unwrap(),
+        "a source-domain marker must not validate under the Cargo pathname",
+    );
+    std::fs::remove_file(cargo_marker).unwrap();
+
+    let mut wrong_schema = original.clone();
+    wrong_schema[8] ^= 0xff;
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&marker, wrong_schema).unwrap();
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(!stable_tree_is_complete(&root, identity).unwrap());
+
+    let other_root = temp.path().join("other-root");
+    std::fs::create_dir(&other_root).unwrap();
+    std::fs::write(other_root.join("file"), b"file").unwrap();
+    let other_marker = other_root.join(STABLE_TREE_MARKER);
+    std::fs::write(&other_marker, original).unwrap();
+    std::fs::set_permissions(&other_marker, std::fs::Permissions::from_mode(0o444)).unwrap();
+    assert!(
+        !stable_tree_is_complete(&other_root, identity).unwrap(),
+        "a valid marker must remain bound to its published root inode",
+    );
+}
+
+#[test]
+fn stable_cargo_hit_keeps_record_and_cas_validation_before_listing_seal() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let records = temp.path().join("records");
+    let stable_parent = temp.path().join("stable");
+    let materializations = temp.path().join("materializations");
+    let identity = 0x5ea1_ca26_ca5d_1ec7;
+    let cache = ArtifactTreeCache::new(&records);
+    let first = cache
+        .load_or_build_with_stable_cargo_output(
+            identity,
+            &stable_parent,
+            &materializations,
+            "stable-cargo-recorded-hit",
+            || Ok(true),
+            || false,
+            |stable| {
+                let output = stable.target_directory.join("debug/deps/harness");
+                std::fs::create_dir_all(output.parent().unwrap())?;
+                std::fs::write(&output, b"stable-cargo-output")?;
+                let mut source = ArtifactTreeSource::new();
+                source.insert_file("target/debug/deps/harness", output)?;
+                Ok(source)
+            },
+        )
+        .unwrap();
+    drop(first);
+
+    reset_stable_root_test_counters();
+    let second = cache
+        .load_or_build_with_stable_cargo_output(
+            identity,
+            &stable_parent,
+            &materializations,
+            "stable-cargo-recorded-hit",
+            || Ok(true),
+            || false,
+            |_| -> Result<ArtifactTreeSource> {
+                panic!("a complete stable Cargo anchor must not rebuild")
+            },
+        )
+        .unwrap();
+    assert!(second.cache_hit());
+    let counters = stable_root_test_counters();
+    assert!(counters.record_reads >= 1);
+    assert!(counters.cas_object_opens >= 1);
+    assert!(counters.listing_directories >= 1);
+    assert!(counters.listing_entries >= 1);
 }
 
 #[test]

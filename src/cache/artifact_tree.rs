@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::io::{Read as _, Write as _};
+use std::mem::MaybeUninit;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
@@ -39,8 +40,12 @@ const MATERIALIZATION_GC_LOCK: &str = ".ktstr-materialization-gc.lock";
 const MATERIALIZATION_GC_STAMP: &str = ".ktstr-materialization-gc.stamp";
 const MATERIALIZATION_GC_CURSOR: &str = ".ktstr-materialization-gc.cursor";
 const ARTIFACT_IO_WORKERS_MAX: usize = 16;
-const STABLE_TREE_MARKER: &str = ".ktstr-artifact-tree-v1";
-const STABLE_BUILD_MARKER: &str = ".ktstr-stable-build-v1";
+const STABLE_TREE_MARKER: &str = ".ktstr-artifact-tree-v2";
+const STABLE_BUILD_MARKER: &str = ".ktstr-stable-build-v2";
+const STABLE_ROOT_MARKER_MAGIC: &[u8; 8] = b"KTSTRSR2";
+const STABLE_ROOT_MARKER_SCHEMA: u32 = 2;
+const STABLE_ROOT_MARKER_LEN: usize = 56;
+const STABLE_ROOT_LISTING_BUFFER_LEN: usize = 64 << 10;
 const LIFECYCLE_DIR: &str = ".artifact-tree-lifecycle-v1";
 const LIFECYCLE_GATE: &str = "namespace.lock";
 const LIFECYCLE_CLOSURE_LOCK_DIR: &str = "closures";
@@ -58,6 +63,113 @@ const LIFECYCLE_BUILD_RESERVATION_MAX: u64 = 64 << 30;
 const LIFECYCLE_BUILD_RESERVATION_MIN: u64 = 8 << 30;
 static OPENAT2_UNAVAILABLE: ProcessAtomicBool = ProcessAtomicBool::new(false);
 static STABLE_REBASE_SEQUENCE: ProcessAtomicU64 = ProcessAtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum StableRootDomain {
+    Source = 1,
+    CargoBuild = 2,
+}
+
+impl StableRootDomain {
+    fn marker_name(self) -> &'static str {
+        match self {
+            Self::Source => STABLE_TREE_MARKER,
+            Self::CargoBuild => STABLE_BUILD_MARKER,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Source),
+            2 => Some(Self::CargoBuild),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StableRootSeal {
+    domain: StableRootDomain,
+    identity: u64,
+    root_dev: u64,
+    root_ino: u64,
+    entry_count: u64,
+    listing_hash: u64,
+}
+
+#[derive(Clone, Debug)]
+struct StableRootListingEntry {
+    path: Vec<u8>,
+    kind: u8,
+    ino: u64,
+    symlink_target: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StableRootListing {
+    entry_count: u64,
+    hash: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StableRootTestCounters {
+    record_reads: usize,
+    cas_object_opens: usize,
+    listing_directories: usize,
+    listing_entries: usize,
+    listing_fallback_stats: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static STABLE_ROOT_TEST_COUNTERS: std::cell::Cell<StableRootTestCounters> =
+        const { std::cell::Cell::new(StableRootTestCounters {
+            record_reads: 0,
+            cas_object_opens: 0,
+            listing_directories: 0,
+            listing_entries: 0,
+            listing_fallback_stats: 0,
+        }) };
+    static STABLE_ROOT_PRE_PUBLISH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn reset_stable_root_test_counters() {
+    STABLE_ROOT_TEST_COUNTERS.set(StableRootTestCounters::default());
+}
+
+#[cfg(test)]
+fn stable_root_test_counters() -> StableRootTestCounters {
+    STABLE_ROOT_TEST_COUNTERS.get()
+}
+
+#[cfg(test)]
+fn update_stable_root_test_counters(update: impl FnOnce(&mut StableRootTestCounters)) {
+    STABLE_ROOT_TEST_COUNTERS.with(|slot| {
+        let mut counters = slot.get();
+        update(&mut counters);
+        slot.set(counters);
+    });
+}
+
+#[cfg(test)]
+fn set_stable_root_pre_publish_hook(hook: impl FnOnce() + 'static) {
+    STABLE_ROOT_PRE_PUBLISH_HOOK.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+    });
+}
+
+#[cfg(test)]
+fn run_stable_root_pre_publish_hook() {
+    STABLE_ROOT_PRE_PUBLISH_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
 enum SourceEntry {
     Directory { mode: u32 },
@@ -912,23 +1024,7 @@ impl ArtifactTreeCache {
     }
 
     fn stable_tree_cache_hit_is_complete(&self, root: &Path, identity: u64) -> Result<bool> {
-        if !stable_tree_is_complete(root, identity)? {
-            return Ok(false);
-        }
-        let (record_path, _, _) = cache_paths(&self.root, identity);
-        let leased = match read_and_lease_record(&record_path, identity) {
-            Ok(Some(leased)) => leased,
-            Ok(None) => return Ok(false),
-            Err(error) => {
-                tracing::debug!(
-                    path = %record_path.display(),
-                    error = %error,
-                    "stable source record is invalid; rebuilding",
-                );
-                return Ok(false);
-            }
-        };
-        stable_root_matches_record(root, &leased.record, false)
+        stable_tree_is_complete(root, identity)
     }
 
     fn reserve_cold_build_space(
@@ -1515,17 +1611,6 @@ impl ArtifactTreeCache {
             build,
         )?;
         let cache_hit = tree.cache_hit();
-        let marker = tree.root().join(STABLE_TREE_MARKER);
-        std::fs::write(&marker, format!("{identity:016x}\n"))
-            .with_context(|| format!("write stable artifact-tree marker {}", marker.display()))?;
-        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o444)).with_context(
-            || {
-                format!(
-                    "make stable artifact-tree marker immutable {}",
-                    marker.display()
-                )
-            },
-        )?;
 
         // Drop the liveness lock only after detaching TempDir cleanup. The
         // installed FICLONEs are independent inodes and retain no CAS lease.
@@ -1570,6 +1655,7 @@ impl ArtifactTreeCache {
                 )
             })?;
         }
+        publish_stable_root_marker(&staged, StableRootDomain::Source, identity)?;
         std::fs::rename(&staged, &final_root).with_context(|| {
             format!(
                 "atomically install stable artifact tree {} -> {}",
@@ -2564,50 +2650,6 @@ fn validate_stable_record_entry(
     Ok(())
 }
 
-fn stable_root_matches_record(
-    root: &Path,
-    record: &ArtifactTreeRecord,
-    cargo_outputs_only: bool,
-) -> Result<bool> {
-    let root_fd = match rustix::fs::open(
-        root,
-        rustix::fs::OFlags::PATH
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    ) {
-        Ok(root_fd) => root_fd,
-        Err(error)
-            if error == rustix::io::Errno::NOENT
-                || error == rustix::io::Errno::NOTDIR
-                || error == rustix::io::Errno::LOOP =>
-        {
-            return Ok(false);
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("open stable output root {}", root.display()));
-        }
-    };
-    for entry in &record.entries {
-        let path = entry.path()?;
-        if cargo_outputs_only && !stable_cargo_output_path(&path) {
-            continue;
-        }
-        if let Err(error) = validate_stable_record_entry(&root_fd, entry, &path) {
-            tracing::debug!(
-                root = %root.display(),
-                path = %path.display(),
-                error = %error,
-                "stable artifact record entry is incomplete; rebuilding",
-            );
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// Reduce a completed Cargo target to the exact runtime closure before its
 /// deterministic pathname becomes a reusable cache anchor.
 ///
@@ -2843,40 +2885,8 @@ fn seal_stable_cargo_build(build: &StableCargoBuild, identity: u64) -> Result<()
 
     // Completeness becomes visible last. A killed or failed sealer therefore
     // leaves an ordinary reconstructible miss, never a marker-backed partial
-    // tree. Creation and rename stay beneath the pinned root descriptor.
-    let sequence = STABLE_REBASE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
-    let temporary_name = format!(
-        ".ktstr-stable-build-marker-{}-{sequence:016x}",
-        std::process::id()
-    );
-    let temporary = rustix::fs::openat(
-        &root,
-        temporary_name.as_str(),
-        rustix::fs::OFlags::RDWR
-            | rustix::fs::OFlags::CREATE
-            | rustix::fs::OFlags::EXCL
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::from_raw_mode(0o600),
-    )
-    .context("create stable Cargo marker beneath pinned root")?;
-    let mut temporary = std::fs::File::from(temporary);
-    let result: Result<()> = (|| {
-        writeln!(temporary, "{identity:016x}").context("write stable Cargo output marker")?;
-        temporary
-            .flush()
-            .context("flush stable Cargo output marker")?;
-        rustix::fs::fchmod(&temporary, rustix::fs::Mode::from_raw_mode(0o444))
-            .context("seal stable Cargo output marker")?;
-        rustix::fs::renameat(&root, temporary_name.as_str(), &root, STABLE_BUILD_MARKER)
-            .context("publish stable Cargo output marker")?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = rustix::fs::unlinkat(&root, temporary_name.as_str(), rustix::fs::AtFlags::empty());
-    }
-    result?;
-    Ok(())
+    // tree. The generic seal is shared with stable source snapshots.
+    publish_stable_root_marker(&build.root, StableRootDomain::CargoBuild, identity)
 }
 
 fn seal_open_stable_cargo_directory(
@@ -2962,43 +2972,9 @@ fn stable_cargo_build_is_complete(
     identity: u64,
     record: Option<&ArtifactTreeRecord>,
 ) -> Result<bool> {
-    let root_metadata = match std::fs::symlink_metadata(root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("stat stable Cargo output {}", root.display()));
-        }
-    };
-    if !root_metadata.is_dir()
-        || root_metadata.file_type().is_symlink()
-        || root_metadata.permissions().mode() & 0o300 != 0o300
-    {
-        return Ok(false);
-    }
-    let marker = root.join(STABLE_BUILD_MARKER);
-    let marker_metadata = match std::fs::symlink_metadata(&marker) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("stat stable Cargo output marker {}", marker.display()));
-        }
-    };
-    if !marker_metadata.is_file()
-        || marker_metadata.file_type().is_symlink()
-        || marker_metadata.permissions().mode() & 0o222 != 0
-    {
-        return Ok(false);
-    }
-    let bytes = std::fs::read(&marker)
-        .with_context(|| format!("read stable Cargo output marker {}", marker.display()))?;
-    if bytes != format!("{identity:016x}\n").as_bytes() {
-        return Ok(false);
-    }
     match record {
-        Some(record) => stable_root_matches_record(root, record, true),
-        None => Ok(true),
+        Some(_) => stable_root_marker_matches(root, StableRootDomain::CargoBuild, identity, true),
+        None => stable_root_marker_matches(root, StableRootDomain::CargoBuild, identity, false),
     }
 }
 
@@ -3094,6 +3070,490 @@ fn remove_stable_tree(root: &Path) -> Result<()> {
 
 fn same_stable_tree_inode(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
     left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+fn same_stable_tree_revision(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
+    same_stable_tree_inode(left, right)
+        && left.st_mode == right.st_mode
+        && left.st_nlink == right.st_nlink
+        && left.st_uid == right.st_uid
+        && left.st_gid == right.st_gid
+        && left.st_size == right.st_size
+        && left.st_mtime == right.st_mtime
+        && left.st_mtime_nsec == right.st_mtime_nsec
+        && left.st_ctime == right.st_ctime
+        && left.st_ctime_nsec == right.st_ctime_nsec
+}
+
+fn encode_stable_root_seal(seal: StableRootSeal) -> [u8; STABLE_ROOT_MARKER_LEN] {
+    let mut bytes = [0_u8; STABLE_ROOT_MARKER_LEN];
+    bytes[0..8].copy_from_slice(STABLE_ROOT_MARKER_MAGIC);
+    bytes[8..12].copy_from_slice(&STABLE_ROOT_MARKER_SCHEMA.to_le_bytes());
+    bytes[12] = seal.domain as u8;
+    bytes[16..24].copy_from_slice(&seal.identity.to_le_bytes());
+    bytes[24..32].copy_from_slice(&seal.root_dev.to_le_bytes());
+    bytes[32..40].copy_from_slice(&seal.root_ino.to_le_bytes());
+    bytes[40..48].copy_from_slice(&seal.entry_count.to_le_bytes());
+    bytes[48..56].copy_from_slice(&seal.listing_hash.to_le_bytes());
+    bytes
+}
+
+fn decode_stable_root_seal(bytes: &[u8]) -> Result<StableRootSeal> {
+    anyhow::ensure!(
+        bytes.len() == STABLE_ROOT_MARKER_LEN,
+        "stable-root marker has length {}, expected {STABLE_ROOT_MARKER_LEN}",
+        bytes.len(),
+    );
+    anyhow::ensure!(
+        &bytes[0..8] == STABLE_ROOT_MARKER_MAGIC,
+        "stable-root marker has unknown magic",
+    );
+    let schema = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed schema field"));
+    anyhow::ensure!(
+        schema == STABLE_ROOT_MARKER_SCHEMA,
+        "stable-root marker schema {schema} is not {STABLE_ROOT_MARKER_SCHEMA}",
+    );
+    anyhow::ensure!(
+        bytes[13..16] == [0, 0, 0],
+        "stable-root marker reserved bytes are nonzero",
+    );
+    let domain =
+        StableRootDomain::from_tag(bytes[12]).context("stable-root marker has unknown domain")?;
+    Ok(StableRootSeal {
+        domain,
+        identity: u64::from_le_bytes(bytes[16..24].try_into().expect("fixed identity field")),
+        root_dev: u64::from_le_bytes(bytes[24..32].try_into().expect("fixed device field")),
+        root_ino: u64::from_le_bytes(bytes[32..40].try_into().expect("fixed inode field")),
+        entry_count: u64::from_le_bytes(bytes[40..48].try_into().expect("fixed entry-count field")),
+        listing_hash: u64::from_le_bytes(
+            bytes[48..56].try_into().expect("fixed listing-hash field"),
+        ),
+    })
+}
+
+struct OpenedStableRootMarker {
+    bytes: [u8; STABLE_ROOT_MARKER_LEN],
+    seal: StableRootSeal,
+    stat: rustix::fs::Stat,
+}
+
+fn read_stable_root_marker_at(
+    root: &std::os::fd::OwnedFd,
+    domain: StableRootDomain,
+) -> Result<OpenedStableRootMarker> {
+    let marker_name = domain.marker_name();
+    let marker = rustix::fs::openat(
+        root,
+        marker_name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| format!("open stable-root marker {marker_name}"))?;
+    let mut marker = std::fs::File::from(marker);
+    let before = rustix::fs::fstat(&marker).context("stat opened stable-root marker")?;
+    anyhow::ensure!(
+        rustix::fs::FileType::from_raw_mode(before.st_mode).is_file(),
+        "stable-root marker is not a regular file",
+    );
+    anyhow::ensure!(
+        before.st_mode & 0o222 == 0,
+        "stable-root marker is writable",
+    );
+    anyhow::ensure!(
+        u64::try_from(before.st_size).ok() == Some(STABLE_ROOT_MARKER_LEN as u64),
+        "stable-root marker has unexpected on-disk length {}",
+        before.st_size,
+    );
+    let mut bytes = Vec::with_capacity(STABLE_ROOT_MARKER_LEN + 1);
+    (&mut marker)
+        .take((STABLE_ROOT_MARKER_LEN + 1) as u64)
+        .read_to_end(&mut bytes)
+        .context("read stable-root marker")?;
+    let after = rustix::fs::fstat(&marker).context("restat opened stable-root marker")?;
+    anyhow::ensure!(
+        same_stable_tree_revision(&before, &after),
+        "stable-root marker changed while reading",
+    );
+    let seal = decode_stable_root_seal(&bytes)?;
+    let bytes: [u8; STABLE_ROOT_MARKER_LEN] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("stable-root marker length changed while decoding"))?;
+    Ok(OpenedStableRootMarker {
+        bytes,
+        seal,
+        stat: after,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct RawStableRootEntry {
+    name: OsString,
+    file_type: rustix::fs::FileType,
+    ino: u64,
+}
+
+fn read_raw_stable_root_entries(
+    directory: &std::os::fd::OwnedFd,
+) -> Result<Vec<RawStableRootEntry>> {
+    // `getdents64` advances the open file description's directory offset.
+    // Reopen `.` beneath the already-verified descriptor so every validation
+    // pass starts at offset zero without sharing seek state with the caller.
+    let listing_directory = rustix::fs::openat(
+        directory,
+        ".",
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .context("reopen stable-root directory for a fresh listing")?;
+    let mut buffer = vec![MaybeUninit::uninit(); STABLE_ROOT_LISTING_BUFFER_LEN];
+    let mut raw = rustix::fs::RawDir::new(&listing_directory, &mut buffer);
+    let mut entries = Vec::new();
+    while let Some(entry) = raw.next() {
+        let entry = entry.context("read stable-root directory entry")?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        entries.push(RawStableRootEntry {
+            name: OsString::from_vec(name.to_vec()),
+            file_type: entry.file_type(),
+            ino: entry.ino(),
+        });
+    }
+    entries.sort_unstable_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+    Ok(entries)
+}
+
+fn collect_stable_root_listing(
+    directory: &std::os::fd::OwnedFd,
+    relative_parent: &Path,
+    marker_name: &str,
+    entries: &mut Vec<StableRootListingEntry>,
+) -> Result<()> {
+    #[cfg(test)]
+    update_stable_root_test_counters(|counters| counters.listing_directories += 1);
+
+    let before = rustix::fs::fstat(directory).context("stat stable-root listing directory")?;
+    anyhow::ensure!(
+        rustix::fs::FileType::from_raw_mode(before.st_mode).is_dir(),
+        "stable-root listing descriptor is not a directory",
+    );
+    for raw in read_raw_stable_root_entries(directory)? {
+        if relative_parent.as_os_str().is_empty() && raw.name.as_bytes() == marker_name.as_bytes() {
+            continue;
+        }
+
+        let relative = relative_parent.join(&raw.name);
+        let mut file_type = raw.file_type;
+        let mut ino = raw.ino;
+        if file_type == rustix::fs::FileType::Unknown || ino == 0 {
+            #[cfg(test)]
+            update_stable_root_test_counters(|counters| {
+                counters.listing_fallback_stats += 1;
+            });
+            let stat =
+                rustix::fs::statat(directory, &raw.name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                    .with_context(|| {
+                        format!("stat unknown stable-root entry {}", relative.display())
+                    })?;
+            file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+            ino = stat.st_ino;
+        }
+
+        let (kind, symlink_target) = if file_type.is_dir() {
+            (1, None)
+        } else if file_type.is_file() {
+            (2, None)
+        } else if file_type.is_symlink() {
+            let target = rustix::fs::readlinkat(directory, &raw.name, Vec::new())
+                .with_context(|| format!("read stable-root symlink {}", relative.display()))?;
+            (3, Some(target.as_bytes().to_vec()))
+        } else {
+            anyhow::bail!(
+                "stable-root entry has unsupported file type: {}",
+                relative.display(),
+            );
+        };
+        anyhow::ensure!(
+            ino != 0,
+            "stable-root entry has no inode: {}",
+            relative.display()
+        );
+        entries.push(StableRootListingEntry {
+            path: relative.as_os_str().as_bytes().to_vec(),
+            kind,
+            ino,
+            symlink_target,
+        });
+        #[cfg(test)]
+        update_stable_root_test_counters(|counters| counters.listing_entries += 1);
+
+        if file_type.is_dir() {
+            let child = rustix::fs::openat(
+                directory,
+                &raw.name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .with_context(|| format!("open stable-root directory {}", relative.display()))?;
+            let opened = rustix::fs::fstat(&child)
+                .with_context(|| format!("stat stable-root directory {}", relative.display()))?;
+            anyhow::ensure!(
+                rustix::fs::FileType::from_raw_mode(opened.st_mode).is_dir()
+                    && opened.st_ino == ino,
+                "stable-root directory changed while opening: {}",
+                relative.display(),
+            );
+            collect_stable_root_listing(&child, &relative, marker_name, entries)?;
+        }
+    }
+    let after = rustix::fs::fstat(directory).context("restat stable-root listing directory")?;
+    anyhow::ensure!(
+        same_stable_tree_revision(&before, &after),
+        "stable-root directory changed while enumerating {}",
+        relative_parent.display(),
+    );
+    Ok(())
+}
+
+fn compute_stable_root_listing(
+    root: &std::os::fd::OwnedFd,
+    root_stat: &rustix::fs::Stat,
+    domain: StableRootDomain,
+    identity: u64,
+) -> Result<StableRootListing> {
+    let mut entries = Vec::new();
+    collect_stable_root_listing(root, Path::new(""), domain.marker_name(), &mut entries)?;
+    let after = rustix::fs::fstat(root).context("restat stable-root after listing")?;
+    anyhow::ensure!(
+        same_stable_tree_revision(root_stat, &after),
+        "stable-root changed while computing its listing",
+    );
+    entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    let entry_count = u64::try_from(entries.len()).context("stable-root entry count overflow")?;
+    let mut hasher = fixed_hasher();
+    hash_bytes(&mut hasher, b"ktstr-stable-root-listing-v2");
+    hasher.write_u8(domain as u8);
+    hasher.write_u64(identity);
+    hasher.write_u64(root_stat.st_dev);
+    hasher.write_u64(root_stat.st_ino);
+    hasher.write_u64(entry_count);
+    for entry in entries {
+        hash_bytes(&mut hasher, &entry.path);
+        hasher.write_u8(entry.kind);
+        hasher.write_u64(entry.ino);
+        if let Some(target) = entry.symlink_target {
+            hash_bytes(&mut hasher, &target);
+        }
+    }
+    Ok(StableRootListing {
+        entry_count,
+        hash: hasher.finish(),
+    })
+}
+
+fn open_stable_root(root: &Path) -> Result<std::os::fd::OwnedFd> {
+    rustix::fs::open(
+        root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| {
+        format!(
+            "open stable-root without following links {}",
+            root.display()
+        )
+    })
+}
+
+fn validate_stable_root_stat(stat: &rustix::fs::Stat) -> Result<()> {
+    anyhow::ensure!(
+        rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir(),
+        "stable-root is not a directory",
+    );
+    anyhow::ensure!(
+        stat.st_mode & 0o300 == 0o300,
+        "stable-root is not owner-writable and searchable",
+    );
+    Ok(())
+}
+
+fn recheck_stable_root_path(root: &Path, expected: &rustix::fs::Stat) -> Result<()> {
+    let current = rustix::fs::open(
+        root,
+        rustix::fs::OFlags::PATH
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| format!("reopen stable-root path {}", root.display()))?;
+    let current = rustix::fs::fstat(&current).context("restat stable-root path")?;
+    anyhow::ensure!(
+        same_stable_tree_revision(expected, &current),
+        "stable-root path changed while validating {}",
+        root.display(),
+    );
+    Ok(())
+}
+
+fn publish_stable_root_marker(
+    root_path: &Path,
+    domain: StableRootDomain,
+    identity: u64,
+) -> Result<()> {
+    let root = open_stable_root(root_path)?;
+    let root_stat = rustix::fs::fstat(&root).context("stat stable-root before publication")?;
+    validate_stable_root_stat(&root_stat)?;
+    let listing = compute_stable_root_listing(&root, &root_stat, domain, identity)?;
+    recheck_stable_root_path(root_path, &root_stat)?;
+    let bytes = encode_stable_root_seal(StableRootSeal {
+        domain,
+        identity,
+        root_dev: root_stat.st_dev,
+        root_ino: root_stat.st_ino,
+        entry_count: listing.entry_count,
+        listing_hash: listing.hash,
+    });
+
+    #[cfg(test)]
+    run_stable_root_pre_publish_hook();
+
+    let sequence = STABLE_REBASE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+    let temporary_name = format!(
+        ".ktstr-stable-root-marker-{}-{sequence:016x}",
+        std::process::id(),
+    );
+    let temporary = rustix::fs::openat(
+        &root,
+        temporary_name.as_str(),
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::from_raw_mode(0o600),
+    )
+    .context("create stable-root marker beneath pinned root")?;
+    let mut temporary = std::fs::File::from(temporary);
+    let result: Result<()> = (|| {
+        temporary
+            .write_all(&bytes)
+            .context("write stable-root marker")?;
+        temporary.flush().context("flush stable-root marker")?;
+        rustix::fs::fchmod(&temporary, rustix::fs::Mode::from_raw_mode(0o444))
+            .context("make stable-root marker immutable")?;
+        rustix::fs::renameat(&root, temporary_name.as_str(), &root, domain.marker_name())
+            .context("publish stable-root marker")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = rustix::fs::unlinkat(&root, temporary_name.as_str(), rustix::fs::AtFlags::empty());
+    }
+    result?;
+    let published = read_stable_root_marker_at(&root, domain)?;
+    anyhow::ensure!(
+        published.bytes == bytes,
+        "published stable-root marker differs from generated seal",
+    );
+    // The marker rename is itself a root-directory mutation, so establish a
+    // fresh revision and repeat the complete descriptor-relative listing.
+    // This closes the publication window between the pre-marker scan and the
+    // atomic marker rename: concurrent entry changes cannot turn a stale seal
+    // into a successful publication.
+    let published_root_stat =
+        rustix::fs::fstat(&root).context("stat stable-root after marker publication")?;
+    anyhow::ensure!(
+        same_stable_tree_inode(&root_stat, &published_root_stat),
+        "stable-root inode changed during marker publication",
+    );
+    let published_listing =
+        compute_stable_root_listing(&root, &published_root_stat, domain, identity)?;
+    anyhow::ensure!(
+        published_listing == listing,
+        "stable-root listing changed during marker publication: before={listing:?}, \
+         after={published_listing:?}",
+    );
+    recheck_stable_root_path(root_path, &published_root_stat)?;
+    let rechecked_marker = read_stable_root_marker_at(&root, domain)?;
+    anyhow::ensure!(
+        rechecked_marker.bytes == published.bytes
+            && same_stable_tree_revision(&rechecked_marker.stat, &published.stat),
+        "stable-root marker changed during post-publication validation",
+    );
+    Ok(())
+}
+
+fn stable_root_marker_matches_inner(
+    root_path: &Path,
+    domain: StableRootDomain,
+    identity: u64,
+    verify_listing: bool,
+) -> Result<()> {
+    let root = open_stable_root(root_path)?;
+    let root_stat = rustix::fs::fstat(&root).context("stat stable-root before validation")?;
+    validate_stable_root_stat(&root_stat)?;
+    let marker = read_stable_root_marker_at(&root, domain)?;
+    anyhow::ensure!(
+        marker.seal.domain == domain,
+        "stable-root marker domain does not match its pathname",
+    );
+    anyhow::ensure!(
+        marker.seal.identity == identity,
+        "stable-root marker identity does not match {identity:016x}",
+    );
+    anyhow::ensure!(
+        marker.seal.root_dev == root_stat.st_dev && marker.seal.root_ino == root_stat.st_ino,
+        "stable-root marker names a different root inode",
+    );
+    if verify_listing {
+        let listing = compute_stable_root_listing(&root, &root_stat, domain, identity)?;
+        anyhow::ensure!(
+            listing.entry_count == marker.seal.entry_count
+                && listing.hash == marker.seal.listing_hash,
+            "stable-root listing does not match its published seal",
+        );
+    }
+    recheck_stable_root_path(root_path, &root_stat)?;
+    let rechecked_marker = read_stable_root_marker_at(&root, domain)?;
+    anyhow::ensure!(
+        rechecked_marker.bytes == marker.bytes
+            && same_stable_tree_revision(&rechecked_marker.stat, &marker.stat),
+        "stable-root marker changed while validating its tree",
+    );
+    Ok(())
+}
+
+fn stable_root_marker_matches(
+    root_path: &Path,
+    domain: StableRootDomain,
+    identity: u64,
+    verify_listing: bool,
+) -> Result<bool> {
+    match stable_root_marker_matches_inner(root_path, domain, identity, verify_listing) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            tracing::debug!(
+                root = %root_path.display(),
+                marker = domain.marker_name(),
+                error = %error,
+                "stable-root seal is incomplete; rebuilding",
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// Recursively empty one already-opened directory and unlink only the parent
@@ -3224,41 +3684,7 @@ fn remove_open_stable_tree_directory(
 }
 
 fn stable_tree_is_complete(root: &Path, identity: u64) -> Result<bool> {
-    let marker = root.join(STABLE_TREE_MARKER);
-    let root_metadata = match std::fs::symlink_metadata(root) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("stat stable artifact-tree root {}", root.display()));
-        }
-    };
-    if !root_metadata.is_dir()
-        || root_metadata.file_type().is_symlink()
-        || root_metadata.permissions().mode() & 0o300 != 0o300
-    {
-        return Ok(false);
-    }
-    let marker_metadata = match std::fs::symlink_metadata(&marker) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("stat stable artifact-tree marker {}", marker.display()));
-        }
-    };
-    if !marker_metadata.is_file() || marker_metadata.permissions().mode() & 0o222 != 0 {
-        return Ok(false);
-    }
-    let bytes = match std::fs::read(&marker) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("read stable artifact-tree marker {}", marker.display()));
-        }
-    };
-    Ok(bytes == format!("{identity:016x}\n").as_bytes())
+    stable_root_marker_matches(root, StableRootDomain::Source, identity, true)
 }
 
 fn checked_mode(mode: u32) -> Result<()> {
@@ -3477,6 +3903,8 @@ fn validate_record(record: &ArtifactTreeRecord, expected_identity: u64) -> Resul
 }
 
 fn read_and_lease_record(path: &Path, identity: u64) -> Result<Option<LeasedRecord>> {
+    #[cfg(test)]
+    update_stable_root_test_counters(|counters| counters.record_reads += 1);
     // Acquire the one namespace-wide shared gate before observing the record.
     // A collector can finish before this point, in which case a missing object
     // is a clean cache miss; after this point it cannot unlink an object before
@@ -3525,6 +3953,8 @@ fn read_and_lease_record(path: &Path, identity: u64) -> Result<Option<LeasedReco
         if !objects.insert(key) {
             continue;
         }
+        #[cfg(test)]
+        update_stable_root_test_counters(|counters| counters.cas_object_opens += 1);
         let Some((object, _)) = content_namespace.open_object(*content_hash, *len)? else {
             return Ok(None);
         };
