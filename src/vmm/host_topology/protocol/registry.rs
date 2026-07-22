@@ -18,6 +18,7 @@ use memmap2::{Mmap, MmapMut};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -810,7 +811,7 @@ pub(super) struct Ticket {
     ticket: u64,
     liveness_path: PathBuf,
     liveness: Option<OwnedFd>,
-    wake: Option<FutexSlot>,
+    shared: Option<TicketSharedMaps>,
     _interrupt_waiter: Option<InterruptibleFlockWaiter>,
     finished: bool,
 }
@@ -839,7 +840,7 @@ impl HeldClaim {
             .liveness
             .take()
             .ok_or_else(|| anyhow::anyhow!("queue ticket liveness fd disappeared at commit"))?;
-        ticket.wake.take();
+        ticket.shared.take();
         ticket._interrupt_waiter.take();
         ticket.finished = true;
         Ok(Self {
@@ -890,7 +891,6 @@ pub(super) fn import_pending_exec_handoff(
     preparation_claim: &ClaimSet,
 ) -> Result<(Ticket, ClaimSet)> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
 
     let namespace = RegistryNamespace::resolve();
     let _namespace = namespace.enter();
@@ -942,7 +942,7 @@ pub(super) fn import_pending_exec_handoff(
         liveness.as_raw_fd() >= 0,
         "invalid pending liveness descriptor"
     );
-    let wake = table.map_futex(slot)?;
+    let shared = table.map_ticket_shared(slot, ticket)?;
     // Keep the inherited owner in the exec-handoff layer until every
     // validation above has succeeded. If import fails, that layer drops the
     // physical preparation owner before this liveness fd; only the completed
@@ -959,7 +959,7 @@ pub(super) fn import_pending_exec_handoff(
             ticket,
             liveness_path,
             liveness: Some(ticket_liveness),
-            wake: Some(wake),
+            shared: Some(shared),
             _interrupt_waiter: None,
             finished: false,
         },
@@ -1064,21 +1064,170 @@ pub(super) fn registry_ex_acquisition_count_for_tests() -> u64 {
     REGISTRY_EX_ACQUISITIONS.with(std::cell::Cell::get)
 }
 
-struct FutexSlot {
-    _map: MmapMut,
-    ptr: *mut AtomicU32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    _device: u64,
+    _inode: u64,
+    length: u64,
 }
 
-// The mapping is process-shared and the only concurrently accessed word is an
-// aligned AtomicU32.  The remaining record bytes are accessed under the
-// registry flock.
-unsafe impl Send for FutexSlot {}
+impl FileIdentity {
+    fn validate_open_path(file: &File, path: &Path, description: &str) -> Result<Self> {
+        let opened = file
+            .metadata()
+            .with_context(|| format!("stat opened {description} {}", path.display()))?;
+        let named = std::fs::metadata(path)
+            .with_context(|| format!("stat named {description} {}", path.display()))?;
+        anyhow::ensure!(
+            opened.is_file(),
+            "{description} {} is not a regular file",
+            path.display(),
+        );
+        anyhow::ensure!(
+            (opened.dev(), opened.ino()) == (named.dev(), named.ino()),
+            "opened {description} {} no longer names its canonical inode",
+            path.display(),
+        );
+        Ok(Self {
+            _device: opened.dev(),
+            _inode: opened.ino(),
+            length: opened.len(),
+        })
+    }
+}
 
-impl FutexSlot {
+/// Read-only MAP_SHARED view retained for one live ticket. The chunk mapping
+/// supplies both ordinary state reads and the shared futex address; the header
+/// mapping supplies queue epochs and coordinator liveness without reopening or
+/// remapping either inode on every wake.
+struct TicketSharedMaps {
+    header: Mmap,
+    chunk: Mmap,
+    layout: HeaderLayout,
+    record_range: std::ops::Range<usize>,
+    header_identity: FileIdentity,
+    chunk_identity: FileIdentity,
+    wake: *const AtomicU32,
+}
+
+// Both mappings are MAP_SHARED and read-only. Non-atomic bytes are read only
+// while the registry SH flock excludes every writer; the sole lock-free access
+// is the aligned AtomicU32 futex word.
+unsafe impl Send for TicketSharedMaps {}
+
+impl TicketSharedMaps {
+    fn open(table: &mut Table, slot: u64, ticket: u64) -> Result<Self> {
+        let next_slot = table.next_slot()?;
+        if slot >= next_slot {
+            anyhow::bail!("queue shared-mapping slot {slot} is outside 0..{next_slot}");
+        }
+
+        let header_path = header_path();
+        let header_file = File::open(&header_path)
+            .with_context(|| format!("open queue registry header {}", header_path.display()))?;
+        let header_identity =
+            FileIdentity::validate_open_path(&header_file, &header_path, "queue registry header")?;
+        let header = unsafe { Mmap::map(&header_file) }
+            .with_context(|| format!("map queue registry header {}", header_path.display()))?;
+        let layout = HeaderLayout::validate(&header)?;
+        anyhow::ensure!(
+            layout == table.layout,
+            "queue registry header layout changed while mapping ticket {ticket}",
+        );
+        anyhow::ensure!(
+            usize::try_from(header_identity.length).is_ok_and(|length| length == header.len()),
+            "queue registry header mapping length does not match its inode",
+        );
+        let mapped_next_slot = read_u64(&header, H_NEXT_SLOT);
+        anyhow::ensure!(
+            slot < mapped_next_slot && mapped_next_slot <= MAX_REGISTRY_SLOTS,
+            "ticket {ticket} slot {slot} is outside mapped registry high-water {mapped_next_slot}",
+        );
+
+        let (chunk, record_range) = record_range(slot, layout.record_size)?;
+        let chunk_path = chunk_path(chunk);
+        let chunk_file = File::open(&chunk_path)
+            .with_context(|| format!("open queue registry chunk {}", chunk_path.display()))?;
+        let chunk_identity =
+            FileIdentity::validate_open_path(&chunk_file, &chunk_path, "queue registry chunk")?;
+        let chunk_map = unsafe { Mmap::map(&chunk_file) }
+            .with_context(|| format!("map queue registry chunk {}", chunk_path.display()))?;
+        anyhow::ensure!(
+            usize::try_from(chunk_identity.length).is_ok_and(|length| length == chunk_map.len()),
+            "queue registry chunk {chunk} mapping length does not match its inode",
+        );
+        anyhow::ensure!(
+            record_range.end <= chunk_map.len(),
+            "queue registry chunk {chunk} is too short for ticket {ticket} slot {slot}: {} bytes < {}",
+            chunk_map.len(),
+            record_range.end,
+        );
+        let bytes = &chunk_map[record_range.clone()];
+        let mapped_ticket = read_u64(bytes, R_TICKET);
+        let state = read_u32(bytes, R_STATE);
+        anyhow::ensure!(
+            mapped_ticket == ticket && state != STATE_FREE,
+            "ticket {ticket} slot {slot} did not name its live record while mapping (ticket={mapped_ticket}, state={state})",
+        );
+        let wake_offset = record_range
+            .start
+            .checked_add(R_WAKE)
+            .ok_or_else(|| anyhow::anyhow!("queue futex offset overflow"))?;
+        let wake = unsafe { chunk_map.as_ptr().add(wake_offset).cast::<AtomicU32>() };
+        anyhow::ensure!(
+            (wake as usize).is_multiple_of(std::mem::align_of::<AtomicU32>()),
+            "ticket {ticket} slot {slot} futex address is not naturally aligned",
+        );
+        Ok(Self {
+            header,
+            chunk: chunk_map,
+            layout,
+            record_range,
+            header_identity,
+            chunk_identity,
+            wake,
+        })
+    }
+
+    fn validate_header(&self, slot: u64, ticket: u64) -> Result<HeaderLayout> {
+        let layout = HeaderLayout::validate(&self.header)?;
+        anyhow::ensure!(
+            layout == self.layout,
+            "queue registry layout changed under live ticket {ticket}",
+        );
+        anyhow::ensure!(
+            usize::try_from(self.header_identity.length)
+                .is_ok_and(|length| length == self.header.len()),
+            "queue registry header inode length changed under live ticket {ticket}",
+        );
+        let next_slot = read_u64(&self.header, H_NEXT_SLOT);
+        anyhow::ensure!(
+            next_slot <= MAX_REGISTRY_SLOTS && slot < next_slot,
+            "live queue ticket {ticket} slot {slot} is outside 0..{next_slot}",
+        );
+        Ok(layout)
+    }
+
+    fn record_bytes(&self, slot: u64, ticket: u64) -> Result<&[u8]> {
+        anyhow::ensure!(
+            self.record_range.end <= self.chunk.len()
+                && usize::try_from(self.chunk_identity.length)
+                    .is_ok_and(|length| length == self.chunk.len()),
+            "queue registry chunk mapping changed under live ticket {ticket}",
+        );
+        let bytes = &self.chunk[self.record_range.clone()];
+        let mapped_ticket = read_u64(bytes, R_TICKET);
+        anyhow::ensure!(
+            mapped_ticket == ticket,
+            "live queue ticket {ticket} disappeared from slot {slot} (found ticket {mapped_ticket})",
+        );
+        Ok(bytes)
+    }
+
     fn expected(&self) -> u32 {
-        // SAFETY: `ptr` is aligned, points into `_map`, and `_map` outlives
+        // SAFETY: `wake` is aligned, points into `chunk`, and `chunk` outlives
         // every access through it.
-        unsafe { (&*self.ptr).load(Ordering::Acquire) }
+        unsafe { (&*self.wake).load(Ordering::Acquire) }
     }
 
     fn wait(&self, expected: u32, timeout: Duration) -> Result<bool> {
@@ -1090,7 +1239,7 @@ impl FutexSlot {
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_futex,
-                self.ptr.cast::<u32>(),
+                self.wake.cast::<u32>(),
                 libc::FUTEX_WAIT,
                 expected,
                 &ts as *const libc::timespec,
@@ -1209,7 +1358,7 @@ impl Ticket {
         );
         table.bump_generation()?;
         table.finish_transaction()?;
-        let wake = table.map_futex(slot)?;
+        let shared = table.map_ticket_shared(slot, ticket)?;
         drop(table);
         drop(_lock);
 
@@ -1219,7 +1368,7 @@ impl Ticket {
             ticket,
             liveness_path,
             liveness: Some(liveness),
-            wake: Some(wake),
+            shared: Some(shared),
             _interrupt_waiter: None,
             finished: false,
         })))
@@ -1669,7 +1818,7 @@ impl Ticket {
             table.elect_coordinator_in_transaction()?;
         }
         table.finish_transaction()?;
-        let wake = table.map_futex(slot)?;
+        let shared = table.map_ticket_shared(slot, ticket)?;
         drop(table);
         drop(_lock);
         notify_coordinator();
@@ -1680,7 +1829,7 @@ impl Ticket {
             ticket,
             liveness_path,
             liveness: Some(liveness),
-            wake: Some(wake),
+            shared: Some(shared),
             _interrupt_waiter: interrupt_waiter,
             finished: false,
         })
@@ -1732,52 +1881,19 @@ impl Ticket {
         let _lock = normalize_cancellation(lock_registry_existing(FlockMode::Shared), cancelled)?;
         #[cfg(test)]
         SHARED_STATE_READS.with(|reads| reads.set(reads.get() + 1));
-        let path = header_path();
-        let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-        let header = unsafe { Mmap::map(&file) }
-            .with_context(|| format!("map admission registry header {}", path.display()))?;
-        let layout = HeaderLayout::validate(&header)?;
-        if atomic_u64(&header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0 {
+        let shared = self
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("queue ticket shared mappings were released"))?;
+        let layout = shared.validate_header(self.slot, self.ticket)?;
+        let header = &shared.header;
+        if atomic_u64(header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0 {
             // A killed writer left mutable state to repair. The caller drops
-            // this SH mapping and upgrades through the rare EX recovery path.
+            // this SH lock and upgrades through the rare EX recovery path.
             return Ok(None);
         }
-        let next_slot = read_u64(&header, H_NEXT_SLOT);
-        if next_slot > MAX_REGISTRY_SLOTS {
-            anyhow::bail!(
-                "queue registry v{VERSION} next-slot value {next_slot} exceeds the supported maximum {MAX_REGISTRY_SLOTS}"
-            );
-        }
-        if self.slot >= next_slot {
-            anyhow::bail!(
-                "live queue ticket {} slot {} is outside 0..{next_slot}",
-                self.ticket,
-                self.slot
-            );
-        }
-        let (chunk, range) = record_range(self.slot, layout.record_size)?;
-        let chunk_path = chunk_path(chunk);
-        let chunk_file = File::open(&chunk_path)
-            .with_context(|| format!("open queue registry chunk {}", chunk_path.display()))?;
-        let chunk_map = unsafe { Mmap::map(&chunk_file) }
-            .with_context(|| format!("map queue registry chunk {}", chunk_path.display()))?;
-        if range.end > chunk_map.len() {
-            anyhow::bail!(
-                "queue registry chunk {chunk} is too short for slot {}: {} bytes < {}",
-                self.slot,
-                chunk_map.len(),
-                range.end
-            );
-        }
-        let bytes = &chunk_map[range];
-        let ticket = read_u64(bytes, R_TICKET);
-        if ticket != self.ticket {
-            anyhow::bail!(
-                "live queue ticket {} disappeared from slot {} (found ticket {ticket})",
-                self.ticket,
-                self.slot
-            );
-        }
+        let next_slot = read_u64(header, H_NEXT_SLOT);
+        let bytes = shared.record_bytes(self.slot, self.ticket)?;
         let state = match read_u32(bytes, R_STATE) {
             STATE_WAITING => State::Waiting,
             STATE_GRANTED => State::Granted,
@@ -1792,15 +1908,15 @@ impl Ticket {
         };
         if check_coordinator_liveness && matches!(state, State::Waiting | State::CoordinatorStandby)
         {
-            let coordinator = read_u64(&header, H_COORDINATOR);
-            let coordinator_slot = read_u64(&header, H_COORDINATOR_SLOT);
+            let coordinator = read_u64(header, H_COORDINATOR);
+            let coordinator_slot = read_u64(header, H_COORDINATOR_SLOT);
             let progress_is_live = if coordinator == 0 {
-                shared_live_inflight_head(&header, layout, next_slot)?
+                shared_live_inflight_head(header, layout, next_slot)?
             } else {
                 coordinator_slot != NONE_SLOT
                     && coordinator_slot < next_slot
                     && ticket_is_live(coordinator_slot, coordinator)?
-                    && coordinator_activity_is_fresh(&header, monotonic_now_ns()?)
+                    && coordinator_activity_is_fresh(header, monotonic_now_ns()?)
             };
             if !progress_is_live {
                 // Drop the SH lock before the caller takes the rare EX
@@ -1822,9 +1938,9 @@ impl Ticket {
         let _namespace = self.namespace.enter();
         check_cancelled(cancelled)?;
         let wake = self
-            .wake
+            .shared
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("queue ticket futex mapping was released"))?;
+            .ok_or_else(|| anyhow::anyhow!("queue ticket shared mappings were released"))?;
         let expected = wake.expected();
         // Sample the futex before the single registry state read. A grant
         // between these operations changes either the observed state or the
@@ -2531,52 +2647,36 @@ impl Ticket {
         let _namespace = self.namespace.enter();
         check_cancelled(cancelled)?;
         let _lock = normalize_cancellation(lock_registry_existing(FlockMode::Shared), cancelled)?;
-        let file = File::open(header_path())?;
-        let header = unsafe { Mmap::map(&file) }?;
-        let layout = HeaderLayout::validate(&header)?;
+        let shared = self
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("queue ticket shared mappings were released"))?;
+        let layout = shared.validate_header(self.slot, self.ticket)?;
+        let header = &shared.header;
         let now = monotonic_now_ns()?;
-        let heartbeat = read_u64(&header, H_COORDINATOR_HEARTBEAT_NS);
-        if atomic_u64(&header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0
-            || read_u64(&header, H_PENDING_FLAGS) != 0
-            || read_u64(&header, H_COORDINATOR) != self.ticket
-            || read_u64(&header, H_COORDINATOR_SLOT) != self.slot
+        let heartbeat = read_u64(header, H_COORDINATOR_HEARTBEAT_NS);
+        if atomic_u64(header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0
+            || read_u64(header, H_PENDING_FLAGS) != 0
+            || read_u64(header, H_COORDINATOR) != self.ticket
+            || read_u64(header, H_COORDINATOR_SLOT) != self.slot
             || heartbeat == 0
             || heartbeat > now
             || now - heartbeat >= COORDINATOR_HEARTBEAT_REFRESH_NS
         {
             return Ok(None);
         }
-        let next_slot = read_u64(&header, H_NEXT_SLOT);
-        if self.slot >= next_slot {
-            anyhow::bail!(
-                "coordinator ticket {} slot {} is outside 0..{next_slot}",
-                self.ticket,
-                self.slot
-            );
-        }
-        let (chunk, range) = record_range(self.slot, layout.record_size)?;
-        let chunk_file = File::open(chunk_path(chunk))?;
-        let chunk_map = unsafe { Mmap::map(&chunk_file) }?;
-        if range.end > chunk_map.len() {
-            anyhow::bail!(
-                "queue registry chunk {chunk} is too short for coordinator slot {}",
-                self.slot
-            );
-        }
-        let record_bytes = &chunk_map[range];
-        if read_u64(record_bytes, R_TICKET) != self.ticket
-            || read_u32(record_bytes, R_STATE) != STATE_COORDINATOR
-        {
+        let record_bytes = shared.record_bytes(self.slot, self.ticket)?;
+        if read_u32(record_bytes, R_STATE) != STATE_COORDINATOR {
             return Ok(None);
         }
         let record = decode_record(record_bytes, layout, self.slot)?;
 
-        let watch_llcs = decode_header_bitset(&header, layout, B_WATCH_LLCS);
+        let watch_llcs = decode_header_bitset(header, layout, B_WATCH_LLCS);
         let (watch_cpus, watch_permits) =
-            split_cpu_permit_indices(decode_header_bitset(&header, layout, B_WATCH_CPUS));
-        let watch_llc_exclusive = decode_header_bitset(&header, layout, B_WATCH_LLC_EXCLUSIVE);
+            split_cpu_permit_indices(decode_header_bitset(header, layout, B_WATCH_CPUS));
+        let watch_llc_exclusive = decode_header_bitset(header, layout, B_WATCH_LLC_EXCLUSIVE);
         let (watch_cpu_exclusive, watch_permit_exclusive) =
-            split_cpu_permit_indices(decode_header_bitset(&header, layout, B_WATCH_CPU_EXCLUSIVE));
+            split_cpu_permit_indices(decode_header_bitset(header, layout, B_WATCH_CPU_EXCLUSIVE));
         let watch = ClaimSet::with_all_claim_modes(
             watch_llcs,
             watch_cpus,
@@ -2623,7 +2723,7 @@ impl Ticket {
             (0..layout.words)
                 .map(|word| {
                     read_u64(
-                        &header,
+                        header,
                         layout.bitset_offset(which) + word * std::mem::size_of::<u64>(),
                     )
                 })
@@ -2642,25 +2742,25 @@ impl Ticket {
         let watched_llcs = closed_llcs.intersection(&watch.llcs).copied();
         let watched_permits = closed_permits.intersection(&watch.permits).copied();
         let cpus_free = watched_cpus.into_iter().all(|cpu| {
-            header_bitmap_bit(&header, layout, B_CPU_KNOWN, cpu)
-                && header_bitmap_bit(&header, layout, B_CPU_SH_AVAILABLE, cpu)
+            header_bitmap_bit(header, layout, B_CPU_KNOWN, cpu)
+                && header_bitmap_bit(header, layout, B_CPU_SH_AVAILABLE, cpu)
                 && (!watch_cpu_exclusive.contains(&cpu)
-                    || header_bitmap_bit(&header, layout, B_CPU_EX_AVAILABLE, cpu))
+                    || header_bitmap_bit(header, layout, B_CPU_EX_AVAILABLE, cpu))
         });
         let llcs_free = watched_llcs.into_iter().all(|llc| {
-            header_bitmap_bit(&header, layout, B_LLC_KNOWN, llc)
-                && header_bitmap_bit(&header, layout, B_LLC_SH_AVAILABLE, llc)
+            header_bitmap_bit(header, layout, B_LLC_KNOWN, llc)
+                && header_bitmap_bit(header, layout, B_LLC_SH_AVAILABLE, llc)
                 && (!watch_llc_exclusive.contains(&llc)
-                    || header_bitmap_bit(&header, layout, B_LLC_EX_AVAILABLE, llc))
+                    || header_bitmap_bit(header, layout, B_LLC_EX_AVAILABLE, llc))
         });
         let permits_free = watched_permits.into_iter().all(|permit| {
             let Ok(index) = permit_resource_index(permit) else {
                 return false;
             };
-            header_bitmap_bit(&header, layout, B_CPU_KNOWN, index)
-                && header_bitmap_bit(&header, layout, B_CPU_SH_AVAILABLE, index)
+            header_bitmap_bit(header, layout, B_CPU_KNOWN, index)
+                && header_bitmap_bit(header, layout, B_CPU_SH_AVAILABLE, index)
                 && (!watch_permit_exclusive.contains(&permit)
-                    || header_bitmap_bit(&header, layout, B_CPU_EX_AVAILABLE, index))
+                    || header_bitmap_bit(header, layout, B_CPU_EX_AVAILABLE, index))
         });
         if !cpus_free || !llcs_free || !permits_free {
             return Ok(None);
@@ -2674,14 +2774,14 @@ impl Ticket {
             availability,
             commit_token: CoordinatorCommitToken {
                 prefix_epoch: read_u64(record_bytes, R_PREFIX_EPOCH),
-                coordinator_epoch: read_u64(&header, H_COORDINATOR_EPOCH).max(1),
+                coordinator_epoch: read_u64(header, H_COORDINATOR_EPOCH).max(1),
             },
             // The registry already knew these resources were free. Their
             // writable closes cannot improve the coordinator's last planning
             // snapshot and are discarded without another planner pass.
             should_step: false,
             observation: None,
-            liveness_due_in: liveness_due_in_from_header(&header, now),
+            liveness_due_in: liveness_due_in_from_header(header, now),
         }))
     }
 
@@ -2792,9 +2892,9 @@ impl Ticket {
         if self.finished {
             return Ok(());
         }
-        // A slot cannot be recycled while this process still has its futex
-        // word mapped.
-        self.wake.take();
+        // A slot cannot be recycled while this process still has retained
+        // views of its header and record.
+        self.shared.take();
         // Keep the targeted wake live through this interruptible acquisition.
         // If it fails, Drop disarms the broker before its retrying cleanup.
         self.remove_record_interruptible(cancelled)?;
@@ -2872,8 +2972,8 @@ impl Ticket {
             }
             return Ok(FinishAcquireResult::Stale);
         }
-        // Keep the per-slot futex mapping live until every stale-success check
-        // above has passed. The real fds are already held; convert the
+        // Keep the retained per-ticket mappings live until every stale-success
+        // check above has passed. The real fds are already held; convert the
         // coordinator record into a crash-recoverable HELD publication before
         // returning them.
         table.promote_record_to_held(&record, exact, contention)?;
@@ -2952,11 +3052,11 @@ impl Ticket {
 
     #[cfg(test)]
     fn abandon_for_tests(mut self) {
-        // Model abrupt owner death: release the mapped wake and liveness OFD,
+        // Model abrupt owner death: release the shared maps and liveness OFD,
         // but deliberately leave the registry record for coordinator
         // liveness pruning. Marking the Rust value finished prevents Drop's
         // opportunistic nonblocking EX cleanup from hiding that path.
-        self.wake.take();
+        self.shared.take();
         self._interrupt_waiter.take();
         self.finished = true;
         self.liveness.take();
@@ -2978,7 +3078,7 @@ impl Ticket {
     }
 
     fn finish_removed_record(&mut self) {
-        self.wake.take();
+        self.shared.take();
         self._interrupt_waiter.take();
         self.finished = true;
         self.liveness.take();
@@ -2992,7 +3092,7 @@ impl Drop for Ticket {
         if self.finished {
             return;
         }
-        self.wake.take();
+        self.shared.take();
         // Destruction never joins an EX-flock convoy. Disarm the targeted
         // broker and make one nonblocking cleanup attempt; if another writer
         // owns the registry, closing liveness is the authoritative removal
@@ -3787,7 +3887,7 @@ pub(super) fn exercise_stalled_takeover_notification_for_tests(
     // stalled-transfer transaction itself.
     watch.drain(&ClaimSet::default())?;
     let wake_before = coordinator
-        .wake
+        .shared
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("stalled coordinator wake mapping disappeared"))?
         .expected();
@@ -3815,7 +3915,7 @@ pub(super) fn exercise_stalled_takeover_notification_for_tests(
         )
     };
     let wake_after = coordinator
-        .wake
+        .shared
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("parked coordinator wake mapping disappeared"))?
         .expected();
@@ -3842,7 +3942,7 @@ pub(super) fn exercise_dirty_repair_notification_for_tests(
 
     watch.drain(&ClaimSet::default())?;
     let wake_before = coordinator
-        .wake
+        .shared
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("repair coordinator wake mapping disappeared"))?
         .expected();
@@ -3870,7 +3970,7 @@ pub(super) fn exercise_dirty_repair_notification_for_tests(
         )
     };
     let wake_after = coordinator
-        .wake
+        .shared
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("repaired coordinator wake mapping disappeared"))?
         .expected();
@@ -3999,9 +4099,11 @@ pub(super) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<boo
     let Some(blocked) = record.blocked_on else {
         return Ok(false);
     };
+    let blocker_serial = table.blocker_serial(blocked.key, blocked.mode)?;
+    let callback_serial = table.max_watch_serial(&record.watch)?.max(blocker_serial);
     Ok(record.state == STATE_WAITING
-        && blocked.serial == table.blocker_serial(blocked.key, blocked.mode)?
-        && record.issue_serial >= table.max_callback_serial(&record, false)?)
+        && blocked.serial == blocker_serial
+        && record.issue_serial >= callback_serial)
 }
 
 #[cfg(test)]
@@ -5519,7 +5621,10 @@ pub(super) fn exercise_replan_crash_repair_for_tests() -> Result<ReplanCrashRepa
         table.begin_transaction()?;
         let prefix = AggregateSnapshot::empty(table.layout);
         let epoch = table.claim_epoch();
-        let issue_serial = table.max_callback_serial(&first_record, false)?;
+        let mut issue_serial = table.max_watch_serial(&first_record.watch)?;
+        if let Some(blocked) = first_record.blocked_on {
+            issue_serial = issue_serial.max(table.blocker_serial(blocked.key, blocked.mode)?);
+        }
         table.publish_prefix(
             first.slot,
             &prefix,
@@ -7253,13 +7358,13 @@ fn exercise_flexible_revocation_replan_case(offset: usize) -> Result<bool> {
             "flexible revoked target's no-churn test inputs changed before rescan",
         );
         let wake_before = target
-            .wake
+            .shared
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("flexible revoked target wake mapping disappeared"))?
             .expected();
         table.grant_compatible()?;
         let wake_after = target
-            .wake
+            .shared
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("flexible revoked target wake mapping disappeared"))?
             .expected();
@@ -7338,7 +7443,7 @@ pub(super) fn exercise_revoked_owner_death_for_tests() -> Result<(bool, bool, bo
                 .record(successor.slot)?
                 .is_some_and(|record| record.state == STATE_WAITING);
         let wake = successor
-            .wake
+            .shared
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("successor wake mapping disappeared"))?
             .expected();
@@ -7355,7 +7460,7 @@ pub(super) fn exercise_revoked_owner_death_for_tests() -> Result<(bool, bool, bo
         table.prune_dead_identities(&[(revoked_slot, revoked_ticket)])?;
         table.grant_compatible()?;
         let wake_after = successor
-            .wake
+            .shared
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("successor wake mapping disappeared"))?
             .expected();
@@ -7403,7 +7508,7 @@ pub(super) fn exercise_revoke_crash_repair_for_tests() -> Result<(bool, bool, bo
             "revoke-crash target was not initially granted",
         );
         let wake_before = revoked
-            .wake
+            .shared
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("revoked wake mapping disappeared"))?
             .expected();
@@ -7413,7 +7518,7 @@ pub(super) fn exercise_revoke_crash_repair_for_tests() -> Result<(bool, bool, bo
         crash_at_for_tests("revoke_state_before_wake");
         table.repair_consistency_if_needed()?;
         let wake_after = revoked
-            .wake
+            .shared
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("revoked wake mapping disappeared"))?
             .expected();
@@ -7486,7 +7591,7 @@ pub(super) fn exercise_waiting_release_wake_for_tests() -> Result<(bool, bool, b
         let mut table = Table::open_existing()?;
         let scans_before = read_u64(&table.header, H_GRANT_SCANS);
         let wake_before = waiting
-            .wake
+            .shared
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WAITING wake mapping disappeared"))?
             .expected();
@@ -7513,7 +7618,7 @@ pub(super) fn exercise_waiting_release_wake_for_tests() -> Result<(bool, bool, b
         let observation_scheduled = improved && table.pending_flags() & PENDING_RESCAN != 0;
         table.grant_compatible()?;
         let wake_after = waiting
-            .wake
+            .shared
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("WAITING wake mapping disappeared"))?
             .expected();
@@ -9016,7 +9121,7 @@ fn publish_acquired_in_table(
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HeaderLayout {
     words: usize,
     bits: usize,
@@ -10705,27 +10810,8 @@ impl Table {
         Ok(())
     }
 
-    fn map_futex(&mut self, slot: u64) -> Result<FutexSlot> {
-        let next_slot = self.next_slot()?;
-        if slot >= next_slot {
-            anyhow::bail!("queue futex slot {slot} is outside 0..{next_slot}");
-        }
-        let (chunk, range) = record_range(slot, self.layout.record_size)?;
-        let file = open_chunk_file(chunk, self.layout.record_size)?;
-        let mut map = unsafe { MmapMut::map_mut(&file) }?;
-        if range.end > map.len() {
-            anyhow::bail!(
-                "queue registry chunk {chunk} is too short for futex slot {slot}: {} bytes < {}",
-                map.len(),
-                range.end
-            );
-        }
-        let offset = range
-            .start
-            .checked_add(R_WAKE)
-            .ok_or_else(|| anyhow::anyhow!("queue futex offset overflow"))?;
-        let ptr = unsafe { map.as_mut_ptr().add(offset).cast::<AtomicU32>() };
-        Ok(FutexSlot { _map: map, ptr })
+    fn map_ticket_shared(&mut self, slot: u64, ticket: u64) -> Result<TicketSharedMaps> {
+        TicketSharedMaps::open(self, slot, ticket)
     }
 
     fn grant_compatible(&mut self) -> Result<(ClaimSet, bool)> {
@@ -11744,39 +11830,6 @@ impl Table {
             serial = serial.max(self.blocker_serial(blocked.key, blocked.mode)?);
         }
         Ok(serial)
-    }
-
-    /// Highest resource-improvement serial observable by one callback
-    /// publication. An acquisition callback can only commit its exact
-    /// designation, so unrelated alternatives in the immutable watch cannot
-    /// invalidate it. A replan callback consumes the whole alternative
-    /// envelope. Either kind also consumes a persisted blocker which may live
-    /// outside that envelope.
-    fn max_callback_serial_for(
-        &self,
-        designated: &ClaimSet,
-        watch: &ClaimSet,
-        acquisition_allowed: bool,
-        blocked_on: Option<BlockedOn>,
-    ) -> Result<u64> {
-        let mut serial = self.max_watch_serial(if acquisition_allowed {
-            designated
-        } else {
-            watch
-        })?;
-        if let Some(blocked) = blocked_on {
-            serial = serial.max(self.blocker_serial(blocked.key, blocked.mode)?);
-        }
-        Ok(serial)
-    }
-
-    fn max_callback_serial(&self, record: &Record, acquisition_allowed: bool) -> Result<u64> {
-        self.max_callback_serial_for(
-            &record.claim,
-            &record.watch,
-            acquisition_allowed,
-            record.blocked_on,
-        )
     }
 
     /// Highest compatibility serial that can make the coordinator's current
