@@ -2469,7 +2469,15 @@ pub(crate) fn activate_pending_ticket<T>(
         ticket.activate_pending(&pending_claim, initial_claim, watch_claim, cancelled),
         cancelled,
     )?;
-    preparation.release_resources_for_exact()?;
+    if let Err(error) = preparation.release_resources_for_exact() {
+        // Activation already published the exact record. Ensure every
+        // remaining preparation OFD closes before exposing its sole
+        // coordinator edge, even on a partial teardown error.
+        drop(preparation);
+        ticket.notify_after_coordinator_payload_drop();
+        return Err(error);
+    }
+    ticket.notify_after_coordinator_payload_drop();
     // Keep only the preparation token until exact physical ownership is
     // published. It bounds resident prepared processes without causing the
     // exact claim to self-contend on its own CPU or memory resources.
@@ -3245,22 +3253,24 @@ fn acquire_as_coordinator_impl<T>(
                     // the coordinator record atomically. Once it commits,
                     // cancellation is for the caller's next lifecycle phase—
                     // not grounds to roll back this committed acquire.
-                    match coordinator.ticket.finish_acquired(
+                    let finish = coordinator.ticket.finish_acquired(
                         &claim,
                         commit_token,
                         &markers,
                         cancelled,
-                    )? {
-                        registry::FinishAcquireResult::Committed(publication) => {
+                    );
+                    match finish {
+                        Ok(registry::FinishAcquireResult::Committed(publication)) => {
                             drop(contention);
                             drop(preparation_contention);
                             drop(held.preparation.take());
+                            coordinator.ticket.notify_after_coordinator_payload_drop();
                             break CoordinatorOutcome::Acquired(Acquired::tracked(
                                 value,
                                 publication,
                             ));
                         }
-                        registry::FinishAcquireResult::Stale => {
+                        Ok(registry::FinishAcquireResult::Stale) => {
                             // An earlier callback changed its reservation after
                             // this planner snapshot. Drop the stale physical fd
                             // set, retain the coordinator ticket, and force one
@@ -3268,9 +3278,20 @@ fn acquire_as_coordinator_impl<T>(
                             drop(value);
                             drop(contention);
                             drop(preparation_contention);
+                            drop(held.preparation.take());
+                            coordinator.ticket.notify_after_coordinator_payload_drop();
                             first = false;
                             force_step = true;
                             continue;
+                        }
+                        Err(error) => {
+                            drop(value);
+                            drop(contention);
+                            drop(preparation_contention);
+                            drop(held.preparation.take());
+                            coordinator.ticket.notify_after_coordinator_payload_drop();
+                            check_interrupted(cancelled)?;
+                            return Err(error);
                         }
                     }
                 }
@@ -3288,17 +3309,19 @@ fn acquire_as_coordinator_impl<T>(
                     let contention = held.take_contention();
                     let markers = contention.marker_vec();
                     let commit_token = held.commit_token()?;
-                    match coordinator.ticket.finish_preparation(
+                    let finish = coordinator.ticket.finish_preparation(
                         &final_claim,
                         &preparation_claim,
                         commit_token,
                         &markers,
                         cancelled,
-                    )? {
-                        registry::FinishPreparationResult::Committed(pending_claim) => {
+                    );
+                    match finish {
+                        Ok(registry::FinishPreparationResult::Committed(pending_claim)) => {
                             drop(contention);
                             drop(preparation_contention);
                             drop(held.preparation.take());
+                            coordinator.ticket.notify_after_coordinator_payload_drop();
                             let pending = pending_admission_from_parts(
                                 coordinator.ticket,
                                 *preparation,
@@ -3306,13 +3329,24 @@ fn acquire_as_coordinator_impl<T>(
                             )?;
                             break CoordinatorOutcome::Prepared(Box::new(pending));
                         }
-                        registry::FinishPreparationResult::Stale => {
+                        Ok(registry::FinishPreparationResult::Stale) => {
                             drop(preparation);
                             drop(contention);
                             drop(preparation_contention);
+                            drop(held.preparation.take());
+                            coordinator.ticket.notify_after_coordinator_payload_drop();
                             first = false;
                             force_step = true;
                             continue;
+                        }
+                        Err(error) => {
+                            drop(preparation);
+                            drop(contention);
+                            drop(preparation_contention);
+                            drop(held.preparation.take());
+                            coordinator.ticket.notify_after_coordinator_payload_drop();
+                            check_interrupted(cancelled)?;
+                            return Err(error);
                         }
                     }
                 }

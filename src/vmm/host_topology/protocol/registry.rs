@@ -1091,6 +1091,7 @@ pub(super) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(b
         FlockMode::Shared,
     );
     ticket.activate_pending(&initial, exact.clone(), exact, None)?;
+    ticket.notify_after_coordinator_payload_drop();
     let result = {
         let _lock = lock_registry_existing(FlockMode::Shared)?;
         let table = Table::open_existing()?;
@@ -1515,8 +1516,14 @@ impl Ticket {
             let bytes = table
                 .record_bytes_mut(self.slot)?
                 .ok_or_else(|| anyhow::anyhow!("pending slot {} disappeared", self.slot))?;
+            // Invalidate the authoritative record before rewriting its claim
+            // and watch. A killed writer then leaves a FREE image which dirty
+            // repair can discard instead of an active PENDING record with
+            // partially cleared bitsets.
+            write_u32(bytes, R_STATE, STATE_FREE);
             clear_record_claim_bits(bytes, layout);
             clear_record_watch_bits(bytes, layout);
+            crash_at_for_tests("activate_pending_state_free_before_record");
             write_u32(
                 bytes,
                 R_CLAIM_LLC_MODE,
@@ -1582,7 +1589,6 @@ impl Ticket {
         self._interrupt_waiter = interrupt_waiter;
         drop(table);
         drop(_lock);
-        notify_coordinator();
         Ok(())
     }
 
@@ -1897,6 +1903,10 @@ impl Ticket {
         let shared = table.map_ticket_shared(slot, ticket)?;
         drop(table);
         drop(_lock);
+        // UNKNOWN and the initial blocker publication are durable now. Close
+        // the writable contention witness before waking the coordinator so it
+        // cannot consume this edge while the resource still appears busy.
+        drop(initial_contention);
         notify_coordinator();
 
         Ok(Self {
@@ -2656,6 +2666,11 @@ impl Ticket {
 
         drop(table);
         drop(lock);
+        // Any contention witness represented by this WAITING publication must
+        // close before the sole targeted edge is observable. In particular,
+        // preparation contention can live outside the immutable run watch, so
+        // there may be no later watched close to repair an early busy sample.
+        drop(result);
         if notify_now {
             notify_coordinator();
         }
@@ -3187,6 +3202,16 @@ impl Ticket {
         Ok(())
     }
 
+    /// Publish the coordinator edge only after caller-owned probe payloads
+    /// and temporary proof OFDs have been destroyed. `finish_acquired` and
+    /// `finish_preparation` deliberately leave this edge to their caller so a
+    /// successor cannot consume UNKNOWN while the corresponding resource is
+    /// still physically busy.
+    pub(super) fn notify_after_coordinator_payload_drop(&self) {
+        let _namespace = self.namespace.enter();
+        notify_coordinator();
+    }
+
     pub(super) fn finish_acquired(
         &mut self,
         exact: &ClaimSet,
@@ -3216,7 +3241,6 @@ impl Ticket {
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
-            notify_coordinator();
             return Ok(FinishAcquireResult::Stale);
         }
         if record.state != STATE_COORDINATOR
@@ -3230,7 +3254,6 @@ impl Ticket {
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
-            notify_coordinator();
             anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
         }
         let reconciled_dirty_suffix = table.min_changed_ticket() < record.ticket;
@@ -3271,7 +3294,6 @@ impl Ticket {
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
-            notify_coordinator();
             return Ok(FinishAcquireResult::Stale);
         }
         // Keep the retained per-ticket mappings live until every stale-success
@@ -3282,7 +3304,6 @@ impl Ticket {
         let held = HeldClaim::from_ticket(self)?;
         drop(table);
         drop(_lock);
-        notify_coordinator();
         cancel_coordinator_commit_for_tests(cancelled);
         Ok(FinishAcquireResult::Committed(held))
     }
@@ -3320,7 +3341,6 @@ impl Ticket {
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
-            notify_coordinator();
             return Ok(FinishPreparationResult::Stale);
         }
         if record.state != STATE_COORDINATOR
@@ -3334,7 +3354,6 @@ impl Ticket {
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
-            notify_coordinator();
             anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
         }
         let reconciled_dirty_suffix = table.min_changed_ticket() < record.ticket;
@@ -3366,7 +3385,6 @@ impl Ticket {
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
-            notify_coordinator();
             return Ok(FinishPreparationResult::Stale);
         }
         let pending_claim = match table.transition_record_to_pending(
@@ -3384,13 +3402,11 @@ impl Ticket {
                 table.finish_transaction()?;
                 drop(table);
                 drop(_lock);
-                notify_coordinator();
                 return Ok(FinishPreparationResult::Stale);
             }
         };
         drop(table);
         drop(_lock);
-        notify_coordinator();
         Ok(FinishPreparationResult::Committed(pending_claim))
     }
 
@@ -12889,8 +12905,16 @@ impl Table {
             let bytes = self
                 .record_bytes_mut(record.slot)?
                 .ok_or_else(|| anyhow::anyhow!("queue slot {} disappeared", record.slot))?;
+            // HELD removes the immutable callback watch even when its exact
+            // claim is unchanged. Publish FREE before either rewrite so dirty
+            // repair never decodes a half-HELD active record.
+            write_u32(bytes, R_STATE, STATE_FREE);
             if claim_changed {
                 clear_record_claim_bits(bytes, layout);
+            }
+            clear_record_watch_bits(bytes, layout);
+            crash_at_for_tests("promote_held_state_free_before_record");
+            if claim_changed {
                 write_u32(
                     bytes,
                     R_CLAIM_LLC_MODE,
@@ -12913,7 +12937,6 @@ impl Table {
                 );
                 encode_exact_claim(bytes, layout, exact)?;
             }
-            clear_record_watch_bits(bytes, layout);
             write_u64(bytes, R_BLOCKED_SERIAL, 0);
             write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
             write_u32(bytes, R_BLOCK_MODE, 0);
