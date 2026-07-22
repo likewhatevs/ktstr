@@ -8718,6 +8718,13 @@ fn exercise_granular_prefix_invalidation_case(
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
+        // Registration is a real liveness path: a sufficiently descheduled
+        // fixture may legitimately transfer the coordinator heartbeat lease
+        // while the remaining synthetic tickets are being constructed.
+        // Restage the complete synthetic image transactionally so overwriting
+        // a promoted predecessor cannot leave the coordinator header pointing
+        // at a non-coordinator record.
+        table.begin_transaction()?;
         for ticket in [&changing, &duplicate_a, &duplicate_b] {
             table.set_record_state(ticket.slot, STATE_PENDING)?;
             table.clear_record_blocked(ticket.slot)?;
@@ -8734,7 +8741,12 @@ fn exercise_granular_prefix_invalidation_case(
             },
         )?;
         table.clear_record_blocked(target.slot)?;
+        table.set_record_state(coordinator.slot, STATE_WAITING)?;
+        table.clear_record_blocked(coordinator.slot)?;
+        table.set_coordinator(0, NONE_SLOT)?;
+        table.elect_coordinator_in_transaction()?;
         table.set_pending_flag(PENDING_RESCAN);
+        table.finish_transaction()?;
         table.grant_compatible()?;
         if target_state == STATE_WAITING {
             // Seed a valid speculative predecessor publication, then model a
