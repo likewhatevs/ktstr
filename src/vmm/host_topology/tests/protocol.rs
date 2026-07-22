@@ -3916,12 +3916,13 @@ fn dirty_repair_preserves_exact_and_watch_cpu_modes() {
 }
 
 #[test]
-fn common_watch_replan_token_is_single_and_advances_without_starvation() {
+fn common_watch_replan_wave_is_work_conserving_and_finite() {
     let _prefixes = LockPrefixesGuard::new();
     let waiters = 1_000usize;
     let outcome = protocol::exercise_replan_token_wave_for_tests(waiters)
-        .expect("exercise finite REPLAN token waves");
+        .expect("exercise finite work-conserving REPLAN waves");
     let expected_exact_grants = (0..waiters).step_by(16).count();
+    let expected_replans = waiters - expected_exact_grants;
     assert!(
         outcome.registration_waiting,
         "flexible registration must not publish speculative callbacks directly",
@@ -3931,93 +3932,80 @@ fn common_watch_replan_token_is_single_and_advances_without_starvation() {
         "one scan must still drain every exact viable disjoint grant",
     );
     assert_eq!(
-        outcome.initial_replans, 1,
-        "a common-watch storm must publish exactly one speculative callback",
+        outcome.initial_replans, expected_replans,
+        "one finite scan must publish every eligible flexible callback",
     );
     assert_eq!(
-        outcome.initial_wakes,
-        expected_exact_grants + 1,
-        "the first scan may wake exact grants plus only one REPLAN owner",
+        outcome.initial_wakes, waiters,
+        "the first scan must wake every exact grant and every eligible REPLAN callback",
     );
     assert_eq!(
         outcome.initial_prefix_comparisons, 1,
-        "the scan may validate its one live coordinator publication, but must not reread the 1,000 flexible WAITING prefixes",
+        "the scan may validate its coordinator publication, but must not reread the 1,000 flexible WAITING prefixes",
     );
     assert_eq!(
         outcome.initial_full_watch_materializations, 0,
         "the authoritative scan must not expand any ticket's encoded alternative watch into BTree nodes",
     );
     assert_eq!(
-        outcome.initial_encoded_watch_serial_walks, 1,
-        "the global serial filter must walk only the selected REPLAN candidate's encoded watch",
+        outcome.initial_encoded_watch_serial_walks, expected_replans,
+        "the global serial filter must walk each eligible callback's encoded watch exactly once",
     );
     assert_eq!(
         outcome.initial_full_prefix_snapshot_publishes, 0,
         "the scan must publish predecessor words directly without allocating unused host-sized holder vectors",
     );
+    assert_eq!(
+        (outcome.repeated_replans, outcome.repeated_wakes),
+        (expected_replans, 0),
+        "repeating the scan must preserve every live callback without duplicate wakes",
+    );
     assert!(
-        outcome.live_token_exact_granted && outcome.live_token_exact_woken,
-        "new exact capacity must still grant and wake while a speculative token is live",
+        outcome.fixed_waiter_granted && outcome.fixed_waiter_woken,
+        "new exact capacity must grant and wake independently while a REPLAN wave is live",
     );
     assert_eq!(
-        (outcome.live_token_replans, outcome.live_token_replan_wakes),
-        (1, 0),
-        "an exact grant scan must preserve the sole live REPLAN token without waking it again",
+        (outcome.fixed_scan_replans, outcome.fixed_scan_replan_wakes,),
+        (expected_replans, 0),
+        "an exact grant scan must preserve the live REPLAN wave without re-waking it",
+    );
+    assert!(
+        outcome.callback_requeued,
+        "an unchanged speculative callback must return to WAITING",
     );
     assert_eq!(
         outcome.callback_prefix_reads, 1,
-        "the selected callback must copy only its own cached prefix record",
+        "each callback must copy only its own cached prefix record",
     );
     assert_eq!(
         outcome.callback_active_reads, 0,
         "callback admission must remain independent of active queue depth",
     );
     assert!(
-        outcome.successive_token_advanced && outcome.third_token_advanced,
-        "repeated common-resource improvements must advance through tickets before wrapping",
+        outcome.mixed_age_old_replanned
+            && outcome.mixed_age_old_woken
+            && outcome.mixed_age_late_replanned
+            && outcome.mixed_age_late_woken,
+        "one scan must publish and wake all eligible callbacks regardless of registration age",
     );
     assert_eq!(
-        (outcome.successive_replans, outcome.successive_wakes),
-        (1, 1),
-        "the second wave must publish and wake one REPLAN owner",
-    );
-    assert_eq!(
-        (outcome.third_replans, outcome.third_wakes),
-        (1, 1),
-        "the third wave must publish and wake one REPLAN owner",
-    );
-    assert!(
-        outcome.dead_owner_token_advanced,
-        "removing the cursor owner must advance directly to a live successor",
-    );
-    assert_eq!(
-        (outcome.dead_owner_replans, outcome.dead_owner_wakes),
-        (1, 1),
-        "owner-death recovery must publish only one successor token",
-    );
-    assert!(
-        outcome.removed_cursor_slot_recycled,
-        "the regression must exercise a new ticket reusing the removed cursor owner's slot",
-    );
-    assert!(
-        outcome.removed_cursor_wrapped,
-        "a frozen round horizon must wrap to old eligible work before post-horizon arrivals",
-    );
-    assert_eq!(
-        (outcome.wrapped_replans, outcome.wrapped_wakes),
-        (1, 1),
-        "round wrap must still publish and wake exactly one speculative owner",
+        (
+            outcome.mixed_age_repeated_replans,
+            outcome.mixed_age_repeated_wakes,
+        ),
+        (2, 0),
+        "the mixed-age wave must remain live without a duplicate wake on a repeated scan",
     );
 }
 
 #[test]
-fn replan_cursor_crash_repair_preserves_one_forward_moving_token() {
+fn replan_wave_crash_repair_recovers_every_eligible_callback_once() {
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_replan_crash_repair_for_tests()
         .expect("repair torn REPLAN cursor publication");
     assert!(
-        outcome.dirty_repair_completed && outcome.torn_token_demoted,
-        "dirty recovery must demote an ambiguously delivered REPLAN publication to invalidated WAITING",
+        outcome.dirty_repair_completed && outcome.torn_callbacks_demoted,
+        "dirty recovery must demote ambiguously delivered REPLAN publications to invalidated WAITING",
     );
     assert!(
         outcome.repair_generation_advanced && outcome.repair_generation_woke,
@@ -4028,18 +4016,18 @@ fn replan_cursor_crash_repair_preserves_one_forward_moving_token() {
         "recovery must retain a coherent finite-round cursor and horizon",
     );
     assert!(
-        outcome.successor_selected,
-        "the repaired round must advance beyond the torn token owner",
+        outcome.all_eligible_recovered,
+        "the repaired scan must republish every eligible callback",
     );
     assert_eq!(
         (outcome.recovered_replans, outcome.recovered_wakes),
-        (1, 1),
-        "recovery must publish and wake exactly one successor REPLAN token",
+        (2, 2),
+        "recovery must publish and wake both eligible REPLAN callbacks",
     );
     assert_eq!(
         (outcome.repeated_replans, outcome.repeated_wakes),
-        (1, 0),
-        "a live recovered token must suppress duplicate token publication and wake",
+        (2, 0),
+        "a repeated scan must preserve the recovered wave without duplicate wakes",
     );
 }
 

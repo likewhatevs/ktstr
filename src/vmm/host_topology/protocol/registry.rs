@@ -156,13 +156,13 @@ const H_LAST_PROGRESS_NS: usize = 184;
 /// Futex sequence paired with `H_GENERATION`. The generation remains a full
 /// u64 diagnostic/epoch while waiters sleep on this non-overlapping u32 word.
 const H_GENERATION_WAKE: usize = 192;
-/// Ticket which most recently received the sole speculative REPLAN token.
-/// Selection resumes strictly after this cursor and wraps once, preventing a
-/// repeatedly-improving oldest alternative from starving later planners.
+/// Ticket which most recently received a speculative REPLAN callback. This is
+/// retained as a crash-repair diagnostic; the authoritative scan publishes
+/// every eligible callback from its already-frozen active-list snapshot.
 const H_REPLAN_CURSOR: usize = 200;
-/// Inclusive ticket high-water frozen for the current REPLAN round. Arrivals
-/// above it wait for the next round, so a continuous registration stream
-/// cannot postpone wraparound to an older eligible waiter.
+/// Inclusive ticket high-water of the most recently published finite REPLAN
+/// wave. Registration is excluded by the registry writer lock while that
+/// active-list snapshot is scanned.
 const H_REPLAN_HORIZON: usize = 208;
 const _: () = assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
 const _: () = assert!(H_GENERATION_WAKE.is_multiple_of(std::mem::align_of::<AtomicU32>()));
@@ -783,30 +783,6 @@ struct ScanRecord {
     backfill_started_ns: u64,
     prev_active: u64,
     next_active: u64,
-}
-
-#[derive(Debug, Clone)]
-struct PrefixWords {
-    cpu_any: Vec<u64>,
-    cpu_exclusive: Vec<u64>,
-    llc_any: Vec<u64>,
-    llc_exclusive: Vec<u64>,
-}
-
-impl PrefixWords {
-    fn copy_from(
-        cpu_any: &[u64],
-        cpu_exclusive: &[u64],
-        llc_any: &[u64],
-        llc_exclusive: &[u64],
-    ) -> Self {
-        Self {
-            cpu_any: cpu_any.to_vec(),
-            cpu_exclusive: cpu_exclusive.to_vec(),
-            llc_any: llc_any.to_vec(),
-            llc_exclusive: llc_exclusive.to_vec(),
-        }
-    }
 }
 
 pub(super) struct Ticket {
@@ -1784,12 +1760,11 @@ impl Ticket {
         } else {
             STATE_WAITING
         };
-        // REPLAN is one speculative planner license for the whole registry,
-        // not runnable capacity. A flexible ticket which cannot use its
-        // exact designation joins WAITING and asks the coordinator scan to
-        // issue that one token in ticket order. Publishing REPLAN directly
-        // here would let a registration storm bypass the scan and wake every
-        // planner at once.
+        // REPLAN is speculative planning work, not runnable capacity. A
+        // flexible ticket which cannot use its exact designation joins
+        // WAITING and asks the authoritative coordinator scan to publish it
+        // with the rest of the current finite planning wave. Registration
+        // itself never bypasses that prefix-validation scan.
         let needs_initial_replan = has_predecessor && flexible && initial_state == STATE_WAITING;
         // A newly appended ticket's predecessor prefix is exactly the global
         // aggregate before its own exact claim is counted.
@@ -2408,6 +2383,15 @@ impl Ticket {
         let consumed_serial = blocked.map_or(callback_snapshot_serial, |(_, serial)| {
             callback_snapshot_serial.max(serial)
         });
+        let unseen_replan_improvement = !acquisition_allowed
+            && table.global_serial() > callback_snapshot_serial
+            && table.max_watch_serial(&watch)? > callback_snapshot_serial;
+        let requires_rescan = acquisition_allowed
+            || changed
+            || blocked_evidence.is_some()
+            || record.blocked_on.is_some()
+            || unseen_replan_improvement
+            || table.coordinator_ticket() == 0;
         if changed {
             table.replace_claim(
                 self.slot,
@@ -2436,14 +2420,25 @@ impl Ticket {
             }
             table.set_record_state(self.slot, STATE_WAITING)?;
             table.set_record_issue_serial(self.slot, consumed_serial)?;
-            table.set_pending_flag(PENDING_RESCAN);
-            table.elect_coordinator_in_transaction()?;
+            if requires_rescan {
+                table.set_pending_flag(PENDING_RESCAN);
+                table.elect_coordinator_in_transaction()?;
+            }
             table.finish_transaction()?;
         }
-        table.bump_generation()?;
+        // An unchanged speculative callback consumed only its private
+        // snapshot. REPLAN and WAITING are both non-fencing, so that fast path
+        // changes no claim, watch, blocker, availability, or coordinator
+        // state. Avoid a global generation futex wake and coordinator scan for
+        // each member of a large planning wave.
+        if requires_rescan {
+            table.bump_generation()?;
+        }
         drop(table);
         drop(lock);
-        notify_coordinator();
+        if requires_rescan {
+            notify_coordinator();
+        }
         Ok(GrantResult::Requeued)
     }
 
@@ -5622,25 +5617,21 @@ pub(crate) struct ReplanTokenWaveOutcome {
     pub(crate) initial_full_watch_materializations: usize,
     pub(crate) initial_encoded_watch_serial_walks: usize,
     pub(crate) initial_full_prefix_snapshot_publishes: usize,
-    pub(crate) live_token_exact_granted: bool,
-    pub(crate) live_token_exact_woken: bool,
-    pub(crate) live_token_replans: usize,
-    pub(crate) live_token_replan_wakes: usize,
+    pub(crate) repeated_replans: usize,
+    pub(crate) repeated_wakes: usize,
+    pub(crate) fixed_waiter_granted: bool,
+    pub(crate) fixed_waiter_woken: bool,
+    pub(crate) fixed_scan_replans: usize,
+    pub(crate) fixed_scan_replan_wakes: usize,
+    pub(crate) callback_requeued: bool,
     pub(crate) callback_prefix_reads: usize,
     pub(crate) callback_active_reads: usize,
-    pub(crate) successive_token_advanced: bool,
-    pub(crate) successive_replans: usize,
-    pub(crate) successive_wakes: usize,
-    pub(crate) third_token_advanced: bool,
-    pub(crate) third_replans: usize,
-    pub(crate) third_wakes: usize,
-    pub(crate) dead_owner_token_advanced: bool,
-    pub(crate) dead_owner_replans: usize,
-    pub(crate) dead_owner_wakes: usize,
-    pub(crate) removed_cursor_slot_recycled: bool,
-    pub(crate) removed_cursor_wrapped: bool,
-    pub(crate) wrapped_replans: usize,
-    pub(crate) wrapped_wakes: usize,
+    pub(crate) mixed_age_old_replanned: bool,
+    pub(crate) mixed_age_old_woken: bool,
+    pub(crate) mixed_age_late_replanned: bool,
+    pub(crate) mixed_age_late_woken: bool,
+    pub(crate) mixed_age_repeated_replans: usize,
+    pub(crate) mixed_age_repeated_wakes: usize,
 }
 
 #[cfg(test)]
@@ -5648,10 +5639,10 @@ pub(crate) struct ReplanCrashRepairOutcome {
     pub(crate) dirty_repair_completed: bool,
     pub(crate) repair_generation_advanced: bool,
     pub(crate) repair_generation_woke: bool,
-    pub(crate) torn_token_demoted: bool,
+    pub(crate) torn_callbacks_demoted: bool,
     pub(crate) cursor_preserved: bool,
     pub(crate) horizon_preserved: bool,
-    pub(crate) successor_selected: bool,
+    pub(crate) all_eligible_recovered: bool,
     pub(crate) recovered_replans: usize,
     pub(crate) recovered_wakes: usize,
     pub(crate) repeated_replans: usize,
@@ -5748,7 +5739,7 @@ pub(super) fn exercise_replan_crash_repair_for_tests() -> Result<ReplanCrashRepa
                     .ok_or_else(|| anyhow::anyhow!("repaired REPLAN slot {slot} disappeared"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let torn_token_demoted = repaired_records
+        let torn_callbacks_demoted = repaired_records
             .iter()
             .all(|record| record.state == STATE_WAITING && record.prefix_epoch == 0);
         let cursor_preserved = read_u64(&table.header, H_REPLAN_CURSOR) == expected_cursor;
@@ -5773,8 +5764,9 @@ pub(super) fn exercise_replan_crash_repair_for_tests() -> Result<ReplanCrashRepa
             .iter()
             .filter(|record| record.state == STATE_REPLAN)
             .count();
-        let successor_selected = recovered_records[0].state == STATE_WAITING
-            && recovered_records[1].state == STATE_REPLAN;
+        let all_eligible_recovered = recovered_records
+            .iter()
+            .all(|record| record.state == STATE_REPLAN);
         let recovered_wakes = usize::from(wake(&mut table, first.slot)? != first_wake_before)
             + usize::from(wake(&mut table, second.slot)? != second_wake_before);
 
@@ -5798,10 +5790,10 @@ pub(super) fn exercise_replan_crash_repair_for_tests() -> Result<ReplanCrashRepa
             dirty_repair_completed,
             repair_generation_advanced,
             repair_generation_woke,
-            torn_token_demoted,
+            torn_callbacks_demoted,
             cursor_preserved,
             horizon_preserved,
-            successor_selected,
+            all_eligible_recovered,
             recovered_replans,
             recovered_wakes,
             repeated_replans,
@@ -6014,7 +6006,7 @@ pub(super) fn exercise_replan_token_wave_for_tests(
     waiter_count: usize,
 ) -> Result<ReplanTokenWaveOutcome> {
     if waiter_count < 4 {
-        anyhow::bail!("REPLAN token wave exercise needs at least four waiters");
+        anyhow::bail!("REPLAN wave exercise needs at least four waiters");
     }
     let coordinator_cpu = 10usize;
     let common_cpu = 20usize;
@@ -6054,7 +6046,7 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         initial_full_watch_materializations,
         initial_encoded_watch_serial_walks,
         initial_full_prefix_snapshot_publishes,
-        first_token,
+        initial_replan_indices,
     ) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
@@ -6142,43 +6134,39 @@ pub(super) fn exercise_replan_token_wave_for_tests(
             initial_full_watch_materializations,
             initial_encoded_watch_serial_walks,
             initial_full_prefix_snapshot_publishes,
-            replans.first().copied(),
+            replans,
         )
     };
-    let first_token = first_token.ok_or_else(|| anyhow::anyhow!("scan issued no REPLAN token"))?;
+    let callback_index = initial_replan_indices
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("scan issued no REPLAN callbacks"))?;
 
-    let live_exact_index = (0..waiter_count)
-        .find(|index| *index != first_token && !exact_grant_indices.contains(index))
-        .ok_or_else(|| anyhow::anyhow!("REPLAN wave retained no blocked exact test ticket"))?;
-    let (
-        live_token_exact_granted,
-        live_token_exact_woken,
-        live_token_replans,
-        live_token_replan_wakes,
-    ) = {
+    let (repeated_replans, repeated_wakes) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
-        let replan_ticket = waiters[first_token]
-            .0
-            .as_ref()
-            .expect("first REPLAN owner remains live");
-        let exact_ticket = waiters[live_exact_index]
-            .0
-            .as_ref()
-            .expect("live-token exact ticket remains live");
-        let replan_wake_before = record_wake(&mut table, replan_ticket.slot)?;
-        let exact_wake_before = record_wake(&mut table, exact_ticket.slot)?;
-        set_cpu_free_for_tests(&mut table, first_waiter_cpu + live_exact_index, true)?;
+        let wakes_before = initial_replan_indices
+            .iter()
+            .map(|index| {
+                record_wake(
+                    &mut table,
+                    waiters[*index]
+                        .0
+                        .as_ref()
+                        .expect("live REPLAN wave ticket")
+                        .slot,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible()?;
-        let exact_granted = table
-            .record(exact_ticket.slot)?
-            .is_some_and(|record| record.state == STATE_GRANTED);
-        let exact_woken = record_wake(&mut table, exact_ticket.slot)? != exact_wake_before;
-        let replans = waiters
+        let replans = initial_replan_indices
             .iter()
-            .filter_map(|(ticket, _)| ticket.as_ref())
-            .filter(|ticket| {
+            .filter(|index| {
+                let ticket = waiters[**index]
+                    .0
+                    .as_ref()
+                    .expect("live REPLAN wave ticket");
                 table
                     .record(ticket.slot)
                     .ok()
@@ -6186,24 +6174,106 @@ pub(super) fn exercise_replan_token_wave_for_tests(
                     .is_some_and(|record| record.state == STATE_REPLAN)
             })
             .count();
-        let replan_wakes =
-            usize::from(record_wake(&mut table, replan_ticket.slot)? != replan_wake_before);
-        (exact_granted, exact_woken, replans, replan_wakes)
+        let wakes = initial_replan_indices
+            .iter()
+            .zip(wakes_before)
+            .filter_map(|(index, before)| {
+                let slot = waiters[*index]
+                    .0
+                    .as_ref()
+                    .expect("live REPLAN wave ticket")
+                    .slot;
+                record_wake(&mut table, slot)
+                    .ok()
+                    .filter(|after| *after != before)
+            })
+            .count();
+        (replans, wakes)
+    };
+
+    // A fixed exact waiter remains independent of the speculative wave. It
+    // can become runnable without republishing or re-waking any live REPLAN
+    // callback.
+    let fixed_cpu = first_waiter_cpu + waiter_count + 10;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, fixed_cpu, false)?;
+    }
+    let fixed_claim = ClaimSet::new(std::iter::empty(), [fixed_cpu], FlockMode::Exclusive);
+    let mut fixed = Ticket::register(fixed_claim.clone(), fixed_claim, None)?;
+    let (fixed_waiter_granted, fixed_waiter_woken, fixed_scan_replans, fixed_scan_replan_wakes) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        anyhow::ensure!(
+            table
+                .record(fixed.slot)?
+                .is_some_and(|record| record.state == STATE_WAITING),
+            "blocked fixed waiter did not register WAITING",
+        );
+        let fixed_wake_before = record_wake(&mut table, fixed.slot)?;
+        let replan_wakes_before = initial_replan_indices
+            .iter()
+            .map(|index| {
+                let slot = waiters[*index]
+                    .0
+                    .as_ref()
+                    .expect("live REPLAN wave ticket")
+                    .slot;
+                Ok((slot, record_wake(&mut table, slot)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        set_cpu_free_for_tests(&mut table, fixed_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        let fixed_waiter_granted = table
+            .record(fixed.slot)?
+            .is_some_and(|record| record.state == STATE_GRANTED);
+        let fixed_waiter_woken = record_wake(&mut table, fixed.slot)? != fixed_wake_before;
+        let fixed_scan_replans = initial_replan_indices
+            .iter()
+            .filter(|index| {
+                let slot = waiters[**index]
+                    .0
+                    .as_ref()
+                    .expect("live REPLAN wave ticket")
+                    .slot;
+                table
+                    .record(slot)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.state == STATE_REPLAN)
+            })
+            .count();
+        let fixed_scan_replan_wakes = replan_wakes_before
+            .into_iter()
+            .filter_map(|(slot, before)| {
+                record_wake(&mut table, slot)
+                    .ok()
+                    .filter(|after| *after != before)
+            })
+            .count();
+        (
+            fixed_waiter_granted,
+            fixed_waiter_woken,
+            fixed_scan_replans,
+            fixed_scan_replan_wakes,
+        )
     };
 
     let active_reads_before = ACTIVE_LIST_RECORD_READS.with(std::cell::Cell::get);
     let prefix_reads_before = GRANT_PREFIX_RECORD_READS.with(std::cell::Cell::get);
-    let first_claim = waiters[first_token].1.clone();
-    let first_result = waiters[first_token]
+    let callback_claim = waiters[callback_index].1.clone();
+    let callback_result = waiters[callback_index]
         .0
         .as_mut()
-        .expect("first REPLAN owner remains live")
+        .expect("selected REPLAN callback remains live")
         .run_granted(
             None,
             |designated, _watch, acquisition_allowed, _predecessors, _availability| {
                 anyhow::ensure!(
-                    !acquisition_allowed && designated == &first_claim,
-                    "REPLAN token received an acquisition license or wrong designation",
+                    !acquisition_allowed && designated == &callback_claim,
+                    "REPLAN callback received an acquisition license or wrong designation",
                 );
                 Ok(GrantAttempt::<()> {
                     acquired: None,
@@ -6214,339 +6284,88 @@ pub(super) fn exercise_replan_token_wave_for_tests(
                 })
             },
         )?;
-    anyhow::ensure!(
-        matches!(first_result, GrantResult::Requeued),
-        "first REPLAN token did not return to WAITING",
-    );
+    let callback_requeued = matches!(callback_result, GrantResult::Requeued);
     let callback_active_reads =
         ACTIVE_LIST_RECORD_READS.with(std::cell::Cell::get) - active_reads_before;
     let callback_prefix_reads =
         GRANT_PREFIX_RECORD_READS.with(std::cell::Cell::get) - prefix_reads_before;
 
-    let (successive_token, successive_replans, successive_wakes) = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        let wakes_before = waiters
-            .iter()
-            .map(|(ticket, _)| {
-                record_wake(
-                    &mut table,
-                    ticket.as_ref().expect("live REPLAN wave ticket").slot,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        table.stamp_resource_improvement(S_CPU_EX, common_cpu)?;
-        table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible()?;
-        let replans = waiters
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (ticket, _))| {
-                table
-                    .record(ticket.as_ref().expect("live REPLAN wave ticket").slot)
-                    .ok()
-                    .flatten()
-                    .filter(|record| record.state == STATE_REPLAN)
-                    .map(|_| index)
-            })
-            .collect::<Vec<_>>();
-        let wakes = waiters
-            .iter()
-            .zip(wakes_before)
-            .filter_map(|((ticket, _), before)| {
-                record_wake(
-                    &mut table,
-                    ticket.as_ref().expect("live REPLAN wave ticket").slot,
-                )
-                .ok()
-                .filter(|after| *after != before)
-            })
-            .count();
-        (replans.first().copied(), replans.len(), wakes)
-    };
-    let successive_token =
-        successive_token.ok_or_else(|| anyhow::anyhow!("successor scan issued no REPLAN token"))?;
-
-    let successive_claim = waiters[successive_token].1.clone();
-    let successive_result = waiters[successive_token]
-        .0
-        .as_mut()
-        .expect("successive REPLAN owner remains live")
-        .run_granted(
-            None,
-            |designated, _watch, acquisition_allowed, _predecessors, _availability| {
-                anyhow::ensure!(
-                    !acquisition_allowed && designated == &successive_claim,
-                    "successive REPLAN token received an acquisition license or wrong designation",
-                );
-                Ok(GrantAttempt::<()> {
-                    acquired: None,
-                    preparation_claim: None,
-                    preparation_contention: None,
-                    next_claim: designated.clone(),
-                    contention: None,
-                })
-            },
-        )?;
-    anyhow::ensure!(
-        matches!(successive_result, GrantResult::Requeued),
-        "successive REPLAN token did not return to WAITING",
-    );
-
-    let (third_token, third_replans, third_wakes) = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        let wakes_before = waiters
-            .iter()
-            .map(|(ticket, _)| {
-                record_wake(
-                    &mut table,
-                    ticket.as_ref().expect("live REPLAN wave ticket").slot,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        table.stamp_resource_improvement(S_CPU_EX, common_cpu)?;
-        table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible()?;
-        let replans = waiters
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (ticket, _))| {
-                table
-                    .record(ticket.as_ref().expect("live REPLAN wave ticket").slot)
-                    .ok()
-                    .flatten()
-                    .filter(|record| record.state == STATE_REPLAN)
-                    .map(|_| index)
-            })
-            .collect::<Vec<_>>();
-        let wakes = waiters
-            .iter()
-            .zip(wakes_before)
-            .filter_map(|((ticket, _), before)| {
-                record_wake(
-                    &mut table,
-                    ticket.as_ref().expect("live REPLAN wave ticket").slot,
-                )
-                .ok()
-                .filter(|after| *after != before)
-            })
-            .count();
-        (replans.first().copied(), replans.len(), wakes)
-    };
-    let third_token =
-        third_token.ok_or_else(|| anyhow::anyhow!("third scan issued no REPLAN token"))?;
-
-    let dead_slot = waiters[third_token]
-        .0
-        .as_ref()
-        .expect("third REPLAN owner remains live")
-        .slot;
-    let dead_ticket = waiters[third_token]
-        .0
-        .as_ref()
-        .expect("third REPLAN owner remains live")
-        .ticket;
-    waiters[third_token]
-        .0
-        .take()
-        .expect("third REPLAN owner remains live")
-        .abandon_for_tests();
-    let (dead_owner_token, dead_owner_replans, dead_owner_wakes) = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        let wakes_before = waiters
-            .iter()
-            .filter_map(|(ticket, _)| ticket.as_ref())
-            .map(|ticket| Ok((ticket.slot, record_wake(&mut table, ticket.slot)?)))
-            .collect::<Result<Vec<_>>>()?;
-        table.prune_dead_identities(&[(dead_slot, dead_ticket)])?;
-        table.grant_compatible()?;
-        let replans = waiters
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (ticket, _))| {
-                let ticket = ticket.as_ref()?;
-                table
-                    .record(ticket.slot)
-                    .ok()
-                    .flatten()
-                    .filter(|record| record.state == STATE_REPLAN)
-                    .map(|_| index)
-            })
-            .collect::<Vec<_>>();
-        let wakes = wakes_before
-            .into_iter()
-            .filter_map(|(slot, before)| {
-                record_wake(&mut table, slot)
-                    .ok()
-                    .filter(|after| *after != before)
-            })
-            .count();
-        (replans.first().copied(), replans.len(), wakes)
-    };
-
-    let dead_owner_token = dead_owner_token
-        .ok_or_else(|| anyhow::anyhow!("owner removal did not advance the REPLAN token"))?;
-    let dead_successor_claim = waiters[dead_owner_token].1.clone();
-    let dead_successor_result = waiters[dead_owner_token]
-        .0
-        .as_mut()
-        .expect("owner-removal successor remains live")
-        .run_granted(
-            None,
-            |designated, _watch, acquisition_allowed, _predecessors, _availability| {
-                anyhow::ensure!(
-                    !acquisition_allowed && designated == &dead_successor_claim,
-                    "owner-removal successor received the wrong REPLAN token",
-                );
-                Ok(GrantAttempt::<()> {
-                    acquired: None,
-                    preparation_claim: None,
-                    preparation_contention: None,
-                    next_claim: designated.clone(),
-                    contention: None,
-                })
-            },
-        )?;
-    anyhow::ensure!(
-        matches!(dead_successor_result, GrantResult::Requeued),
-        "owner-removal successor did not return to WAITING",
-    );
-
-    // Drive the finite round to its high-water ticket without walking every
-    // intermediate callback, then remove that cursor owner and recycle its
-    // slot with a newer, already-GRANTED fixed ticket. With no eligible work
-    // left in (cursor, horizon], selection must begin a new round and wrap to
-    // the oldest eligible waiter rather than confusing the recycled slot for
-    // the old ticket identity.
-    let last_index = waiters
-        .iter()
-        .rposition(|(ticket, _)| ticket.is_some())
-        .ok_or_else(|| anyhow::anyhow!("REPLAN wave retained no live last ticket"))?;
-    let last_ticket_id = waiters[last_index]
-        .0
-        .as_ref()
-        .expect("last REPLAN wave ticket remains live")
-        .ticket;
+    // The completed callback is older than the newly registered flexible
+    // ticket. A single writer-locked scan must publish both eligible ages as
+    // one finite wave; no later callback or serial change is required to keep
+    // the new arrival live.
+    let late_cpu = fixed_cpu + 1;
     {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
-        write_u64(
-            &mut table.header,
-            H_REPLAN_CURSOR,
-            last_ticket_id.saturating_sub(1),
-        );
-        write_u64(&mut table.header, H_REPLAN_HORIZON, last_ticket_id);
+        set_cpu_free_for_tests(&mut table, late_cpu, false)?;
+    }
+    let late_claim = ClaimSet::new(std::iter::empty(), [late_cpu], FlockMode::Exclusive);
+    let late_watch = ClaimSet::new(
+        std::iter::empty(),
+        [late_cpu, common_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut late = Ticket::register(late_claim, late_watch, None)?;
+    let (
+        mixed_age_old_replanned,
+        mixed_age_old_woken,
+        mixed_age_late_replanned,
+        mixed_age_late_woken,
+    ) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let old = waiters[callback_index]
+            .0
+            .as_ref()
+            .expect("old pre-horizon callback remains live");
+        anyhow::ensure!(old.ticket < late.ticket, "late ticket was not post-horizon");
+        let old_wake_before = record_wake(&mut table, old.slot)?;
+        let late_wake_before = record_wake(&mut table, late.slot)?;
         table.stamp_resource_improvement(S_CPU_EX, common_cpu)?;
         table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible()?;
-        anyhow::ensure!(
+        let mixed_age_old_replanned = table
+            .record(old.slot)?
+            .is_some_and(|record| record.state == STATE_REPLAN);
+        let mixed_age_late_replanned = table
+            .record(late.slot)?
+            .is_some_and(|record| record.state == STATE_REPLAN);
+        (
+            mixed_age_old_replanned,
+            record_wake(&mut table, old.slot)? != old_wake_before,
+            mixed_age_late_replanned,
+            record_wake(&mut table, late.slot)? != late_wake_before,
+        )
+    };
+
+    let (mixed_age_repeated_replans, mixed_age_repeated_wakes) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let old = waiters[callback_index]
+            .0
+            .as_ref()
+            .expect("old mixed-age callback remains live");
+        let old_wake_before = record_wake(&mut table, old.slot)?;
+        let late_wake_before = record_wake(&mut table, late.slot)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        let repeated_replans = usize::from(
             table
-                .record(
-                    waiters[last_index]
-                        .0
-                        .as_ref()
-                        .expect("last REPLAN wave ticket remains live")
-                        .slot,
-                )?
+                .record(old.slot)?
                 .is_some_and(|record| record.state == STATE_REPLAN),
-            "finite REPLAN round did not reach its last ticket",
+        ) + usize::from(
+            table
+                .record(late.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN),
         );
-    }
-    let last_claim = waiters[last_index].1.clone();
-    let last_result = waiters[last_index]
-        .0
-        .as_mut()
-        .expect("last REPLAN owner remains live")
-        .run_granted(
-            None,
-            |designated, _watch, acquisition_allowed, _predecessors, _availability| {
-                anyhow::ensure!(
-                    !acquisition_allowed && designated == &last_claim,
-                    "last REPLAN owner received the wrong token",
-                );
-                Ok(GrantAttempt::<()> {
-                    acquired: None,
-                    preparation_claim: None,
-                    preparation_contention: None,
-                    next_claim: designated.clone(),
-                    contention: None,
-                })
-            },
-        )?;
-    anyhow::ensure!(
-        matches!(last_result, GrantResult::Requeued),
-        "last REPLAN owner did not return to WAITING",
-    );
-    let recycled_slot = waiters[last_index]
-        .0
-        .as_ref()
-        .expect("last REPLAN owner remains live")
-        .slot;
-    waiters[last_index]
-        .0
-        .as_mut()
-        .expect("last REPLAN owner remains live")
-        .finish(None)?;
-    drop(waiters[last_index].0.take());
-
-    let replacement_cpu = first_waiter_cpu + waiter_count + 10;
-    {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        set_cpu_free_for_tests(&mut table, replacement_cpu, true)?;
-    }
-    let replacement_claim =
-        ClaimSet::new(std::iter::empty(), [replacement_cpu], FlockMode::Exclusive);
-    let mut replacement = Ticket::register(replacement_claim.clone(), replacement_claim, None)?;
-    let removed_cursor_slot_recycled = replacement.slot == recycled_slot;
-    let mut late_arrivals = Vec::new();
-    for index in 0..8usize {
-        let cpu = replacement_cpu + index + 1;
-        let claim = ClaimSet::new(std::iter::empty(), [cpu], FlockMode::Exclusive);
-        let watch = ClaimSet::new(std::iter::empty(), [cpu, common_cpu], FlockMode::Exclusive);
-        late_arrivals.push(Ticket::register(claim, watch, None)?);
-    }
-    let (wrapped_token, wrapped_replans, wrapped_wakes) = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        let wakes_before = waiters
-            .iter()
-            .filter_map(|(ticket, _)| ticket.as_ref())
-            .map(|ticket| Ok((ticket.slot, record_wake(&mut table, ticket.slot)?)))
-            .collect::<Result<Vec<_>>>()?;
-        table.stamp_resource_improvement(S_CPU_EX, common_cpu)?;
-        table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible()?;
-        let replans = waiters
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (ticket, _))| {
-                let ticket = ticket.as_ref()?;
-                table
-                    .record(ticket.slot)
-                    .ok()
-                    .flatten()
-                    .filter(|record| record.state == STATE_REPLAN)
-                    .map(|_| index)
-            })
-            .collect::<Vec<_>>();
-        let wakes = wakes_before
-            .into_iter()
-            .filter_map(|(slot, before)| {
-                record_wake(&mut table, slot)
-                    .ok()
-                    .filter(|after| *after != before)
-            })
-            .count();
-        (replans.first().copied(), replans.len(), wakes)
+        let repeated_wakes = usize::from(record_wake(&mut table, old.slot)? != old_wake_before)
+            + usize::from(record_wake(&mut table, late.slot)? != late_wake_before);
+        (repeated_replans, repeated_wakes)
     };
-    for ticket in late_arrivals.iter_mut().rev() {
-        ticket.finish(None)?;
-    }
-    replacement.finish(None)?;
 
+    late.finish(None)?;
+    fixed.finish(None)?;
     for (ticket, _) in waiters.iter_mut().rev() {
         if let Some(ticket) = ticket.as_mut() {
             ticket.finish(None)?;
@@ -6563,25 +6382,21 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         initial_full_watch_materializations,
         initial_encoded_watch_serial_walks,
         initial_full_prefix_snapshot_publishes,
-        live_token_exact_granted,
-        live_token_exact_woken,
-        live_token_replans,
-        live_token_replan_wakes,
+        repeated_replans,
+        repeated_wakes,
+        fixed_waiter_granted,
+        fixed_waiter_woken,
+        fixed_scan_replans,
+        fixed_scan_replan_wakes,
+        callback_requeued,
         callback_prefix_reads,
         callback_active_reads,
-        successive_token_advanced: successive_token > first_token,
-        successive_replans,
-        successive_wakes,
-        third_token_advanced: third_token > successive_token,
-        third_replans,
-        third_wakes,
-        dead_owner_token_advanced: dead_owner_token > third_token,
-        dead_owner_replans,
-        dead_owner_wakes,
-        removed_cursor_slot_recycled,
-        removed_cursor_wrapped: wrapped_token == Some(first_token),
-        wrapped_replans,
-        wrapped_wakes,
+        mixed_age_old_replanned,
+        mixed_age_old_woken,
+        mixed_age_late_replanned,
+        mixed_age_late_woken,
+        mixed_age_repeated_replans,
+        mixed_age_repeated_wakes,
     })
 }
 
@@ -6671,18 +6486,6 @@ fn exercise_granular_prefix_invalidation_case(
         )
     };
     let mut target = Ticket::register(target_claim.clone(), target_watch, None)?;
-    // WAITING is only meaningful here while another ticket owns the sole
-    // speculative REPLAN token. Keep that owner later in queue order so its
-    // state never enters the target's predecessor prefix.
-    let token_holder_claim = ClaimSet::new(std::iter::empty(), [offset + 30], FlockMode::Exclusive);
-    let token_holder_watch = ClaimSet::new(
-        std::iter::empty(),
-        [offset + 30, offset + 31],
-        FlockMode::Exclusive,
-    );
-    let mut token_holder = (target_state == STATE_WAITING)
-        .then(|| Ticket::register(token_holder_claim.clone(), token_holder_watch.clone(), None))
-        .transpose()?;
 
     let (coordinator_before, target_before) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
@@ -6695,15 +6498,9 @@ fn exercise_granular_prefix_invalidation_case(
         set_cpu_free_for_tests(&mut table, offset + 10, true)?;
         set_cpu_free_for_tests(&mut table, offset + 20, target_state == STATE_GRANTED)?;
         set_cpu_free_for_tests(&mut table, offset + 21, false)?;
-        if let Some(holder) = token_holder.as_ref() {
-            set_cpu_free_for_tests(&mut table, offset + 30, false)?;
-            set_cpu_free_for_tests(&mut table, offset + 31, false)?;
-            table.set_record_state(holder.slot, STATE_REPLAN)?;
-            table.clear_record_blocked(holder.slot)?;
-        }
         table.set_record_state(
             target.slot,
-            if target_state == STATE_REPLAN {
+            if matches!(target_state, STATE_REPLAN | STATE_WAITING) {
                 STATE_REPLAN
             } else {
                 STATE_WAITING
@@ -6712,6 +6509,19 @@ fn exercise_granular_prefix_invalidation_case(
         table.clear_record_blocked(target.slot)?;
         table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible()?;
+        if target_state == STATE_WAITING {
+            // Seed a valid speculative predecessor publication, then model a
+            // completed unchanged callback. REPLAN and WAITING are both
+            // non-fencing, so preserving the cached prefix is exactly the
+            // production fast path exercised by the following mutations.
+            anyhow::ensure!(
+                table
+                    .record(target.slot)?
+                    .is_some_and(|record| record.state == STATE_REPLAN),
+                "granular invalidation WAITING target was not seeded through REPLAN",
+            );
+            table.set_record_state(target.slot, STATE_WAITING)?;
+        }
         let prepared = table
             .record(target.slot)?
             .ok_or_else(|| anyhow::anyhow!("granular invalidation target disappeared"))?;
@@ -6774,22 +6584,6 @@ fn exercise_granular_prefix_invalidation_case(
     let (coordinator_changed, target_changed) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
-        if let Some(holder) = token_holder.as_ref() {
-            // Retire the artificial token without changing the target's
-            // predecessor prefix: the later disjoint owner becomes an exact
-            // grant in a separate authoritative scan.
-            set_cpu_free_for_tests(&mut table, offset + 30, true)?;
-            table.set_record_state(holder.slot, STATE_WAITING)?;
-            table.clear_record_blocked(holder.slot)?;
-            table.set_pending_flag(PENDING_RESCAN);
-            table.grant_compatible()?;
-            anyhow::ensure!(
-                table
-                    .record(holder.slot)?
-                    .is_some_and(|record| record.state == STATE_GRANTED),
-                "granular invalidation token holder did not become an exact grant",
-            );
-        }
         let changing_record = table
             .record(changing.slot)?
             .ok_or_else(|| anyhow::anyhow!("changing predecessor disappeared"))?;
@@ -6828,9 +6622,6 @@ fn exercise_granular_prefix_invalidation_case(
         _ => anyhow::bail!("unsupported granular invalidation target state {target_state}"),
     };
 
-    if let Some(holder) = token_holder.as_mut() {
-        holder.finish(None)?;
-    }
     target.finish(None)?;
     duplicate_b.finish(None)?;
     duplicate_a.finish(None)?;
@@ -7227,10 +7018,8 @@ pub(super) fn exercise_granted_serial_scope_for_tests() -> Result<(bool, bool, b
             .map(|(index, ticket)| {
                 let expected = if index.is_multiple_of(2) {
                     STATE_GRANTED
-                } else if index == 1 {
-                    STATE_REPLAN
                 } else {
-                    STATE_WAITING
+                    STATE_REPLAN
                 };
                 let record = table
                     .record(ticket.slot)?
@@ -10922,14 +10711,6 @@ impl Table {
             admission_open: bool,
         }
 
-        struct ReplanCandidate {
-            slot: u64,
-            ticket: u64,
-            prefix: PrefixWords,
-            issue_serial: u64,
-            external_blocker: Option<ContentionMarker>,
-        }
-
         // The scan publishes a mutually dependent set of prefix caches,
         // grants/revocations, REPLAN cursor state, and wakes. A scanner dying
         // after activating an earlier fence but before revoking a conflicting
@@ -10947,16 +10728,14 @@ impl Table {
         let mut scan_publication_epoch = claim_epoch;
         let coordinator_ticket = self.coordinator_ticket();
         let global_serial = self.global_serial();
-        // REPLAN is a speculative planner token, not a resource claim. Keep
-        // at most one such callback live across the registry. Exact viable
-        // WAITING claims below remain fully work-conserving and are granted
-        // independently of this token.
-        let replan_outstanding = records.iter().any(|record| record.state == STATE_REPLAN);
-        let replan_cursor = read_u64(&self.header, H_REPLAN_CURSOR);
-        let replan_horizon = read_u64(&self.header, H_REPLAN_HORIZON);
+        // REPLAN is a speculative planner callback, not a resource claim.
+        // Publish every eligible callback in the current finite round as one
+        // work-conserving wave. Their exact replacements still return to
+        // WAITING and require a fresh authoritative scan before acquisition,
+        // so this parallelizes planning without weakening queue fences.
         let next_round_horizon = read_u64(&self.header, H_NEXT_TICKET).saturating_sub(1);
-        let mut replan_in_round: Option<ReplanCandidate> = None;
-        let mut earliest_replan: Option<ReplanCandidate> = None;
+        let mut replan_wave_started = false;
+        let mut replan_wake_slots = Vec::new();
         let mut changed = false;
         let mut coordinator_prefix_changed = false;
         let mut backfill_head: Option<BackfillHead> = None;
@@ -11028,14 +10807,8 @@ impl Table {
                     }
                     _ => true,
                 };
-            let in_current_replan_round =
-                record.ticket > replan_cursor && record.ticket <= replan_horizon;
-            let consider_waiting_replan = !replan_outstanding
-                && record.state == STATE_WAITING
-                && record.ticket != coordinator_ticket
-                && flexible
-                && (earliest_replan.is_none()
-                    || (replan_in_round.is_none() && in_current_replan_round));
+            let consider_waiting_replan =
+                record.state == STATE_WAITING && record.ticket != coordinator_ticket && flexible;
             // Existing callback/coordinator publications must compare their
             // complete predecessor prefix. Fence participation can change
             // inside this very scan (for example WAITING -> GRANTED) without
@@ -11175,11 +10948,11 @@ impl Table {
                 && flexible
                 && consider_waiting_replan
             {
-                // The global serial is an O(1) rejection filter. Only walk
-                // this ticket's potentially large alternative watch when a
-                // newer global observation could actually be relevant. Once
-                // one eligible ticket consumes the token, later flexible
-                // waiters skip both the watch walk and callback publication.
+                // The global serial is an O(1) rejection filter. Walk this
+                // ticket's encoded alternative watch only when a newer global
+                // observation could actually be relevant. Every eligible
+                // ticket in this writer-locked active-list snapshot joins the
+                // same parallel publication wave.
                 let waiting_serial = if global_serial > record.issue_serial {
                     self.max_encoded_watch_serial(
                         record.slot,
@@ -11202,27 +10975,29 @@ impl Table {
                     true
                 };
                 if relevant_resource_change || prefix_invalid || !waiting_prefix_matches {
-                    let prefix =
-                        PrefixWords::copy_from(&cpu_any, &cpu_exclusive, &llc_any, &llc_exclusive);
-                    let candidate = ReplanCandidate {
-                        slot: record.slot,
-                        ticket: record.ticket,
-                        prefix,
-                        issue_serial: waiting_serial,
-                        external_blocker: record.external_blocker,
-                    };
-                    if earliest_replan.is_none() {
-                        earliest_replan = Some(ReplanCandidate {
-                            slot: candidate.slot,
-                            ticket: candidate.ticket,
-                            prefix: candidate.prefix.clone(),
-                            issue_serial: candidate.issue_serial,
-                            external_blocker: candidate.external_blocker,
-                        });
+                    if !replan_wave_started {
+                        // Freeze the diagnostic high-water before the first
+                        // callback publication. Dirty repair invalidates all
+                        // flexible waiters after any torn point in this wave.
+                        write_u64(&mut self.header, H_REPLAN_HORIZON, next_round_horizon);
+                        replan_wave_started = true;
                     }
-                    if in_current_replan_round && replan_in_round.is_none() {
-                        replan_in_round = Some(candidate);
-                    }
+                    self.publish_prefix_words(
+                        record.slot,
+                        &cpu_any,
+                        &cpu_exclusive,
+                        &llc_any,
+                        &llc_exclusive,
+                        R_REPLAN_CLAIM_EPOCH,
+                        scan_publication_epoch,
+                        waiting_serial,
+                    )?;
+                    self.set_record_state(record.slot, STATE_REPLAN)?;
+                    self.clear_record_blocked_known(record.slot, record.external_blocker)?;
+                    write_u64(&mut self.header, H_REPLAN_CURSOR, record.ticket);
+                    crash_at_for_tests("replan_state_and_cursor_before_wake");
+                    replan_wake_slots.push(record.slot);
+                    changed = true;
                 }
             } else if record.state == STATE_GRANTED && (prefix_invalid || !published_prefix_matches)
             {
@@ -11303,41 +11078,16 @@ impl Table {
                 changed = true;
             }
         }
-        if !replan_outstanding
-            && let Some((candidate, publish_horizon)) = replan_in_round
-                .map(|candidate| (candidate, replan_horizon))
-                .or_else(|| earliest_replan.map(|candidate| (candidate, next_round_horizon)))
-        {
-            // Cursor, callback publication, state, and wake are one
-            // crash-recoverable unit. Dirty repair demotes a torn publication
-            // to invalidated WAITING, after which the cursor simply resumes
-            // at the next live ticket (or wraps if its owner was removed).
-            anyhow::ensure!(
-                self.record_identity_is(candidate.slot, candidate.ticket, STATE_WAITING)?,
-                "REPLAN candidate ticket {} changed during its scan",
-                candidate.ticket,
-            );
-            self.publish_prefix_words(
-                candidate.slot,
-                &candidate.prefix.cpu_any,
-                &candidate.prefix.cpu_exclusive,
-                &candidate.prefix.llc_any,
-                &candidate.prefix.llc_exclusive,
-                R_REPLAN_CLAIM_EPOCH,
-                scan_publication_epoch,
-                candidate.issue_serial,
-            )?;
-            self.set_record_state(candidate.slot, STATE_REPLAN)?;
-            self.clear_record_blocked_known(candidate.slot, candidate.external_blocker)?;
-            // Publish the new round high-water first. If the process dies
-            // before the cursor store, dirty repair sees a conservative older
-            // cursor under the new finite horizon. The complete transaction
-            // then advances both with the callback state and wake.
-            write_u64(&mut self.header, H_REPLAN_HORIZON, publish_horizon);
-            write_u64(&mut self.header, H_REPLAN_CURSOR, candidate.ticket);
-            crash_at_for_tests("replan_state_and_cursor_before_wake");
-            self.wake_slot(candidate.slot)?;
-            changed = true;
+        // Publish the complete wave before making its workers runnable. This
+        // keeps awakened planners from convoying on the writer while it is
+        // still copying later prefixes. A crash anywhere before the clean
+        // marker leaves the transaction dirty; repair demotes the entire
+        // ambiguously delivered wave before any completion can commit.
+        if replan_wave_started {
+            crash_at_for_tests("replan_wave_published_before_wake");
+        }
+        for slot in replan_wake_slots {
+            self.wake_slot(slot)?;
         }
         if changed {
             self.bump_generation()?;
@@ -12985,7 +12735,7 @@ impl Table {
                 // Recovery cannot prove which speculative callbacks reached
                 // user code before the interrupted transaction. Rebuild all
                 // flexible tickets as ordinary waiters and let the pending
-                // authoritative scan issue exactly one fresh REPLAN token.
+                // authoritative scan publish one fresh finite REPLAN wave.
                 self.invalidate_record_prefix(record.slot)?;
             }
             if state != STATE_COORDINATOR_STANDBY {
