@@ -2282,17 +2282,33 @@ pub(crate) fn exercise_coordinator_payload_notify_order_for_tests()
     })
 }
 
-/// A stale physical attempt is temporary: retain the private preparation
-/// token across its forced fresh planner turn, then release it when the
-/// coordinator exits without committing exact HELD ownership.
 #[cfg(test)]
-pub(crate) fn exercise_stale_coordinator_preparation_retention_for_tests()
--> Result<(bool, bool, bool)> {
-    let token = 205usize;
+pub(crate) struct StaleCoordinatorPreparationCase {
+    pub(crate) token_retained_on_retry: bool,
+    pub(crate) attempt_released_on_retry: bool,
+    pub(crate) aborted: bool,
+    pub(crate) token_released_on_exit: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct StaleCoordinatorPreparationOutcome {
+    pub(crate) complete: StaleCoordinatorPreparationCase,
+    pub(crate) prepare: StaleCoordinatorPreparationCase,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum StaleCoordinatorAttempt {
+    Complete,
+    Prepare,
+}
+
+#[cfg(test)]
+fn token_only_preparation_for_tests(token: usize) -> Result<super::PreparationPermit> {
     let path = super::permit_lock_path(token);
     let token_fd = crate::flock::try_flock(&path, FlockMode::Exclusive)?
         .ok_or_else(|| anyhow::anyhow!("coordinator retention test token {token} is busy"))?;
-    let preparation = super::PreparationPermit {
+    Ok(super::PreparationPermit {
         index: token,
         token_permit: token,
         cpu_permits: Vec::new(),
@@ -2302,36 +2318,101 @@ pub(crate) fn exercise_stale_coordinator_preparation_retention_for_tests()
         affinity_cpu: 0,
         original_affinity: Vec::new(),
         affinity_constrained: false,
+    })
+}
+
+#[cfg(test)]
+fn exercise_stale_coordinator_preparation_case(
+    retained_token: usize,
+    claim_cpu: usize,
+    attempt_token: usize,
+    attempt: StaleCoordinatorAttempt,
+) -> Result<StaleCoordinatorPreparationCase> {
+    let retained_path = super::permit_lock_path(retained_token);
+    let attempt_path = super::permit_lock_path(attempt_token);
+    let retained_preparation = token_only_preparation_for_tests(retained_token)?;
+    let mut attempt_preparation = match attempt {
+        StaleCoordinatorAttempt::Complete => None,
+        StaleCoordinatorAttempt::Prepare => {
+            Some(Box::new(token_only_preparation_for_tests(attempt_token)?))
+        }
     };
-    let claim = ClaimSet::new(std::iter::empty(), [206usize], FlockMode::Exclusive);
+    let claim = ClaimSet::new(std::iter::empty(), [claim_cpu], FlockMode::Exclusive);
     let ticket = registry::Ticket::register(claim.clone(), claim.clone(), None)?;
     let coordinator = Box::new(CoordinatorTicket {
         ticket,
-        preparation: Some(preparation),
+        preparation: Some(retained_preparation),
         preparation_watch: None,
     });
     let mut steps = 0usize;
     let mut token_retained_on_retry = false;
+    let mut attempt_released_on_retry = matches!(attempt, StaleCoordinatorAttempt::Complete);
     let outcome = acquire_as_coordinator(coordinator, |held| {
         steps += 1;
         if steps == 1 {
             registry::invalidate_coordinator_commit_token_for_tests()?;
-            return Ok(CoordinatorStep::Complete {
-                claim: claim.clone(),
-                value: (),
+            return Ok(match attempt {
+                StaleCoordinatorAttempt::Complete => CoordinatorStep::Complete {
+                    claim: claim.clone(),
+                    value: (),
+                },
+                StaleCoordinatorAttempt::Prepare => {
+                    let preparation = attempt_preparation
+                        .take()
+                        .expect("stale Prepare payload was already consumed");
+                    CoordinatorStep::Prepare {
+                        final_claim: claim.clone(),
+                        preparation_claim: preparation.claim(),
+                        preparation,
+                    }
+                }
             });
         }
         let reusable = held.clone_reusable_permits()?;
-        token_retained_on_retry = reusable.len() == 1 && reusable[0].0 == token;
+        token_retained_on_retry =
+            reusable.len() == 1 && reusable[0].0 == retained_token;
+        if matches!(attempt, StaleCoordinatorAttempt::Prepare) {
+            let released = crate::flock::try_flock(&attempt_path, FlockMode::Exclusive)?;
+            attempt_released_on_retry = released.is_some();
+            drop(released);
+        }
         Ok(CoordinatorStep::Abort {
             reason: "stale preparation retention observed".to_owned(),
         })
     })?;
     let aborted = matches!(outcome, CoordinatorOutcome::Aborted { .. });
-    let released = crate::flock::try_flock(&path, FlockMode::Exclusive)?;
+    let released = crate::flock::try_flock(&retained_path, FlockMode::Exclusive)?;
     let token_released_on_exit = released.is_some();
     drop(released);
-    Ok((token_retained_on_retry, aborted, token_released_on_exit))
+    Ok(StaleCoordinatorPreparationCase {
+        token_retained_on_retry,
+        attempt_released_on_retry,
+        aborted,
+        token_released_on_exit,
+    })
+}
+
+/// A stale physical attempt is temporary: retain the private preparation
+/// token across its forced fresh planner turn, drop only attempt-local payloads,
+/// then release the token when the coordinator exits without committing exact
+/// HELD ownership. Exercise both exact Complete and new Prepare attempts.
+#[cfg(test)]
+pub(crate) fn exercise_stale_coordinator_preparation_retention_for_tests()
+-> Result<StaleCoordinatorPreparationOutcome> {
+    Ok(StaleCoordinatorPreparationOutcome {
+        complete: exercise_stale_coordinator_preparation_case(
+            205,
+            206,
+            207,
+            StaleCoordinatorAttempt::Complete,
+        )?,
+        prepare: exercise_stale_coordinator_preparation_case(
+            208,
+            209,
+            210,
+            StaleCoordinatorAttempt::Prepare,
+        )?,
+    })
 }
 
 #[cfg(test)]
@@ -3519,12 +3600,14 @@ fn acquire_as_coordinator_impl<T>(
                         Ok(registry::FinishAcquireResult::Stale) => {
                             // An earlier callback changed its reservation after
                             // this planner snapshot. Drop the stale physical fd
-                            // set, retain the coordinator ticket, and force one
-                            // fresh planner turn after the pending prefix scan.
+                            // set, retain the coordinator ticket and its private
+                            // preparation token, and force one fresh planner turn
+                            // after the pending prefix scan. The token continues
+                            // to bound this resident prepared process until exact
+                            // HELD publication or terminal coordinator teardown.
                             drop(value);
                             drop(contention);
                             drop(preparation_contention);
-                            drop(held.preparation.take());
                             coordinator.ticket.notify_after_coordinator_payload_drop();
                             first = false;
                             force_step = true;
@@ -3576,10 +3659,13 @@ fn acquire_as_coordinator_impl<T>(
                             break CoordinatorOutcome::Prepared(Box::new(pending));
                         }
                         Ok(registry::FinishPreparationResult::Stale) => {
+                            // The new preparation attempt is stale, but the
+                            // private token inherited from exact activation
+                            // still bounds this resident prepared process across
+                            // the forced fresh planner turn.
                             drop(preparation);
                             drop(contention);
                             drop(preparation_contention);
-                            drop(held.preparation.take());
                             coordinator.ticket.notify_after_coordinator_payload_drop();
                             first = false;
                             force_step = true;

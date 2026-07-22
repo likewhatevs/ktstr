@@ -4986,18 +4986,29 @@ fn coordinator_rejections_notify_after_complete_and_prepare_payloads_drop() {
 #[test]
 fn stale_coordinator_retry_retains_preparation_token_until_terminal_exit() {
     let _prefixes = LockPrefixesGuard::new();
-    let (retained_on_retry, aborted, released_on_exit) =
-        protocol::exercise_stale_coordinator_preparation_retention_for_tests()
-            .expect("exercise stale coordinator preparation-token retention");
-    assert!(
-        retained_on_retry,
-        "a stale exact attempt must retain the prepared-process token for its forced fresh planner turn",
-    );
-    assert!(aborted, "the retention fixture must terminate through Abort");
-    assert!(
-        released_on_exit,
-        "terminal coordinator exit must release the retained preparation token",
-    );
+    let outcome = protocol::exercise_stale_coordinator_preparation_retention_for_tests()
+        .expect("exercise stale coordinator preparation-token retention");
+    for (label, case) in [
+        ("Complete", outcome.complete),
+        ("Prepare", outcome.prepare),
+    ] {
+        assert!(
+            case.token_retained_on_retry,
+            "a stale {label} attempt must retain the prepared-process token for its forced fresh planner turn",
+        );
+        assert!(
+            case.attempt_released_on_retry,
+            "a stale {label} attempt must release only its attempt-local payload before retry",
+        );
+        assert!(
+            case.aborted,
+            "the stale {label} retention fixture must terminate through Abort",
+        );
+        assert!(
+            case.token_released_on_exit,
+            "terminal coordinator exit after stale {label} must release the retained preparation token",
+        );
+    }
 }
 
 #[test]
