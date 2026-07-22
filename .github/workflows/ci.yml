@@ -38,6 +38,7 @@ jobs:
   # overrides RUSTFLAGS for the linker (see below).
   lint:
     runs-on: [ktstr-x64]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
@@ -49,6 +50,7 @@ jobs:
 
   compile-fail:
     runs-on: [ktstr-x64]
+    timeout-minutes: 30
     # Match the self-hosted test jobs' linker (clang + mold) — the
     # default linker is untested on these runners, and compile-fail
     # links the full test harness. This overrides .cargo/config.toml's
@@ -66,7 +68,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.138
       - run: just compile-fail
       # ktstr-macros host unit tests — host-side + needs cargo-nextest
       # (installed above), so they ride the compile-fail job rather than
@@ -94,6 +96,7 @@ jobs:
   # — the verify script does NOT run tests, only the prod-side build).
   devdep-isolation:
     runs-on: [ktstr-x64]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
@@ -106,6 +109,7 @@ jobs:
 
   docs-link-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: ./.github/actions/setup
@@ -116,6 +120,7 @@ jobs:
 
   test-x64:
     runs-on: [ktstr-x64]
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -134,7 +139,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.138
       - name: Run ktstr tests
         shell: bash
         run: |
@@ -177,6 +182,7 @@ jobs:
 
   test-arm64:
     runs-on: [ktstr-arm64]
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -196,7 +202,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.138
       - name: Run ktstr tests
         shell: bash
         run: |
@@ -247,6 +253,7 @@ jobs:
   # arches' metadata regardless of the host arch (metadata-only), so a
   # single runner already spans x86_64 + aarch64.
   distro-resolve:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -261,7 +268,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.138
       - run: just test-distro-resolve
 
   # Full acquire+boot e2e (Layer 2): `kernel build --kernel <spec>` then
@@ -276,6 +283,7 @@ jobs:
   # zero network. SteamOS is x86_64-only (Valve ships no other arch).
   distro-boot-x64:
     runs-on: [ktstr-x64]
+    timeout-minutes: 90
     env:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
@@ -287,7 +295,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.138
       # Build the kernel the hermetic local-package boot repacks.
       - run: just kernel-build 6.14
       - run: just distro-boot fedora 'fc[0-9]'
@@ -299,6 +307,7 @@ jobs:
 
   distro-boot-arm64:
     runs-on: [ktstr-arm64]
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: "32"
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
@@ -311,7 +320,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.138
       - run: just kernel-build 6.14
       - run: just distro-boot fedora 'fc[0-9]'
       - run: just distro-boot ubuntu generic
@@ -320,6 +329,7 @@ jobs:
 
   coverage-x64:
     runs-on: [ktstr-x64]
+    timeout-minutes: 90
     env:
       KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
       KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-coverage-x64
@@ -333,7 +343,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-llvm-cov,cargo-nextest
+          tool: cargo-llvm-cov,cargo-nextest@0.9.138
       - name: Run ktstr coverage
         shell: bash
         run: |
@@ -374,6 +384,7 @@ jobs:
 
   coverage-arm64:
     runs-on: [ktstr-arm64]
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: "32"
       KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
@@ -388,7 +399,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-llvm-cov,cargo-nextest
+          tool: cargo-llvm-cov,cargo-nextest@0.9.138
       - name: Run ktstr coverage
         shell: bash
         run: |
