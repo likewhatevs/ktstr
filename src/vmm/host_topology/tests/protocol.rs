@@ -4372,42 +4372,46 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
         "callback admission must remain independent of active queue depth",
     );
     assert!(
-        !outcome.mixed_age_old_replanned
-            && !outcome.mixed_age_old_woken
-            && !outcome.mixed_age_late_replanned
-            && !outcome.mixed_age_late_woken,
-        "a live finite wave must leave both an older returned callback and a later arrival for the next speculative wave",
+        outcome.mixed_age_old_replanned
+            && outcome.mixed_age_old_woken
+            && outcome.mixed_age_late_replanned
+            && outcome.mixed_age_late_woken,
+        "a relevant scan must publish and wake both a returned old callback and a post-horizon arrival while the finite wave remains live",
+    );
+    assert_eq!(
+        outcome.mixed_age_stragglers_remaining,
+        expected_replans - 1,
+        "incremental publication must not wait for the original callbacks to drain",
+    );
+    assert_eq!(
+        outcome.mixed_age_outstanding,
+        expected_replans + 1,
+        "one returned callback plus one late arrival must join the surviving original wave",
+    );
+    assert!(
+        outcome.mixed_age_horizon_extended && outcome.mixed_age_deadline_preserved,
+        "incremental publication must extend the diagnostic ticket horizon without extending the original lease deadline",
     );
     assert_eq!(
         (
             outcome.mixed_age_repeated_replans,
             outcome.mixed_age_repeated_wakes,
+            outcome.mixed_age_repeated_outstanding,
         ),
-        (0, 0),
-        "repeated scans must not extend or wake a live finite wave",
+        (2, 0, expected_replans + 1),
+        "a repeated scan must preserve the extended wave without duplicate publications or wakes",
     );
     assert!(
-        outcome.next_wave_edge_published,
-        "all original callback completions must coalesce one pending next-wave rescan without running it",
-    );
-    assert_eq!(
-        outcome.next_wave_scan_delta, 1,
-        "one authoritative scan must consume the completed finite-wave edge",
-    );
-    assert!(
-        outcome.next_wave_old_replanned
-            && outcome.next_wave_old_woken
-            && outcome.next_wave_late_replanned
-            && outcome.next_wave_late_woken,
-        "the next wave must publish and wake both the older returned callback and post-horizon arrival exactly once",
+        outcome.mixed_age_callbacks_drained && outcome.mixed_age_clock_cleared,
+        "completing the original stragglers and both incremental callbacks must drain the exact count and clear the shared lease clock",
     );
     assert_eq!(
         (
-            outcome.next_wave_repeated_replans,
-            outcome.next_wave_repeated_wakes,
+            outcome.mixed_age_post_drain_replans,
+            outcome.mixed_age_post_drain_wakes,
         ),
-        (2, 0),
-        "a repeated scan must preserve both next-wave callbacks without duplicate wakes",
+        (0, 0),
+        "the completion edge must not republish or wake drained callbacks without a fresh relevant change",
     );
 }
 
@@ -4548,6 +4552,12 @@ fn expired_replan_wave_quarantines_stragglers_without_blocking_completed_work() 
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_replan_wave_expiry_for_tests()
         .expect("exercise bounded speculative callback wave");
+    assert!(
+        outcome.incremental_late_published
+            && outcome.incremental_horizon_extended
+            && outcome.incremental_deadline_preserved,
+        "a post-horizon flexible waiter must join the live wave without renewing its original deadline",
+    );
     assert!(
         outcome.ordinary_wave_not_expired_early,
         "an ordinary finite wave must retain every callback until its exact deadline",

@@ -1067,9 +1067,7 @@ pub(super) fn exercise_held_teardown_notify_count_for_tests() -> Result<u64> {
     let held = publish_acquired(&claim)?;
     let before = NOTIFY_CALLS.with(std::cell::Cell::get);
     drop(held);
-    Ok(NOTIFY_CALLS
-        .with(std::cell::Cell::get)
-        .wrapping_sub(before))
+    Ok(NOTIFY_CALLS.with(std::cell::Cell::get).wrapping_sub(before))
 }
 
 #[cfg(test)]
@@ -6606,14 +6604,15 @@ pub(crate) struct ReplanTokenWaveOutcome {
     pub(crate) mixed_age_late_woken: bool,
     pub(crate) mixed_age_repeated_replans: usize,
     pub(crate) mixed_age_repeated_wakes: usize,
-    pub(crate) next_wave_edge_published: bool,
-    pub(crate) next_wave_scan_delta: u64,
-    pub(crate) next_wave_old_replanned: bool,
-    pub(crate) next_wave_old_woken: bool,
-    pub(crate) next_wave_late_replanned: bool,
-    pub(crate) next_wave_late_woken: bool,
-    pub(crate) next_wave_repeated_replans: usize,
-    pub(crate) next_wave_repeated_wakes: usize,
+    pub(crate) mixed_age_stragglers_remaining: usize,
+    pub(crate) mixed_age_outstanding: usize,
+    pub(crate) mixed_age_horizon_extended: bool,
+    pub(crate) mixed_age_deadline_preserved: bool,
+    pub(crate) mixed_age_repeated_outstanding: usize,
+    pub(crate) mixed_age_callbacks_drained: bool,
+    pub(crate) mixed_age_clock_cleared: bool,
+    pub(crate) mixed_age_post_drain_replans: usize,
+    pub(crate) mixed_age_post_drain_wakes: usize,
 }
 
 #[cfg(test)]
@@ -6669,6 +6668,9 @@ pub(crate) struct CoordinatorPendingReplanOutcome {
 
 #[cfg(test)]
 pub(crate) struct ReplanWaveExpiryOutcome {
+    pub(crate) incremental_late_published: bool,
+    pub(crate) incremental_horizon_extended: bool,
+    pub(crate) incremental_deadline_preserved: bool,
     pub(crate) ordinary_wave_not_expired_early: bool,
     pub(crate) completed_replacement_preserved: bool,
     pub(crate) stragglers_quarantined: bool,
@@ -7342,9 +7344,10 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         GRANT_PREFIX_RECORD_READS.with(std::cell::Cell::get) - prefix_reads_before;
 
     // The completed callback is older than the newly registered flexible
-    // ticket. While the finite publication wave still has live callbacks,
-    // neither may join another speculative wave. Ordinary authoritative scans
-    // remain free to grant either ticket if its exact claim becomes viable.
+    // ticket. A subsequent relevant observation must publish both immediately
+    // even while the original finite wave retains live stragglers. Extending
+    // that wave moves only its diagnostic ticket horizon; every callback still
+    // shares the original bounded lease deadline.
     let late_cpu = fixed_cpu + 1;
     {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
@@ -7357,12 +7360,16 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         [late_cpu, common_cpu],
         FlockMode::Exclusive,
     );
-    let mut late = Ticket::register(late_claim, late_watch, None)?;
+    let mut late = Ticket::register(late_claim.clone(), late_watch, None)?;
     let (
         mixed_age_old_replanned,
         mixed_age_old_woken,
         mixed_age_late_replanned,
         mixed_age_late_woken,
+        mixed_age_stragglers_remaining,
+        mixed_age_outstanding,
+        mixed_age_horizon_extended,
+        mixed_age_deadline_preserved,
     ) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
@@ -7373,6 +7380,8 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         anyhow::ensure!(old.ticket < late.ticket, "late ticket was not post-horizon");
         let old_wake_before = record_wake(&mut table, old.slot)?;
         let late_wake_before = record_wake(&mut table, late.slot)?;
+        let horizon_before = read_u64(&table.header, H_REPLAN_HORIZON);
+        let deadline_before = table.replan_wave_deadline_ns();
         table.stamp_resource_improvement(S_CPU_EX, common_cpu)?;
         table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible()?;
@@ -7382,15 +7391,33 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         let mixed_age_late_replanned = table
             .record(late.slot)?
             .is_some_and(|record| record.state == STATE_REPLAN);
+        let mixed_age_stragglers_remaining = initial_replan_indices
+            .iter()
+            .copied()
+            .filter(|index| *index != callback_index)
+            .filter(|index| {
+                waiters[*index]
+                    .0
+                    .as_ref()
+                    .and_then(|ticket| table.record(ticket.slot).ok().flatten())
+                    .is_some_and(|record| record.state == STATE_REPLAN)
+            })
+            .count();
         (
             mixed_age_old_replanned,
             record_wake(&mut table, old.slot)? != old_wake_before,
             mixed_age_late_replanned,
             record_wake(&mut table, late.slot)? != late_wake_before,
+            mixed_age_stragglers_remaining,
+            usize::try_from(table.replan_outstanding())
+                .context("mixed-age REPLAN count does not fit usize")?,
+            horizon_before < late.ticket
+                && read_u64(&table.header, H_REPLAN_HORIZON) >= late.ticket,
+            deadline_before != 0 && table.replan_wave_deadline_ns() == deadline_before,
         )
     };
 
-    let (mixed_age_repeated_replans, mixed_age_repeated_wakes) = {
+    let (mixed_age_repeated_replans, mixed_age_repeated_wakes, mixed_age_repeated_outstanding) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         let old = waiters[callback_index]
@@ -7412,26 +7439,19 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         );
         let repeated_wakes = usize::from(record_wake(&mut table, old.slot)? != old_wake_before)
             + usize::from(record_wake(&mut table, late.slot)? != late_wake_before);
-        (repeated_replans, repeated_wakes)
-    };
-
-    // Return every remaining callback from the finite first wave. Every
-    // completion coalesces the same rescan edge; after the wave drains, one
-    // scan may publish the next speculative wave for both the older returned
-    // callback and the post-horizon arrival deferred above.
-    let (next_wave_scans_before, next_wave_old_wake_before, next_wave_late_wake_before) = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        let old = waiters[callback_index]
-            .0
-            .as_ref()
-            .expect("old next-wave callback remains live");
         (
-            read_u64(&table.header, H_GRANT_SCANS),
-            record_wake(&mut table, old.slot)?,
-            record_wake(&mut table, late.slot)?,
+            repeated_replans,
+            repeated_wakes,
+            usize::try_from(table.replan_outstanding())
+                .context("repeated mixed-age REPLAN count does not fit usize")?,
         )
     };
+
+    // Complete the original stragglers, followed by the two callbacks which
+    // joined incrementally. Entry snapshots consume every observation already
+    // published before they returned; draining the wave therefore clears its
+    // clock, and the coalesced post-completion scan has no reason to republish
+    // either callback without a fresh input change.
     for index in initial_replan_indices
         .iter()
         .copied()
@@ -7463,51 +7483,67 @@ pub(super) fn exercise_replan_token_wave_for_tests(
             "remaining first-wave callback did not return to WAITING",
         );
     }
-    let next_wave_edge_published = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let table = Table::open_existing()?;
-        table.replan_outstanding() == 0
-            && table.pending_flags() & PENDING_RESCAN != 0
-            && read_u64(&table.header, H_GRANT_SCANS) == next_wave_scans_before
-    };
+    let old_result = waiters[callback_index]
+        .0
+        .as_mut()
+        .expect("incrementally republished old callback remains live")
+        .run_granted(
+            None,
+            |current, _watch, acquisition_allowed, _predecessors, _availability| {
+                anyhow::ensure!(
+                    !acquisition_allowed && current == &callback_claim,
+                    "incrementally republished old callback received the wrong publication",
+                );
+                Ok(GrantAttempt::<()> {
+                    acquired: None,
+                    preparation_claim: None,
+                    preparation_contention: None,
+                    next_claim: current.clone(),
+                    contention: None,
+                })
+            },
+        )?;
+    anyhow::ensure!(
+        matches!(old_result, GrantResult::Requeued),
+        "incrementally republished old callback did not return to WAITING",
+    );
+    let late_result = late.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &late_claim,
+                "incrementally published late callback received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: current.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    anyhow::ensure!(
+        matches!(late_result, GrantResult::Requeued),
+        "incrementally published late callback did not return to WAITING",
+    );
+
     let (
-        next_wave_scan_delta,
-        next_wave_old_replanned,
-        next_wave_old_woken,
-        next_wave_late_replanned,
-        next_wave_late_woken,
+        mixed_age_callbacks_drained,
+        mixed_age_clock_cleared,
+        mixed_age_post_drain_replans,
+        mixed_age_post_drain_wakes,
     ) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
-        table.grant_compatible()?;
         let old = waiters[callback_index]
             .0
             .as_ref()
-            .expect("old next-wave callback remains live");
-        (
-            read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(next_wave_scans_before),
-            table
-                .record(old.slot)?
-                .is_some_and(|record| record.state == STATE_REPLAN),
-            record_wake(&mut table, old.slot)? != next_wave_old_wake_before,
-            table
-                .record(late.slot)?
-                .is_some_and(|record| record.state == STATE_REPLAN),
-            record_wake(&mut table, late.slot)? != next_wave_late_wake_before,
-        )
-    };
-    let (next_wave_repeated_replans, next_wave_repeated_wakes) = {
-        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
-        let mut table = Table::open_existing()?;
-        let old = waiters[callback_index]
-            .0
-            .as_ref()
-            .expect("old next-wave callback remains live");
+            .expect("drained old mixed-age callback remains live");
         let old_wake_before = record_wake(&mut table, old.slot)?;
         let late_wake_before = record_wake(&mut table, late.slot)?;
-        table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible()?;
-        let repeated_replans = usize::from(
+        let post_drain_replans = usize::from(
             table
                 .record(old.slot)?
                 .is_some_and(|record| record.state == STATE_REPLAN),
@@ -7516,9 +7552,14 @@ pub(super) fn exercise_replan_token_wave_for_tests(
                 .record(late.slot)?
                 .is_some_and(|record| record.state == STATE_REPLAN),
         );
-        let repeated_wakes = usize::from(record_wake(&mut table, old.slot)? != old_wake_before)
+        let post_drain_wakes = usize::from(record_wake(&mut table, old.slot)? != old_wake_before)
             + usize::from(record_wake(&mut table, late.slot)? != late_wake_before);
-        (repeated_replans, repeated_wakes)
+        (
+            table.replan_outstanding() == 0,
+            table.replan_wave_started_ns() == 0 && table.replan_wave_deadline_ns() == 0,
+            post_drain_replans,
+            post_drain_wakes,
+        )
     };
 
     late.finish(None)?;
@@ -7554,14 +7595,15 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         mixed_age_late_woken,
         mixed_age_repeated_replans,
         mixed_age_repeated_wakes,
-        next_wave_edge_published,
-        next_wave_scan_delta,
-        next_wave_old_replanned,
-        next_wave_old_woken,
-        next_wave_late_replanned,
-        next_wave_late_woken,
-        next_wave_repeated_replans,
-        next_wave_repeated_wakes,
+        mixed_age_stragglers_remaining,
+        mixed_age_outstanding,
+        mixed_age_horizon_extended,
+        mixed_age_deadline_preserved,
+        mixed_age_repeated_outstanding,
+        mixed_age_callbacks_drained,
+        mixed_age_clock_cleared,
+        mixed_age_post_drain_replans,
+        mixed_age_post_drain_wakes,
     })
 }
 
@@ -8283,6 +8325,43 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
         "completed expiry callback did not return to WAITING",
     );
 
+    // Join one post-horizon waiter to the still-live wave. The extension must
+    // share the original deadline: continuous arrivals may increase useful
+    // planner parallelism, but cannot renew a stuck callback's lease.
+    let incremental_designated_cpu = 1_307usize;
+    let incremental_alternative_cpu = 1_308usize;
+    let incremental_designated = ClaimSet::new(
+        std::iter::empty(),
+        [incremental_designated_cpu],
+        FlockMode::Exclusive,
+    );
+    let incremental_watch = ClaimSet::new(
+        std::iter::empty(),
+        [incremental_designated_cpu, incremental_alternative_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut incremental_late = Ticket::register(incremental_designated, incremental_watch, None)?;
+    let (incremental_late_published, incremental_horizon_extended, incremental_deadline_preserved) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, incremental_designated_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, incremental_alternative_cpu, false)?;
+        let horizon_before = read_u64(&table.header, H_REPLAN_HORIZON);
+        table.stamp_resource_improvement(S_CPU_EX, incremental_alternative_cpu)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(wave_started_ns.saturating_add(1))?;
+        (
+            table.replan_outstanding() == 3
+                && table
+                    .record(incremental_late.slot)?
+                    .is_some_and(|record| record.state == STATE_REPLAN),
+            horizon_before < incremental_late.ticket
+                && read_u64(&table.header, H_REPLAN_HORIZON) >= incremental_late.ticket,
+            table.replan_wave_started_ns() == wave_started_ns
+                && table.replan_wave_deadline_ns() == wave_deadline_ns,
+        )
+    };
+
     let mut ordinary_wave_not_expired_early = false;
     let mut completed_replacement_preserved = false;
     let mut stragglers_quarantined = false;
@@ -8294,7 +8373,7 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
     let completed_slot = callbacks[0].0.slot;
     let late_slot = callbacks[1].0.slot;
     let entry_slot = callbacks[2].0.slot;
-    let straggler_slots = [late_slot, entry_slot];
+    let straggler_slots = [late_slot, entry_slot, incremental_late.slot];
     let completed_replacement_for_check = callbacks[0].2.clone();
     let late_designated = callbacks[1].1.clone();
     let late_replacement = callbacks[1].2.clone();
@@ -8311,7 +8390,7 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
             let expired_early =
                 table.expire_replan_wave_if_due_at(wave_deadline_ns.saturating_sub(1))?;
             ordinary_wave_not_expired_early = !expired_early
-                && table.replan_outstanding() == 2
+                && table.replan_outstanding() == 3
                 && straggler_slots.iter().all(|slot| {
                     table
                         .record(*slot)
@@ -8412,11 +8491,15 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
         )
     };
 
+    incremental_late.finish(None)?;
     for (ticket, _, _) in callbacks.iter_mut().rev() {
         ticket.finish(None)?;
     }
     coordinator.finish(None)?;
     Ok(ReplanWaveExpiryOutcome {
+        incremental_late_published,
+        incremental_horizon_extended,
+        incremental_deadline_preserved,
         ordinary_wave_not_expired_early,
         completed_replacement_preserved,
         stragglers_quarantined,
@@ -13781,8 +13864,7 @@ impl Table {
                         // lease: its original deadline bounds both an old
                         // straggler and all incrementally published work.
                         let horizon = if replan_lease_active {
-                            read_u64(&self.header, H_REPLAN_HORIZON)
-                                .max(next_round_horizon)
+                            read_u64(&self.header, H_REPLAN_HORIZON).max(next_round_horizon)
                         } else {
                             next_round_horizon
                         };
