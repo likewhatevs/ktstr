@@ -3165,6 +3165,13 @@ impl Ticket {
     }
 
     #[cfg(test)]
+    fn state_without_recovery_for_tests(&self) -> Result<State> {
+        self.state_shared(false, None)?.ok_or_else(|| {
+            anyhow::anyhow!("test state observation unexpectedly needed repair or acknowledgement")
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn state_or_wait_for_tests(&self) -> Result<()> {
         self.state_or_wait(Duration::ZERO, None).map(|_| ())
     }
@@ -5459,8 +5466,12 @@ pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConser
     let (initial_grants, initial_waiters, disjoint_grants, backfill_started_ns) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
-        table.set_record_state(coordinator.slot, STATE_COORDINATOR)?;
-        table.set_record_state(wide_ticket.slot, STATE_WAITING)?;
+        table.restage_coordinator_for_tests(
+            &coordinator,
+            std::iter::once(&wide_ticket)
+                .chain(conflicting.iter())
+                .chain(disjoint.iter()),
+        )?;
         table.set_record_backfill_capacity(wide_ticket.slot, TEST_CAPACITY)?;
         let scan_now_ns = monotonic_now_ns()?.max(1);
         let stale_future_ns = scan_now_ns
@@ -5468,11 +5479,6 @@ pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConser
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| anyhow::anyhow!("synthetic future backfill epoch overflow"))?;
         table.set_record_backfill_started_ns(wide_ticket.slot, stale_future_ns)?;
-        table.clear_record_blocked(wide_ticket.slot)?;
-        for ticket in conflicting.iter().chain(&disjoint) {
-            table.set_record_state(ticket.slot, STATE_WAITING)?;
-            table.clear_record_blocked(ticket.slot)?;
-        }
         set_cpu_free_for_tests(&mut table, 0, true)?;
         set_cpu_free_for_tests(&mut table, 1, false)?;
         set_cpu_free_for_tests(&mut table, 2, true)?;
@@ -6126,17 +6132,10 @@ pub(super) fn exercise_coordinator_turnover_for_tests(
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
-        for (index, ticket) in tickets.iter().enumerate() {
-            table.set_record_state(
-                ticket.slot,
-                if index == 0 {
-                    STATE_COORDINATOR
-                } else {
-                    STATE_WAITING
-                },
-            )?;
-            table.clear_record_blocked(ticket.slot)?;
-        }
+        let (coordinator, waiters) = tickets
+            .split_first()
+            .ok_or_else(|| anyhow::anyhow!("coordinator-turnover ticket list disappeared"))?;
+        table.restage_coordinator_for_tests(coordinator, waiters)?;
         for (cpu, available) in [(1usize, false), (2usize, true)] {
             set_cpu_free_for_tests(&mut table, cpu, available)?;
         }
@@ -6218,6 +6217,10 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
+        table.restage_coordinator_for_tests(
+            &coordinator,
+            waiters.iter().map(|(ticket, _)| ticket),
+        )?;
         let claim_epoch = table.claim_epoch();
         let prefix_bits = table.layout.bits;
         set_cpu_free_for_tests(&mut table, 0, false)?;
@@ -7166,6 +7169,12 @@ pub(super) fn exercise_replan_token_wave_for_tests(
     ) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
+        table.restage_coordinator_for_tests(
+            &coordinator,
+            waiters
+                .iter()
+                .map(|(ticket, _)| ticket.as_ref().expect("live REPLAN wave ticket")),
+        )?;
         let registration_waiting = waiters.iter().all(|(ticket, _)| {
             ticket.as_ref().is_some_and(|ticket| {
                 table
@@ -7713,6 +7722,10 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
     let (scans_before, generation_wake_before) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
+        table.restage_coordinator_for_tests(
+            &coordinator,
+            callbacks.iter().map(|(ticket, _, _)| ticket),
+        )?;
         set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
         for index in 0..callback_count {
             set_cpu_free_for_tests(&mut table, designated_base + index, false)?;
@@ -9959,7 +9972,7 @@ pub(super) fn exercise_one_shot_replacement_for_tests()
         let mut table = Table::open_existing()?;
         table.grant_compatible()?;
     }
-    if waiter.state(None)? != State::Replan {
+    if waiter.state_without_recovery_for_tests()? != State::Replan {
         anyhow::bail!("one-shot replacement waiter did not receive the REPLAN token");
     }
 
@@ -10020,7 +10033,7 @@ pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, boo
         let mut table = Table::open_existing()?;
         table.grant_compatible()?;
     }
-    if waiter.state(None)? != State::Replan {
+    if waiter.state_without_recovery_for_tests()? != State::Replan {
         anyhow::bail!("epoch validation waiter did not receive the REPLAN token");
     }
 
@@ -10046,8 +10059,8 @@ pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, boo
             })
         },
     )?;
-    let torn_demoted =
-        matches!(torn, GrantResult::LostGrant) && waiter.state(None)? == State::Waiting;
+    let torn_demoted = matches!(torn, GrantResult::LostGrant)
+        && waiter.state_without_recovery_for_tests()? == State::Waiting;
     let empty = BTreeSet::new();
     coordinator.schedule(
         None,
@@ -10062,7 +10075,7 @@ pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, boo
         false,
         None,
     )?;
-    let torn_rejected = torn_demoted && waiter.state(None)? == State::Replan;
+    let torn_rejected = torn_demoted && waiter.state_without_recovery_for_tests()? == State::Replan;
 
     {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
@@ -10106,8 +10119,8 @@ pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, boo
             })
         },
     )?;
-    let stale_rejected =
-        matches!(stale, GrantResult::LostGrant) && waiter.state(None)? == State::Waiting;
+    let stale_rejected = matches!(stale, GrantResult::LostGrant)
+        && waiter.state_without_recovery_for_tests()? == State::Waiting;
 
     waiter.finish(None)?;
     coordinator.finish(None)?;
@@ -10232,7 +10245,7 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
         table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible()?;
     }
-    if waiter.state(None)? != State::Replan {
+    if waiter.state_without_recovery_for_tests()? != State::Replan {
         anyhow::bail!("release-prefix waiter did not receive the REPLAN token");
     }
     let acquired = predecessor.run_granted(
@@ -10411,7 +10424,7 @@ pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
         set_cpu_free_for_tests(&mut table, 2, false)?;
         table.grant_compatible()?;
     }
-    if waiter.state(None)? != State::Replan {
+    if waiter.state_without_recovery_for_tests()? != State::Replan {
         anyhow::bail!("issue-serial waiter did not receive the REPLAN token");
     }
 
@@ -10445,8 +10458,8 @@ pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
             })
         },
     )?;
-    stale_snapshot_published_once &=
-        matches!(first, GrantResult::Requeued) && waiter.state(None)? == State::Waiting;
+    stale_snapshot_published_once &= matches!(first, GrantResult::Requeued)
+        && waiter.state_without_recovery_for_tests()? == State::Waiting;
     {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
@@ -10457,7 +10470,7 @@ pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
         table.grant_compatible()?;
     }
     anyhow::ensure!(
-        waiter.state(None)? == State::Replan,
+        waiter.state_without_recovery_for_tests()? == State::Replan,
         "WAITING callback did not replan from its unconsumed improvement",
     );
 
@@ -10535,7 +10548,7 @@ pub(super) fn exercise_stale_acquired_release_order_for_tests()
         table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible()?;
     }
-    if waiter.state(None)? != State::Granted {
+    if waiter.state_without_recovery_for_tests()? != State::Granted {
         anyhow::bail!("stale-acquired exercise failed to prepare a live grant");
     }
 
@@ -10763,7 +10776,7 @@ pub(super) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool
         table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible()?;
     }
-    if waiter.state(None)? != State::Granted {
+    if waiter.state_without_recovery_for_tests()? != State::Granted {
         anyhow::bail!("stale-contention exercise failed to grant the disjoint waiter");
     }
 
@@ -14370,6 +14383,44 @@ impl Table {
             visited += 1;
         }
         Ok(())
+    }
+
+    /// Restore a synthetic test queue after registration has exercised real
+    /// wall-clock coordinator recovery. Large fixtures may take longer than a
+    /// production lease merely to append their records on an oversubscribed
+    /// host; their explicit scan assertions must start from the intended
+    /// oldest coordinator rather than whichever waiter registration happened
+    /// to promote. Keep this test-only and transactional so the published
+    /// header and record state are never incoherent.
+    #[cfg(test)]
+    fn restage_coordinator_for_tests<'a>(
+        &mut self,
+        coordinator: &Ticket,
+        waiters: impl IntoIterator<Item = &'a Ticket>,
+    ) -> Result<()> {
+        self.begin_transaction()?;
+        let record = self
+            .record(coordinator.slot)?
+            .filter(|record| record.ticket == coordinator.ticket)
+            .ok_or_else(|| anyhow::anyhow!("synthetic coordinator ticket disappeared"))?;
+        self.set_record_state(record.slot, STATE_WAITING)?;
+        self.clear_record_blocked(record.slot)?;
+        for waiter in waiters {
+            let record = self
+                .record(waiter.slot)?
+                .filter(|record| record.ticket == waiter.ticket)
+                .ok_or_else(|| anyhow::anyhow!("synthetic waiter ticket disappeared"))?;
+            self.set_record_state(record.slot, STATE_WAITING)?;
+            self.clear_record_blocked(record.slot)?;
+        }
+        self.set_coordinator(0, NONE_SLOT)?;
+        self.elect_coordinator_in_transaction()?;
+        anyhow::ensure!(
+            self.coordinator_ticket() == coordinator.ticket
+                && self.coordinator_slot()? == coordinator.slot,
+            "synthetic queue did not re-elect its oldest intended coordinator",
+        );
+        self.finish_transaction()
     }
 
     fn begin_transaction(&mut self) -> Result<()> {
