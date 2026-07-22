@@ -4652,6 +4652,14 @@ fn completed_replan_replacement_grants_before_straggler_wave_drains() {
         .expect("exercise progress past an outstanding speculative callback");
     assert!(outcome.completion_requeued);
     assert_eq!(
+        outcome.callback_notify_delta, 0,
+        "a partial speculative wave must not target-wake its live coordinator per callback",
+    );
+    assert!(
+        outcome.heartbeat_observed_pending,
+        "the coordinator heartbeat must observe and consume a partial batch behind a straggler",
+    );
+    assert_eq!(
         (
             outcome.callback_scan_delta,
             outcome.callback_generation_wake_delta,
@@ -4729,10 +4737,15 @@ fn coordinator_commit_reconciles_pending_replan_edge_by_physical_conflict() {
 #[test]
 fn replan_completion_elects_after_waiting_publication_with_preexisting_edge() {
     let _prefixes = LockPrefixesGuard::new();
+    let (elected, notify_delta) = protocol::exercise_replan_completion_election_for_tests()
+        .expect("exercise coordinator election from completed speculative callback");
     assert!(
-        protocol::exercise_replan_completion_election_for_tests()
-            .expect("exercise coordinator election from completed speculative callback"),
+        elected,
         "a completed callback must become coordinator when its predecessor disappeared while RESCAN was already pending",
+    );
+    assert_eq!(
+        notify_delta, 1,
+        "electing a missing coordinator must bypass wave batching and notify immediately",
     );
 }
 

@@ -2117,7 +2117,7 @@ pub(crate) fn exercise_coordinator_pending_replan_for_tests()
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_replan_completion_election_for_tests() -> Result<bool> {
+pub(crate) fn exercise_replan_completion_election_for_tests() -> Result<(bool, u64)> {
     registry::exercise_replan_completion_election_for_tests()
 }
 

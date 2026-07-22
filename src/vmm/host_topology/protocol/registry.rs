@@ -6837,6 +6837,8 @@ pub(crate) struct BoundedReplanWindowOutcome {
 #[cfg(test)]
 pub(crate) struct ReplanStragglerProgressOutcome {
     pub(crate) completion_requeued: bool,
+    pub(crate) callback_notify_delta: u64,
+    pub(crate) heartbeat_observed_pending: bool,
     pub(crate) callback_scan_delta: u64,
     pub(crate) callback_generation_wake_delta: u32,
     pub(crate) edge_coalesced_with_straggler: bool,
@@ -8227,7 +8229,7 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
     let mut later_grant =
         Ticket::register(later_grant_claim.clone(), later_grant_claim.clone(), None)?;
 
-    let (scans_before, generation_wake_before, wave_deadline_ns) = {
+    let (scans_before, generation_wake_before, wave_deadline_ns, notify_before) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         for cpu in [
@@ -8259,6 +8261,7 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
             read_u64(&table.header, H_GRANT_SCANS),
             table.generation_wake(),
             table.replan_wave_deadline_ns(),
+            NOTIFY_CALLS.with(std::cell::Cell::get),
         )
     };
 
@@ -8279,6 +8282,11 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
         },
     )?;
     let completion_requeued = matches!(callback_result, GrantResult::Requeued);
+    let callback_notify_delta = NOTIFY_CALLS
+        .with(std::cell::Cell::get)
+        .wrapping_sub(notify_before);
+    let heartbeat = coordinator.heartbeat_at(None, None)?;
+    let heartbeat_observed_pending = !heartbeat.parked && heartbeat.rescan_pending;
 
     let mut dirty_later_callback_ran = false;
     let dirty_later_result = later_grant.run_granted(
@@ -8373,6 +8381,8 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
     coordinator.finish(None)?;
     Ok(ReplanStragglerProgressOutcome {
         completion_requeued,
+        callback_notify_delta,
+        heartbeat_observed_pending,
         callback_scan_delta,
         callback_generation_wake_delta,
         edge_coalesced_with_straggler,
@@ -8570,7 +8580,7 @@ pub(super) fn exercise_pending_replan_grant_races_for_tests()
 /// RESCAN edge was already pending. Election must run after REPLAN -> WAITING
 /// publication even though no new transport edge is needed.
 #[cfg(test)]
-pub(super) fn exercise_replan_completion_election_for_tests() -> Result<bool> {
+pub(super) fn exercise_replan_completion_election_for_tests() -> Result<(bool, u64)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [1_250usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     let designated = ClaimSet::new(std::iter::empty(), [1_251usize], FlockMode::Exclusive);
@@ -8605,6 +8615,7 @@ pub(super) fn exercise_replan_completion_election_for_tests() -> Result<bool> {
             "completion-election fixture retained a coordinator or lost its pending edge",
         );
     }
+    let notify_before = NOTIFY_CALLS.with(std::cell::Cell::get);
     let result = callback.run_granted(
         None,
         |current, _watch, acquisition_allowed, _predecessors, _availability| {
@@ -8630,8 +8641,11 @@ pub(super) fn exercise_replan_completion_election_for_tests() -> Result<bool> {
                 record.state == STATE_COORDINATOR && record.claim == replacement
             })
     };
+    let notify_delta = NOTIFY_CALLS
+        .with(std::cell::Cell::get)
+        .wrapping_sub(notify_before);
     callback.finish(None)?;
-    Ok(elected)
+    Ok((elected, notify_delta))
 }
 
 /// Drive a finite wave across its lease boundary without sleeping. One
