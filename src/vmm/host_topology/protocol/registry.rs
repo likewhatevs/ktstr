@@ -3775,6 +3775,119 @@ pub(super) fn expire_coordinator_lease_for_tests() -> Result<()> {
 }
 
 #[cfg(test)]
+pub(super) fn exercise_stalled_takeover_notification_for_tests(
+    watch: &super::LockDirWatch,
+) -> Result<(bool, bool, bool, bool)> {
+    let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(claim.clone(), claim.clone(), None)?;
+    let mut successor = Ticket::register(claim.clone(), claim, None)?;
+
+    // Install the real watch before this helper is called, then discard every
+    // registration edge. The only event observed below must come from the
+    // stalled-transfer transaction itself.
+    watch.drain(&ClaimSet::default())?;
+    let wake_before = coordinator
+        .wake
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("stalled coordinator wake mapping disappeared"))?
+        .expected();
+    let (coordinator_parked, successor_promoted) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        anyhow::ensure!(
+            table.coordinator_ticket() == coordinator.ticket
+                && table.coordinator_slot()? == coordinator.slot,
+            "stalled-takeover fixture did not elect its first ticket",
+        );
+        write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+        write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
+        table.recover_coordinator_if_dead()?;
+        (
+            table.record(coordinator.slot)?.is_some_and(|record| {
+                record.ticket == coordinator.ticket && record.state == STATE_COORDINATOR_STANDBY
+            }),
+            table.record(successor.slot)?.is_some_and(|record| {
+                record.ticket == successor.ticket
+                    && record.state == STATE_COORDINATOR
+                    && table.coordinator_ticket() == successor.ticket
+            }),
+        )
+    };
+    let wake_after = coordinator
+        .wake
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("parked coordinator wake mapping disappeared"))?
+        .expected();
+    let notified = watch
+        .drain(&ClaimSet::default())?
+        .contains_registry_notify();
+
+    successor.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((
+        wake_after != wake_before,
+        coordinator_parked,
+        successor_promoted,
+        notified,
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn exercise_dirty_repair_notification_for_tests(
+    watch: &super::LockDirWatch,
+) -> Result<(bool, bool, bool, bool)> {
+    let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(claim.clone(), claim, None)?;
+
+    watch.drain(&ClaimSet::default())?;
+    let wake_before = coordinator
+        .wake
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("repair coordinator wake mapping disappeared"))?
+        .expected();
+    let (repair_clean, coordinator_restored) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        anyhow::ensure!(
+            table.coordinator_ticket() == coordinator.ticket
+                && table.coordinator_slot()? == coordinator.slot,
+            "dirty-repair fixture did not elect its ticket",
+        );
+        // Model a writer dying after parking the coordinator record but
+        // before publishing a matching header and notification edge.
+        atomic_u64(&table.header, H_AGGREGATE_DIRTY).store(1, Ordering::SeqCst);
+        table.set_record_state(coordinator.slot, STATE_COORDINATOR_STANDBY)?;
+        table.repair_consistency_if_needed()?;
+        (
+            atomic_u64(&table.header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) == 0,
+            table.record(coordinator.slot)?.is_some_and(|record| {
+                record.ticket == coordinator.ticket
+                    && record.state == STATE_COORDINATOR
+                    && table.coordinator_ticket() == coordinator.ticket
+            }),
+        )
+    };
+    let wake_after = coordinator
+        .wake
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("repaired coordinator wake mapping disappeared"))?
+        .expected();
+    let notified = watch
+        .drain(&ClaimSet::default())?
+        .contains_registry_notify();
+
+    coordinator.finish(None)?;
+    Ok((
+        repair_clean,
+        coordinator_restored,
+        wake_after != wake_before,
+        notified,
+    ))
+}
+
+#[cfg(test)]
 pub(super) fn exercise_clean_coordinator_mismatch_recovery_for_tests() -> Result<()> {
     let first_claim = ClaimSet::with_modes(
         std::iter::empty(),
@@ -11229,6 +11342,11 @@ impl Table {
         self.wake_slot(current.slot)?;
         self.wake_slot(successor.slot)?;
         self.finish_transaction()?;
+        // The displaced coordinator may already be blocked in its real
+        // inotify wait. Its slot futex wakes state_or_wait, but cannot wake
+        // that directory poll; publish the same event edge ordinary queue
+        // mutations use so it observes STANDBY and parks immediately.
+        notify_coordinator();
         Ok(())
     }
 
@@ -12754,6 +12872,11 @@ impl Table {
             self.wake_slot(record.slot)?;
         }
         atomic_u64(&self.header, H_AGGREGATE_DIRTY).store(0, Ordering::SeqCst);
+        // A killed writer may have torn coordinator/standby state after the
+        // last event edge. Once the repaired image is clean, always wake the
+        // real inotify transport as well as targeted slot futexes so no
+        // coordinator remains parked until the long recovery fallback.
+        notify_coordinator();
         Ok(())
     }
 

@@ -1542,6 +1542,48 @@ fn coordinator_watch_wakes_for_registry_notification() {
 }
 
 #[test]
+fn stalled_takeover_wakes_and_parks_the_displaced_coordinator() {
+    let _prefixes = LockPrefixesGuard::new();
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
+    let (slot_woken, coordinator_parked, successor_promoted, inotify_notified) =
+        protocol::exercise_stalled_takeover_notification_for_tests(&watch)
+            .expect("exercise stalled coordinator takeover");
+    assert!(
+        slot_woken,
+        "stalled takeover must wake the displaced coordinator's slot futex",
+    );
+    assert!(
+        coordinator_parked && successor_promoted,
+        "stalled takeover must atomically park the old coordinator and promote its successor",
+    );
+    assert!(
+        inotify_notified,
+        "stalled takeover must also wake an old coordinator already blocked in real inotify",
+    );
+}
+
+#[test]
+fn dirty_repair_notifies_real_coordinator_watch_after_publishing_clean_state() {
+    let _prefixes = LockPrefixesGuard::new();
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
+    let (repair_clean, coordinator_restored, slot_woken, inotify_notified) =
+        protocol::exercise_dirty_repair_notification_for_tests(&watch)
+            .expect("exercise dirty coordinator repair");
+    assert!(
+        repair_clean && coordinator_restored,
+        "dirty repair must publish a clean image with one coherent coordinator",
+    );
+    assert!(
+        slot_woken,
+        "dirty repair must retain its targeted coordinator futex wake",
+    );
+    assert!(
+        inotify_notified,
+        "dirty repair must wake a real coordinator watch after clearing the torn image",
+    );
+}
+
+#[test]
 fn coordinator_watch_observes_owner_liveness_close_but_not_readonly_probes() {
     let _prefixes = LockPrefixesGuard::new();
     let claim = protocol::ClaimSet::new(

@@ -1798,6 +1798,20 @@ pub(crate) fn expire_coordinator_lease_for_tests() -> Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_stalled_takeover_notification_for_tests(
+    watch: &LockDirWatch,
+) -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_stalled_takeover_notification_for_tests(watch)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_dirty_repair_notification_for_tests(
+    watch: &LockDirWatch,
+) -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_dirty_repair_notification_for_tests(watch)
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_clean_coordinator_mismatch_recovery_for_tests() -> Result<()> {
     registry::exercise_clean_coordinator_mismatch_recovery_for_tests()
 }
