@@ -7742,7 +7742,9 @@ pub(crate) struct ReplanStragglerProgressOutcome {
     pub(crate) callback_generation_wake_delta: u32,
     pub(crate) edge_coalesced_with_straggler: bool,
     pub(crate) later_grant_fenced_until_scan: bool,
-    pub(crate) later_grant_demotion_promoted_urgent: bool,
+    pub(crate) later_grant_demotion_shortened_deferred_edge: bool,
+    pub(crate) later_grant_demotion_notified_once: bool,
+    pub(crate) later_grant_demotion_deadline_exact: bool,
     pub(crate) later_disjoint_grant_regranted_after_scan: bool,
     pub(crate) authoritative_scan_delta: u64,
     pub(crate) completed_replacement_granted: bool,
@@ -9622,7 +9624,9 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
     let (
         callback_scan_delta,
         callback_generation_wake_delta,
-        later_grant_demotion_promoted_urgent,
+        later_grant_demotion_shortened_deferred_edge,
+        later_grant_demotion_notified_once,
+        later_grant_demotion_deadline_exact,
         authoritative_scan_delta,
         completed_replacement_granted,
         straggler_still_replan,
@@ -9633,16 +9637,29 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
         let callback_scan_delta = read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
         let callback_generation_wake_delta =
             table.generation_wake().wrapping_sub(generation_wake_before);
-        let later_grant_demotion_promoted_urgent = table.replan_outstanding() == 1
-            && table.pending_flags() & PENDING_REPLAN_RESCAN == 0
-            && table.pending_flags() & PENDING_RESCAN != 0
+        let shortened_deadline_ns = table.deferred_rescan_deadline_ns();
+        let later_grant_demotion_shortened_deferred_edge = table.replan_outstanding() == 1
+            && table.pending_flags() & PENDING_REPLAN_RESCAN != 0
+            && table.pending_flags() & PENDING_RESCAN == 0
+            && shortened_deadline_ns != 0
+            && shortened_deadline_ns < deferred_deadline_ns
             && table
                 .record(straggler.slot)?
                 .is_some_and(|record| record.state == STATE_REPLAN);
+        let later_grant_demotion_notified_once = NOTIFY_CALLS
+            .with(std::cell::Cell::get)
+            .wrapping_sub(notify_before)
+            == 1;
+        let later_grant_demotion_deadline_exact = shortened_deadline_ns != 0
+            && !table.deferred_rescan_due_at(shortened_deadline_ns.saturating_sub(1))
+            && table.deferred_rescan_due_at(shortened_deadline_ns);
         set_cpu_free_for_tests(&mut table, first_replacement_cpu, true)?;
         set_cpu_free_for_tests(&mut table, later_grant_cpu, true)?;
-        table.prepare_grant_scan_at(deferred_deadline_ns)?;
-        table.grant_compatible_at(deferred_deadline_ns)?;
+        anyhow::ensure!(
+            table.prepare_grant_scan_at(shortened_deadline_ns)?,
+            "shortened dirty-grant deadline did not promote its deferred scan",
+        );
+        table.grant_compatible_at(shortened_deadline_ns)?;
         let authoritative_scan_delta =
             read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
         let completed_replacement_granted = table.record(first.slot)?.is_some_and(|record| {
@@ -9653,11 +9670,13 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
             .is_some_and(|record| record.state == STATE_REPLAN)
             && table.replan_outstanding() == 1;
         let wave_deadline_not_reached = table.replan_wave_deadline_ns() == wave_deadline_ns
-            && deferred_deadline_ns < wave_deadline_ns;
+            && shortened_deadline_ns < wave_deadline_ns;
         (
             callback_scan_delta,
             callback_generation_wake_delta,
-            later_grant_demotion_promoted_urgent,
+            later_grant_demotion_shortened_deferred_edge,
+            later_grant_demotion_notified_once,
+            later_grant_demotion_deadline_exact,
             authoritative_scan_delta,
             completed_replacement_granted,
             straggler_still_replan,
@@ -9699,7 +9718,9 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
         callback_generation_wake_delta,
         edge_coalesced_with_straggler,
         later_grant_fenced_until_scan,
-        later_grant_demotion_promoted_urgent,
+        later_grant_demotion_shortened_deferred_edge,
+        later_grant_demotion_notified_once,
+        later_grant_demotion_deadline_exact,
         later_disjoint_grant_regranted_after_scan,
         authoritative_scan_delta,
         completed_replacement_granted,

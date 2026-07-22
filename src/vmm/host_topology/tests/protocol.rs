@@ -5054,8 +5054,17 @@ fn completed_replan_replacement_grants_before_straggler_wave_drains() {
         "the partial completion must remain deferred while its unrelated speculative callback is live",
     );
     assert!(
-        outcome.later_grant_fenced_until_scan && outcome.later_grant_demotion_promoted_urgent,
-        "a previously granted dirty suffix must self-demote and promote the deferred edge for an immediate authoritative scan",
+        outcome.later_grant_fenced_until_scan
+            && outcome.later_grant_demotion_shortened_deferred_edge,
+        "a previously granted dirty suffix must self-demote and shorten the deferred edge before its authoritative scan",
+    );
+    assert!(
+        outcome.later_grant_demotion_notified_once,
+        "the shortened dirty-suffix deadline must be transported exactly once",
+    );
+    assert!(
+        outcome.later_grant_demotion_deadline_exact,
+        "the shortened dirty-suffix deadline must neither flush early nor slide past its exact bound",
     );
     assert_eq!(
         outcome.authoritative_scan_delta, 1,
