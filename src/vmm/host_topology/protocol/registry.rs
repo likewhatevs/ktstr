@@ -495,14 +495,19 @@ fn arm_drop_before_notify_probe(
     payload_dropped: std::rc::Rc<std::cell::Cell<bool>>,
     dropped_at_notify: std::rc::Rc<std::cell::Cell<bool>>,
 ) {
+    arm_notify_hook_for_tests(move || {
+        dropped_at_notify.set(payload_dropped.get());
+    });
+}
+
+#[cfg(test)]
+pub(super) fn arm_notify_hook_for_tests(hook: impl FnOnce() + 'static) {
     NOTIFY_HOOK.with(|slot| {
         assert!(
             slot.borrow().is_none(),
             "a coordinator-notify hook is already installed on this test thread"
         );
-        *slot.borrow_mut() = Some(Box::new(move || {
-            dropped_at_notify.set(payload_dropped.get());
-        }));
+        *slot.borrow_mut() = Some(Box::new(hook));
     });
 }
 
@@ -4798,6 +4803,43 @@ pub(super) fn expire_coordinator_lease_for_tests() -> Result<()> {
     write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
     write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
     Ok(())
+}
+
+/// Transfer the current coordinator to a live waiter while leaving an already
+/// pending rescan edge in place. Optionally demote the displaced ticket from
+/// STANDBY to WAITING to exercise the lost-license error path rather than the
+/// ordinary parked-coordinator stale path.
+#[cfg(test)]
+pub(super) fn force_coordinator_commit_race_for_tests(lost_license: bool) -> Result<bool> {
+    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    let displaced_ticket = table.coordinator_ticket();
+    let displaced_slot = table.coordinator_slot()?;
+    anyhow::ensure!(
+        displaced_ticket != 0 && displaced_slot != NONE_SLOT,
+        "coordinator commit-race fixture has no active coordinator",
+    );
+    table.set_pending_flag(PENDING_RESCAN);
+    write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+    write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
+    table.recover_coordinator_if_dead_at(
+        monotonic_now_ns()?.saturating_add(COORDINATOR_HEARTBEAT_LEASE_NS),
+    )?;
+    anyhow::ensure!(
+        table.coordinator_ticket() != displaced_ticket
+            && table.record(displaced_slot)?.is_some_and(|record| {
+                record.ticket == displaced_ticket
+                    && record.state == STATE_COORDINATOR_STANDBY
+            }),
+        "coordinator commit-race fixture did not transfer the active lease",
+    );
+    if lost_license {
+        table.begin_transaction()?;
+        table.set_record_state(displaced_slot, STATE_WAITING)?;
+        table.finish_transaction()?;
+    }
+    Ok(table.pending_flags() & PENDING_RESCAN != 0)
 }
 
 #[cfg(test)]

@@ -2089,6 +2089,167 @@ pub(crate) fn exercise_acknowledgement_payload_notify_order_for_tests()
 }
 
 #[cfg(test)]
+pub(crate) struct CoordinatorPayloadNotifyCase {
+    pub(crate) commit_terminated: bool,
+    pub(crate) rescan_was_already_pending: bool,
+    pub(crate) payload_released: bool,
+    pub(crate) payload_released_at_notify: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct CoordinatorPayloadNotifyOutcome {
+    pub(crate) complete_standby: CoordinatorPayloadNotifyCase,
+    pub(crate) complete_lost_license: CoordinatorPayloadNotifyCase,
+    pub(crate) prepare_standby: CoordinatorPayloadNotifyCase,
+    pub(crate) prepare_lost_license: CoordinatorPayloadNotifyCase,
+}
+
+#[cfg(test)]
+struct CoordinatorOpaqueDropProbe {
+    dropped: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+#[cfg(test)]
+impl Drop for CoordinatorOpaqueDropProbe {
+    fn drop(&mut self) {
+        self.dropped.set(true);
+    }
+}
+
+#[cfg(test)]
+fn exercise_coordinator_complete_notify_case(
+    cpu: usize,
+    lost_license: bool,
+) -> Result<CoordinatorPayloadNotifyCase> {
+    let claim = ClaimSet::new(std::iter::empty(), [cpu], FlockMode::Exclusive);
+    let coordinator_ticket = registry::Ticket::register(claim.clone(), claim.clone(), None)?;
+    let mut successor = registry::Ticket::register(claim.clone(), claim.clone(), None)?;
+    let coordinator = Box::new(CoordinatorTicket {
+        ticket: coordinator_ticket,
+        preparation: None,
+        preparation_watch: None,
+    });
+    let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+    let hook_cancelled = std::sync::Arc::clone(&cancelled);
+    let payload_dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+    let step_payload_dropped = std::rc::Rc::clone(&payload_dropped);
+    let hook_payload_dropped = std::rc::Rc::clone(&payload_dropped);
+    let payload_dropped_at_notify = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook_payload_dropped_at_notify = std::rc::Rc::clone(&payload_dropped_at_notify);
+    let rescan_was_already_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+    let step_rescan_was_already_pending = std::rc::Rc::clone(&rescan_was_already_pending);
+    let mut stepped = false;
+    let result = acquire_as_coordinator_interruptible(coordinator, &cancelled, move |_| {
+        anyhow::ensure!(!stepped, "coordinator Complete race ran more than one planner step");
+        stepped = true;
+        step_rescan_was_already_pending
+            .set(registry::force_coordinator_commit_race_for_tests(lost_license)?);
+        registry::arm_notify_hook_for_tests(move || {
+            hook_payload_dropped_at_notify.set(hook_payload_dropped.get());
+            hook_cancelled.store(true, Ordering::Release);
+        });
+        Ok(CoordinatorStep::Complete {
+            claim: claim.clone(),
+            value: CoordinatorOpaqueDropProbe {
+                dropped: std::rc::Rc::clone(&step_payload_dropped),
+            },
+        })
+    });
+    let outcome = CoordinatorPayloadNotifyCase {
+        commit_terminated: result.is_err(),
+        rescan_was_already_pending: rescan_was_already_pending.get(),
+        payload_released: payload_dropped.get(),
+        payload_released_at_notify: payload_dropped_at_notify.get(),
+    };
+    successor.finish(None)?;
+    Ok(outcome)
+}
+
+#[cfg(test)]
+fn exercise_coordinator_prepare_notify_case(
+    permit: usize,
+    lost_license: bool,
+) -> Result<CoordinatorPayloadNotifyCase> {
+    let path = super::permit_lock_path(permit);
+    let permit_fd = crate::flock::try_flock(&path, FlockMode::Exclusive)?
+        .ok_or_else(|| anyhow::anyhow!("coordinator Prepare test permit {permit} is busy"))?;
+    let preparation = super::PreparationPermit {
+        index: permit,
+        token_permit: permit,
+        cpu_permits: Vec::new(),
+        memory_permits: Vec::new(),
+        permit_fds: vec![(permit, permit_fd)],
+        affinity_lock: None,
+        affinity_cpu: 0,
+        original_affinity: Vec::new(),
+        affinity_constrained: false,
+    };
+    let claim = preparation.claim();
+    let coordinator_ticket = registry::Ticket::register(claim.clone(), claim.clone(), None)?;
+    let mut successor = registry::Ticket::register(claim.clone(), claim.clone(), None)?;
+    let coordinator = Box::new(CoordinatorTicket {
+        ticket: coordinator_ticket,
+        preparation: None,
+        preparation_watch: None,
+    });
+    let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+    let hook_cancelled = std::sync::Arc::clone(&cancelled);
+    let payload_released_at_notify = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook_payload_released_at_notify = std::rc::Rc::clone(&payload_released_at_notify);
+    let rescan_was_already_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+    let step_rescan_was_already_pending = std::rc::Rc::clone(&rescan_was_already_pending);
+    let mut preparation = Some(Box::new(preparation));
+    let mut stepped = false;
+    let hook_path = path.clone();
+    let result = acquire_as_coordinator_interruptible(coordinator, &cancelled, move |_| {
+        anyhow::ensure!(!stepped, "coordinator Prepare race ran more than one planner step");
+        stepped = true;
+        step_rescan_was_already_pending
+            .set(registry::force_coordinator_commit_race_for_tests(lost_license)?);
+        registry::arm_notify_hook_for_tests(move || {
+            let released = crate::flock::try_flock(&hook_path, FlockMode::Exclusive)
+                .ok()
+                .flatten();
+            hook_payload_released_at_notify.set(released.is_some());
+            drop(released);
+            hook_cancelled.store(true, Ordering::Release);
+        });
+        Ok(CoordinatorStep::Prepare {
+            final_claim: claim.clone(),
+            preparation_claim: claim.clone(),
+            preparation: preparation
+                .take()
+                .expect("coordinator Prepare race payload was already consumed"),
+        })
+    });
+    let released_after_commit = crate::flock::try_flock(&path, FlockMode::Exclusive)?;
+    let outcome = CoordinatorPayloadNotifyCase {
+        commit_terminated: result.is_err(),
+        rescan_was_already_pending: rescan_was_already_pending.get(),
+        payload_released: released_after_commit.is_some(),
+        payload_released_at_notify: payload_released_at_notify.get(),
+    };
+    drop(released_after_commit);
+    successor.finish(None)?;
+    Ok(outcome)
+}
+
+/// Coordinator commit rejection must preserve the same opaque-payload
+/// destruction boundary as ordinary granted callbacks. Exercise both the
+/// parked-coordinator Stale return and the incoherent-license error while a
+/// rescan edge is already coalesced, for exact Complete and Prepare payloads.
+#[cfg(test)]
+pub(crate) fn exercise_coordinator_payload_notify_order_for_tests()
+-> Result<CoordinatorPayloadNotifyOutcome> {
+    Ok(CoordinatorPayloadNotifyOutcome {
+        complete_standby: exercise_coordinator_complete_notify_case(201, false)?,
+        complete_lost_license: exercise_coordinator_complete_notify_case(202, true)?,
+        prepare_standby: exercise_coordinator_prepare_notify_case(203, false)?,
+        prepare_lost_license: exercise_coordinator_prepare_notify_case(204, true)?,
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool, bool, bool)> {
     registry::exercise_stale_contention_commit_for_tests()
 }

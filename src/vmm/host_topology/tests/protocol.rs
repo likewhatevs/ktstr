@@ -4933,6 +4933,36 @@ fn expired_and_revoked_payloads_notify_after_drop_when_rescan_is_already_pending
 }
 
 #[test]
+fn coordinator_rejections_notify_after_complete_and_prepare_payloads_drop() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_coordinator_payload_notify_order_for_tests()
+        .expect("exercise coordinator rejected-payload notification ordering");
+    for (label, case) in [
+        ("Complete standby Stale", outcome.complete_standby),
+        ("Complete lost-license error", outcome.complete_lost_license),
+        ("Prepare standby Stale", outcome.prepare_standby),
+        ("Prepare lost-license error", outcome.prepare_lost_license),
+    ] {
+        assert!(
+            case.commit_terminated,
+            "{label} must terminate the rejected coordinator commit",
+        );
+        assert!(
+            case.rescan_was_already_pending,
+            "{label} must exercise notification ordering with RESCAN already pending",
+        );
+        assert!(
+            case.payload_released,
+            "{label} must release its caller-owned physical payload",
+        );
+        assert!(
+            case.payload_released_at_notify,
+            "{label} must release its physical payload before the targeted coordinator notification",
+        );
+    }
+}
+
+#[test]
 fn predecessor_prefixes_preserve_modes_order_and_dirty_repair() {
     let _prefixes = LockPrefixesGuard::new();
     let (initial_modes, successor_excluded, repaired_modes, repaired_order) =
