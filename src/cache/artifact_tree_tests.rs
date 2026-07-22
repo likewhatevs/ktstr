@@ -1663,6 +1663,95 @@ fn stable_source_direct_hit_survives_deleted_record_and_cas_without_opening_eith
 }
 
 #[test]
+fn stable_source_live_validation_epoch_scans_once_and_rescans_after_drain() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let input = temp.path().join("input");
+    std::fs::write(&input, b"validation-epoch").unwrap();
+    let records = temp.path().join("records");
+    let stable = temp.path().join("stable");
+    let identity = 0x0057_ab1e_e90c_0001;
+    let cache = ArtifactTreeCache::new(&records);
+    let first = cache
+        .load_or_build_stable(
+            identity,
+            &stable,
+            "stable-source-validation-epoch",
+            || Ok(true),
+            || false,
+            || {
+                let mut source = ArtifactTreeSource::new();
+                source.insert_immutable_path("source/nested/file", &input)?;
+                Ok(source)
+            },
+        )
+        .unwrap();
+
+    reset_stable_root_test_counters();
+    let second = cache
+        .load_or_build_stable(
+            identity,
+            &stable,
+            "stable-source-validation-epoch",
+            || Ok(true),
+            || false,
+            || -> Result<ArtifactTreeSource> {
+                panic!("a live validation epoch must reuse the stable source")
+            },
+        )
+        .unwrap();
+    let joined = stable_root_test_counters();
+    assert_eq!(joined.listing_directories, 0);
+    assert_eq!(joined.listing_entries, 0);
+    assert_eq!(
+        joined.lifecycle_collections, 0,
+        "a stable-source hit must not run whole-cache lifecycle GC",
+    );
+
+    // Either live owner is enough to keep the epoch open. This mirrors
+    // independent cargo-ktstr lane processes: each flock comes from a fresh
+    // open file description even though this regression runs in one process.
+    drop(first);
+    reset_stable_root_test_counters();
+    let third = cache
+        .load_or_build_stable(
+            identity,
+            &stable,
+            "stable-source-validation-epoch",
+            || Ok(true),
+            || false,
+            || -> Result<ArtifactTreeSource> {
+                panic!("a surviving validation owner must keep the epoch live")
+            },
+        )
+        .unwrap();
+    let still_joined = stable_root_test_counters();
+    assert_eq!(still_joined.listing_directories, 0);
+    assert_eq!(still_joined.listing_entries, 0);
+
+    drop(second);
+    drop(third);
+    reset_stable_root_test_counters();
+    let next_epoch = cache
+        .load_or_build_stable(
+            identity,
+            &stable,
+            "stable-source-validation-epoch",
+            || Ok(true),
+            || false,
+            || -> Result<ArtifactTreeSource> {
+                panic!("an intact stable source must survive the epoch boundary")
+            },
+        )
+        .unwrap();
+    assert!(next_epoch.cache_hit());
+    let rescanned = stable_root_test_counters();
+    assert_eq!(rescanned.listing_directories, 3);
+    assert_eq!(rescanned.listing_entries, 3);
+}
+
+#[test]
 fn stable_source_direct_hit_listing_scales_with_directories_not_files() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("stable");

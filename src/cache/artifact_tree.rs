@@ -42,6 +42,7 @@ const MATERIALIZATION_GC_CURSOR: &str = ".ktstr-materialization-gc.cursor";
 const ARTIFACT_IO_WORKERS_MAX: usize = 16;
 const STABLE_TREE_MARKER: &str = ".ktstr-artifact-tree-v2";
 const STABLE_BUILD_MARKER: &str = ".ktstr-stable-build-v2";
+const STABLE_VALIDATION_LOCK_DIR: &str = ".stable-root-validation-v1";
 const STABLE_ROOT_MARKER_MAGIC: &[u8; 8] = b"KTSTRSR2";
 const STABLE_ROOT_MARKER_SCHEMA: u32 = 2;
 const STABLE_ROOT_MARKER_LEN: usize = 56;
@@ -52,7 +53,6 @@ const LIFECYCLE_CLOSURE_LOCK_DIR: &str = "closures";
 const LIFECYCLE_ACCESS_DIR: &str = "access";
 const LIFECYCLE_RESERVATION_DIR: &str = "reservations";
 const LIFECYCLE_GC_STAMP: &str = "gc.stamp";
-const LIFECYCLE_GC_INTERVAL: Duration = Duration::from_secs(30);
 const LIFECYCLE_ACCESS_INTERVAL: Duration = Duration::from_secs(60);
 const LIFECYCLE_ORPHAN_GRACE: Duration = Duration::from_secs(60);
 const LIFECYCLE_MIN_FREE_RESERVE: u64 = 32 << 30;
@@ -120,6 +120,7 @@ struct StableRootTestCounters {
     listing_directories: usize,
     listing_entries: usize,
     listing_fallback_stats: usize,
+    lifecycle_collections: usize,
 }
 
 #[cfg(test)]
@@ -131,6 +132,7 @@ thread_local! {
             listing_directories: 0,
             listing_entries: 0,
             listing_fallback_stats: 0,
+            lifecycle_collections: 0,
         }) };
     static STABLE_ROOT_PRE_PUBLISH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
@@ -751,6 +753,17 @@ struct BuildSpaceReservation {
     _temporary: tempfile::NamedTempFile,
 }
 
+/// One live validation epoch for a stable source root.
+///
+/// The first owner after the previous epoch drains recursively validates the
+/// root. Concurrent owners join that epoch under a shared kernel flock and
+/// need only recheck the marker/root inode. This keeps one complete source
+/// walk as the deletion-recovery boundary without making every Cargo lane
+/// repeat it while the same immutable root is already in use.
+struct StableRootValidationLease {
+    _epoch: std::os::fd::OwnedFd,
+}
+
 /// One private materialization of a reusable artifact tree.
 ///
 /// Every regular file is an independent FICLONE inode by construction. CAS
@@ -788,6 +801,10 @@ pub struct StableArtifactTree {
     // the closure lease independent of record validity for the full owner
     // lifetime.
     _closure: ArtifactClosureLease,
+    // Keep the validated source-root epoch live for every consumer of the
+    // embedded pathname. Once the last owner drops, the next invocation must
+    // perform a fresh recursive validation before starting a new epoch.
+    _validation: StableRootValidationLease,
 }
 
 impl StableArtifactTree {
@@ -1002,7 +1019,6 @@ impl ArtifactTreeCache {
     fn acquire_closure(&self, identity: u64) -> Result<ArtifactClosureLease> {
         let lifecycle_root = self.lifecycle_root();
         ensure_lifecycle_dirs(&lifecycle_root)?;
-        maybe_collect_artifact_cache(&lifecycle_root, Some(identity), Some(&self.root))?;
 
         // Lock order is global SH -> closure SH. The global gate is released
         // immediately after the closure lock is established, allowing GC of
@@ -1023,8 +1039,64 @@ impl ArtifactTreeCache {
         })
     }
 
-    fn stable_tree_cache_hit_is_complete(&self, root: &Path, identity: u64) -> Result<bool> {
-        stable_tree_is_complete(root, identity)
+    fn acquire_stable_tree_validation(
+        &self,
+        root: &Path,
+        identity: u64,
+        freshly_published: bool,
+    ) -> Result<Option<StableRootValidationLease>> {
+        let validation_root = self.root.join(STABLE_VALIDATION_LOCK_DIR);
+        std::fs::create_dir_all(&validation_root).with_context(|| {
+            format!(
+                "create stable-root validation lock directory {}",
+                validation_root.display(),
+            )
+        })?;
+        let coordination_path = validation_root.join(format!("{identity:016x}.coord"));
+        let epoch_path = validation_root.join(format!("{identity:016x}.epoch"));
+
+        // Serialize the EX-probe -> SH-join transition. Without this mutex a
+        // follower could observe contention, the last epoch owner could drop,
+        // and a new leader could begin rebuilding before the follower joined.
+        let coordination =
+            crate::flock::block_flock(&coordination_path, crate::flock::FlockMode::Exclusive)?;
+        let (epoch, leader) = if let Some(epoch) =
+            crate::flock::try_flock(&epoch_path, crate::flock::FlockMode::Exclusive)?
+        {
+            (epoch, true)
+        } else {
+            (
+                crate::flock::block_flock(&epoch_path, crate::flock::FlockMode::Shared)?,
+                false,
+            )
+        };
+
+        let complete = if leader && !freshly_published {
+            // No validated owner remains, so a new invocation must prove the
+            // complete recursive seal. Partial manual cache deletion therefore
+            // becomes a normal reconstructible miss on the very next epoch.
+            stable_tree_is_complete(root, identity)?
+        } else {
+            // A live epoch leader already proved the listing, or this caller
+            // just published it with the same double-scan protocol. Bind this
+            // owner to the exact marker and root inode without walking files.
+            stable_root_marker_matches(root, StableRootDomain::Source, identity, false)?
+        };
+        if !complete {
+            drop(epoch);
+            drop(coordination);
+            return Ok(None);
+        }
+        if leader {
+            super::content::flock_retry(&epoch, rustix::fs::FlockOperation::LockShared)
+                .with_context(|| {
+                    format!(
+                        "downgrade stable-root validation epoch {identity:016x} to shared ownership"
+                    )
+                })?;
+        }
+        drop(coordination);
+        Ok(Some(StableRootValidationLease { _epoch: epoch }))
     }
 
     fn reserve_cold_build_space(
@@ -1540,7 +1612,9 @@ impl ArtifactTreeCache {
             )
         })?;
         let final_root = stable_parent.join(format!("{identity:016x}"));
-        if self.stable_tree_cache_hit_is_complete(&final_root, identity)? {
+        if let Some(validation) =
+            self.acquire_stable_tree_validation(&final_root, identity, false)?
+        {
             anyhow::ensure!(
                 validate_cached_identity()?,
                 "artifact tree inputs changed before accepting stable build {identity:016x}"
@@ -1551,6 +1625,7 @@ impl ArtifactTreeCache {
                 identity,
                 cache_hit: true,
                 _closure: closure,
+                _validation: validation,
             });
         }
 
@@ -1571,7 +1646,9 @@ impl ArtifactTreeCache {
             crate::flock::FlockMode::Exclusive,
         )?;
         closure.acquire_shared()?;
-        if self.stable_tree_cache_hit_is_complete(&final_root, identity)? {
+        if let Some(validation) =
+            self.acquire_stable_tree_validation(&final_root, identity, false)?
+        {
             anyhow::ensure!(
                 validate_cached_identity()?,
                 "artifact tree inputs changed before accepting stable build {identity:016x}"
@@ -1582,6 +1659,7 @@ impl ArtifactTreeCache {
                 identity,
                 cache_hit: true,
                 _closure: closure,
+                _validation: validation,
             });
         }
         // This must inspect the directory entry itself rather than `exists()`:
@@ -1663,12 +1741,21 @@ impl ArtifactTreeCache {
                 final_root.display(),
             )
         })?;
+        let validation = self
+            .acquire_stable_tree_validation(&final_root, identity, true)?
+            .with_context(|| {
+                format!(
+                    "freshly published stable artifact tree is incomplete: {}",
+                    final_root.display(),
+                )
+            })?;
         touch_closure_access(&materialized_closure);
         Ok(StableArtifactTree {
             root: final_root,
             identity,
             cache_hit,
             _closure: materialized_closure,
+            _validation: validation,
         })
     }
 }
@@ -2076,26 +2163,14 @@ fn active_build_reservations(root: &Path) -> Result<(u64, BTreeSet<u64>)> {
     Ok((total, identities))
 }
 
-fn maybe_collect_artifact_cache(
-    root: &Path,
-    protected: Option<u64>,
-    protected_namespace: Option<&Path>,
-) -> Result<()> {
-    let stamp = lifecycle_directory(root).join(LIFECYCLE_GC_STAMP);
-    if stamp.metadata().ok().is_some_and(|metadata| {
-        !cache_entry_is_older_than(&metadata, SystemTime::now(), LIFECYCLE_GC_INTERVAL)
-    }) {
-        return Ok(());
-    }
-    collect_artifact_cache(root, protected, protected_namespace, false)
-}
-
 fn collect_artifact_cache(
     root: &Path,
     protected: Option<u64>,
     protected_namespace: Option<&Path>,
     forced: bool,
 ) -> Result<()> {
+    #[cfg(test)]
+    update_stable_root_test_counters(|counters| counters.lifecycle_collections += 1);
     ensure_lifecycle_dirs(root)?;
     let gate_path = lifecycle_gate_path(root);
     let Some(global) = (if forced {
@@ -2382,9 +2457,9 @@ fn collect_artifact_cache(
     // bounded descriptor windows before entering this cache). Waiting for
     // content EX would self-deadlock before the closure can be consumed and
     // release that lease. Record/stable-root reclamation above is still
-    // synchronous. Throttle a contended CAS pass with the rest of lifecycle
-    // collection: retrying the complete namespace scan at every lookup turns
-    // ordinary content readers into a cross-process GC storm.
+    // synchronous. Lifecycle collection runs at cold-build reservation
+    // boundaries, where new cache growth can actually require reclamation;
+    // direct hits never turn the complete namespace scan into a lookup storm.
     let content_sweep_complete =
         super::content::collect_unreachable_content_objects(&retained_objects, now, false)?;
     if !content_sweep_complete {
