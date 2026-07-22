@@ -107,6 +107,10 @@ impl MaterializedNextestArtifacts {
         self.tree.cache_hit()
     }
 
+    pub(crate) fn stable_source(&self) -> &StableCargoSource {
+        &self._stable_source
+    }
+
     /// Install the complete instrumented closure in a persistent coverage
     /// recovery bundle.
     ///
@@ -700,8 +704,8 @@ fn source_path_is_excluded(root: &Path, path: &Path, outputs: &[PathBuf]) -> boo
     outputs
         .iter()
         // An output can only exclude source files when the output is inside
-        // this source root.  Stable scheduler discovery deliberately plans a
-        // second source closure from a workspace inside ktstr's cache.  In
+        // this source root. Standalone scheduler discovery can still plan a
+        // source closure from a workspace already inside ktstr's cache. In
         // that case the cache root is an ancestor of the source root, not an
         // output contained by it, and must not exclude the source itself.
         .any(|output| output.starts_with(root) && (path == output || path.starts_with(output)))
@@ -2578,6 +2582,125 @@ pub(crate) struct StableCargoSource {
 }
 
 impl StableCargoSource {
+    /// Reuse this already-materialized immutable source when another Cargo
+    /// producer was declared from inside it.
+    ///
+    /// Scheduler manifests embed the stable `CARGO_MANIFEST_DIR`, so their
+    /// declaring workspace is commonly this exact tree. Replanning that tree
+    /// as live input and materializing it under a second stable identity adds
+    /// a complete source scan and COW publication without adding any
+    /// correctness: this owner already pins the source closure. The enclosing
+    /// source identity is conservative (an unrelated file can invalidate the
+    /// scheduler artifact) but complete, and every pathname coordinate is
+    /// normalized before it enters the producer identity.
+    pub(crate) fn contained_invocation_identity(
+        &self,
+        metadata: &cargo_metadata::Metadata,
+        mode: &str,
+        build_surface: &[String],
+        output_roots: &[PathBuf],
+        invocation: &Path,
+    ) -> Result<Option<u64>, String> {
+        let owned_root = canonical_or_lexical(self._tree.root());
+        let is_owned = |path: &Path| canonical_or_lexical(path).starts_with(&owned_root);
+        if !is_owned(metadata.workspace_root.as_std_path())
+            || !is_owned(invocation)
+            || metadata
+                .packages
+                .iter()
+                .filter(|package| package.source.is_none())
+                .any(|package| !is_owned(package.manifest_path.as_std_path()))
+        {
+            return Ok(None);
+        }
+
+        let mut replacements = BTreeMap::<PathBuf, Vec<u8>>::new();
+        let mut insert = |path: PathBuf, replacement: Vec<u8>| {
+            replacements.entry(path).or_insert(replacement);
+        };
+        for (index, (writable, stable)) in self.cargo_root_remaps.iter().enumerate() {
+            let replacement = format!("$SOURCE/{index}").into_bytes();
+            insert(canonical_or_lexical(writable), replacement.clone());
+            insert(canonical_or_lexical(stable), replacement);
+        }
+        for (index, (writable, stable)) in self.cargo_argument_remaps.iter().enumerate() {
+            let replacement = format!("$CARGO_ARGUMENT/{index}").into_bytes();
+            insert(canonical_or_lexical(writable), replacement.clone());
+            insert(canonical_or_lexical(stable), replacement);
+        }
+        insert(
+            canonical_or_lexical(&self.original_workspace_root),
+            b"$WORKSPACE".to_vec(),
+        );
+        insert(
+            canonical_or_lexical(&self.workspace_root),
+            b"$WORKSPACE".to_vec(),
+        );
+        insert(
+            canonical_or_lexical(&self.original_invocation_root),
+            b"$INVOCATION".to_vec(),
+        );
+        insert(
+            canonical_or_lexical(&self.invocation_root),
+            b"$INVOCATION".to_vec(),
+        );
+        for output in output_roots {
+            insert(canonical_or_lexical(output), b"$OUTPUT".to_vec());
+        }
+        let mut replacements = replacements.into_iter().collect::<Vec<_>>();
+        replacements.sort_by(|left, right| {
+            right
+                .0
+                .as_os_str()
+                .as_bytes()
+                .len()
+                .cmp(&left.0.as_os_str().as_bytes().len())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let normalized_args = build_surface
+            .iter()
+            .map(|argument| {
+                let mut value = argument.as_bytes().to_vec();
+                for (path, replacement) in &replacements {
+                    let needle = path.as_os_str().as_bytes();
+                    if needle.is_empty() {
+                        continue;
+                    }
+                    while let Some(index) = value
+                        .windows(needle.len())
+                        .position(|window| window == needle)
+                    {
+                        value.splice(index..index + needle.len(), replacement.iter().copied());
+                    }
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        let workspace = canonical_or_lexical(metadata.workspace_root.as_std_path());
+        let environment = crate::verifier::scheduler_build_environment(&workspace, &|| {
+            crate::interrupt::INTERRUPTED.load(Ordering::Acquire)
+        })?;
+        let external_packages = metadata
+            .packages
+            .iter()
+            .filter_map(|package| {
+                package
+                    .source
+                    .as_ref()
+                    .map(|source| format!("{}@{}:{}", package.name, package.version, source))
+            })
+            .collect::<BTreeSet<_>>();
+        let tools = tool_fingerprints(mode, &workspace)?;
+        Ok(Some(artifact_identity(
+            mode,
+            self._tree.identity(),
+            &normalized_args,
+            &external_packages,
+            &environment,
+            &tools,
+        )))
+    }
+
     fn execution_source_root_remaps(&self) -> Vec<(PathBuf, PathBuf)> {
         self.cargo_root_remaps
             .iter()
@@ -3728,7 +3851,7 @@ rustflags = ['-C', 'target-cpu=x86-64-v3']\n",
     }
 
     #[test]
-    fn stable_source_can_resnapshot_nested_scheduler_workspace_inside_cache() {
+    fn stable_source_reuses_nested_scheduler_workspace_without_resnapshot() {
         let _environment = lock_env();
         let checkout = std::env::current_dir().unwrap();
         let temp = tempfile::Builder::new()
@@ -3790,45 +3913,63 @@ rustflags = ['-C', 'target-cpu=x86-64-v3']\n",
             .no_deps()
             .exec()
             .unwrap();
-        let second = plan_source_layout(
-            &scheduler_metadata,
-            &[scheduler_metadata
-                .target_directory
-                .as_std_path()
-                .to_path_buf()],
-            &[],
-            scheduler_metadata.workspace_root.as_std_path(),
-        )
-        .unwrap();
-        let nested_root = second
-            .roots
-            .iter()
-            .find(|root| root.source.starts_with(&cache))
-            .unwrap_or_else(|| {
-                panic!(
-                    "nested source plan escaped its cache tree: {:?}",
-                    second
-                        .roots
-                        .iter()
-                        .map(|root| &root.source)
-                        .collect::<Vec<_>>()
-                )
-            });
-        assert!(nested_root.input_paths.contains(Path::new("Cargo.toml")));
-        assert!(
-            nested_root
-                .input_paths
-                .contains(Path::new("scheduler/Cargo.toml"))
+        let stable_records = cache.join("stable-sources-v2");
+        let record_count = std::fs::read_dir(&stable_records).unwrap().count();
+        let target = scheduler_metadata
+            .target_directory
+            .as_std_path()
+            .to_path_buf();
+        let identity = first
+            .contained_invocation_identity(
+                &scheduler_metadata,
+                "scheduler-workspace",
+                &[
+                    "build".to_string(),
+                    "--target-dir".to_string(),
+                    target.display().to_string(),
+                ],
+                std::slice::from_ref(&target),
+                scheduler_metadata.workspace_root.as_std_path(),
+            )
+            .unwrap()
+            .expect("the outer stable owner covers the scheduler");
+        let writable_target = metadata.target_directory.as_std_path().to_path_buf();
+        let identity_with_writable_output = first
+            .contained_invocation_identity(
+                &scheduler_metadata,
+                "scheduler-workspace",
+                &[
+                    "build".to_string(),
+                    "--target-dir".to_string(),
+                    writable_target.display().to_string(),
+                ],
+                std::slice::from_ref(&writable_target),
+                scheduler_metadata.workspace_root.as_std_path(),
+            )
+            .unwrap()
+            .expect("the scheduler remains inside the outer stable owner");
+        assert_eq!(
+            identity, identity_with_writable_output,
+            "output placement must not split direct stable-source reuse",
         );
-
-        let second = materialize_stable_source(&second, "nested stable-source fixture").unwrap();
-        assert!(second.workspace_root.join("Cargo.toml").is_file());
-        assert!(second.workspace_root.join("scheduler/Cargo.toml").is_file());
-        cargo_metadata::MetadataCommand::new()
-            .manifest_path(second.workspace_root.join("scheduler/Cargo.toml"))
-            .no_deps()
-            .exec()
-            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(&stable_records).unwrap().count(),
+            record_count,
+            "scheduler identity reuse must not publish a second stable source",
+        );
+        assert!(
+            first
+                .contained_invocation_identity(
+                    &metadata,
+                    "scheduler-workspace",
+                    &["build".to_string()],
+                    &[metadata.target_directory.as_std_path().to_path_buf()],
+                    metadata.workspace_root.as_std_path(),
+                )
+                .unwrap()
+                .is_none(),
+            "a writable checkout cannot borrow an unrelated stable owner",
+        );
     }
 
     #[test]

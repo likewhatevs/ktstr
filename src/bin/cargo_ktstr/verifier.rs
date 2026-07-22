@@ -1361,7 +1361,7 @@ fn force_scheduler_stable_target(mut args: Vec<String>, target: &Path) -> Vec<St
 struct WorkspaceSchedulerArtifacts {
     paths: BTreeMap<String, PathBuf>,
     tree: ktstr::cache::artifact_tree::MaterializedArtifactTree,
-    stable_source: crate::nextest_artifact_cache::StableCargoSource,
+    stable_source: Option<crate::nextest_artifact_cache::StableCargoSource>,
 }
 
 fn scheduler_identity_not_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), String> {
@@ -1694,6 +1694,7 @@ fn build_scheduler_workspace(
     profile: &str,
     build_options: &[String],
     cli_label: &str,
+    containing_source: Option<&crate::nextest_artifact_cache::StableCargoSource>,
 ) -> Result<WorkspaceSchedulerArtifacts, String> {
     let metadata = group.metadata.as_ref().ok_or_else(|| {
         format!(
@@ -1703,15 +1704,44 @@ fn build_scheduler_workspace(
     })?;
     let (identity_build_args, identity_target_dir) =
         scheduler_workspace_execution(group, profile, build_options);
-    let identity_plan = crate::nextest_artifact_cache::identity_plan_for_invocation(
-        metadata,
-        "scheduler-workspace",
-        &identity_build_args,
-        std::slice::from_ref(&identity_target_dir),
-        &group.root,
-    )?;
-    let identity = identity_plan.identity;
-    let stable_source = identity_plan.stable_source(cli_label)?;
+    let reused_identity = containing_source
+        .map(|source| {
+            source.contained_invocation_identity(
+                metadata,
+                "scheduler-workspace",
+                &identity_build_args,
+                std::slice::from_ref(&identity_target_dir),
+                &group.root,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let mut owned_stable_source = None;
+    let (identity, stable_source, source_is_already_stable) =
+        if let Some(identity) = reused_identity {
+            (
+                identity,
+                containing_source.expect("reused identity has a containing source"),
+                true,
+            )
+        } else {
+            let identity_plan = crate::nextest_artifact_cache::identity_plan_for_invocation(
+                metadata,
+                "scheduler-workspace",
+                &identity_build_args,
+                std::slice::from_ref(&identity_target_dir),
+                &group.root,
+            )?;
+            let identity = identity_plan.identity;
+            owned_stable_source = Some(identity_plan.stable_source(cli_label)?);
+            (
+                identity,
+                owned_stable_source
+                    .as_ref()
+                    .expect("stable scheduler source materialized above"),
+                false,
+            )
+        };
     let stable_build_options = stable_source.remap_cargo_args(build_options);
     let (build_args, _identity_target_dir) =
         scheduler_workspace_execution(group, profile, &stable_build_options);
@@ -1726,15 +1756,22 @@ fn build_scheduler_workspace(
             // The build consumes only the immutable stable source whose
             // identity was validated before publication. There is no live
             // checkout left to rewalk after Cargo exits.
-            let stable_group = scheduler_group_remapped_to_stable_source(
-                group,
-                &stable_source.workspace_root,
-                &stable_build_options,
-            )?;
+            let (stable_group, stable_workspace_root) = if source_is_already_stable {
+                (group.clone(), group.root.as_path())
+            } else {
+                (
+                    scheduler_group_remapped_to_stable_source(
+                        group,
+                        &stable_source.workspace_root,
+                        &stable_build_options,
+                    )?,
+                    stable_source.workspace_root.as_path(),
+                )
+            };
             let mut command = Command::new("cargo");
             let stable_build_dir = stable_build.root.join("build");
             command
-                .current_dir(&stable_source.workspace_root)
+                .current_dir(stable_workspace_root)
                 .args(force_scheduler_stable_target(
                     build_args.clone(),
                     &stable_build.target_directory,
@@ -1783,7 +1820,7 @@ fn build_scheduler_workspace(
     Ok(WorkspaceSchedulerArtifacts {
         paths: cached.paths,
         tree: cached.tree,
-        stable_source,
+        stable_source: owned_stable_source,
     })
 }
 
@@ -1818,6 +1855,7 @@ pub(crate) fn prepare_scheduler_artifacts(
         cli_profile,
         cargo_args,
         invocation_dir,
+        None,
     )
 }
 
@@ -1826,6 +1864,7 @@ pub(crate) fn prepare_scheduler_artifacts(
 /// reopen the large test executables merely to rediscover the same stamps.
 pub(crate) fn prepare_scheduler_artifacts_from_cached_manifests(
     manifests: &[ktstr::test_support::SchedulerManifestProbe],
+    stable_source: &crate::nextest_artifact_cache::StableCargoSource,
     cli_profile: Option<&str>,
     cargo_args: &[String],
     invocation_dir: &Path,
@@ -1836,6 +1875,7 @@ pub(crate) fn prepare_scheduler_artifacts_from_cached_manifests(
         cli_profile,
         cargo_args,
         invocation_dir,
+        Some(stable_source),
     )
 }
 
@@ -1844,6 +1884,7 @@ fn prepare_scheduler_artifacts_from_requirements(
     cli_profile: Option<&str>,
     cargo_args: &[String],
     invocation_dir: &Path,
+    stable_source: Option<&crate::nextest_artifact_cache::StableCargoSource>,
 ) -> Result<PreparedSchedulerArtifacts, String> {
     use ktstr::scheduler_artifact::{
         SCHEDULER_ARTIFACT_MANIFEST_VERSION, SchedulerArtifactEntry, SchedulerArtifactManifest,
@@ -1957,12 +1998,18 @@ fn prepare_scheduler_artifacts_from_requirements(
     let mut scheduler_trees = Vec::new();
     let mut scheduler_sources = Vec::new();
     for group in &groups {
-        let artifacts = build_scheduler_workspace(group, &profile, &build_options, "cargo ktstr")?;
+        let artifacts = build_scheduler_workspace(
+            group,
+            &profile,
+            &build_options,
+            "cargo ktstr",
+            stable_source,
+        )?;
         for path in artifacts.paths.values() {
             snapshot_paths.insert(path.clone(), path.clone());
         }
         scheduler_trees.push(artifacts.tree);
-        scheduler_sources.push(artifacts.stable_source);
+        scheduler_sources.extend(artifacts.stable_source);
         for request in &group.requests {
             let emitted = artifacts
                 .paths
@@ -2081,12 +2128,13 @@ fn prebuild_scheduler_manifest(
             profile,
             context.build_options,
             "cargo ktstr verifier",
+            None,
         )?;
         for path in artifacts.paths.values() {
             snapshot_paths.insert(path.clone(), path.clone());
         }
         scheduler_trees.push(artifacts.tree);
-        scheduler_sources.push(artifacts.stable_source);
+        scheduler_sources.extend(artifacts.stable_source);
         if context
             .interrupted
             .load(std::sync::atomic::Ordering::Acquire)

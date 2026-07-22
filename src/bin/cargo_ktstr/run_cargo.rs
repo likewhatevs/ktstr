@@ -4585,6 +4585,10 @@ fn run_cargo_sub(
         Some(
             crate::verifier::prepare_scheduler_artifacts_from_cached_manifests(
                 manifests,
+                cached_nextest
+                    .as_ref()
+                    .expect("cached manifests came from cached nextest artifacts")
+                    .stable_source(),
                 profile.as_deref(),
                 &args,
                 &invocation_dir,
