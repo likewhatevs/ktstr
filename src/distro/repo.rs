@@ -24,7 +24,9 @@
 //!   `linux-image-generic-hwe-{YY.MM}` meta package's `Depends` pins
 //!   the concrete `linux-image-{kver}-generic`, whose modules live in
 //!   `linux-modules{,-extra}-{kver}-generic`. debuginfo is the
-//!   `-dbgsym` ddeb from `ddebs.ubuntu.com`.
+//!   `-dbgsym` ddeb from `ddebs.ubuntu.com`, with Launchpad's primary
+//!   archive API and file store as an independent resolution/download
+//!   provider when the DDEB archive is unavailable.
 //! - **Amazon Linux 2023** — repo base from
 //!   `https://cdn.amazonlinux.com/al2023/core/mirrors/latest/{arch}/mirror.list`.
 //!   AL2023 carries parallel kernel STREAMS as differently-named
@@ -79,13 +81,20 @@ use sha2::{Digest, Sha256};
 
 pub use crate::kernel_path::DistroKind;
 
-/// A single resolved package: name, version, download URL, and the
-/// sha256 the repo metadata declares for it.
+/// A single resolved package: name, version, ordered official download URLs,
+/// and the sha256 the repository metadata declares for it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PackageRef {
     pub name: String,
     pub version: String,
     pub url: String,
+    /// Equivalent official origins, tried in order after [`Self::url`].
+    ///
+    /// Acquisition verifies every origin against the same content hash, so
+    /// this stays generic rather than embedding repository-specific fallback
+    /// policy in the downloader.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternate_urls: Vec<String>,
     pub sha256: String,
     pub size: Option<u64>,
 }
@@ -314,14 +323,25 @@ fn validate_cached_package(package: &PackageRef) -> Result<()> {
             package.name
         );
     }
-    let url = Url::parse(&package.url)
-        .with_context(|| format!("cached distro package {} has an invalid URL", package.name))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        bail!(
-            "cached distro package {} URL must be absolute http(s): {}",
-            package.name,
-            package.url
-        );
+    let mut seen_urls = std::collections::HashSet::new();
+    for url in std::iter::once(&package.url).chain(&package.alternate_urls) {
+        let parsed = Url::parse(url).with_context(|| {
+            format!("cached distro package {} has an invalid URL", package.name)
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            bail!(
+                "cached distro package {} URL must be absolute http(s): {}",
+                package.name,
+                url
+            );
+        }
+        if !seen_urls.insert(url) {
+            bail!(
+                "cached distro package {} repeats download URL {}",
+                package.name,
+                url
+            );
+        }
     }
     if package.sha256.len() != 64 || !package.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!(
@@ -1025,6 +1045,7 @@ fn build_package_set(
                 name: c.name.clone(),
                 version: c.evr.display(),
                 url: join_url(base, &c.href)?,
+                alternate_urls: Vec::new(),
                 sha256: c.sha256.clone(),
                 size: c.size,
             }),
@@ -1107,7 +1128,10 @@ fn resolve_fedora(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
 const UBUNTU_META_RELEASE_LTS: &str = "https://changelogs.ubuntu.com/meta-release-lts";
 const UBUNTU_ARCHIVE: &str = "https://archive.ubuntu.com/ubuntu/";
 const UBUNTU_PORTS: &str = "https://ports.ubuntu.com/ubuntu-ports/";
-const UBUNTU_DDEBS: &str = "http://ddebs.ubuntu.com/";
+const UBUNTU_DDEBS: &str = "https://ddebs.ubuntu.com/";
+const LAUNCHPAD_PRIMARY_ARCHIVE_API: &str =
+    "https://api.launchpad.net/devel/ubuntu/+archive/primary";
+const LAUNCHPAD_PRIMARY_FILES: &str = "https://launchpad.net/ubuntu/+archive/primary/+files/";
 
 /// Map the host arch string to Ubuntu's package architecture.
 fn ubuntu_arch(arch: &str) -> Result<&'static str> {
@@ -1141,9 +1165,6 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
     };
 
     let debs = fetch_deb_packages(archive_base, &codename, deb_arch)?;
-    // Fetch debuginfo metadata up front: the chosen kernel version
-    // depends on which kernels actually have a published dbgsym ddeb.
-    let ddebs = fetch_deb_packages(UBUNTU_DDEBS, &codename, deb_arch)?;
     let meta_name = format!("linux-image-generic-hwe-{version}");
     let meta_pkg = newest_deb(&debs, &meta_name).ok_or_else(|| {
         anyhow!("HWE meta {meta_name} not found in {codename}-updates/{deb_arch}")
@@ -1159,17 +1180,49 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
     // demand the bleeding edge when an equally-valid, complete kernel is
     // one step back. A hard error remains only when NO kernel in the
     // series has debuginfo — a genuinely broken archive, not a lag.
-    let selected = newest_kernel_with_debuginfo(&debs, &ddebs).ok_or_else(|| {
-        anyhow!(
-            "no Ubuntu {codename}-updates/{deb_arch} kernel has both an image and \
-             a dbgsym ddeb on ddebs.ubuntu.com — debuginfo is mandatory"
-        )
-    })?;
+    // The DDEB archive is the fast index provider. Launchpad's official API
+    // and Librarian are a genuinely independent provider: unlike switching
+    // schemes on ddebs.ubuntu.com, they can resolve a cold cache while that
+    // archive returns 503. A healthy DDEB result also carries a deterministic
+    // Launchpad file URL as an independent download origin, verified against
+    // the DDEB index's exact SHA256 and size.
+    let selected = match fetch_ubuntu_ddebs(&codename, deb_arch).and_then(|ddebs| {
+        let selected = newest_kernel_with_debuginfo(&debs, &ddebs).ok_or_else(|| {
+            anyhow!(
+                "no Ubuntu {codename}-updates/{deb_arch} kernel has both an image and \
+                 a dbgsym ddeb in the DDEB index"
+            )
+        })?;
+        Ok(UbuntuResolvedSelection {
+            kver: selected.kver,
+            image: selected.image,
+            debuginfo: ubuntu_ddeb_package_ref(selected.dbgsym)?,
+        })
+    }) {
+        Ok(selected) => selected,
+        Err(ddebs_error) => {
+            tracing::warn!(
+                codename,
+                arch = deb_arch,
+                error = %format!("{ddebs_error:#}"),
+                "Ubuntu DDEB index unavailable; resolving exact dbgsym through Launchpad",
+            );
+            newest_kernel_with_launchpad_debuginfo(&debs, &codename, deb_arch)?.ok_or_else(
+                || {
+                    anyhow!(
+                        "no Ubuntu {codename}-updates/{deb_arch} kernel has a published \
+                         dbgsym in either official provider; DDEB index failed: \
+                         {ddebs_error:#}"
+                    )
+                },
+            )?
+        }
+    };
     let kver = selected.kver.as_str();
     if kver != preferred_kver {
         eprintln!(
             "ktstr: newest HWE kernel {preferred_kver} has no dbgsym ddeb yet \
-             (Ubuntu ddebs lag a publish by hours); using {kver}, the newest \
+             (Ubuntu dbgsym publishing can lag by hours); using {kver}, the newest \
              fully-published kernel with debuginfo"
         );
     }
@@ -1191,7 +1244,7 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
     // version selection and debuginfo selection one atomic operation.
     // There is deliberately no second name lookup that could disagree
     // with the fallback decision.
-    let debuginfo = vec![deb_package_ref(selected.dbgsym, UBUNTU_DDEBS)?];
+    let debuginfo = vec![selected.debuginfo];
 
     // Report the CHOSEN kernel's image version (a fallback may be older
     // than the HWE meta's), not the meta package's.
@@ -1208,10 +1261,19 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
 
 /// One fully-published Ubuntu kernel and the exact image/dbgsym stanzas
 /// selected for it.
-struct UbuntuKernelSelection<'a> {
+struct UbuntuKernelSelection<'image, 'debug> {
+    kver: String,
+    image: &'image DebPkg,
+    dbgsym: &'debug DebPkg,
+}
+
+/// Provider-independent resolved Ubuntu selection. The image stanza always
+/// comes from Ubuntu's normal archive; the owned debuginfo reference may come
+/// from the DDEB index or Launchpad's API/Librarian.
+struct UbuntuResolvedSelection<'a> {
     kver: String,
     image: &'a DebPkg,
-    dbgsym: &'a DebPkg,
+    debuginfo: PackageRef,
 }
 
 /// Newest kernel (e.g. `6.17.0-38`) in the `-updates` `debs`
@@ -1227,10 +1289,10 @@ struct UbuntuKernelSelection<'a> {
 /// image debs (not the ddebs) so a stray dbgsym without a matching image
 /// can never be selected; the digit-prefix filter drops meta/unsigned/
 /// flavored names, leaving only concrete `MAJOR.MINOR.PATCH-ABI` kvers.
-fn newest_kernel_with_debuginfo<'a>(
-    debs: &'a [DebPkg],
-    ddebs: &'a [DebPkg],
-) -> Option<UbuntuKernelSelection<'a>> {
+fn newest_kernel_with_debuginfo<'image, 'debug>(
+    debs: &'image [DebPkg],
+    ddebs: &'debug [DebPkg],
+) -> Option<UbuntuKernelSelection<'image, 'debug>> {
     debs.iter()
         .filter_map(|p| {
             p.package
@@ -1257,6 +1319,69 @@ fn ubuntu_dbgsym<'a>(ddebs: &'a [DebPkg], kver: &str) -> Option<&'a DebPkg> {
     newest_deb(ddebs, &unsigned).or_else(|| newest_deb(ddebs, &signed))
 }
 
+/// Query candidate images newest-first through an injected exact dbgsym
+/// lookup. Unsigned is Ubuntu's canonical vmlinux carrier; the signed package
+/// is accepted only when the unsigned publication is absent.
+fn newest_kernel_with_exact_dbgsym_lookup<'a, F>(
+    debs: &'a [DebPkg],
+    mut lookup: F,
+) -> Result<Option<UbuntuResolvedSelection<'a>>>
+where
+    F: FnMut(&str, &str) -> Result<Option<PackageRef>>,
+{
+    let mut images: Vec<(String, &'a DebPkg)> = debs
+        .iter()
+        .filter_map(|image| {
+            image
+                .package
+                .strip_prefix("linux-image-")
+                .and_then(|name| name.strip_suffix("-generic"))
+                .filter(|kver| kver.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                .map(|kver| (kver.to_string(), image))
+        })
+        .collect();
+    images.sort_by(|(_, a), (_, b)| deb_version_cmp(&b.version, &a.version));
+
+    for (kver, image) in images {
+        let names = [
+            format!("linux-image-unsigned-{kver}-generic-dbgsym"),
+            format!("linux-image-{kver}-generic-dbgsym"),
+        ];
+        for name in names {
+            let Some(debuginfo) = lookup(&name, &image.version)? else {
+                continue;
+            };
+            if debuginfo.name != name || debuginfo.version != image.version {
+                bail!(
+                    "exact dbgsym lookup returned {} {} for requested {} {}",
+                    debuginfo.name,
+                    debuginfo.version,
+                    name,
+                    image.version
+                );
+            }
+            validate_cached_package(&debuginfo)
+                .with_context(|| format!("validate exact dbgsym result for {name}"))?;
+            return Ok(Some(UbuntuResolvedSelection {
+                kver,
+                image,
+                debuginfo,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn newest_kernel_with_launchpad_debuginfo<'a>(
+    debs: &'a [DebPkg],
+    codename: &str,
+    deb_arch: &str,
+) -> Result<Option<UbuntuResolvedSelection<'a>>> {
+    newest_kernel_with_exact_dbgsym_lookup(debs, |name, version| {
+        fetch_launchpad_ddeb(codename, deb_arch, name, version)
+    })
+}
+
 /// Fetch and parse `{codename}-updates` `Packages.gz` for `deb_arch`.
 fn fetch_deb_packages(base: &str, codename: &str, deb_arch: &str) -> Result<Vec<DebPkg>> {
     let url = deb_packages_url(base, codename, deb_arch);
@@ -1266,6 +1391,214 @@ fn fetch_deb_packages(base: &str, codename: &str, deb_arch: &str) -> Result<Vec<
         .read_to_string(&mut text)
         .with_context(|| format!("gunzip {url}"))?;
     Ok(parse_deb_packages(&text))
+}
+
+/// Fetch Ubuntu's debug-package index from its one published DDEB archive.
+/// Availability failover is Launchpad below, not another scheme on this host.
+fn fetch_ubuntu_ddebs(codename: &str, deb_arch: &str) -> Result<Vec<DebPkg>> {
+    fetch_deb_packages(UBUNTU_DDEBS, codename, deb_arch)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LaunchpadBinaryPublications {
+    total_size: usize,
+    entries: Vec<LaunchpadBinaryPublication>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LaunchpadBinaryPublication {
+    self_link: String,
+    binary_package_name: String,
+    binary_package_version: String,
+    distro_arch_series_link: String,
+    status: String,
+    pocket: String,
+    is_debug: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LaunchpadBinaryFile {
+    url: String,
+    sha256: String,
+    size: u64,
+}
+
+fn launchpad_arch_series(codename: &str, deb_arch: &str) -> String {
+    format!("https://api.launchpad.net/devel/ubuntu/{codename}/{deb_arch}")
+}
+
+/// Exact anonymous Launchpad query for one published Updates-pocket binary.
+/// Every identity axis is repeated in response validation; query filtering is
+/// an optimization, never the correctness boundary.
+fn launchpad_ddeb_query_url(
+    codename: &str,
+    deb_arch: &str,
+    name: &str,
+    version: &str,
+) -> Result<String> {
+    let mut url = Url::parse(LAUNCHPAD_PRIMARY_ARCHIVE_API)
+        .context("parse Launchpad primary archive API URL")?;
+    url.query_pairs_mut()
+        .append_pair("ws.op", "getPublishedBinaries")
+        .append_pair("binary_name", name)
+        .append_pair("exact_match", "true")
+        .append_pair("version", version)
+        .append_pair(
+            "distro_arch_series",
+            &launchpad_arch_series(codename, deb_arch),
+        )
+        .append_pair("pocket", "Updates")
+        .append_pair("status", "Published")
+        .append_pair("order_by", "published_date_desc");
+    Ok(url.to_string())
+}
+
+fn validate_launchpad_binarypub_url(value: &str) -> Result<Url> {
+    const PREFIX: &str = "/devel/ubuntu/+archive/primary/+binarypub/";
+    let url = Url::parse(value).context("parse Launchpad binary publication URL")?;
+    let id = url.path().strip_prefix(PREFIX).unwrap_or_default();
+    if url.scheme() != "https"
+        || url.host_str() != Some("api.launchpad.net")
+        || id.is_empty()
+        || !id.bytes().all(|byte| byte.is_ascii_digit())
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("Launchpad returned a non-primary binary publication URL: {value}");
+    }
+    Ok(url)
+}
+
+fn exact_launchpad_publication(
+    bytes: &[u8],
+    codename: &str,
+    deb_arch: &str,
+    name: &str,
+    version: &str,
+) -> Result<Option<LaunchpadBinaryPublication>> {
+    let mut response: LaunchpadBinaryPublications =
+        serde_json::from_slice(bytes).context("parse Launchpad published-binaries response")?;
+    if response.total_size == 0 {
+        if !response.entries.is_empty() {
+            bail!("Launchpad returned entries with total_size=0");
+        }
+        return Ok(None);
+    }
+    if response.total_size != response.entries.len() {
+        bail!(
+            "exact Launchpad dbgsym query returned a paginated or torn result: \
+             total_size={}, entries={}",
+            response.total_size,
+            response.entries.len()
+        );
+    }
+    if response.entries.len() != 1 {
+        bail!(
+            "exact Launchpad dbgsym query returned {} publications for {name} {version}",
+            response.entries.len()
+        );
+    }
+
+    let publication = response.entries.pop().unwrap();
+    let expected_arch_series = launchpad_arch_series(codename, deb_arch);
+    if publication.binary_package_name != name
+        || publication.binary_package_version != version
+        || publication.distro_arch_series_link != expected_arch_series
+        || publication.status != "Published"
+        || publication.pocket != "Updates"
+        || !publication.is_debug
+    {
+        bail!(
+            "Launchpad dbgsym publication identity mismatch for requested \
+             {name} {version} in {codename}/{deb_arch}: {publication:?}"
+        );
+    }
+    validate_launchpad_binarypub_url(&publication.self_link)?;
+    Ok(Some(publication))
+}
+
+fn launchpad_binary_files_url(self_link: &str) -> Result<String> {
+    let mut url = validate_launchpad_binarypub_url(self_link)?;
+    url.query_pairs_mut()
+        .append_pair("ws.op", "binaryFileUrls")
+        .append_pair("include_meta", "true");
+    Ok(url.to_string())
+}
+
+fn launchpad_ddeb_package_ref(
+    bytes: &[u8],
+    name: &str,
+    version: &str,
+    deb_arch: &str,
+) -> Result<PackageRef> {
+    let mut files: Vec<LaunchpadBinaryFile> =
+        serde_json::from_slice(bytes).context("parse Launchpad binary-file response")?;
+    if files.len() != 1 {
+        bail!(
+            "Launchpad returned {} binary files for exact dbgsym {name} {version}",
+            files.len()
+        );
+    }
+    let file = files.pop().unwrap();
+    let url = Url::parse(&file.url).context("parse Launchpad dbgsym file URL")?;
+    let filename = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or_default();
+    let expected_filename = format!("{name}_{version}_{deb_arch}.ddeb");
+    if url.scheme() != "https"
+        || url.host_str() != Some("launchpad.net")
+        || !url.path().starts_with("/ubuntu/+archive/primary/+files/")
+        || filename != expected_filename
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!(
+            "Launchpad returned an invalid primary-archive dbgsym URL: {}",
+            file.url
+        );
+    }
+    if file.sha256.len() != 64
+        || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || file.size == 0
+    {
+        bail!("Launchpad returned invalid SHA256/size metadata for {name} {version}");
+    }
+
+    Ok(PackageRef {
+        name: name.to_string(),
+        version: version.to_string(),
+        url: file.url,
+        alternate_urls: Vec::new(),
+        sha256: file.sha256,
+        size: Some(file.size),
+    })
+}
+
+fn fetch_launchpad_ddeb(
+    codename: &str,
+    deb_arch: &str,
+    name: &str,
+    version: &str,
+) -> Result<Option<PackageRef>> {
+    let query_url = launchpad_ddeb_query_url(codename, deb_arch, name, version)?;
+    let publications = crate::fetch::fetch_metadata_bytes(
+        &query_url,
+        "fetch Ubuntu dbgsym publication from Launchpad",
+    )?;
+    let Some(publication) =
+        exact_launchpad_publication(&publications, codename, deb_arch, name, version)?
+    else {
+        return Ok(None);
+    };
+    let files_url = launchpad_binary_files_url(&publication.self_link)?;
+    let files = crate::fetch::fetch_metadata_bytes(
+        &files_url,
+        "fetch Ubuntu dbgsym file metadata from Launchpad",
+    )?;
+    Ok(Some(launchpad_ddeb_package_ref(
+        &files, name, version, deb_arch,
+    )?))
 }
 
 fn deb_packages_url(base: &str, codename: &str, deb_arch: &str) -> String {
@@ -1306,9 +1639,28 @@ fn deb_package_ref(p: &DebPkg, base: &str) -> Result<PackageRef> {
         name: p.package.clone(),
         version: p.version.clone(),
         url: join_url(base, &p.filename)?,
+        alternate_urls: Vec::new(),
         sha256: p.sha256.clone(),
         size: p.size,
     })
+}
+
+/// Build a DDEB reference with Launchpad's primary-archive file store as an
+/// independent download origin. Both URLs are accepted only for bytes matching
+/// the DDEB index's exact SHA256 and size.
+fn ubuntu_ddeb_package_ref(p: &DebPkg) -> Result<PackageRef> {
+    let mut package = deb_package_ref(p, UBUNTU_DDEBS)?;
+    let filename = p
+        .filename
+        .rsplit('/')
+        .next()
+        .filter(|filename| filename.ends_with(".ddeb"))
+        .ok_or_else(|| anyhow!("Ubuntu dbgsym has invalid Filename: {}", p.filename))?;
+    let launchpad_url = join_url(LAUNCHPAD_PRIMARY_FILES, filename)?;
+    if launchpad_url != package.url {
+        package.alternate_urls.push(launchpad_url);
+    }
+    Ok(package)
 }
 
 const AL2023_MIRROR: &str = "https://cdn.amazonlinux.com/al2023/core/mirrors/latest";
@@ -1572,6 +1924,7 @@ fn resolve_steamos(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKe
         name: kernel.name.clone(),
         version: kernel.version.clone(),
         url: format!("{base}{}", kernel.filename),
+        alternate_urls: Vec::new(),
         sha256: kernel.sha256.clone(),
         size: kernel.csize,
     }];
