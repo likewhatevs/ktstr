@@ -2140,10 +2140,17 @@ fn exercise_coordinator_complete_notify_case(
     let step_rescan_was_already_pending = std::rc::Rc::clone(&rescan_was_already_pending);
     let mut stepped = false;
     let result = acquire_as_coordinator_interruptible(coordinator, &cancelled, move |_| {
-        anyhow::ensure!(!stepped, "coordinator Complete race ran more than one planner step");
+        anyhow::ensure!(
+            !stepped,
+            "coordinator Complete race ran more than one planner step"
+        );
         stepped = true;
-        step_rescan_was_already_pending
-            .set(registry::force_coordinator_commit_race_for_tests(lost_license)?);
+        step_rescan_was_already_pending.set(registry::force_coordinator_commit_race_for_tests(
+            lost_license,
+        )?);
+        let hook_cancelled = std::sync::Arc::clone(&hook_cancelled);
+        let hook_payload_dropped = std::rc::Rc::clone(&hook_payload_dropped);
+        let hook_payload_dropped_at_notify = std::rc::Rc::clone(&hook_payload_dropped_at_notify);
         registry::arm_notify_hook_for_tests(move || {
             hook_payload_dropped_at_notify.set(hook_payload_dropped.get());
             hook_cancelled.store(true, Ordering::Release);
@@ -2201,27 +2208,36 @@ fn exercise_coordinator_prepare_notify_case(
     let mut preparation = Some(Box::new(preparation));
     let mut stepped = false;
     let hook_path = path.clone();
-    let result = acquire_as_coordinator_interruptible(coordinator, &cancelled, move |_| {
-        anyhow::ensure!(!stepped, "coordinator Prepare race ran more than one planner step");
-        stepped = true;
-        step_rescan_was_already_pending
-            .set(registry::force_coordinator_commit_race_for_tests(lost_license)?);
-        registry::arm_notify_hook_for_tests(move || {
-            let released = crate::flock::try_flock(&hook_path, FlockMode::Exclusive)
-                .ok()
-                .flatten();
-            hook_payload_released_at_notify.set(released.is_some());
-            drop(released);
-            hook_cancelled.store(true, Ordering::Release);
+    let result: Result<CoordinatorOutcome<()>> =
+        acquire_as_coordinator_interruptible(coordinator, &cancelled, move |_| {
+            anyhow::ensure!(
+                !stepped,
+                "coordinator Prepare race ran more than one planner step"
+            );
+            stepped = true;
+            step_rescan_was_already_pending.set(registry::force_coordinator_commit_race_for_tests(
+                lost_license,
+            )?);
+            let hook_cancelled = std::sync::Arc::clone(&hook_cancelled);
+            let hook_payload_released_at_notify =
+                std::rc::Rc::clone(&hook_payload_released_at_notify);
+            let hook_path = hook_path.clone();
+            registry::arm_notify_hook_for_tests(move || {
+                let released = crate::flock::try_flock(&hook_path, FlockMode::Exclusive)
+                    .ok()
+                    .flatten();
+                hook_payload_released_at_notify.set(released.is_some());
+                drop(released);
+                hook_cancelled.store(true, Ordering::Release);
+            });
+            Ok(CoordinatorStep::Prepare {
+                final_claim: claim.clone(),
+                preparation_claim: claim.clone(),
+                preparation: preparation
+                    .take()
+                    .expect("coordinator Prepare race payload was already consumed"),
+            })
         });
-        Ok(CoordinatorStep::Prepare {
-            final_claim: claim.clone(),
-            preparation_claim: claim.clone(),
-            preparation: preparation
-                .take()
-                .expect("coordinator Prepare race payload was already consumed"),
-        })
-    });
     let released_after_commit = crate::flock::try_flock(&path, FlockMode::Exclusive)?;
     let outcome = CoordinatorPayloadNotifyCase {
         commit_terminated: result.is_err(),

@@ -4571,9 +4571,9 @@ pub(super) fn exercise_dead_waiter_takeover_skip_for_tests() -> Result<(bool, bo
             record.ticket == live.ticket && record.state == STATE_COORDINATOR
         });
         let dead_skipped = table.coordinator_ticket() != dead_ticket
-            && !table
+            && table
                 .record(dead_slot)?
-                .is_some_and(|record| record.state == STATE_COORDINATOR);
+                .is_none_or(|record| record.state != STATE_COORDINATOR);
         table.prune_dead()?;
         (transferred_to_live, coherent_states, dead_skipped)
     };
@@ -4829,8 +4829,7 @@ pub(super) fn force_coordinator_commit_race_for_tests(lost_license: bool) -> Res
     anyhow::ensure!(
         table.coordinator_ticket() != displaced_ticket
             && table.record(displaced_slot)?.is_some_and(|record| {
-                record.ticket == displaced_ticket
-                    && record.state == STATE_COORDINATOR_STANDBY
+                record.ticket == displaced_ticket && record.state == STATE_COORDINATOR_STANDBY
             }),
         "coordinator commit-race fixture did not transfer the active lease",
     );
