@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ21");
-const VERSION: u32 = 21;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ22");
+const VERSION: u32 = 22;
 #[cfg(test)]
 const RETAINED_FUTEX_WAIT_MARKER_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 const HEADER_FIXED: usize = 256;
@@ -35,8 +35,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v21-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v21-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v22-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v22-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 const WAIT_DIAGNOSTIC_BUCKET_SECS: u64 = 30;
@@ -156,8 +156,9 @@ const H_LAST_PROGRESS_NS: usize = 184;
 /// Futex sequence paired with `H_GENERATION`. The generation remains a full
 /// u64 diagnostic/epoch while waiters sleep on this non-overlapping u32 word.
 const H_GENERATION_WAKE: usize = 192;
-/// Ticket which most recently received a speculative REPLAN callback. This is
-/// retained as a crash-repair diagnostic; it is not an admission cursor.
+/// Ticket which most recently received a speculative REPLAN callback. New
+/// callback publications start after this ticket and wrap once, so a stream
+/// of changing early tickets cannot monopolize the bounded planner window.
 const H_REPLAN_CURSOR: usize = 200;
 /// Inclusive ticket high-water admitted under the current non-renewing REPLAN
 /// lease. Each registry-writer scan observes a finite active-list snapshot,
@@ -175,6 +176,11 @@ const H_REPLAN_OUTSTANDING: usize = 216;
 /// cannot keep a stopped planner alive forever.
 const H_REPLAN_WAVE_STARTED_NS: usize = 224;
 const H_REPLAN_WAVE_DEADLINE_NS: usize = 232;
+/// Immutable maximum number of speculative planner callbacks which this host
+/// may execute concurrently. Actual VM admission remains independently
+/// bounded by the exact CPU/memory/token claims: this limits only parallel
+/// placement computation, whose callbacks otherwise form a process herd.
+const H_REPLAN_CAPACITY: usize = 240;
 const _: () = assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
 const _: () = assert!(H_GENERATION_WAKE.is_multiple_of(std::mem::align_of::<AtomicU32>()));
 const _: () = assert!(H_REPLAN_CURSOR.is_multiple_of(std::mem::align_of::<u64>()));
@@ -182,6 +188,7 @@ const _: () = assert!(H_REPLAN_HORIZON.is_multiple_of(std::mem::align_of::<u64>(
 const _: () = assert!(H_REPLAN_OUTSTANDING.is_multiple_of(std::mem::align_of::<u64>()));
 const _: () = assert!(H_REPLAN_WAVE_STARTED_NS.is_multiple_of(std::mem::align_of::<u64>()));
 const _: () = assert!(H_REPLAN_WAVE_DEADLINE_NS.is_multiple_of(std::mem::align_of::<u64>()));
+const _: () = assert!(H_REPLAN_CAPACITY.is_multiple_of(std::mem::align_of::<u64>()));
 
 const R_STATE: usize = 0;
 const R_WAKE: usize = 4;
@@ -1939,11 +1946,23 @@ impl Ticket {
     }
 
     pub(super) fn state(&self, cancelled: Option<&AtomicBool>) -> Result<State> {
+        self.state_with_recovery(false, cancelled)
+    }
+
+    fn state_with_recovery(
+        &self,
+        allow_stalled_takeover: bool,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<State> {
         let _namespace = self.namespace.enter();
         let _lock = lock_registry_interruptible_existing(cancelled)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
-        table.recover_coordinator_if_dead()?;
+        if allow_stalled_takeover {
+            table.recover_coordinator_if_stalled()?;
+        } else {
+            table.recover_coordinator_if_dead()?;
+        }
         let mut record = table
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
@@ -2087,7 +2106,7 @@ impl Ticket {
             // on every predecessor transition.
             match self.state_shared(true, cancelled)? {
                 Some(state) => Ok(state),
-                None => self.state(cancelled),
+                None => self.state_with_recovery(true, cancelled),
             }
         } else {
             Ok(state)
@@ -4113,7 +4132,8 @@ fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<WaitDia
             "bucket={bucket}\ncaptured_unix_secs={unix_secs}\nregistry_version={VERSION} \
          coordinator={} coordinator_slot={} coordinator_epoch={} coordinator_heartbeat_ns={} \
          last_progress_ns={} stalled_ns={} generation={} claim_epoch={} min_changed_ticket={} \
-         pending_flags={:#x} replan_outstanding={} replan_wave_started_ns={} replan_wave_deadline_ns={} \
+         pending_flags={:#x} replan_outstanding={} replan_capacity={} replan_cursor={} replan_horizon={} \
+         replan_wave_started_ns={} replan_wave_deadline_ns={} \
          global_serial={} grant_scans={} next_slot={} active_tail={} \
          active_records={} records_rendered={} records_truncated={}\n{}\n",
             table.coordinator_ticket(),
@@ -4127,6 +4147,9 @@ fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<WaitDia
             table.min_changed_ticket(),
             table.pending_flags(),
             table.replan_outstanding(),
+            table.replan_capacity(),
+            read_u64(&table.header, H_REPLAN_CURSOR),
+            read_u64(&table.header, H_REPLAN_HORIZON),
             read_u64(&table.header, H_REPLAN_WAVE_STARTED_NS),
             read_u64(&table.header, H_REPLAN_WAVE_DEADLINE_NS),
             table.global_serial(),
@@ -4192,6 +4215,57 @@ pub(super) fn snapshot() -> Result<Vec<(u64, u32, ClaimSet)>> {
 }
 
 #[cfg(test)]
+pub(super) fn registration_batch_kept_initial_coordinator_for_tests(
+    initial: &Ticket,
+    tickets: &[Ticket],
+) -> Result<bool> {
+    let _namespace = initial.namespace.enter();
+    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    Ok(table.coordinator_ticket() == initial.ticket
+        && table.coordinator_slot()? == initial.slot
+        && table
+            .record(initial.slot)?
+            .is_some_and(|record| record.state == STATE_COORDINATOR)
+        && tickets.iter().all(|ticket| {
+            table
+                .record(ticket.slot)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.state != STATE_COORDINATOR_STANDBY)
+        }))
+}
+
+#[cfg(test)]
+pub(super) fn exercise_replan_capacity_validation_for_tests() -> Result<(bool, bool, bool)> {
+    let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut ticket = Ticket::register(claim.clone(), claim, None)?;
+    let (preserved_by_repair, zero_rejected, oversized_rejected) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.set_replan_capacity_for_tests(3)?;
+        atomic_u64(&table.header, H_AGGREGATE_DIRTY).store(1, Ordering::SeqCst);
+        table.repair_consistency_if_needed()?;
+        let preserved_by_repair = table.replan_capacity() == 3;
+        write_u64(&mut table.header, H_REPLAN_CAPACITY, 0);
+        let zero_rejected = HeaderLayout::validate(&table.header).is_err();
+        write_u64(
+            &mut table.header,
+            H_REPLAN_CAPACITY,
+            u64::try_from(table.layout.bits)
+                .context("test registry layout does not fit capacity header")?
+                .saturating_add(1),
+        );
+        let oversized_rejected = HeaderLayout::validate(&table.header).is_err();
+        write_u64(&mut table.header, H_REPLAN_CAPACITY, 3);
+        (preserved_by_repair, zero_rejected, oversized_rejected)
+    };
+    ticket.finish(None)?;
+    Ok((preserved_by_repair, zero_rejected, oversized_rejected))
+}
+
+#[cfg(test)]
 pub(super) fn diagnostics_for_tests() -> Result<String> {
     let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Exclusive)? else {
         return Ok(if registry_lock_path().exists() {
@@ -4241,7 +4315,8 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
     Ok(format!(
         "coordinator={} coordinator_slot={} coordinator_epoch={} coordinator_heartbeat_ns={} \
          last_progress_ns={} generation={} claim_epoch={} min_changed_ticket={} \
-         pending_flags={:#x} replan_outstanding={} global_serial={} grant_scans={}; [{}]",
+         pending_flags={:#x} replan_outstanding={} replan_capacity={} replan_cursor={} \
+         replan_horizon={} global_serial={} grant_scans={}; [{}]",
         table.coordinator_ticket(),
         table.coordinator_slot()?,
         table.coordinator_epoch(),
@@ -4252,6 +4327,9 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
         table.min_changed_ticket(),
         table.pending_flags(),
         table.replan_outstanding(),
+        table.replan_capacity(),
+        read_u64(&table.header, H_REPLAN_CURSOR),
+        read_u64(&table.header, H_REPLAN_HORIZON),
         table.global_serial(),
         read_u64(&table.header, H_GRANT_SCANS),
         rows.join("; "),
@@ -4359,14 +4437,14 @@ pub(super) fn exercise_coordinator_heartbeat_deadline_for_tests()
             H_LAST_PROGRESS_NS,
             deadline.saturating_sub(1),
         );
-        table.recover_coordinator_if_dead_at(deadline.saturating_sub(1))?;
+        table.recover_coordinator_if_stalled_at(deadline.saturating_sub(1))?;
         let healthy = table.coordinator_ticket() == coordinator.ticket
             && table.coordinator_slot()? == coordinator.slot
             && table.record(coordinator.slot)?.is_some_and(|record| {
                 record.ticket == coordinator.ticket && record.state == STATE_COORDINATOR
             });
 
-        table.recover_coordinator_if_dead_at(deadline)?;
+        table.recover_coordinator_if_stalled_at(deadline)?;
         let takeover = table.coordinator_ticket() == successor.ticket
             && table.coordinator_slot()? == successor.slot
             && table.record(successor.slot)?.is_some_and(|record| {
@@ -4466,7 +4544,7 @@ pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
         let mut table = Table::open_existing()?;
         write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
         write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
-        table.recover_coordinator_if_dead_at(first_now)?;
+        table.recover_coordinator_if_stalled_at(first_now)?;
         (
             table.coordinator_ticket() == coordinator_b.ticket
                 && table.coordinator_slot()? == coordinator_b.slot,
@@ -4504,7 +4582,7 @@ pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
         let mut table = Table::open_existing()?;
         write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
         write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
-        table.recover_coordinator_if_dead_at(second_now)?;
+        table.recover_coordinator_if_stalled_at(second_now)?;
         (
             table.coordinator_ticket() == coordinator_c.ticket
                 && table.coordinator_slot()? == coordinator_c.slot,
@@ -4596,7 +4674,7 @@ pub(super) fn exercise_dead_waiter_takeover_skip_for_tests() -> Result<(bool, bo
         );
         write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
         write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
-        table.recover_coordinator_if_dead_at(
+        table.recover_coordinator_if_stalled_at(
             monotonic_now_ns()?.max(COORDINATOR_HEARTBEAT_LEASE_NS),
         )?;
         let transferred_to_live =
@@ -4694,7 +4772,7 @@ pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
         let mut table = Table::open_existing()?;
         write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
         write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
-        table.recover_coordinator_if_dead_at(first_now)?;
+        table.recover_coordinator_if_stalled_at(first_now)?;
         let first_header_transferred = table.coordinator_ticket() == coordinator_b.ticket
             && table.coordinator_slot()? == coordinator_b.slot;
         let first_states_coherent = table.record(coordinator_a.slot)?.is_some_and(|record| {
@@ -4744,7 +4822,7 @@ pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
         let mut table = Table::open_existing()?;
         write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
         write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
-        table.recover_coordinator_if_dead_at(second_now)?;
+        table.recover_coordinator_if_stalled_at(second_now)?;
         (
             table.coordinator_ticket() == coordinator_a.ticket
                 && table.coordinator_slot()? == coordinator_a.slot,
@@ -4859,7 +4937,7 @@ pub(super) fn force_coordinator_commit_race_for_tests(lost_license: bool) -> Res
     table.set_pending_flag(PENDING_RESCAN);
     write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
     write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
-    table.recover_coordinator_if_dead_at(
+    table.recover_coordinator_if_stalled_at(
         monotonic_now_ns()?.saturating_add(COORDINATOR_HEARTBEAT_LEASE_NS),
     )?;
     anyhow::ensure!(
@@ -4925,7 +5003,7 @@ pub(super) fn exercise_stalled_takeover_notification_for_tests(
         );
         write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
         write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
-        table.recover_coordinator_if_dead()?;
+        table.recover_coordinator_if_stalled()?;
         (
             table.record(coordinator.slot)?.is_some_and(|record| {
                 record.ticket == coordinator.ticket && record.state == STATE_COORDINATOR_STANDBY
@@ -6687,6 +6765,14 @@ pub(crate) struct ReplanChangedWaveOutcome {
 }
 
 #[cfg(test)]
+pub(crate) struct BoundedReplanWindowOutcome {
+    pub(crate) capacity: usize,
+    pub(crate) peak_outstanding: usize,
+    pub(crate) slices: Vec<Vec<usize>>,
+    pub(crate) disjoint_exact_granted: bool,
+}
+
+#[cfg(test)]
 pub(crate) struct ReplanStragglerProgressOutcome {
     pub(crate) completion_requeued: bool,
     pub(crate) callback_scan_delta: u64,
@@ -7120,6 +7206,156 @@ pub(super) fn exercise_grant_scan_crash_fence_for_tests() -> Result<(bool, bool,
     Ok((stale_later_rejected, later_demoted, earlier_regranted))
 }
 
+/// Exercise a deliberately tiny planner window while every completed early
+/// callback becomes eligible again. The cyclic cursor must visit the later
+/// tickets instead of letting that changing prefix monopolize each refill.
+#[cfg(test)]
+pub(super) fn exercise_bounded_replan_window_for_tests(
+    capacity: usize,
+    waiter_count: usize,
+) -> Result<BoundedReplanWindowOutcome> {
+    anyhow::ensure!(capacity >= 2, "bounded REPLAN fixture needs capacity >= 2");
+    anyhow::ensure!(
+        waiter_count > capacity.saturating_mul(2),
+        "bounded REPLAN fixture needs more than two complete windows",
+    );
+    let coordinator_cpu = 2_000usize;
+    let first_waiter_cpu = 2_010usize;
+    let common_cpu = first_waiter_cpu + waiter_count + 1;
+    let fixed_cpu = common_cpu + 1;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let mut claims = Vec::with_capacity(waiter_count);
+    let mut waiters = Vec::with_capacity(waiter_count);
+    for index in 0..waiter_count {
+        let claim = ClaimSet::new(
+            std::iter::empty(),
+            [first_waiter_cpu + index],
+            FlockMode::Exclusive,
+        );
+        let watch = ClaimSet::new(
+            std::iter::empty(),
+            [first_waiter_cpu + index, common_cpu],
+            FlockMode::Exclusive,
+        );
+        waiters.push(Ticket::register(claim.clone(), watch, None)?);
+        claims.push(claim);
+    }
+    let fixed_claim = ClaimSet::new(std::iter::empty(), [fixed_cpu], FlockMode::Exclusive);
+    let mut fixed = Ticket::register(fixed_claim.clone(), fixed_claim, None)?;
+
+    let mut slices = Vec::new();
+    let mut peak_outstanding = 0usize;
+    let disjoint_exact_granted;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.set_replan_capacity_for_tests(capacity)?;
+        set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, common_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, fixed_cpu, true)?;
+        for index in 0..waiter_count {
+            set_cpu_free_for_tests(&mut table, first_waiter_cpu + index, false)?;
+        }
+        table.stamp_resource_improvement(S_CPU_EX, common_cpu)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        let selected = waiters
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ticket)| {
+                table
+                    .record(ticket.slot)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.state == STATE_REPLAN)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        peak_outstanding = peak_outstanding.max(
+            usize::try_from(table.replan_outstanding())
+                .context("initial bounded REPLAN count does not fit usize")?,
+        );
+        slices.push(selected);
+        disjoint_exact_granted = table
+            .record(fixed.slot)?
+            .is_some_and(|record| record.state == STATE_GRANTED);
+    }
+
+    let window_count = waiter_count.div_ceil(capacity);
+    while slices.len() < window_count {
+        let selected = slices
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("bounded REPLAN fixture published no first window"))?;
+        anyhow::ensure!(
+            !selected.is_empty() && selected.len() <= capacity,
+            "bounded REPLAN fixture published malformed slice {selected:?}",
+        );
+        for index in selected {
+            let designated = claims[index].clone();
+            let result = waiters[index].run_granted(
+                None,
+                |current, _watch, acquisition_allowed, _predecessors, _availability| {
+                    anyhow::ensure!(
+                        !acquisition_allowed && current == &designated,
+                        "bounded REPLAN callback received an exact acquisition license",
+                    );
+                    Ok(GrantAttempt::<()> {
+                        acquired: None,
+                        preparation_claim: None,
+                        preparation_contention: None,
+                        next_claim: designated.clone(),
+                        contention: None,
+                    })
+                },
+            )?;
+            anyhow::ensure!(
+                matches!(result, GrantResult::Requeued),
+                "bounded REPLAN callback did not return to WAITING",
+            );
+        }
+        let next = {
+            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+            let mut table = Table::open_existing()?;
+            table.stamp_resource_improvement(S_CPU_EX, common_cpu)?;
+            table.set_pending_flag(PENDING_RESCAN);
+            table.grant_compatible()?;
+            peak_outstanding = peak_outstanding.max(
+                usize::try_from(table.replan_outstanding())
+                    .context("refilled bounded REPLAN count does not fit usize")?,
+            );
+            waiters
+                .iter()
+                .enumerate()
+                .filter_map(|(index, ticket)| {
+                    table
+                        .record(ticket.slot)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|record| record.state == STATE_REPLAN)
+                        .then_some(index)
+                })
+                .collect()
+        };
+        slices.push(next);
+    }
+
+    fixed.finish(None)?;
+    for waiter in waiters.iter_mut().rev() {
+        waiter.finish(None)?;
+    }
+    coordinator.finish(None)?;
+    Ok(BoundedReplanWindowOutcome {
+        capacity,
+        peak_outstanding,
+        slices,
+        disjoint_exact_granted,
+    })
+}
+
 #[cfg(test)]
 pub(super) fn exercise_replan_token_wave_for_tests(
     waiter_count: usize,
@@ -7169,6 +7405,7 @@ pub(super) fn exercise_replan_token_wave_for_tests(
     ) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
+        table.set_replan_capacity_for_tests(waiter_count)?;
         table.restage_coordinator_for_tests(
             &coordinator,
             waiters
@@ -7722,6 +7959,7 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
     let (scans_before, generation_wake_before) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
+        table.set_replan_capacity_for_tests(callback_count)?;
         table.restage_coordinator_for_tests(
             &coordinator,
             callbacks.iter().map(|(ticket, _, _)| ticket),
@@ -11178,7 +11416,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .saturating_add(1)
         })
         .unwrap_or(0);
-    // The v21 mapping is deliberately overprovisioned once. It never needs a
+    // The v22 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
     // a disjoint internal bit range immediately after possible host CPUs.
@@ -11273,11 +11511,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-registry-v21")
+    active_protocol_dir().join("ktstr-acquire-registry-v22")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-events-v21")
+    active_protocol_dir().join("ktstr-acquire-events-v22")
 }
 
 #[cfg(test)]
@@ -11349,7 +11587,21 @@ pub(super) fn wait_for_generation_change(expected: u32, timeout: Duration) -> Re
     }
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
-        Some(libc::EAGAIN) | Some(libc::EINTR) | Some(libc::ETIMEDOUT) => Ok(()),
+        Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(()),
+        Some(libc::ETIMEDOUT) => {
+            // This caller owns no queue ticket, so it cannot use the ordinary
+            // waiter futex path to recover a live coordinator which stopped
+            // making progress. The completed bounded wait is the sole license
+            // for a semantic lease transfer; registration itself performs
+            // dead-liveness repair only and never churns a merely descheduled
+            // pre-loop owner.
+            drop(map);
+            drop(file);
+            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+            let mut table = Table::open_existing()?;
+            table.repair_consistency_if_needed()?;
+            table.recover_coordinator_if_stalled()
+        }
         _ => Err(error).context("wait for admission registry generation change"),
     }
 }
@@ -11477,7 +11729,7 @@ fn lock_registry_for_initialization() -> Result<RegistryLock> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
     // Materialization order is protocol: once registry.lock is nameable, every
-    // v21 entrant must also be able to join the writer-intent gate ahead of it.
+    // v22 entrant must also be able to join the writer-intent gate ahead of it.
     let writer_intent = block_flock(registry_writer_intent_path(), FlockMode::Shared)?;
     let registry = block_flock(registry_lock_path(), FlockMode::Exclusive)?;
     let lock = finish_registry_lock(registry, writer_intent, FlockMode::Exclusive);
@@ -11802,6 +12054,17 @@ impl HeaderLayout {
                 expected.header_size
             );
         }
+        let replan_capacity = read_u64(map, H_REPLAN_CAPACITY);
+        if replan_capacity == 0
+            || usize::try_from(replan_capacity)
+                .ok()
+                .is_none_or(|capacity| capacity > expected.bits)
+        {
+            anyhow::bail!(
+                "queue registry v{VERSION} planner capacity {replan_capacity} is outside 1..={}",
+                expected.bits,
+            );
+        }
         Ok(expected)
     }
 
@@ -11981,6 +12244,27 @@ impl Table {
 
     fn replan_outstanding(&self) -> u64 {
         read_u64(&self.header, H_REPLAN_OUTSTANDING)
+    }
+
+    fn replan_capacity(&self) -> usize {
+        usize::try_from(read_u64(&self.header, H_REPLAN_CAPACITY))
+            .expect("validated queue registry planner capacity fits usize")
+    }
+
+    #[cfg(test)]
+    fn set_replan_capacity_for_tests(&mut self, capacity: usize) -> Result<()> {
+        anyhow::ensure!(
+            capacity != 0 && capacity <= self.layout.bits,
+            "test planner capacity {capacity} is outside 1..={}",
+            self.layout.bits,
+        );
+        let encoded = u64::try_from(capacity).context("test planner capacity does not fit header")?;
+        anyhow::ensure!(
+            self.replan_outstanding() <= encoded,
+            "cannot shrink test planner capacity below outstanding callbacks",
+        );
+        write_u64(&mut self.header, H_REPLAN_CAPACITY, encoded);
+        Ok(())
     }
 
     fn replan_wave_started_ns(&self) -> u64 {
@@ -13705,6 +13989,17 @@ impl Table {
             admission_open: bool,
         }
 
+        struct ReplanCandidate {
+            slot: u64,
+            ticket: u64,
+            waiting_serial: u64,
+            external_blocker: Option<ContentionMarker>,
+            cpu_any: Vec<u64>,
+            cpu_exclusive: Vec<u64>,
+            llc_any: Vec<u64>,
+            llc_exclusive: Vec<u64>,
+        }
+
         // The scan publishes a mutually dependent set of prefix caches,
         // grants/revocations, REPLAN cursor state, and wakes. A scanner dying
         // after activating an earlier fence but before revoking a conflicting
@@ -13727,14 +14022,21 @@ impl Table {
         let mut scan_publication_epoch = claim_epoch;
         let coordinator_ticket = self.coordinator_ticket();
         let global_serial = self.global_serial();
-        // REPLAN is a speculative planner callback, not a resource claim.
-        // Publish every eligible callback in this finite writer-locked
-        // snapshot. Later scans may publish more while older callbacks remain
-        // live: their exact replacements still return to WAITING and require
-        // a fresh authoritative scan before acquisition, so incremental
-        // planning cannot weaken queue fences.
-        let next_round_horizon = read_u64(&self.header, H_NEXT_TICKET).saturating_sub(1);
-        let replan_lease_active = self.replan_outstanding() != 0;
+        // REPLAN is a speculative planner callback, not a resource claim. A
+        // host-width window bounds concurrent placement computation while
+        // exact grants and admitted VMs retain their independent resource
+        // capacity. Each callback completion publishes one coalesced rescan
+        // edge, so every scan refills the available portion of this window.
+        let replan_outstanding = usize::try_from(self.replan_outstanding())
+            .context("queue registry speculative callback count does not fit usize")?;
+        let replan_capacity = self.replan_capacity();
+        anyhow::ensure!(
+            replan_outstanding <= replan_capacity,
+            "queue registry has {replan_outstanding} speculative callbacks for planner capacity {replan_capacity}",
+        );
+        let replan_slots = replan_capacity - replan_outstanding;
+        let replan_cursor = read_u64(&self.header, H_REPLAN_CURSOR);
+        let replan_lease_active = replan_outstanding != 0;
         // Production entry expires a due lease before this scan. Preserve the
         // boundary if the clock crosses its deadline between those two
         // monotonic samples instead of publishing immediately-expired work.
@@ -13742,6 +14044,13 @@ impl Table {
             !replan_lease_active || !self.replan_wave_due_at(backfill_now_ns);
         let mut replan_batch_started = false;
         let mut replan_wake_slots = Vec::new();
+        // Records are scanned in ticket order because their predecessor
+        // prefixes are order-sensitive. Retain the cyclic tail first and only
+        // enough wrapped-head fallbacks to fill the remaining window. REPLAN
+        // is non-fencing, so deferring these state publications until after
+        // the scan cannot alter any later ticket's compatibility decision.
+        let mut replan_tail = Vec::<ReplanCandidate>::new();
+        let mut replan_wrapped_head = Vec::<ReplanCandidate>::new();
         let mut changed = false;
         let mut coordinator_prefix_changed = false;
         let mut backfill_head: Option<BackfillHead> = None;
@@ -13968,8 +14277,7 @@ impl Table {
                 // The global serial is an O(1) rejection filter. Walk this
                 // ticket's encoded alternative watch only when a newer global
                 // observation could actually be relevant. Every eligible
-                // ticket in this writer-locked active-list snapshot joins the
-                // same parallel publication wave.
+                // ticket may join the bounded parallel publication wave.
                 let waiting_serial = if global_serial > record.issue_serial {
                     self.max_encoded_watch_serial(
                         record.slot,
@@ -13993,39 +14301,35 @@ impl Table {
                 };
                 if (relevant_resource_change || prefix_invalid || !waiting_prefix_matches)
                     && replan_publication_open
+                    && replan_slots != 0
                 {
-                    if !replan_batch_started {
-                        // Extend only the diagnostic high-water. Never gate a
-                        // later arrival on this value, and never renew a live
-                        // lease: its original deadline bounds both an old
-                        // straggler and all incrementally published work.
-                        let horizon = if replan_lease_active {
-                            read_u64(&self.header, H_REPLAN_HORIZON).max(next_round_horizon)
-                        } else {
-                            next_round_horizon
-                        };
-                        write_u64(&mut self.header, H_REPLAN_HORIZON, horizon);
-                        if !replan_lease_active {
-                            self.arm_replan_wave_at(backfill_now_ns);
+                    if record.ticket > replan_cursor {
+                        if replan_tail.len() < replan_slots {
+                            replan_tail.push(ReplanCandidate {
+                                slot: record.slot,
+                                ticket: record.ticket,
+                                waiting_serial,
+                                external_blocker: record.external_blocker,
+                                cpu_any: cpu_any.clone(),
+                                cpu_exclusive: cpu_exclusive.clone(),
+                                llc_any: llc_any.clone(),
+                                llc_exclusive: llc_exclusive.clone(),
+                            });
+                            replan_wrapped_head
+                                .truncate(replan_slots.saturating_sub(replan_tail.len()));
                         }
-                        replan_batch_started = true;
+                    } else if replan_wrapped_head.len() < replan_slots {
+                        replan_wrapped_head.push(ReplanCandidate {
+                            slot: record.slot,
+                            ticket: record.ticket,
+                            waiting_serial,
+                            external_blocker: record.external_blocker,
+                            cpu_any: cpu_any.clone(),
+                            cpu_exclusive: cpu_exclusive.clone(),
+                            llc_any: llc_any.clone(),
+                            llc_exclusive: llc_exclusive.clone(),
+                        });
                     }
-                    self.publish_prefix_words(
-                        record.slot,
-                        &cpu_any,
-                        &cpu_exclusive,
-                        &llc_any,
-                        &llc_exclusive,
-                        R_REPLAN_CLAIM_EPOCH,
-                        scan_publication_epoch,
-                        waiting_serial,
-                    )?;
-                    self.set_record_state(record.slot, STATE_REPLAN)?;
-                    self.clear_record_blocked_known(record.slot, record.external_blocker)?;
-                    write_u64(&mut self.header, H_REPLAN_CURSOR, record.ticket);
-                    crash_at_for_tests("replan_state_and_cursor_before_wake");
-                    replan_wake_slots.push(record.slot);
-                    changed = true;
                 }
             } else if record.state == STATE_GRANTED && (prefix_invalid || !published_prefix_matches)
             {
@@ -14105,6 +14409,35 @@ impl Table {
                 self.set_record_backfill_started_ns(record.slot, 0)?;
                 changed = true;
             }
+        }
+        for candidate in replan_tail.into_iter().chain(replan_wrapped_head) {
+            if !replan_batch_started {
+                // Never renew a live lease: its original deadline bounds both
+                // an old straggler and all incrementally published work.
+                if !replan_lease_active {
+                    self.arm_replan_wave_at(backfill_now_ns);
+                    write_u64(&mut self.header, H_REPLAN_HORIZON, candidate.ticket);
+                }
+                replan_batch_started = true;
+            }
+            self.publish_prefix_words(
+                candidate.slot,
+                &candidate.cpu_any,
+                &candidate.cpu_exclusive,
+                &candidate.llc_any,
+                &candidate.llc_exclusive,
+                R_REPLAN_CLAIM_EPOCH,
+                scan_publication_epoch,
+                candidate.waiting_serial,
+            )?;
+            self.set_record_state(candidate.slot, STATE_REPLAN)?;
+            self.clear_record_blocked_known(candidate.slot, candidate.external_blocker)?;
+            write_u64(&mut self.header, H_REPLAN_CURSOR, candidate.ticket);
+            let horizon = read_u64(&self.header, H_REPLAN_HORIZON).max(candidate.ticket);
+            write_u64(&mut self.header, H_REPLAN_HORIZON, horizon);
+            crash_at_for_tests("replan_state_and_cursor_before_wake");
+            replan_wake_slots.push(candidate.slot);
+            changed = true;
         }
         // Publish the complete scan batch before making its workers runnable.
         // This keeps awakened planners from convoying on the writer while it
@@ -14204,10 +14537,19 @@ impl Table {
     }
 
     fn recover_coordinator_if_dead(&mut self) -> Result<()> {
-        self.recover_coordinator_if_dead_at(monotonic_now_ns()?)
+        self.recover_coordinator_at(monotonic_now_ns()?, false)
     }
 
-    fn recover_coordinator_if_dead_at(&mut self, now: u64) -> Result<()> {
+    fn recover_coordinator_if_stalled(&mut self) -> Result<()> {
+        self.recover_coordinator_at(monotonic_now_ns()?, true)
+    }
+
+    #[cfg(test)]
+    fn recover_coordinator_if_stalled_at(&mut self, now: u64) -> Result<()> {
+        self.recover_coordinator_at(now, true)
+    }
+
+    fn recover_coordinator_at(&mut self, now: u64, allow_stalled_takeover: bool) -> Result<()> {
         if self.expire_replan_wave_if_due_at(now)? {
             // Fallback recovery may run in an ordinary ticket after a timed
             // futex wait. Wake the coordinator's real inotify transport as
@@ -14238,7 +14580,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v21 publication validates
+            // and record states together. Current v22 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();
@@ -14263,6 +14605,17 @@ impl Table {
             // re-electing dead coordinators one O(N) scan at a time.
             self.prune_dead()?;
             return self.elect_coordinator();
+        }
+
+        // Ordinary registry mutations repair a coordinator which actually
+        // died, but never transfer a merely stale live lease. Only a waiting
+        // ticket's bounded recovery timeout may make that semantic decision.
+        // This keeps a large same-thread registration batch from repeatedly
+        // displacing its elected owner before any ticket has entered the
+        // coordinator loop, while preserving the same eight-second recovery
+        // bound once a successor is genuinely waiting for progress.
+        if !allow_stalled_takeover {
+            return Ok(());
         }
 
         if coordinator_activity_is_fresh(&self.header, now) {
@@ -15996,6 +16349,12 @@ fn initialize_header_file(path: &PathBuf, layout: HeaderLayout) -> Result<File> 
         write_u64(&mut header, H_REPLAN_OUTSTANDING, 0);
         write_u64(&mut header, H_REPLAN_WAVE_STARTED_NS, 0);
         write_u64(&mut header, H_REPLAN_WAVE_DEADLINE_NS, 0);
+        write_u64(
+            &mut header,
+            H_REPLAN_CAPACITY,
+            u64::try_from(host_cpu_resource_bits().max(1))
+                .context("host planner capacity does not fit queue header")?,
+        );
         write_u64(&mut header, H_LAST_PROGRESS_NS, monotonic_now_ns()?);
         // Magic is published last in an inode nobody else can name. The
         // registry path changes only after the complete mapping is flushed.

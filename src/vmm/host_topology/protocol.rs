@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v21
+//! Every ktstr process sharing a lock directory participates in one v22
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -1966,6 +1966,19 @@ pub(crate) fn exercise_replan_token_wave_for_tests(
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_bounded_replan_window_for_tests(
+    capacity: usize,
+    waiters: usize,
+) -> Result<registry::BoundedReplanWindowOutcome> {
+    registry::exercise_bounded_replan_window_for_tests(capacity, waiters)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_replan_capacity_validation_for_tests() -> Result<(bool, bool, bool)> {
+    registry::exercise_replan_capacity_validation_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_changed_replan_wave_completions_for_tests(
     callbacks: usize,
 ) -> Result<registry::ReplanChangedWaveOutcome> {
@@ -2687,6 +2700,12 @@ pub(crate) fn exercise_registry_high_water_for_tests(waiters: usize) -> Result<u
             claim.clone(),
             None,
         )?);
+    }
+    if let Some(initial) = tickets.first() {
+        anyhow::ensure!(
+            registry::registration_batch_kept_initial_coordinator_for_tests(initial, &tickets)?,
+            "serial registration displaced its live initial coordinator before any ticket was driven",
+        );
     }
     let snapshot = registry::snapshot()?;
     if let Some(coordinator) = tickets.first_mut() {

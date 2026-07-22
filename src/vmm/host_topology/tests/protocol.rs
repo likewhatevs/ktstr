@@ -1066,8 +1066,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v21");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v21");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v22");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v22");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1239,7 +1239,7 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v21");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v22");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
     crate::flock::materialize(wrong_registry.join("registry.turnstile"))
         .expect("materialize wrong registry writer-intent gate");
@@ -4426,6 +4426,56 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
 }
 
 #[test]
+fn planner_replan_window_is_bounded_and_refills_cyclically() {
+    let _prefixes = LockPrefixesGuard::new();
+    let capacity = 4usize;
+    let waiters = 11usize;
+    let outcome = protocol::exercise_bounded_replan_window_for_tests(capacity, waiters)
+        .expect("exercise bounded cyclic REPLAN refills");
+    assert_eq!(outcome.capacity, capacity);
+    assert_eq!(
+        outcome.peak_outstanding, capacity,
+        "speculative planner callbacks must never exceed the immutable host window",
+    );
+    assert!(
+        outcome.disjoint_exact_granted,
+        "a full planner window must not limit independent exact VM admission",
+    );
+    assert_eq!(outcome.slices.len(), waiters.div_ceil(capacity));
+    let mut first_seen = Vec::new();
+    for slice in &outcome.slices {
+        assert!(
+            !slice.is_empty() && slice.len() <= capacity,
+            "each refill must publish at most one bounded slice: {slice:?}",
+        );
+        for &index in slice {
+            if !first_seen.contains(&index) {
+                first_seen.push(index);
+            }
+        }
+    }
+    assert_eq!(
+        first_seen,
+        (0..waiters).collect::<Vec<_>>(),
+        "continuously changing early callbacks must not monopolize later refill slices",
+    );
+}
+
+#[test]
+fn planner_capacity_is_immutable_across_repair_and_validated() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (preserved, zero_rejected, oversized_rejected) =
+        protocol::exercise_replan_capacity_validation_for_tests()
+            .expect("exercise planner-capacity repair and validation");
+    assert!(preserved, "dirty repair must preserve immutable host capacity");
+    assert!(zero_rejected, "a zero planner capacity must fail validation");
+    assert!(
+        oversized_rejected,
+        "a planner capacity larger than the registry layout must fail validation",
+    );
+}
+
+#[test]
 fn changed_replan_completions_coalesce_one_authoritative_scan() {
     let _prefixes = LockPrefixesGuard::new();
     let callbacks = 1_000usize;
@@ -7200,7 +7250,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v21
+    // Leave the replacement as an external, unregistered flock. A current-v22
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -7502,7 +7552,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v21 HELD lifecycle removes its registry record only after the
+    // The v22 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");
