@@ -2282,6 +2282,58 @@ pub(crate) fn exercise_coordinator_payload_notify_order_for_tests()
     })
 }
 
+/// A stale physical attempt is temporary: retain the private preparation
+/// token across its forced fresh planner turn, then release it when the
+/// coordinator exits without committing exact HELD ownership.
+#[cfg(test)]
+pub(crate) fn exercise_stale_coordinator_preparation_retention_for_tests()
+-> Result<(bool, bool, bool)> {
+    let token = 205usize;
+    let path = super::permit_lock_path(token);
+    let token_fd = crate::flock::try_flock(&path, FlockMode::Exclusive)?
+        .ok_or_else(|| anyhow::anyhow!("coordinator retention test token {token} is busy"))?;
+    let preparation = super::PreparationPermit {
+        index: token,
+        token_permit: token,
+        cpu_permits: Vec::new(),
+        memory_permits: Vec::new(),
+        permit_fds: vec![(token, token_fd)],
+        affinity_lock: None,
+        affinity_cpu: 0,
+        original_affinity: Vec::new(),
+        affinity_constrained: false,
+    };
+    let claim = ClaimSet::new(std::iter::empty(), [206usize], FlockMode::Exclusive);
+    let ticket = registry::Ticket::register(claim.clone(), claim.clone(), None)?;
+    let coordinator = Box::new(CoordinatorTicket {
+        ticket,
+        preparation: Some(preparation),
+        preparation_watch: None,
+    });
+    let mut steps = 0usize;
+    let mut token_retained_on_retry = false;
+    let outcome = acquire_as_coordinator(coordinator, |held| {
+        steps += 1;
+        if steps == 1 {
+            registry::invalidate_coordinator_commit_token_for_tests()?;
+            return Ok(CoordinatorStep::Complete {
+                claim: claim.clone(),
+                value: (),
+            });
+        }
+        let reusable = held.clone_reusable_permits()?;
+        token_retained_on_retry = reusable.len() == 1 && reusable[0].0 == token;
+        Ok(CoordinatorStep::Abort {
+            reason: "stale preparation retention observed".to_owned(),
+        })
+    })?;
+    let aborted = matches!(outcome, CoordinatorOutcome::Aborted { .. });
+    let released = crate::flock::try_flock(&path, FlockMode::Exclusive)?;
+    let token_released_on_exit = released.is_some();
+    drop(released);
+    Ok((token_retained_on_retry, aborted, token_released_on_exit))
+}
+
 #[cfg(test)]
 pub(crate) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool, bool, bool)> {
     registry::exercise_stale_contention_commit_for_tests()

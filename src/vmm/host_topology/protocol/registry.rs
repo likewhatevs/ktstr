@@ -4853,6 +4853,26 @@ pub(super) fn force_coordinator_commit_race_for_tests(lost_license: bool) -> Res
     Ok(table.pending_flags() & PENDING_RESCAN != 0)
 }
 
+/// Invalidate only the caller's coordinator commit token, leaving the same
+/// ticket elected so the coordinator loop must take its stale retry path.
+#[cfg(test)]
+pub(super) fn invalidate_coordinator_commit_token_for_tests() -> Result<()> {
+    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    anyhow::ensure!(
+        table.coordinator_ticket() != 0 && table.coordinator_slot()? != NONE_SLOT,
+        "coordinator token invalidation fixture has no elected coordinator",
+    );
+    let next = table
+        .coordinator_epoch()
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("coordinator token invalidation exhausted the epoch"))?;
+    table.begin_transaction()?;
+    write_u64(&mut table.header, H_COORDINATOR_EPOCH, next);
+    table.finish_transaction()
+}
+
 #[cfg(test)]
 pub(super) fn exercise_stalled_takeover_notification_for_tests(
     watch: &super::LockDirWatch,

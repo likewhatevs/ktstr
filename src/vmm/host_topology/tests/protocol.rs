@@ -4984,6 +4984,23 @@ fn coordinator_rejections_notify_after_complete_and_prepare_payloads_drop() {
 }
 
 #[test]
+fn stale_coordinator_retry_retains_preparation_token_until_terminal_exit() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (retained_on_retry, aborted, released_on_exit) =
+        protocol::exercise_stale_coordinator_preparation_retention_for_tests()
+            .expect("exercise stale coordinator preparation-token retention");
+    assert!(
+        retained_on_retry,
+        "a stale exact attempt must retain the prepared-process token for its forced fresh planner turn",
+    );
+    assert!(aborted, "the retention fixture must terminate through Abort");
+    assert!(
+        released_on_exit,
+        "terminal coordinator exit must release the retained preparation token",
+    );
+}
+
+#[test]
 fn predecessor_prefixes_preserve_modes_order_and_dirty_repair() {
     let _prefixes = LockPrefixesGuard::new();
     let (initial_modes, successor_excluded, repaired_modes, repaired_order) =
