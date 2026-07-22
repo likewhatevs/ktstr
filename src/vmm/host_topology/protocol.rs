@@ -2008,7 +2008,7 @@ pub(crate) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(b
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usize)> {
+pub(crate) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usize, u32, u32)> {
     registry::exercise_busy_to_free_close_for_tests()
 }
 
@@ -2089,6 +2089,13 @@ pub(crate) fn exercise_replan_capacity_validation_for_tests() -> Result<(bool, b
 #[cfg(test)]
 pub(crate) fn exercise_generation_timeout_takeover_for_tests() -> Result<(bool, bool)> {
     registry::exercise_generation_timeout_takeover_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_quiet_generation_additions_for_tests(
+    additions: usize,
+) -> Result<registry::QuietGenerationAdditionsOutcome> {
+    registry::exercise_quiet_generation_additions_for_tests(additions)
 }
 
 #[cfg(test)]

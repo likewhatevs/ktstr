@@ -946,7 +946,7 @@ impl HeldClaim {
             .filter(|record| record.ticket == self.ticket)
         {
             table.remove_record(&record, false)?;
-            table.bump_generation()?;
+            table.advance_generation_and_wake_pending()?;
         }
         drop(table);
         drop(_lock);
@@ -1471,7 +1471,7 @@ impl Ticket {
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("queue ticket id overflow"))?,
         );
-        table.bump_generation()?;
+        table.advance_generation()?;
         table.finish_transaction()?;
         let shared = table.map_ticket_shared(slot, ticket)?;
         drop(table);
@@ -1620,7 +1620,7 @@ impl Ticket {
             write_u32(bytes, R_STATE, STATE_WAITING);
         }
         table.mark_claim_changed(self.ticket)?;
-        table.bump_generation()?;
+        table.advance_generation_and_wake_pending()?;
         table.elect_coordinator_in_transaction()?;
         table.finish_transaction()?;
         self._interrupt_waiter = interrupt_waiter;
@@ -1677,7 +1677,7 @@ impl Ticket {
             Ok(attempted) => attempted,
             Err(error) => {
                 table.remove_record(&record, false)?;
-                table.bump_generation()?;
+                table.advance_generation_and_wake_pending()?;
                 self.finish_removed_record();
                 drop(table);
                 drop(_lock);
@@ -1687,7 +1687,7 @@ impl Ticket {
         };
         let Some((exact, value)) = attempted else {
             table.remove_record(&record, false)?;
-            table.bump_generation()?;
+            table.advance_generation_and_wake_pending()?;
             self.finish_removed_record();
             drop(table);
             drop(_lock);
@@ -1714,7 +1714,7 @@ impl Ticket {
             }
             Ok(false) => {
                 table.remove_record(&record, false)?;
-                table.bump_generation()?;
+                table.advance_generation_and_wake_pending()?;
                 self.finish_removed_record();
                 drop(table);
                 drop(_lock);
@@ -1724,7 +1724,7 @@ impl Ticket {
             }
             Err(error) => {
                 table.remove_record(&record, false)?;
-                table.bump_generation()?;
+                table.advance_generation_and_wake_pending()?;
                 self.finish_removed_record();
                 drop(table);
                 drop(_lock);
@@ -1931,7 +1931,7 @@ impl Ticket {
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("queue ticket id overflow"))?,
         );
-        table.bump_generation()?;
+        table.advance_generation()?;
         if needs_initial_replan {
             table.schedule_deferred_replan_rescan_in_transaction()?;
         }
@@ -2890,7 +2890,11 @@ impl Ticket {
             }
             table.apply_possible_release(&release_plan)?;
             table.mark_blockers_unknown(contention)?;
-            table.bump_generation()?;
+            if claim_changed {
+                table.advance_generation_and_wake_pending()?;
+            } else {
+                table.advance_generation()?;
+            }
             table.finish_transaction()?;
         }
         let should_scan = table.prepare_grant_scan()?;
@@ -2957,7 +2961,7 @@ impl Ticket {
         table.begin_transaction()?;
         table.set_record_blocked(self.slot, marker, blocked_at)?;
         table.mark_blocker_unknown(marker)?;
-        table.bump_generation()?;
+        table.advance_generation()?;
         table.finish_transaction()?;
         Ok(())
     }
@@ -3183,7 +3187,14 @@ impl Ticket {
         }
         let planner_serial_before = table.max_coordinator_planner_serial(&record)?;
         table.begin_transaction()?;
-        table.apply_observation(request, observation)?;
+        let improved = table.apply_observation(request, observation)?;
+        if improved {
+            // The caller still owns every physical proof flock here. Publish
+            // the admission wake while registry EX remains held, then drop
+            // those proofs below before any awakened registrant can acquire
+            // EX and rebuild its preparation sweep.
+            table.advance_generation_and_wake_pending()?;
+        }
         table.finish_transaction()?;
         let planner_serial_after = table.max_coordinator_planner_serial(&record)?;
         // Keep the registry EX fence while dropping proof flocks, then grant
@@ -3326,7 +3337,7 @@ impl Ticket {
             table.begin_transaction()?;
             table.mark_unknown(&exact.cpus, &exact.llcs, &exact.permits)?;
             table.mark_blockers_unknown(contention)?;
-            table.bump_generation()?;
+            table.advance_generation()?;
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
@@ -3339,7 +3350,7 @@ impl Ticket {
             table.begin_transaction()?;
             table.mark_unknown(&exact.cpus, &exact.llcs, &exact.permits)?;
             table.mark_blockers_unknown(contention)?;
-            table.bump_generation()?;
+            table.advance_generation()?;
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
@@ -3380,7 +3391,7 @@ impl Ticket {
             table.begin_transaction()?;
             table.mark_unknown(&exact.cpus, &exact.llcs, &exact.permits)?;
             table.mark_blockers_unknown(contention)?;
-            table.bump_generation()?;
+            table.advance_generation()?;
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
@@ -3427,7 +3438,7 @@ impl Ticket {
             table.begin_transaction()?;
             table.mark_unknown(&preparation.cpus, &preparation.llcs, &preparation.permits)?;
             table.mark_blockers_unknown(contention)?;
-            table.bump_generation()?;
+            table.advance_generation()?;
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
@@ -3440,7 +3451,7 @@ impl Ticket {
             table.begin_transaction()?;
             table.mark_unknown(&preparation.cpus, &preparation.llcs, &preparation.permits)?;
             table.mark_blockers_unknown(contention)?;
-            table.bump_generation()?;
+            table.advance_generation()?;
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
@@ -3472,7 +3483,7 @@ impl Ticket {
             table.begin_transaction()?;
             table.mark_unknown(&preparation.cpus, &preparation.llcs, &preparation.permits)?;
             table.mark_blockers_unknown(contention)?;
-            table.bump_generation()?;
+            table.advance_generation()?;
             table.finish_transaction()?;
             drop(table);
             drop(_lock);
@@ -3489,7 +3500,7 @@ impl Ticket {
                 table.begin_transaction()?;
                 table.mark_unknown(&preparation.cpus, &preparation.llcs, &preparation.permits)?;
                 table.mark_blockers_unknown(contention)?;
-                table.bump_generation()?;
+                table.advance_generation()?;
                 table.finish_transaction()?;
                 drop(table);
                 drop(_lock);
@@ -3530,7 +3541,7 @@ impl Ticket {
             && record.ticket == self.ticket
         {
             table.remove_record(&record, false)?;
-            table.bump_generation()?;
+            table.advance_generation_and_wake_pending()?;
         }
         Ok(())
     }
@@ -4179,7 +4190,7 @@ fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<WaitDia
         rendered: format!(
             "bucket={bucket}\ncaptured_unix_secs={unix_secs}\nregistry_version={VERSION} \
          coordinator={} coordinator_slot={} coordinator_epoch={} coordinator_heartbeat_ns={} \
-         last_progress_ns={} stalled_ns={} generation={} claim_epoch={} min_changed_ticket={} \
+         last_progress_ns={} stalled_ns={} generation={} generation_wake={} claim_epoch={} min_changed_ticket={} \
          pending_flags={:#x} replan_outstanding={} replan_capacity={} replan_cursor={} replan_horizon={} \
          replan_wave_started_ns={} replan_wave_deadline_ns={} \
          global_serial={} grant_scans={} next_slot={} active_tail={} \
@@ -4191,6 +4202,7 @@ fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<WaitDia
             last_progress_ns,
             stalled_ns,
             table.generation(),
+            table.generation_wake(),
             table.claim_epoch(),
             table.min_changed_ticket(),
             table.pending_flags(),
@@ -4362,6 +4374,155 @@ pub(super) fn exercise_generation_timeout_takeover_for_tests() -> Result<(bool, 
     Ok((mutation_retained_owner, timeout_transferred))
 }
 
+/// Exercise the three monotonic-worsening publication paths against the real
+/// registry lifecycle. Each batch stays live while its counters are sampled,
+/// proving additions advance the structural image without changing the futex
+/// word; synchronous teardown then proves improvements still broadcast.
+#[cfg(test)]
+pub(super) fn exercise_quiet_generation_additions_for_tests(
+    additions: usize,
+) -> Result<QuietGenerationAdditionsOutcome> {
+    anyhow::ensure!(additions > 0, "quiet-generation fixture needs additions");
+
+    fn counters() -> Result<(u64, u32)> {
+        let _lock = lock_registry_existing(FlockMode::Shared)?;
+        let table = Table::open_existing()?;
+        Ok((table.generation(), table.generation_wake()))
+    }
+
+    fn count_state(tickets: &[Ticket], expected: u32) -> Result<usize> {
+        let _lock = lock_registry_existing(FlockMode::Shared)?;
+        let mut table = Table::open_existing()?;
+        tickets.iter().try_fold(0usize, |count, ticket| {
+            let record = table
+                .record(ticket.slot)?
+                .filter(|record| record.ticket == ticket.ticket)
+                .ok_or_else(|| anyhow::anyhow!("quiet-generation ticket disappeared"))?;
+            Ok(count + usize::from(record.state == expected))
+        })
+    }
+
+    // The high anchor fixes the registry layout and keeps one live coordinator
+    // throughout. Its immutable watch also keeps the GRANTED fixture's CPU
+    // observed, so every addition deterministically takes the same state path
+    // instead of the first addition creating a fresh UNKNOWN observation.
+    let anchor_claim = ClaimSet::new(std::iter::empty(), [2_200usize], FlockMode::Exclusive);
+    let anchor_watch = ClaimSet::new(
+        std::iter::empty(),
+        [2_198usize, 2_200usize],
+        FlockMode::Exclusive,
+    );
+    let mut anchor = Ticket::register(anchor_claim.clone(), anchor_watch, None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, 2_198, true)?;
+    }
+
+    let pending_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [2_197usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let pending_before = counters()?;
+    let mut pending = Vec::with_capacity(additions);
+    for _ in 0..additions {
+        match Ticket::register_pending(
+            required_resource_bits(&pending_claim),
+            pending_claim.clone(),
+        )? {
+            PendingRegistration::Registered(ticket) => pending.push(*ticket),
+            PendingRegistration::Contended(_) => {
+                anyhow::bail!("compatible PENDING addition unexpectedly contended")
+            }
+        }
+    }
+    let pending_after = counters()?;
+    for ticket in &mut pending {
+        ticket.finish(None)?;
+    }
+    let pending_released = counters()?;
+
+    let waiting_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [2_200usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let waiting_before = counters()?;
+    let mut waiting = Vec::with_capacity(additions);
+    for _ in 0..additions {
+        waiting.push(Ticket::register(
+            waiting_claim.clone(),
+            waiting_claim.clone(),
+            None,
+        )?);
+    }
+    let waiting_after = counters()?;
+    let waiting_state_count = count_state(&waiting, STATE_WAITING)?;
+    for ticket in &mut waiting {
+        ticket.finish(None)?;
+    }
+    let waiting_released = counters()?;
+
+    let granted_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [2_198usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let granted_before = counters()?;
+    let mut granted = Vec::with_capacity(additions);
+    for _ in 0..additions {
+        granted.push(Ticket::register(
+            granted_claim.clone(),
+            granted_claim.clone(),
+            None,
+        )?);
+    }
+    let granted_after = counters()?;
+    let granted_state_count = count_state(&granted, STATE_GRANTED)?;
+    for ticket in &mut granted {
+        ticket.finish(None)?;
+    }
+    let granted_released = counters()?;
+
+    let held_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [2_199usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let held_before = counters()?;
+    let mut held = Vec::with_capacity(additions);
+    for _ in 0..additions {
+        held.push(publish_acquired(&held_claim)?);
+    }
+    let held_after = counters()?;
+    drop(held);
+    let held_released = counters()?;
+
+    anchor.finish(None)?;
+    Ok(QuietGenerationAdditionsOutcome {
+        additions,
+        pending_generation_delta: pending_after.0.saturating_sub(pending_before.0),
+        pending_wake_delta: pending_after.1.wrapping_sub(pending_before.1),
+        pending_release_wake_delta: pending_released.1.wrapping_sub(pending_after.1),
+        waiting_generation_delta: waiting_after.0.saturating_sub(waiting_before.0),
+        waiting_wake_delta: waiting_after.1.wrapping_sub(waiting_before.1),
+        waiting_release_wake_delta: waiting_released.1.wrapping_sub(waiting_after.1),
+        waiting_state_count,
+        granted_generation_delta: granted_after.0.saturating_sub(granted_before.0),
+        granted_wake_delta: granted_after.1.wrapping_sub(granted_before.1),
+        granted_release_wake_delta: granted_released.1.wrapping_sub(granted_after.1),
+        granted_state_count,
+        held_generation_delta: held_after.0.saturating_sub(held_before.0),
+        held_wake_delta: held_after.1.wrapping_sub(held_before.1),
+        held_release_wake_delta: held_released.1.wrapping_sub(held_after.1),
+    })
+}
+
 #[cfg(test)]
 pub(super) fn diagnostics_for_tests() -> Result<String> {
     let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Exclusive)? else {
@@ -4411,7 +4572,7 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
     }
     Ok(format!(
         "coordinator={} coordinator_slot={} coordinator_epoch={} coordinator_heartbeat_ns={} \
-         last_progress_ns={} generation={} claim_epoch={} min_changed_ticket={} \
+         last_progress_ns={} generation={} generation_wake={} claim_epoch={} min_changed_ticket={} \
          pending_flags={:#x} replan_outstanding={} replan_capacity={} replan_cursor={} \
          replan_horizon={} global_serial={} grant_scans={}; [{}]",
         table.coordinator_ticket(),
@@ -4420,6 +4581,7 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
         read_u64(&table.header, H_COORDINATOR_HEARTBEAT_NS),
         read_u64(&table.header, H_LAST_PROGRESS_NS),
         table.generation(),
+        table.generation_wake(),
         table.claim_epoch(),
         table.min_changed_ticket(),
         table.pending_flags(),
@@ -4457,6 +4619,7 @@ pub(crate) struct RepeatedCoordinatorTakeoverOutcome {
     pub(crate) intervening_grant_callback_suppressed: bool,
     pub(crate) intervening_grant_waiting_before_scan: bool,
     pub(crate) intervening_grant_regranted_after_scan: bool,
+    pub(crate) state_only_generation_wake_unchanged: bool,
 }
 
 #[cfg(test)]
@@ -4469,6 +4632,7 @@ pub(crate) struct FreshWaitingCoordinatorTakeoverOutcome {
     pub(crate) second_states_coherent: bool,
     pub(crate) second_epoch_advanced: bool,
     pub(crate) second_wakes_target_only_b_and_c: bool,
+    pub(crate) state_only_generation_wake_unchanged: bool,
 }
 
 #[cfg(test)]
@@ -4583,7 +4747,7 @@ pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
     let claim_c = ClaimSet::new(std::iter::empty(), [13usize], FlockMode::Exclusive);
     let mut coordinator_c = Ticket::register(claim_c.clone(), claim_c, None)?;
 
-    let (initial_epoch, wakes_before) = {
+    let (initial_epoch, initial_generation_wake, wakes_before) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
@@ -4627,6 +4791,7 @@ pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
         };
         (
             table.coordinator_epoch(),
+            table.generation_wake(),
             (
                 wake(&coordinator_a, "A")?,
                 wake(&coordinator_b, "B")?,
@@ -4674,7 +4839,7 @@ pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
     );
 
     let second_now = first_now.saturating_add(COORDINATOR_HEARTBEAT_LEASE_NS);
-    let (second_transfer_to_c, second_states_coherent, second_epoch) = {
+    let (second_transfer_to_c, second_states_coherent, second_epoch, final_generation_wake) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
@@ -4691,6 +4856,7 @@ pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
                 record.ticket == coordinator_c.ticket && record.state == STATE_COORDINATOR
             }),
             table.coordinator_epoch(),
+            table.generation_wake(),
         )
     };
     let wakes_after_second = (
@@ -4727,6 +4893,7 @@ pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
         second_wakes_target_only_b_and_c: wakes_after_second.0 == wakes_after_first.0
             && wakes_after_second.1 != wakes_after_first.1
             && wakes_after_second.2 != wakes_after_first.2,
+        state_only_generation_wake_unchanged: final_generation_wake == initial_generation_wake,
     })
 }
 
@@ -4827,7 +4994,7 @@ pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
     let mut coordinator_b =
         Ticket::register(coordinator_b_claim.clone(), coordinator_b_claim, None)?;
 
-    let (initial_epoch, wake_a_before, wake_b_before) = {
+    let (initial_epoch, initial_generation_wake, wake_a_before, wake_b_before) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         table.repair_consistency_if_needed()?;
@@ -4860,7 +5027,12 @@ pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("coordinator B wake mapping disappeared"))?
             .expected();
-        (table.coordinator_epoch(), wake_a, wake_b)
+        (
+            table.coordinator_epoch(),
+            table.generation_wake(),
+            wake_a,
+            wake_b,
+        )
     };
 
     let first_now = monotonic_now_ns()?.max(COORDINATOR_HEARTBEAT_LEASE_NS);
@@ -4966,7 +5138,11 @@ pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
     )?;
     let intervening_grant_callback_suppressed =
         !intervening_callback_ran && matches!(intervening_result, GrantResult::LostGrant);
-    let (intervening_grant_waiting_before_scan, intervening_grant_regranted_after_scan) = {
+    let (
+        intervening_grant_waiting_before_scan,
+        intervening_grant_regranted_after_scan,
+        final_generation_wake,
+    ) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         let waiting = table.record(intervening.slot)?.is_some_and(|record| {
@@ -4977,7 +5153,7 @@ pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
         let regranted = table.record(intervening.slot)?.is_some_and(|record| {
             record.ticket == intervening.ticket && record.state == STATE_GRANTED
         });
-        (waiting, regranted)
+        (waiting, regranted, table.generation_wake())
     };
 
     coordinator_b.finish(None)?;
@@ -4999,6 +5175,7 @@ pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
         intervening_grant_callback_suppressed,
         intervening_grant_waiting_before_scan,
         intervening_grant_regranted_after_scan,
+        state_only_generation_wake_unchanged: final_generation_wake == initial_generation_wake,
     })
 }
 
@@ -5249,7 +5426,7 @@ pub(super) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
         // Registration and cancellation both advance the structural
         // generation. This deliberately exercises that generic churn without
         // manufacturing coordinator or runnable-queue progress.
-        table.bump_generation()?;
+        table.advance_generation()?;
     }
     Ok(())
 }
@@ -6000,7 +6177,13 @@ pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(b
 }
 
 #[cfg(test)]
-pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usize)> {
+pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usize, u32, u32)> {
+    fn generation_wake() -> Result<u32> {
+        let _lock = lock_registry_existing(FlockMode::Shared)?;
+        let table = Table::open_existing()?;
+        Ok(table.generation_wake())
+    }
+
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let mut ticket = Ticket::register(claim.clone(), claim, None)?;
     let empty = BTreeSet::new();
@@ -6034,6 +6217,7 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
         anyhow::bail!("first busy observation must not report usable capacity");
     }
     let scans_before = diagnostic_counter_for_tests(H_GRANT_SCANS)?;
+    let wake_before_schedule = generation_wake()?;
     let closed = BTreeSet::from([1usize]);
     let pending = ticket.schedule(
         None,
@@ -6048,6 +6232,7 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
         false,
         None,
     )?;
+    let wake_after_schedule = generation_wake()?;
     let request = pending
         .observation
         .ok_or_else(|| anyhow::anyhow!("busy resource close must request an observation"))?;
@@ -6061,11 +6246,18 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
         },
     );
     let improved = ticket.apply_observation(&request, &free, || {}, None)?;
+    let wake_after_observation = generation_wake()?;
     let observations = 1;
     let planner_steps = usize::from(improved.should_step);
     let scans = diagnostic_counter_for_tests(H_GRANT_SCANS)? - scans_before;
     ticket.finish(None)?;
-    Ok((observations, scans, planner_steps))
+    Ok((
+        observations,
+        scans,
+        planner_steps,
+        wake_after_schedule.wrapping_sub(wake_before_schedule),
+        wake_after_observation.wrapping_sub(wake_after_schedule),
+    ))
 }
 
 #[cfg(test)]
@@ -6861,6 +7053,25 @@ pub(crate) struct ReplanChangedWaveOutcome {
     pub(crate) authoritative_scan_delta: u64,
     pub(crate) authoritative_flags_clear: bool,
     pub(crate) replacements_preserved: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct QuietGenerationAdditionsOutcome {
+    pub(crate) additions: usize,
+    pub(crate) pending_generation_delta: u64,
+    pub(crate) pending_wake_delta: u32,
+    pub(crate) pending_release_wake_delta: u32,
+    pub(crate) waiting_generation_delta: u64,
+    pub(crate) waiting_wake_delta: u32,
+    pub(crate) waiting_release_wake_delta: u32,
+    pub(crate) waiting_state_count: usize,
+    pub(crate) granted_generation_delta: u64,
+    pub(crate) granted_wake_delta: u32,
+    pub(crate) granted_release_wake_delta: u32,
+    pub(crate) granted_state_count: usize,
+    pub(crate) held_generation_delta: u64,
+    pub(crate) held_wake_delta: u32,
+    pub(crate) held_release_wake_delta: u32,
 }
 
 #[cfg(test)]
@@ -11204,7 +11415,7 @@ pub(super) fn exercise_stale_acquired_release_order_for_tests()
                 None,
                 false,
             )?;
-            table.bump_generation()?;
+            table.advance_generation_and_wake_pending()?;
             table.grant_compatible()?;
             Ok(GrantAttempt {
                 acquired: Some(DropProbe {
@@ -11421,7 +11632,7 @@ pub(super) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool
             // this mid-callback improvement instead of immediately waking
             // itself for the same already-disproved state.
             table.stamp_resource_improvement(S_CPU_EX, 1)?;
-            table.bump_generation()?;
+            table.advance_generation_and_wake_pending()?;
             table.grant_compatible()?;
             Ok(GrantAttempt::<()> {
                 acquired: None,
@@ -12340,7 +12551,7 @@ fn publish_acquired_in_table(
             .ok_or_else(|| anyhow::anyhow!("queue ticket id overflow"))?,
     );
     table.mark_claim_changed(ticket)?;
-    table.bump_generation()?;
+    table.advance_generation()?;
     table.finish_transaction()?;
     Ok(HeldClaim {
         namespace,
@@ -12590,18 +12801,32 @@ impl Table {
         atomic_u32(&self.header, H_GENERATION_WAKE).load(Ordering::Acquire)
     }
 
-    fn bump_generation(&mut self) -> Result<()> {
+    /// Advance the structural image version without waking pending-admission
+    /// futex sleepers. This is valid when aggregate exact claims and physical
+    /// availability cannot become less restrictive. Additions, queue-state
+    /// publications, and negative observations can invalidate work, but cannot
+    /// make a rejected physical preparation placement become runnable.
+    fn advance_generation(&mut self) -> Result<()> {
         let next = self
             .generation()
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("queue registry generation exhausted"))?;
         write_u64(&mut self.header, H_GENERATION, next);
+        Ok(())
+    }
+
+    /// Advance the structural image and wake every pending-admission sleeper.
+    /// Exact-claim releases/replacements and physical-release observations can
+    /// each make a different preparation candidate runnable; repair can expose
+    /// either kind of improvement, so all such paths retain the broadcast.
+    fn advance_generation_and_wake_pending(&mut self) -> Result<()> {
+        self.advance_generation()?;
         let wake = atomic_u32(&self.header, H_GENERATION_WAKE);
         wake.fetch_add(1, Ordering::Release);
         // SAFETY: this is an aligned AtomicU32 in a MAP_SHARED registry
-        // mapping. Wake every registration waiter because each may hold a
-        // different physical preparation candidate and can make progress on
-        // the same logical transition.
+        // mapping. Wake every pending registrant because each may discover a
+        // different physical preparation candidate made runnable by this
+        // improvement when it rebuilds its probe after waking.
         unsafe {
             libc::syscall(
                 libc::SYS_futex,
@@ -14036,7 +14261,11 @@ impl Table {
             self.set_coordinator(0, NONE_SLOT)?;
             self.elect_coordinator_in_transaction()?;
         }
-        self.bump_generation()?;
+        if claim_changed {
+            self.advance_generation_and_wake_pending()?;
+        } else {
+            self.advance_generation()?;
+        }
         self.finish_transaction()?;
         Ok(())
     }
@@ -14157,7 +14386,7 @@ impl Table {
             self.set_coordinator(0, NONE_SLOT)?;
             self.elect_coordinator_in_transaction()?;
         }
-        self.bump_generation()?;
+        self.advance_generation_and_wake_pending()?;
         self.finish_transaction()?;
         Ok(PendingTransition::Committed(pending_claim))
     }
@@ -14993,7 +15222,7 @@ impl Table {
             self.wake_slot(slot)?;
         }
         if changed {
-            self.bump_generation()?;
+            self.advance_generation()?;
             self.note_queue_progress()?;
         }
         self.finish_claim_scan();
@@ -15047,7 +15276,7 @@ impl Table {
         } else {
             self.set_urgent_rescan();
         }
-        self.bump_generation()?;
+        self.advance_generation_and_wake_pending()?;
         self.finish_transaction()?;
         for record in dead {
             let _ = std::fs::remove_file(liveness_path(record.slot, record.ticket));
@@ -15091,7 +15320,7 @@ impl Table {
         } else {
             self.set_urgent_rescan();
         }
-        self.bump_generation()?;
+        self.advance_generation_and_wake_pending()?;
         self.finish_transaction()?;
         for record in dead {
             let _ = std::fs::remove_file(liveness_path(record.slot, record.ticket));
@@ -15245,7 +15474,7 @@ impl Table {
         // standby ticket, so dirty from the earlier identity rather than
         // assuming every successor lies later in queue order.
         self.mark_claim_changed(changed_suffix)?;
-        self.bump_generation()?;
+        self.advance_generation()?;
         self.wake_slot(current.slot)?;
         self.wake_slot(successor.slot)?;
         self.finish_transaction()?;
@@ -15292,7 +15521,7 @@ impl Table {
                 self.set_record_state(record.slot, STATE_COORDINATOR)?;
                 self.clear_record_blocked(record.slot)?;
                 self.wake_slot(record.slot)?;
-                self.bump_generation()?;
+                self.advance_generation()?;
                 return Ok(());
             }
             slot = record.next_active;
@@ -16805,7 +17034,7 @@ impl Table {
         // entirely of PENDING/HELD/REVOKED records). Publish the structural
         // generation and wake every such waiter before declaring the rebuilt
         // image clean.
-        self.bump_generation()?;
+        self.advance_generation_and_wake_pending()?;
         // A torn GRANTED -> REVOKED publication may have died before its
         // targeted wake. REVOKED remains a predecessor fence through repair,
         // so wake every such owner to force prompt acknowledgement rather

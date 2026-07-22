@@ -1700,6 +1700,10 @@ fn repeated_coordinator_lease_takeover_fences_the_complete_older_suffix() {
             && outcome.intervening_grant_regranted_after_scan,
         "the intervening C grant must not enter on its previous-lease token and may become current again only after the authoritative scan",
     );
+    assert!(
+        outcome.state_only_generation_wake_unchanged,
+        "coordinator transfers and grant-state churn must use targeted slot wakes without broadcasting pending registrants",
+    );
 }
 
 #[test]
@@ -1726,6 +1730,10 @@ fn repeated_coordinator_lease_takeover_prefers_a_fresh_waiter_before_standby() {
     assert!(
         outcome.second_wakes_target_only_b_and_c,
         "the second transfer must target B and C without recycling or waking standby A",
+    );
+    assert!(
+        outcome.state_only_generation_wake_unchanged,
+        "coordinator election and takeover must not broadcast the pending-admission futex",
     );
 }
 
@@ -4122,13 +4130,18 @@ fn stale_heartbeat_release_fallback_ignores_unwatched_out_of_range_indices() {
 #[test]
 fn busy_to_free_close_produces_exactly_one_improvement() {
     let _prefixes = LockPrefixesGuard::new();
-    let (observations, scans, planner_steps) =
+    let (observations, scans, planner_steps, schedule_wakes, observation_wakes) =
         protocol::exercise_busy_to_free_close_for_tests().expect("exercise busy-to-free close");
     assert_eq!(
         (observations, scans, planner_steps),
         (1, 1, 1),
         "a real busy-to-free transition must produce one observation, one \
          grant scan, and one coordinator planner wake",
+    );
+    assert_eq!(
+        (schedule_wakes, observation_wakes),
+        (0, 1),
+        "publishing a speculative release observation must stay quiet; only its proven physical improvement may wake pending registrants",
     );
 }
 
@@ -4593,6 +4606,52 @@ fn only_a_completed_bounded_wait_transfers_a_stale_live_coordinator() {
     assert!(
         timeout_transferred,
         "the generation-futex timeout must transfer a stale lease to its live waiter",
+    );
+}
+
+#[test]
+fn monotonic_additions_advance_generation_without_broadcasting_pending_registrants() {
+    let _prefixes = LockPrefixesGuard::new();
+    let additions = 512usize;
+    let outcome = protocol::exercise_quiet_generation_additions_for_tests(additions)
+        .expect("exercise quiet structural-generation additions");
+    assert_eq!(outcome.additions, additions);
+    assert_eq!(
+        (
+            outcome.pending_generation_delta,
+            outcome.waiting_generation_delta,
+            outcome.granted_generation_delta,
+            outcome.held_generation_delta,
+        ),
+        (
+            additions as u64,
+            additions as u64,
+            additions as u64,
+            additions as u64,
+        ),
+        "every PENDING, WAITING, GRANTED, and HELD publication must advance the structural image exactly once",
+    );
+    assert_eq!(
+        (outcome.waiting_state_count, outcome.granted_state_count),
+        (additions, additions),
+        "the ordinary-registration batches must exercise both production state paths",
+    );
+    assert_eq!(
+        (
+            outcome.pending_wake_delta,
+            outcome.waiting_wake_delta,
+            outcome.granted_wake_delta,
+            outcome.held_wake_delta,
+        ),
+        (0, 0, 0, 0),
+        "monotonic-worsening additions must not broadcast pending-admission futex waiters",
+    );
+    assert!(
+        outcome.pending_release_wake_delta > 0
+            && outcome.waiting_release_wake_delta > 0
+            && outcome.granted_release_wake_delta > 0
+            && outcome.held_release_wake_delta > 0,
+        "the matching release paths must retain their generation-futex wake",
     );
 }
 
