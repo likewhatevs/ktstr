@@ -4290,8 +4290,8 @@ fn run_cargo_sub(
         // detection-vs-KTSTR_KERNEL discrimination rationale.
         cmd.env(ktstr::KTSTR_ORCHESTRATED_ENV, "1");
 
-        // Probe each resolved kernel's commit ONCE here, in the
-        // orchestrator, and pass a `dir=commit;...` map down via
+        // Resolve each kernel's build commit ONCE here, in the orchestrator,
+        // and pass a `dir=commit;...` map down via
         // KTSTR_KERNEL_COMMIT so the sidecar writer skips a redundant gix
         // HEAD + dirty-walk in every per-test nextest process (that walk
         // is memoized per process but not across processes — N tests
@@ -4300,20 +4300,16 @@ fn run_cargo_sub(
         // itself up. `;` joins entries, `=` splits dir from commit;
         // neither appears in a short hash (hex + optional `-dirty`), and
         // a kernel path containing either would already have broken
-        // KTSTR_KERNEL_LIST's own encoding. The commit is resolved via
-        // source_dir_for (the same resolution the sidecar uses) then
-        // detect_kernel_commit, so the value matches the sidecar's
-        // fallback exactly — including clean Path kernels whose resolved
-        // dir is a cache entry, not a git tree. Kernels with no
-        // recoverable source (transient Range/Git, or a Version/CacheKey
-        // cache miss) probe to None and are omitted; their sidecar falls
-        // back to the same (correct) None.
+        // KTSTR_KERNEL_LIST's own encoding. Normal resolved cache entries use
+        // the commit already captured in metadata when the kernel was built;
+        // only raw source paths and legacy Local entries need a gix dirty
+        // walk. The sidecar calls the same helper on a map miss, so kernels
+        // with no recoverable commit consistently remain omitted.
         let commit_map = resolved
             .iter()
             .filter_map(|(_, dir)| {
                 let raw = dir.display().to_string();
-                let commit = ktstr::test_support::source_dir_for(&raw)
-                    .and_then(|src| ktstr::test_support::detect_kernel_commit(&src))?;
+                let commit = ktstr::test_support::kernel_commit_for_resolved(&raw)?;
                 Some(format!("{raw}={commit}"))
             })
             .collect::<Vec<_>>()

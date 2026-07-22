@@ -2276,6 +2276,81 @@ fn create_fake_image_in(dir: &std::path::Path) -> std::path::PathBuf {
     image
 }
 
+#[test]
+fn resolved_kernel_commit_uses_cache_metadata_without_source_walk() {
+    let cache_entry = tempfile::TempDir::new().expect("cache entry tempdir");
+    let metadata = crate::cache::KernelMetadata::new(
+        crate::cache::KernelSource::Local {
+            source_tree_path: Some(cache_entry.path().join("missing-source")),
+            git_hash: Some("a1b2c3d".to_string()),
+        },
+        std::env::consts::ARCH,
+        "bzImage",
+        "2026-07-22T00:00:00Z",
+    );
+    std::fs::write(
+        cache_entry.path().join("metadata.json"),
+        serde_json::to_vec(&metadata).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+
+    assert_eq!(
+        super::super::kernel_commit_for_resolved(
+            cache_entry.path().to_str().expect("utf-8 cache path"),
+        )
+        .as_deref(),
+        Some("a1b2c3d"),
+        "resolved cache metadata is authoritative even when its historical source path is absent",
+    );
+}
+
+#[test]
+fn resolved_kernel_commit_legacy_local_metadata_walks_recorded_source() {
+    let cache_entry = tempfile::TempDir::new().expect("cache entry tempdir");
+    let source = tempfile::TempDir::new().expect("source tempdir");
+    let head = init_clean_repo_with_file(source.path());
+    let metadata = crate::cache::KernelMetadata::new(
+        crate::cache::KernelSource::Local {
+            source_tree_path: Some(source.path().to_path_buf()),
+            git_hash: None,
+        },
+        std::env::consts::ARCH,
+        "bzImage",
+        "2026-07-22T00:00:00Z",
+    );
+    std::fs::write(
+        cache_entry.path().join("metadata.json"),
+        serde_json::to_vec(&metadata).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+    let expected = head.to_hex_with_len(7).to_string();
+
+    assert_eq!(
+        super::super::kernel_commit_for_resolved(
+            cache_entry.path().to_str().expect("utf-8 cache path"),
+        )
+        .as_deref(),
+        Some(expected.as_str()),
+        "legacy Local metadata without git_hash must retain the recorded-source fallback",
+    );
+}
+
+#[test]
+fn resolved_kernel_commit_raw_source_path_walks_repo() {
+    let source = tempfile::TempDir::new().expect("source tempdir");
+    let head = init_clean_repo_with_file(source.path());
+    let expected = head.to_hex_with_len(7).to_string();
+
+    assert_eq!(
+        super::super::kernel_commit_for_resolved(
+            source.path().to_str().expect("utf-8 source path"),
+        )
+        .as_deref(),
+        Some(expected.as_str()),
+        "raw source paths without cache metadata must retain commit detection",
+    );
+}
+
 /// Tarball-shaped lookup hit yields the entry's source_tree_path
 /// directly when the entry is a Local source. Pins the fast
 /// path of the Version arm before exercising the fallback scan.
