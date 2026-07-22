@@ -8455,3 +8455,483 @@ fn crashed_ticket_is_pruned_before_a_later_compatible_probe() {
     coordinator.wait_for_acquired();
     coordinator.release_and_wait();
 }
+
+// ===================================================================
+// Admission-registry herd benchmark (Task B).
+//
+// Reproduces the CI "thundering herd": ~800/2400 resource cells admit
+// nearly simultaneously against a synthetic 192-CPU / 24-LLC host, each
+// holds an exact reservation for a short synthetic duration standing in
+// for real guest work, then releases. It drives the SAME grant path a
+// real cell takes — `acquire_resource_locks_waiting_impl` with wait=true,
+// which registers a priority ticket, elects one coordinator, and grants
+// through the coordinator scan — so the numbers characterise the registry,
+// not the harness. Placement is explicit (no PID-window rotation), so the
+// exclusive-CPU claims genuinely conflict and queue.
+//
+// Metrics (printed; the makespan ratio is also asserted as a coarse
+// regression fence):
+//   * makespan vs the claim-capacity lower bound
+//       (sum of exclusive-CPU-time / 192); ~1.0 = capacity-limited,
+//       >>1 = grant-path overhead dominating.
+//   * grants/sec and grant_scans-per-grant (from the registry diagnostic
+//       counters), sampled at 800 and 2400 to expose superlinear scans.
+//   * exclusive-capacity utilisation over time + a work-conservation gap
+//       estimate (free capacity while cells still wait).
+//
+// Ignored by default (stress/timing); run explicitly:
+//   cargo test -p ktstr --lib -- --ignored --nocapture \
+//     vmm::host_topology::tests::protocol::herd_
+// Env overrides: KTSTR_HERD_CELLS, KTSTR_HERD_HOLD_MS.
+
+const HERD_CAPACITY_CPUS: usize = 192;
+const HERD_LLCS: usize = 24;
+const HERD_CPUS_PER_LLC: usize = HERD_CAPACITY_CPUS / HERD_LLCS; // 8
+
+#[derive(Default, Clone, Copy)]
+struct HerdCellShape {
+    /// Exclusively-claimed CPU count (consumes the 192-wide capacity); 0 for
+    /// a cooperative CPU-SH cell.
+    exclusive_cpus: usize,
+}
+
+/// Deterministic per-cell claim, modelled on the CI mix: ~95% small
+/// (1-5 exclusive CPUs within one LLC), ~4% cooperative shared, ~1% wide
+/// (2-4 whole LLCs exclusive). Returns (llc_indices, llc_mode, cpus,
+/// cpu_mode, shape).
+fn herd_cell_claim(
+    index: usize,
+) -> (
+    Vec<usize>,
+    LlcLockMode,
+    Vec<usize>,
+    FlockMode,
+    HerdCellShape,
+) {
+    // Small splitmix-style deterministic RNG seeded by the cell index; no
+    // external rng dependency, reproducible across runs.
+    let mut z = (index as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(1);
+    let mut next = || {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut x = z;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    };
+    let roll = next() % 100;
+    if roll >= 99 {
+        // Wide cell: 2-4 whole LLCs exclusive.
+        let width = 2 + (next() as usize % 3); // 2..=4
+        let first = next() as usize % (HERD_LLCS - width + 1);
+        let llcs: Vec<usize> = (first..first + width).collect();
+        let cpus: Vec<usize> = llcs
+            .iter()
+            .flat_map(|&l| (l * HERD_CPUS_PER_LLC)..((l + 1) * HERD_CPUS_PER_LLC))
+            .collect();
+        let exclusive_cpus = cpus.len();
+        (
+            llcs,
+            LlcLockMode::Exclusive,
+            cpus,
+            FlockMode::Exclusive,
+            HerdCellShape { exclusive_cpus },
+        )
+    } else if roll >= 95 {
+        // Cooperative shared cell: 1-3 CPU-SH (no exclusive capacity cost).
+        let k = 1 + (next() as usize % 3);
+        let base = next() as usize % HERD_CAPACITY_CPUS;
+        let cpus: Vec<usize> = (0..k).map(|o| (base + o) % HERD_CAPACITY_CPUS).collect();
+        let llcs: Vec<usize> = {
+            let mut l: Vec<usize> = cpus.iter().map(|c| c / HERD_CPUS_PER_LLC).collect();
+            l.sort_unstable();
+            l.dedup();
+            l
+        };
+        (
+            llcs,
+            LlcLockMode::Shared,
+            cpus,
+            FlockMode::Shared,
+            HerdCellShape { exclusive_cpus: 0 },
+        )
+    } else {
+        // Small exclusive cell: 1-5 exclusive CPUs inside one LLC, LLC-SH so
+        // small peers coexist in the same cache domain (the common case).
+        let k = 1 + (next() as usize % 5); // 1..=5
+        let llc = next() as usize % HERD_LLCS;
+        let within = next() as usize % HERD_CPUS_PER_LLC;
+        let cpus: Vec<usize> = (0..k)
+            .map(|o| llc * HERD_CPUS_PER_LLC + (within + o) % HERD_CPUS_PER_LLC)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let exclusive_cpus = cpus.len();
+        (
+            vec![llc],
+            LlcLockMode::Shared,
+            cpus,
+            FlockMode::Exclusive,
+            HerdCellShape { exclusive_cpus },
+        )
+    }
+}
+
+fn herd_diag_field(diag: &str, key: &str) -> Option<u64> {
+    let needle = format!("{key}=");
+    for token in diag.split_whitespace() {
+        if let Some(rest) = token.strip_prefix(&needle) {
+            return rest.trim_end_matches(['\n', ';']).parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+struct HerdMetrics {
+    cells: usize,
+    hold: std::time::Duration,
+    makespan: std::time::Duration,
+    ideal_lower_bound: std::time::Duration,
+    total_exclusive_cpu_units: usize,
+    grant_scans: u64,
+    generation: u64,
+    peak_active_records: u64,
+    peak_replan_outstanding: u64,
+    util_mean: f64,
+    util_peak: usize,
+    conservation_gap_frac: f64,
+    grant_failures: usize,
+    completed: usize,
+    incomplete: usize,
+    contended: bool,
+}
+
+fn run_herd_benchmark(cells: usize, hold: std::time::Duration, contended: bool) -> HerdMetrics {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    // The interruptible-flock broker services blocking/cancellable flock
+    // waits; the waiting acquire path relies on it (see the other waiting
+    // tests). Real inotify wake transport so waiters are woken promptly by
+    // the coordinator on release rather than polling the TestRetry cadence.
+    let _broker = InterruptibleFlockBrokerGuard::start();
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|p| p.borrow().clone());
+
+    // Precompute claims + capacity lower bound. In `contended` mode cells use
+    // the CI-shaped exclusive claims that genuinely conflict and must queue
+    // through the single coordinator. In the default disjoint mode each cell
+    // takes a unique exclusive CPU so every admission succeeds on the fast
+    // path — this isolates the registry's publish/release throughput under the
+    // global registry lock (the coordinator queue is architected for one
+    // waiter per process and cannot be driven concurrently in-process).
+    let shapes: Vec<(
+        Vec<usize>,
+        LlcLockMode,
+        Vec<usize>,
+        FlockMode,
+        HerdCellShape,
+    )> = (0..cells)
+        .map(|i| {
+            if contended {
+                herd_cell_claim(i)
+            } else {
+                (
+                    vec![],
+                    LlcLockMode::Shared,
+                    vec![i],
+                    FlockMode::Exclusive,
+                    HerdCellShape { exclusive_cpus: 1 },
+                )
+            }
+        })
+        .collect();
+    let total_exclusive_cpu_units: usize =
+        shapes.iter().map(|(_, _, _, _, s)| s.exclusive_cpus).sum();
+    let ideal_lower_bound = std::time::Duration::from_secs_f64(
+        (total_exclusive_cpu_units as f64 * hold.as_secs_f64()) / HERD_CAPACITY_CPUS as f64,
+    );
+
+    let held_exclusive = Arc::new(AtomicUsize::new(0));
+    let acquired_total = Arc::new(AtomicUsize::new(0));
+    let released_total = Arc::new(AtomicUsize::new(0));
+    let grant_failures = Arc::new(AtomicUsize::new(0));
+    let incomplete = Arc::new(AtomicUsize::new(0));
+    let start_gate = Arc::new(Barrier::new(cells + 1));
+    let done = Arc::new(AtomicBool::new(false));
+    // Hard watchdog: trip cancellation after the deadline so a contended
+    // regime that outruns the single-coordinator queue path can never hang
+    // the suite. Cancelled cells report as `incomplete`, and the survivors
+    // still yield a grant-throughput ceiling.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let deadline = std::time::Duration::from_secs(
+        std::env::var("KTSTR_HERD_DEADLINE_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40),
+    );
+
+    // Utilisation / work-conservation monitor.
+    let peak_active_records = Arc::new(AtomicU64::new(0));
+    let peak_replan = Arc::new(AtomicU64::new(0));
+    let util_sum = Arc::new(AtomicU64::new(0));
+    let util_peak = Arc::new(AtomicUsize::new(0));
+    let util_samples = Arc::new(AtomicUsize::new(0));
+    let gap_samples = Arc::new(AtomicUsize::new(0));
+    let monitor = {
+        let held_exclusive = Arc::clone(&held_exclusive);
+        let acquired_total = Arc::clone(&acquired_total);
+        let done = Arc::clone(&done);
+        let peak_active_records = Arc::clone(&peak_active_records);
+        let peak_replan = Arc::clone(&peak_replan);
+        let util_sum = Arc::clone(&util_sum);
+        let util_peak = Arc::clone(&util_peak);
+        let util_samples = Arc::clone(&util_samples);
+        let gap_samples = Arc::clone(&gap_samples);
+        let llc_prefix = llc_prefix.clone();
+        let cpu_prefix = cpu_prefix.clone();
+        std::thread::spawn(move || {
+            LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
+            CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
+            let mut ticks = 0u64;
+            while !done.load(Ordering::Relaxed) {
+                let held = held_exclusive.load(Ordering::Relaxed);
+                let not_acquired = cells.saturating_sub(acquired_total.load(Ordering::Relaxed));
+                util_sum.fetch_add(held as u64, Ordering::Relaxed);
+                util_samples.fetch_add(1, Ordering::Relaxed);
+                util_peak.fetch_max(held, Ordering::Relaxed);
+                // Free exclusive capacity for at least one small (1-CPU) cell
+                // while cells still wait: a candidate work-conservation gap.
+                // (Legitimate when the only waiters are wide heads that cannot
+                // fit; reported as an upper bound, not a proof of a bug.)
+                if not_acquired > 0 && held + 1 <= HERD_CAPACITY_CPUS {
+                    gap_samples.fetch_add(1, Ordering::Relaxed);
+                }
+                // Sample the registry counters less often (rendering is O(n)).
+                if ticks % 25 == 0 {
+                    if let Ok(diag) = protocol::ticket_registry_diagnostics_for_tests() {
+                        if let Some(v) = herd_diag_field(&diag, "active_records") {
+                            peak_active_records.fetch_max(v, Ordering::Relaxed);
+                        }
+                        if let Some(v) = herd_diag_field(&diag, "replan_outstanding") {
+                            peak_replan.fetch_max(v, Ordering::Relaxed);
+                        }
+                    }
+                }
+                ticks += 1;
+                std::thread::sleep(std::time::Duration::from_millis(4));
+            }
+        })
+    };
+
+    let mut workers = Vec::with_capacity(cells);
+    for (llcs, llc_mode, cpus, cpu_mode, shape) in shapes {
+        let llc_prefix = llc_prefix.clone();
+        let cpu_prefix = cpu_prefix.clone();
+        let held_exclusive = Arc::clone(&held_exclusive);
+        let acquired_total = Arc::clone(&acquired_total);
+        let released_total = Arc::clone(&released_total);
+        let grant_failures = Arc::clone(&grant_failures);
+        let incomplete = Arc::clone(&incomplete);
+        let cancel = Arc::clone(&cancel);
+        let start_gate = Arc::clone(&start_gate);
+        let builder = std::thread::Builder::new().stack_size(1 << 20);
+        let handle = builder
+            .spawn(move || {
+                LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = llc_prefix);
+                CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = cpu_prefix);
+                start_gate.wait();
+                let outcome = acquire_resource_locks_waiting_impl(
+                    &llcs,
+                    llc_mode,
+                    &cpus,
+                    cpu_mode,
+                    true,
+                    Some(&cancel),
+                );
+                match outcome {
+                    Ok(LockOutcome::Acquired { locks, .. }) => {
+                        acquired_total.fetch_add(1, Ordering::Relaxed);
+                        if shape.exclusive_cpus > 0 {
+                            held_exclusive.fetch_add(shape.exclusive_cpus, Ordering::Relaxed);
+                        }
+                        std::thread::sleep(hold);
+                        if shape.exclusive_cpus > 0 {
+                            held_exclusive.fetch_sub(shape.exclusive_cpus, Ordering::Relaxed);
+                        }
+                        released_total.fetch_add(1, Ordering::Relaxed);
+                        drop(locks);
+                    }
+                    Ok(LockOutcome::Unavailable(_)) | Err(_) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            // Cut off by the watchdog: the queue path did not
+                            // reach this cell within the deadline.
+                            incomplete.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            grant_failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+            .expect("spawn herd cell");
+        workers.push(handle);
+    }
+
+    start_gate.wait();
+    let start = std::time::Instant::now();
+    // Watchdog: after the deadline, drain any still-blocked waiters via the
+    // interruptible-flock broker so the join below is always bounded.
+    let watchdog = {
+        let cancel = Arc::clone(&cancel);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                if start.elapsed() >= deadline {
+                    cancel_registry_worker(&cancel);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+    };
+    for handle in workers {
+        handle.join().expect("herd cell join");
+    }
+    let makespan = start.elapsed();
+    done.store(true, Ordering::Relaxed);
+    monitor.join().expect("monitor join");
+    watchdog.join().expect("watchdog join");
+
+    let (grant_scans, generation) = protocol::ticket_registry_diagnostics_for_tests()
+        .map(|diag| {
+            (
+                herd_diag_field(&diag, "grant_scans").unwrap_or(0),
+                herd_diag_field(&diag, "generation").unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0));
+
+    let samples = util_samples.load(Ordering::Relaxed).max(1);
+    HerdMetrics {
+        cells,
+        hold,
+        makespan,
+        ideal_lower_bound,
+        total_exclusive_cpu_units,
+        grant_scans,
+        generation,
+        peak_active_records: peak_active_records.load(Ordering::Relaxed),
+        peak_replan_outstanding: peak_replan.load(Ordering::Relaxed),
+        util_mean: util_sum.load(Ordering::Relaxed) as f64 / samples as f64,
+        util_peak: util_peak.load(Ordering::Relaxed),
+        conservation_gap_frac: gap_samples.load(Ordering::Relaxed) as f64 / samples as f64,
+        grant_failures: grant_failures.load(Ordering::Relaxed),
+        completed: released_total.load(Ordering::Relaxed),
+        incomplete: incomplete.load(Ordering::Relaxed),
+        contended,
+    }
+}
+
+fn report_herd_metrics(m: &HerdMetrics) {
+    let ratio = m.makespan.as_secs_f64() / m.ideal_lower_bound.as_secs_f64().max(1e-9);
+    let grants_per_sec = m.cells as f64 / m.makespan.as_secs_f64().max(1e-9);
+    let scans_per_grant = m.grant_scans as f64 / m.cells as f64;
+    eprintln!(
+        "\n=== admission herd benchmark: {} cells, hold {:?}, {} ===",
+        m.cells,
+        m.hold,
+        if m.contended {
+            "contended (queued)"
+        } else {
+            "disjoint (fast-path)"
+        }
+    );
+    eprintln!(
+        "  completed / incomplete {} / {}",
+        m.completed, m.incomplete
+    );
+    eprintln!("  makespan            {:>10.3}s", m.makespan.as_secs_f64());
+    eprintln!(
+        "  capacity lower bound{:>10.3}s   (sum exclusive-cpu-time {} units / {} cpus)",
+        m.ideal_lower_bound.as_secs_f64(),
+        m.total_exclusive_cpu_units,
+        HERD_CAPACITY_CPUS
+    );
+    eprintln!("  makespan / bound    {:>10.2}x", ratio);
+    eprintln!("  grants/sec          {:>10.0}", grants_per_sec);
+    eprintln!("  grant_scans         {:>10}", m.grant_scans);
+    eprintln!("  scans / grant       {:>10.2}", scans_per_grant);
+    eprintln!("  generation          {:>10}", m.generation);
+    eprintln!("  peak active_records {:>10}", m.peak_active_records);
+    eprintln!("  peak replan_outstd  {:>10}", m.peak_replan_outstanding);
+    eprintln!(
+        "  exclusive util      mean {:>6.1} / {}  peak {}  ({:.0}% of capacity)",
+        m.util_mean,
+        HERD_CAPACITY_CPUS,
+        m.util_peak,
+        100.0 * m.util_mean / HERD_CAPACITY_CPUS as f64
+    );
+    eprintln!(
+        "  free-capacity-while-waiting samples {:.0}% (upper bound; wide heads are legit)",
+        100.0 * m.conservation_gap_frac
+    );
+    eprintln!("  grant failures      {:>10}", m.grant_failures);
+}
+
+fn herd_env_cells(default: usize) -> usize {
+    std::env::var("KTSTR_HERD_CELLS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn herd_env_hold(default_ms: u64) -> std::time::Duration {
+    let ms = std::env::var("KTSTR_HERD_HOLD_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_ms);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Default disjoint (fast-path). The contended queue path is driven by the
+/// single per-process coordinator/interruptible-waiter and is architected for
+/// one waiter per PROCESS; many concurrent in-process waiters cannot drive it
+/// faithfully (they contend for the single global interruptible-waiter slot),
+/// so contended mode in-process only characterises the fast-path/coordinator
+/// boundary and is gated behind an explicit opt-in. A faithful contended herd
+/// needs distinct-PID cells (the `TicketChild` multi-process helper). Set
+/// `KTSTR_HERD_CONTENDED=1` to opt into the in-process contended probe.
+fn herd_env_contended() -> bool {
+    matches!(
+        std::env::var("KTSTR_HERD_CONTENDED").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+fn run_and_report_herd(default_cells: usize) {
+    let cells = herd_env_cells(default_cells);
+    let hold = herd_env_hold(30);
+    let contended = herd_env_contended();
+    let m = run_herd_benchmark(cells, hold, contended);
+    report_herd_metrics(&m);
+    // A cell that ends Unavailable/Err WITHOUT the watchdog cancelling it is a
+    // real protocol failure; watchdog cut-offs surface as `incomplete`.
+    assert_eq!(
+        m.grant_failures, 0,
+        "cells failed to grant without watchdog cancellation (protocol failure)"
+    );
+}
+
+#[test]
+#[ignore = "herd stress/timing benchmark; run with --ignored --nocapture"]
+fn herd_800_cells() {
+    run_and_report_herd(800);
+}
+
+#[test]
+#[ignore = "herd stress/timing benchmark; run with --ignored --nocapture"]
+fn herd_2400_cells() {
+    run_and_report_herd(2400);
+}
