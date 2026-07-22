@@ -135,7 +135,13 @@ jobs:
       - uses: taiki-e/install-action@v2.83.3
         with:
           tool: cargo-nextest
-      - run: just test "${{ matrix.kernel-version }}" "${{ matrix.features }}"
+      - name: Run ktstr tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+          just test "${{ matrix.kernel-version }}" "${{ matrix.features }}" 2>&1 \
+            | tee "${KTSTR_BUILD_DIAGNOSTICS_DIR}/nextest-transcript.log"
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - if: ${{ !cancelled() }}
@@ -145,7 +151,9 @@ jobs:
         uses: actions/upload-artifact@v7.0.0
         with:
           name: cargo-diagnostics-x64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
-          path: ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+          path: |
+            ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+            target/nextest/ci/junit.xml
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload ktstr failure dumps
@@ -189,7 +197,13 @@ jobs:
       - uses: taiki-e/install-action@v2.83.3
         with:
           tool: cargo-nextest
-      - run: just test "${{ matrix.kernel-version }}" "${{ matrix.features }}"
+      - name: Run ktstr tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+          just test "${{ matrix.kernel-version }}" "${{ matrix.features }}" 2>&1 \
+            | tee "${KTSTR_BUILD_DIAGNOSTICS_DIR}/nextest-transcript.log"
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - if: ${{ !cancelled() }}
@@ -199,7 +213,9 @@ jobs:
         uses: actions/upload-artifact@v7.0.0
         with:
           name: cargo-diagnostics-arm64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
-          path: ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+          path: |
+            ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+            target/nextest/ci/junit.xml
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload ktstr failure dumps
@@ -318,7 +334,13 @@ jobs:
       - uses: taiki-e/install-action@v2.83.3
         with:
           tool: cargo-llvm-cov,cargo-nextest
-      - run: just coverage 7.1 wprof
+      - name: Run ktstr coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+          just coverage 7.1 wprof 2>&1 \
+            | tee "${KTSTR_BUILD_DIAGNOSTICS_DIR}/nextest-transcript.log"
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - name: Upload cargo-ktstr build diagnostics
@@ -326,7 +348,10 @@ jobs:
         uses: actions/upload-artifact@v7.0.0
         with:
           name: cargo-diagnostics-coverage-x64
-          path: ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+          path: |
+            ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+            target/nextest/ci/junit.xml
+            target/llvm-cov-target/nextest/ci/junit.xml
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload ktstr failure dumps
@@ -364,7 +389,13 @@ jobs:
       - uses: taiki-e/install-action@v2.83.3
         with:
           tool: cargo-llvm-cov,cargo-nextest
-      - run: just coverage 7.1 wprof
+      - name: Run ktstr coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+          just coverage 7.1 wprof 2>&1 \
+            | tee "${KTSTR_BUILD_DIAGNOSTICS_DIR}/nextest-transcript.log"
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - name: Upload cargo-ktstr build diagnostics
@@ -372,7 +403,10 @@ jobs:
         uses: actions/upload-artifact@v7.0.0
         with:
           name: cargo-diagnostics-coverage-arm64
-          path: ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+          path: |
+            ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+            target/nextest/ci/junit.xml
+            target/llvm-cov-target/nextest/ci/junit.xml
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload ktstr failure dumps
