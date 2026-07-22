@@ -30,6 +30,8 @@ const VERSION: u32 = 24;
 #[cfg(test)]
 const RETAINED_FUTEX_WAIT_MARKER_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 #[cfg(test)]
+const RETAINED_FUTEX_WAIT_GATE_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_GATE";
+#[cfg(test)]
 thread_local! {
     static GENERATION_WAIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1579,6 +1581,27 @@ impl TicketSharedMaps {
                 )
             })?;
         }
+        #[cfg(test)]
+        if let Some(gate) = std::env::var_os(RETAINED_FUTEX_WAIT_GATE_ENV) {
+            // Let the cross-process regression deterministically put the
+            // publication between the userspace sample and FUTEX_WAIT. This
+            // is test-only; production never polls a filesystem gate here.
+            while !Path::new(&gate).exists() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        #[cfg(test)]
+        let publish_wait_resolution = || -> Result<()> {
+            if let Some(marker) = &wait_marker {
+                std::fs::write(marker, b"woken").with_context(|| {
+                    format!(
+                        "publish retained-futex wake marker {}",
+                        Path::new(marker).display()
+                    )
+                })?;
+            }
+            Ok(())
+        };
         let ts = libc::timespec {
             tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
             tv_nsec: timeout.subsec_nanos().into(),
@@ -1597,20 +1620,23 @@ impl TicketSharedMaps {
         };
         if rc == 0 {
             #[cfg(test)]
-            if let Some(marker) = wait_marker {
-                std::fs::write(&marker, b"woken").with_context(|| {
-                    format!(
-                        "publish retained-futex wake marker {}",
-                        Path::new(&marker).display()
-                    )
-                })?;
-            }
+            publish_wait_resolution()?;
             return Ok(false);
         }
         let error = std::io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::ETIMEDOUT) => Ok(true),
-            Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(false),
+            Some(libc::EAGAIN) => {
+                // The shared wake word changed after `expected` was sampled
+                // but before FUTEX_WAIT entered the kernel. That is the
+                // sample-before-wait protocol resolving the same publication,
+                // not a missed wake. Keep the test marker faithful to that
+                // semantic so descheduling cannot strand its observer.
+                #[cfg(test)]
+                publish_wait_resolution()?;
+                Ok(false)
+            }
+            Some(libc::EINTR) => Ok(false),
             _ => Err(error.into()),
         }
     }
@@ -5986,6 +6012,19 @@ pub(super) fn ticket_is_waiting_for_tests(pid: u32) -> Result<bool> {
         .into_iter()
         .find(|record| record.pid == pid)
         .is_some_and(|record| record.state == STATE_WAITING))
+}
+
+#[cfg(test)]
+pub(super) fn ticket_is_granted_for_tests(pid: u32) -> Result<bool> {
+    let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Shared)? else {
+        return Ok(false);
+    };
+    let mut table = Table::open_existing()?;
+    Ok(table
+        .records()?
+        .into_iter()
+        .find(|record| record.pid == pid)
+        .is_some_and(|record| record.state == STATE_GRANTED))
 }
 
 #[cfg(test)]

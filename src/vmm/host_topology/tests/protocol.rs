@@ -5947,6 +5947,7 @@ const TICKET_HELPER_COORDINATOR_WAITING: &str = "KTSTR_TEST_TICKET_COORDINATOR_W
 const TICKET_HELPER_MAPPING_COUNT: &str = "KTSTR_TEST_TICKET_MAPPING_COUNT";
 const TICKET_HELPER_PENDING_ACTIVATE_GATE: &str = "KTSTR_TEST_TICKET_PENDING_ACTIVATE_GATE";
 const RETAINED_FUTEX_WAIT_MARKER: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
+const RETAINED_FUTEX_WAIT_GATE: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_GATE";
 
 const PENDING_V3_LLC_PREFIX: &str = "KTSTR_TEST_PENDING_V3_LLC_PREFIX";
 const PENDING_V3_CPU_PREFIX: &str = "KTSTR_TEST_PENDING_V3_CPU_PREFIX";
@@ -6576,6 +6577,7 @@ struct TicketSpawnOptions<'a> {
     coordinator_waiting: Option<&'a std::path::Path>,
     record_mapping_count: bool,
     retained_futex_wait_marker: Option<&'a std::path::Path>,
+    retained_futex_wait_gate: Option<&'a std::path::Path>,
     pending_activate_gate: Option<&'a std::path::Path>,
 }
 
@@ -6739,6 +6741,26 @@ impl TicketChild {
         )
     }
 
+    fn spawn_recording_retained_wait_before_syscall(
+        marker_dir: &std::path::Path,
+        label: &str,
+        candidates: &str,
+        futex_wait_marker: &std::path::Path,
+        futex_wait_gate: &std::path::Path,
+    ) -> Self {
+        Self::spawn_with_options(
+            marker_dir,
+            label,
+            candidates,
+            TicketSpawnOptions {
+                record_mapping_count: true,
+                retained_futex_wait_marker: Some(futex_wait_marker),
+                retained_futex_wait_gate: Some(futex_wait_gate),
+                ..TicketSpawnOptions::default()
+            },
+        )
+    }
+
     fn spawn_with_options(
         marker_dir: &std::path::Path,
         label: &str,
@@ -6821,6 +6843,9 @@ impl TicketChild {
         }
         if let Some(marker) = options.retained_futex_wait_marker {
             command.env(RETAINED_FUTEX_WAIT_MARKER, marker);
+        }
+        if let Some(gate) = options.retained_futex_wait_gate {
+            command.env(RETAINED_FUTEX_WAIT_GATE, gate);
         }
         if let Some(gate) = options.pending_activate_gate {
             command.env(TICKET_HELPER_PENDING_ACTIVATE_GATE, gate);
@@ -7222,11 +7247,66 @@ fn retained_shared_mapping_wakes_waiter_across_processes() {
     });
 
     // This close wakes the coordinator process, which publishes GRANTED and
-    // FUTEX_WAKEs the different process already sleeping on its retained
-    // read-only MAP_SHARED record view.
+    // FUTEX_WAKEs the different process sleeping on (or just about to sleep
+    // on) its retained read-only MAP_SHARED record view.
     drop(waiter_blocker);
     waiter.wait_for_acquired();
-    waiter.wait_for_observation("successful retained FUTEX_WAKE", || {
+    waiter.wait_for_observation("resolved retained futex publication", || {
+        (std::fs::read(&futex_wait_marker).ok()?.as_slice() == b"woken").then_some(())
+    });
+    waiter.wait_for_mapping_count(1);
+    waiter.release_and_wait();
+
+    drop(coordinator_blocker);
+    coordinator.wait_for_acquired();
+    coordinator.release_and_wait();
+}
+
+#[test]
+fn retained_shared_mapping_resolves_wake_before_futex_wait() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let coordinator_blocker =
+        crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
+            .expect("open coordinator blocker")
+            .expect("hold coordinator blocker");
+    let waiter_blocker =
+        crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
+            .expect("open waiter blocker")
+            .expect("hold waiter blocker");
+    let coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
+    coordinator.wait_for_probe();
+
+    let futex_wait_marker = markers.path().join("waiter.futex-wait");
+    let futex_wait_gate = markers.path().join("allow-waiter-futex-wait");
+    let waiter = TicketChild::spawn_recording_retained_wait_before_syscall(
+        markers.path(),
+        "early-wake-retained-map-waiter",
+        "2",
+        &futex_wait_marker,
+        &futex_wait_gate,
+    );
+    waiter.wait_for_path(&futex_wait_marker, "retained FUTEX_WAIT entry");
+    waiter.wait_for_observation("retained-map waiter publication", || {
+        protocol::ticket_is_waiting_for_tests(waiter.pid)
+            .expect("read retained-map waiter state")
+            .then_some(())
+    });
+
+    // Hold the waiter between its userspace sample and FUTEX_WAIT while the
+    // coordinator publishes GRANTED and executes FUTEX_WAKE. Opening the gate
+    // then forces FUTEX_WAIT to observe the changed retained MAP_SHARED word
+    // as EAGAIN, deterministically covering the early-wake half of
+    // sample-before-wait.
+    drop(waiter_blocker);
+    waiter.wait_for_observation("retained-map early grant", || {
+        protocol::ticket_is_granted_for_tests(waiter.pid)
+            .expect("read retained-map waiter state")
+            .then_some(())
+    });
+    std::fs::write(&futex_wait_gate, b"continue").expect("release retained FUTEX_WAIT gate");
+    waiter.wait_for_acquired();
+    waiter.wait_for_observation("resolved retained futex publication", || {
         (std::fs::read(&futex_wait_marker).ok()?.as_slice() == b"woken").then_some(())
     });
     waiter.wait_for_mapping_count(1);

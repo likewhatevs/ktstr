@@ -2869,6 +2869,11 @@ pub(crate) fn ticket_is_waiting_for_tests(pid: u32) -> Result<bool> {
 }
 
 #[cfg(test)]
+pub(crate) fn ticket_is_granted_for_tests(pid: u32) -> Result<bool> {
+    registry::ticket_is_granted_for_tests(pid)
+}
+
+#[cfg(test)]
 pub(crate) fn ticket_is_revoked_for_tests(pid: u32) -> Result<bool> {
     registry::ticket_is_revoked_for_tests(pid)
 }
