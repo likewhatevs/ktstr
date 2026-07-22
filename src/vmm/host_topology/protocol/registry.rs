@@ -868,6 +868,64 @@ struct EncodedWatchModes {
     permit: ClaimMode,
 }
 
+/// Exact identity of one encoded alternative-watch serial query.
+///
+/// Grant scans commonly contain hundreds of generated cells with the same
+/// host-wide alternative set. Retain the complete encoded words rather than a
+/// digest so memoization can never turn a hash collision into a missed
+/// resource-improvement observation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct EncodedWatchSerialMemoKey {
+    cpu_words: Vec<u64>,
+    llc_words: Vec<u64>,
+    permit_words: Vec<u64>,
+    cpu_exclusive: bool,
+    llc_exclusive: bool,
+    permit_exclusive: bool,
+    blocked_on: Option<EncodedWatchSerialBlockedOn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct EncodedWatchSerialBlockedOn {
+    kind: u32,
+    index: usize,
+    exclusive: bool,
+    serial: u64,
+}
+
+impl EncodedWatchSerialBlockedOn {
+    fn new(blocked: BlockedOn) -> Self {
+        let (kind, index) = match blocked.key {
+            ResourceKey::Cpu(index) => (BLOCK_CPU, index),
+            ResourceKey::Llc(index) => (BLOCK_LLC, index),
+            ResourceKey::Permit(index) => (BLOCK_PERMIT, index),
+        };
+        Self {
+            kind,
+            index,
+            exclusive: blocked.mode == FlockMode::Exclusive,
+            serial: blocked.serial,
+        }
+    }
+
+    fn resource_key(self) -> Result<ResourceKey> {
+        match self.kind {
+            BLOCK_CPU => Ok(ResourceKey::Cpu(self.index)),
+            BLOCK_LLC => Ok(ResourceKey::Llc(self.index)),
+            BLOCK_PERMIT => Ok(ResourceKey::Permit(self.index)),
+            kind => anyhow::bail!("invalid encoded watch memo blocker kind {kind}"),
+        }
+    }
+
+    fn mode(self) -> FlockMode {
+        if self.exclusive {
+            FlockMode::Exclusive
+        } else {
+            FlockMode::Shared
+        }
+    }
+}
+
 /// The grant scan needs every exact claim, but almost never needs to
 /// materialize a ticket's potentially host-wide alternative watch. Keep the
 /// scan representation small and retain only the encoded-watch facts needed
@@ -7016,6 +7074,21 @@ pub(crate) struct ReplanTokenWaveOutcome {
     pub(crate) initial_prefix_comparisons: usize,
     pub(crate) initial_full_watch_materializations: usize,
     pub(crate) initial_encoded_watch_serial_walks: usize,
+    pub(crate) memo_identical_waiters: usize,
+    pub(crate) memo_identical_replans: usize,
+    pub(crate) memo_identical_serial_walks: usize,
+    pub(crate) memo_mixed_waiters: usize,
+    pub(crate) memo_mixed_replans: usize,
+    pub(crate) memo_mixed_serial_walks: usize,
+    pub(crate) memo_guard_waiters: usize,
+    pub(crate) memo_guard_initial_capacity: usize,
+    pub(crate) memo_guard_initial_replans: usize,
+    pub(crate) memo_guard_saturated_replans: usize,
+    pub(crate) memo_guard_saturated_serial_walks: usize,
+    pub(crate) memo_guard_closed_replans: usize,
+    pub(crate) memo_guard_closed_serial_walks: usize,
+    pub(crate) memo_guard_opened_replans: usize,
+    pub(crate) memo_guard_opened_serial_walks: usize,
     pub(crate) initial_full_prefix_snapshot_publishes: usize,
     pub(crate) repeated_replans: usize,
     pub(crate) repeated_wakes: usize,
@@ -7041,6 +7114,172 @@ pub(crate) struct ReplanTokenWaveOutcome {
     pub(crate) mixed_age_clock_cleared: bool,
     pub(crate) mixed_age_post_drain_replans: usize,
     pub(crate) mixed_age_post_drain_wakes: usize,
+}
+
+#[cfg(test)]
+struct EncodedWatchSerialMemoCaseOutcome {
+    initial_replans: usize,
+    initial_serial_walks: usize,
+    saturated_replans: usize,
+    saturated_serial_walks: usize,
+    closed_replans: usize,
+    closed_serial_walks: usize,
+    opened_replans: usize,
+    opened_serial_walks: usize,
+}
+
+#[cfg(test)]
+fn exercise_encoded_watch_serial_memo_case_for_tests(
+    waiter_count: usize,
+    mixed_keys: bool,
+    initial_capacity: usize,
+) -> Result<EncodedWatchSerialMemoCaseOutcome> {
+    anyhow::ensure!(waiter_count >= 6, "watch memo exercise needs six waiters");
+    anyhow::ensure!(
+        initial_capacity != 0 && initial_capacity <= waiter_count,
+        "watch memo exercise capacity must fit its waiter count",
+    );
+    let coordinator_cpu = 2usize;
+    let common_cpu = 20usize;
+    let blocker_a_cpu = 21usize;
+    let blocker_b_cpu = 22usize;
+    let distinct_cpu = 23usize;
+    let first_waiter_cpu = 100usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+
+    let base_watch = ClaimSet::new(
+        std::iter::empty(),
+        (first_waiter_cpu..first_waiter_cpu + waiter_count).chain([
+            common_cpu,
+            blocker_a_cpu,
+            blocker_b_cpu,
+        ]),
+        FlockMode::Exclusive,
+    );
+    let mut waiters = Vec::with_capacity(waiter_count);
+    for index in 0..waiter_count {
+        let claim = ClaimSet::new(
+            std::iter::empty(),
+            [first_waiter_cpu + index],
+            FlockMode::Exclusive,
+        );
+        let mut watch = base_watch.clone();
+        if mixed_keys && index == 2 {
+            watch.cpus.insert(distinct_cpu);
+        }
+        let blocker = if mixed_keys {
+            match index {
+                3 | 4 => Some(ContentionMarker {
+                    blocker: ResourceKey::Cpu(blocker_a_cpu),
+                    mode: FlockMode::Exclusive,
+                }),
+                5 => Some(ContentionMarker {
+                    blocker: ResourceKey::Cpu(blocker_b_cpu),
+                    mode: FlockMode::Exclusive,
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        waiters.push((Ticket::register(claim, watch, None)?, blocker));
+    }
+
+    let outcome = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.set_replan_capacity_for_tests(initial_capacity)?;
+        table.restage_coordinator_for_tests(
+            &coordinator,
+            waiters.iter().map(|(ticket, _)| ticket),
+        )?;
+        set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
+        for cpu in &base_watch.cpus {
+            set_cpu_free_for_tests(&mut table, *cpu, false)?;
+        }
+        if mixed_keys {
+            set_cpu_free_for_tests(&mut table, distinct_cpu, false)?;
+        }
+        for (ticket, blocker) in &waiters {
+            if let Some(blocker) = blocker {
+                table.set_record_blocked(ticket.slot, *blocker, 0)?;
+            }
+        }
+        table.stamp_resource_improvement(S_CPU_EX, common_cpu)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        let walks_before = ENCODED_WATCH_SERIAL_WALKS.with(std::cell::Cell::get);
+        table.grant_compatible()?;
+        let initial_serial_walks = ENCODED_WATCH_SERIAL_WALKS
+            .with(std::cell::Cell::get)
+            .saturating_sub(walks_before);
+        let count_replans = |table: &mut Table| -> Result<usize> {
+            waiters.iter().try_fold(0usize, |count, (ticket, _)| {
+                Ok(count
+                    + usize::from(
+                        table
+                            .record(ticket.slot)?
+                            .is_some_and(|record| record.state == STATE_REPLAN),
+                    ))
+            })
+        };
+        let initial_replans = count_replans(&mut table)?;
+
+        let mut saturated_replans = initial_replans;
+        let mut saturated_serial_walks = 0usize;
+        let mut closed_replans = initial_replans;
+        let mut closed_serial_walks = 0usize;
+        let mut opened_replans = initial_replans;
+        let mut opened_serial_walks = 0usize;
+        if initial_capacity < waiter_count {
+            table.set_pending_flag(PENDING_RESCAN);
+            let walks_before = ENCODED_WATCH_SERIAL_WALKS.with(std::cell::Cell::get);
+            table.grant_compatible()?;
+            saturated_serial_walks = ENCODED_WATCH_SERIAL_WALKS
+                .with(std::cell::Cell::get)
+                .saturating_sub(walks_before);
+            saturated_replans = count_replans(&mut table)?;
+
+            table.set_replan_capacity_for_tests(waiter_count)?;
+            let closed_now = monotonic_now_ns()?.max(2);
+            write_u64(&mut table.header, H_REPLAN_WAVE_STARTED_NS, closed_now - 1);
+            write_u64(&mut table.header, H_REPLAN_WAVE_DEADLINE_NS, closed_now);
+            table.set_pending_flag(PENDING_RESCAN);
+            let walks_before = ENCODED_WATCH_SERIAL_WALKS.with(std::cell::Cell::get);
+            table.grant_compatible_at(closed_now)?;
+            closed_serial_walks = ENCODED_WATCH_SERIAL_WALKS
+                .with(std::cell::Cell::get)
+                .saturating_sub(walks_before);
+            closed_replans = count_replans(&mut table)?;
+
+            let opened_now = closed_now.saturating_add(1);
+            table.arm_replan_wave_at(opened_now);
+            table.set_pending_flag(PENDING_RESCAN);
+            let walks_before = ENCODED_WATCH_SERIAL_WALKS.with(std::cell::Cell::get);
+            table.grant_compatible_at(opened_now)?;
+            opened_serial_walks = ENCODED_WATCH_SERIAL_WALKS
+                .with(std::cell::Cell::get)
+                .saturating_sub(walks_before);
+            opened_replans = count_replans(&mut table)?;
+        }
+        EncodedWatchSerialMemoCaseOutcome {
+            initial_replans,
+            initial_serial_walks,
+            saturated_replans,
+            saturated_serial_walks,
+            closed_replans,
+            closed_serial_walks,
+            opened_replans,
+            opened_serial_walks,
+        }
+    };
+
+    for (ticket, _) in waiters.iter_mut().rev() {
+        ticket.finish(None)?;
+    }
+    coordinator.finish(None)?;
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -8208,6 +8447,30 @@ pub(super) fn exercise_replan_token_wave_for_tests(
     }
     coordinator.finish(None)?;
 
+    let memo_identical_waiters = 64usize;
+    let memo_identical = exercise_encoded_watch_serial_memo_case_for_tests(
+        memo_identical_waiters,
+        false,
+        memo_identical_waiters,
+    )?;
+    let memo_identical_replans = memo_identical.initial_replans;
+    let memo_identical_serial_walks = memo_identical.initial_serial_walks;
+    let memo_mixed_waiters = 8usize;
+    let memo_mixed = exercise_encoded_watch_serial_memo_case_for_tests(
+        memo_mixed_waiters,
+        true,
+        memo_mixed_waiters,
+    )?;
+    let memo_mixed_replans = memo_mixed.initial_replans;
+    let memo_mixed_serial_walks = memo_mixed.initial_serial_walks;
+    let memo_guard_waiters = 8usize;
+    let memo_guard_initial_capacity = 2usize;
+    let memo_guard = exercise_encoded_watch_serial_memo_case_for_tests(
+        memo_guard_waiters,
+        false,
+        memo_guard_initial_capacity,
+    )?;
+
     Ok(ReplanTokenWaveOutcome {
         registration_waiting,
         exact_grants,
@@ -8216,6 +8479,21 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         initial_prefix_comparisons,
         initial_full_watch_materializations,
         initial_encoded_watch_serial_walks,
+        memo_identical_waiters,
+        memo_identical_replans,
+        memo_identical_serial_walks,
+        memo_mixed_waiters,
+        memo_mixed_replans,
+        memo_mixed_serial_walks,
+        memo_guard_waiters,
+        memo_guard_initial_capacity,
+        memo_guard_initial_replans: memo_guard.initial_replans,
+        memo_guard_saturated_replans: memo_guard.saturated_replans,
+        memo_guard_saturated_serial_walks: memo_guard.saturated_serial_walks,
+        memo_guard_closed_replans: memo_guard.closed_replans,
+        memo_guard_closed_serial_walks: memo_guard.closed_serial_walks,
+        memo_guard_opened_replans: memo_guard.opened_replans,
+        memo_guard_opened_serial_walks: memo_guard.opened_serial_walks,
         initial_full_prefix_snapshot_publishes,
         repeated_replans,
         repeated_wakes,
@@ -14841,6 +15119,10 @@ impl Table {
         let mut changed = false;
         let mut coordinator_prefix_changed = false;
         let mut backfill_head: Option<BackfillHead> = None;
+        // Generated cells overwhelmingly share one host-wide alternative
+        // watch. The exact key keeps collision handling semantic while making
+        // their resource-serial lookup a once-per-scan cost.
+        let mut encoded_watch_serial_memo = BTreeMap::<EncodedWatchSerialMemoKey, u64>::new();
         self.bump_grant_scans();
 
         for record in records {
@@ -15060,13 +15342,16 @@ impl Table {
                 && record.ticket != coordinator_ticket
                 && flexible
                 && consider_waiting_replan
+                && replan_publication_open
+                && replan_slots != 0
             {
                 // The global serial is an O(1) rejection filter. Walk this
                 // ticket's encoded alternative watch only when a newer global
                 // observation could actually be relevant. Every eligible
                 // ticket may join the bounded parallel publication wave.
                 let waiting_serial = if global_serial > record.issue_serial {
-                    self.max_encoded_watch_serial(
+                    self.memoized_encoded_watch_serial(
+                        &mut encoded_watch_serial_memo,
                         record.slot,
                         record.watch_modes,
                         record.blocked_on,
@@ -15086,10 +15371,7 @@ impl Table {
                 } else {
                     true
                 };
-                if (relevant_resource_change || prefix_invalid || !waiting_prefix_matches)
-                    && replan_publication_open
-                    && replan_slots != 0
-                {
+                if relevant_resource_change || prefix_invalid || !waiting_prefix_matches {
                     if record.ticket > replan_cursor {
                         if replan_tail.len() < replan_slots {
                             replan_tail.push(ReplanCandidate {
@@ -15866,18 +16148,13 @@ impl Table {
         Ok(serial)
     }
 
-    /// Walk one selected ticket's encoded alternative watch without building
-    /// BTreeSets. The global serial rejects the other queue records before
-    /// this is called, so a storm pays this host-width cost once rather than
-    /// once per waiter.
-    fn max_encoded_watch_serial(
+    /// Read one ticket's encoded alternative watch without building BTreeSets.
+    fn encoded_watch_serial_memo_key(
         &mut self,
         slot: u64,
         modes: EncodedWatchModes,
         blocked_on: Option<BlockedOn>,
-    ) -> Result<u64> {
-        #[cfg(test)]
-        ENCODED_WATCH_SERIAL_WALKS.with(|count| count.set(count.get().saturating_add(1)));
+    ) -> Result<EncodedWatchSerialMemoKey> {
         let layout = self.layout;
         let (cpu_words, llc_words, permit_words) = {
             let bytes = self.record_bytes(slot)?.ok_or_else(|| {
@@ -15895,43 +16172,82 @@ impl Table {
                 copy_words(RB_WATCH_PERMITS),
             )
         };
+        Ok(EncodedWatchSerialMemoKey {
+            cpu_words,
+            llc_words,
+            permit_words,
+            cpu_exclusive: modes.cpu == ClaimMode::Exclusive,
+            llc_exclusive: modes.llc == ClaimMode::Exclusive,
+            permit_exclusive: modes.permit == ClaimMode::Exclusive,
+            blocked_on: blocked_on.map(EncodedWatchSerialBlockedOn::new),
+        })
+    }
+
+    /// Return one exact encoded-watch serial query, memoized for the duration
+    /// of a single grant scan. Registry EX keeps every resource serial stable
+    /// for that duration. Full key equality, including blocker identity and
+    /// its observation serial, is the correctness check; ordering is only an
+    /// index. Each record's issue serial remains outside the memo and is
+    /// compared independently with the returned maximum.
+    fn memoized_encoded_watch_serial(
+        &mut self,
+        memo: &mut BTreeMap<EncodedWatchSerialMemoKey, u64>,
+        slot: u64,
+        modes: EncodedWatchModes,
+        blocked_on: Option<BlockedOn>,
+    ) -> Result<u64> {
+        let key = self.encoded_watch_serial_memo_key(slot, modes, blocked_on)?;
+        if let Some(&serial) = memo.get(&key) {
+            return Ok(serial);
+        }
+        let serial = self.max_encoded_watch_serial_for_key(&key)?;
+        memo.insert(key, serial);
+        Ok(serial)
+    }
+
+    /// Walk one unique encoded alternative watch's set bits. The per-scan memo
+    /// makes a generated-cell storm pay this host-width cost once per exact
+    /// watch/blocker identity rather than once per waiter.
+    fn max_encoded_watch_serial_for_key(&self, key: &EncodedWatchSerialMemoKey) -> Result<u64> {
+        #[cfg(test)]
+        ENCODED_WATCH_SERIAL_WALKS.with(|count| count.set(count.get().saturating_add(1)));
         let mut serial = 0u64;
-        for (word_index, mut word) in cpu_words.into_iter().enumerate() {
+        for (word_index, mut word) in key.cpu_words.iter().copied().enumerate() {
             while word != 0 {
                 let bit = word.trailing_zeros() as usize;
                 let index = word_index * 64 + bit;
                 serial = serial.max(self.resource_serial(S_CPU_SH, index)?);
-                if modes.cpu == ClaimMode::Exclusive {
+                if key.cpu_exclusive {
                     serial = serial.max(self.resource_serial(S_CPU_EX, index)?);
                 }
                 word &= word - 1;
             }
         }
-        for (word_index, mut word) in llc_words.into_iter().enumerate() {
+        for (word_index, mut word) in key.llc_words.iter().copied().enumerate() {
             while word != 0 {
                 let bit = word.trailing_zeros() as usize;
                 let index = word_index * 64 + bit;
                 serial = serial.max(self.resource_serial(S_LLC_SH, index)?);
-                if modes.llc == ClaimMode::Exclusive {
+                if key.llc_exclusive {
                     serial = serial.max(self.resource_serial(S_LLC_EX, index)?);
                 }
                 word &= word - 1;
             }
         }
-        for (word_index, mut word) in permit_words.into_iter().enumerate() {
+        for (word_index, mut word) in key.permit_words.iter().copied().enumerate() {
             while word != 0 {
                 let bit = word.trailing_zeros() as usize;
                 let permit = word_index * 64 + bit;
                 let index = permit_resource_index(permit)?;
                 serial = serial.max(self.resource_serial(S_CPU_SH, index)?);
-                if modes.permit == ClaimMode::Exclusive {
+                if key.permit_exclusive {
                     serial = serial.max(self.resource_serial(S_CPU_EX, index)?);
                 }
                 word &= word - 1;
             }
         }
-        if let Some(blocked) = blocked_on {
-            serial = serial.max(self.blocker_serial(blocked.key, blocked.mode)?);
+        if let Some(blocked) = key.blocked_on {
+            serial = serial.max(self.blocker_serial(blocked.resource_key()?, blocked.mode())?);
         }
         Ok(serial)
     }

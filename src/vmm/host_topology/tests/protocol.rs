@@ -4641,6 +4641,48 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
         "the global serial filter must walk each eligible callback's encoded watch exactly once",
     );
     assert_eq!(
+        (
+            outcome.memo_identical_replans,
+            outcome.memo_identical_serial_walks,
+        ),
+        (outcome.memo_identical_waiters, 1),
+        "one grant scan must walk an identical encoded alternative watch once total for all eligible waiters",
+    );
+    assert_eq!(
+        (outcome.memo_mixed_replans, outcome.memo_mixed_serial_walks),
+        (outcome.memo_mixed_waiters, 4),
+        "full encoded words and blocker identity must form four exact memo keys: shared watch, distinct watch, and two distinct blockers",
+    );
+    assert_eq!(
+        (
+            outcome.memo_guard_initial_replans,
+            outcome.memo_guard_saturated_replans,
+            outcome.memo_guard_saturated_serial_walks,
+        ),
+        (
+            outcome.memo_guard_initial_capacity,
+            outcome.memo_guard_initial_capacity,
+            0,
+        ),
+        "a saturated planner wave must neither publish more callbacks nor walk deferred WAITING watches",
+    );
+    assert_eq!(
+        (
+            outcome.memo_guard_closed_replans,
+            outcome.memo_guard_closed_serial_walks,
+        ),
+        (outcome.memo_guard_initial_capacity, 0),
+        "a lease-closed planner wave must leave callbacks deferred without walking their watches",
+    );
+    assert_eq!(
+        (
+            outcome.memo_guard_opened_replans,
+            outcome.memo_guard_opened_serial_walks,
+        ),
+        (outcome.memo_guard_waiters, 1),
+        "opening planner capacity must publish every unchanged eligible waiter after one shared watch walk",
+    );
+    assert_eq!(
         outcome.initial_full_prefix_snapshot_publishes, 0,
         "the scan must publish predecessor words directly without allocating unused host-sized holder vectors",
     );
