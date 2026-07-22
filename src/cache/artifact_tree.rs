@@ -53,12 +53,15 @@ const LIFECYCLE_CLOSURE_LOCK_DIR: &str = "closures";
 const LIFECYCLE_ACCESS_DIR: &str = "access";
 const LIFECYCLE_RESERVATION_DIR: &str = "reservations";
 const LIFECYCLE_GC_STAMP: &str = "gc.stamp";
+const BUILD_SPACE_HIGH_WATER: &str = ".build-space-high-water-v1";
+const BUILD_SPACE_HIGH_WATER_LOCK: &str = ".build-space-high-water-v1.lock";
+const BUILD_SPACE_HIGH_WATER_MAGIC: u64 = 0x4b54_5354_5242_5731;
 const LIFECYCLE_ACCESS_INTERVAL: Duration = Duration::from_secs(60);
 const LIFECYCLE_ORPHAN_GRACE: Duration = Duration::from_secs(60);
 const LIFECYCLE_MIN_FREE_RESERVE: u64 = 32 << 30;
 const LIFECYCLE_CACHE_CAPACITY_DIVISOR: u64 = 3;
 const LIFECYCLE_FREE_RESERVE_DIVISOR: u64 = 5;
-const LIFECYCLE_BUILD_RESERVATION_DIVISOR: u64 = 8;
+const LIFECYCLE_BUILD_RESERVATION_HEADROOM_DIVISOR: u64 = 4;
 const LIFECYCLE_BUILD_RESERVATION_MAX: u64 = 64 << 30;
 const LIFECYCLE_BUILD_RESERVATION_MIN: u64 = 8 << 30;
 static OPENAT2_UNAVAILABLE: ProcessAtomicBool = ProcessAtomicBool::new(false);
@@ -1108,11 +1111,7 @@ impl ArtifactTreeCache {
             "artifact build-space reservation attempted while holding closure {:016x}; lifecycle lock order is global then closure",
             closure.identity,
         );
-        let filesystem = lifecycle_filesystem_space(&closure.lifecycle_root)?;
-        let bytes = (filesystem.capacity / LIFECYCLE_BUILD_RESERVATION_DIVISOR).clamp(
-            LIFECYCLE_BUILD_RESERVATION_MIN,
-            LIFECYCLE_BUILD_RESERVATION_MAX,
-        );
+        let bytes = historical_build_space_reservation(&self.root)?;
         let directory = closure
             .lifecycle_root
             .join(LIFECYCLE_DIR)
@@ -1370,6 +1369,13 @@ impl ArtifactTreeCache {
                         &record_content_objects(&leased.record),
                     )?;
                     write_record(&record_path, &leased.record)?;
+                    if let Err(error) = update_build_space_high_water(&self.root, &leased.record) {
+                        tracing::debug!(
+                            namespace = %self.root.display(),
+                            error = %error,
+                            "could not update reconstructible artifact build-space history",
+                        );
+                    }
                     Ok(SelectedRecord {
                         leased,
                         cache_hit: false,
@@ -1868,6 +1874,166 @@ fn read_record_for_lifecycle(path: &Path, identity: u64) -> Result<ArtifactTreeR
         .with_context(|| format!("parse lifecycle artifact record {}", path.display()))?;
     validate_record(&record, identity)?;
     Ok(record)
+}
+
+fn record_build_space_bytes(record: &ArtifactTreeRecord) -> u64 {
+    record.entries.iter().fold(0u64, |sum, entry| {
+        sum.saturating_add(match entry {
+            RecordEntry::File { len, .. } => *len,
+            RecordEntry::Directory { .. } | RecordEntry::Symlink { .. } => 0,
+        })
+    })
+}
+
+fn scan_build_space_high_water(namespace: &Path) -> Result<Option<u64>> {
+    let records = namespace.join(RECORD_DIR);
+    let entries = match std::fs::read_dir(&records) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("scan artifact build history {}", records.display()));
+        }
+    };
+    let mut high_water = None::<u64>;
+    for entry in entries {
+        let entry = entry.context("read artifact build-history record entry")?;
+        let Some(identity) = parse_identity_filename(&entry.file_name(), ".json") else {
+            continue;
+        };
+        let record = match read_record_for_lifecycle(&entry.path(), identity) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::debug!(
+                    path = %entry.path().display(),
+                    error = %error,
+                    "ignoring reconstructible invalid artifact build-history record",
+                );
+                continue;
+            }
+        };
+        let bytes = record_build_space_bytes(&record);
+        high_water = Some(high_water.unwrap_or_default().max(bytes));
+    }
+    Ok(high_water)
+}
+
+fn read_build_space_high_water(namespace: &Path) -> Option<u64> {
+    let path = namespace.join(BUILD_SPACE_HIGH_WATER);
+    match std::fs::read_to_string(&path) {
+        Ok(encoded) => {
+            let mut fields = encoded.split_whitespace();
+            let value = fields
+                .next()
+                .and_then(|value| u64::from_str_radix(value, 16).ok());
+            let check = fields
+                .next()
+                .and_then(|value| u64::from_str_radix(value, 16).ok());
+            if let (Some(value), Some(check), None) = (value, check, fields.next())
+                && check == value ^ BUILD_SPACE_HIGH_WATER_MAGIC
+            {
+                Some(value)
+            } else {
+                tracing::debug!(
+                    path = %path.display(),
+                    "ignoring reconstructible invalid artifact build-space history",
+                );
+                None
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %error,
+                "ignoring unreadable reconstructible artifact build-space history",
+            );
+            None
+        }
+    }
+}
+
+fn write_build_space_high_water(namespace: &Path, high_water: u64) -> Result<()> {
+    let path = namespace.join(BUILD_SPACE_HIGH_WATER);
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".build-space-high-water-")
+        .tempfile_in(namespace)
+        .with_context(|| {
+            format!(
+                "create artifact build-space history temp in {}",
+                namespace.display()
+            )
+        })?;
+    writeln!(
+        temporary.as_file_mut(),
+        "{high_water:016x} {:016x}",
+        high_water ^ BUILD_SPACE_HIGH_WATER_MAGIC,
+    )
+    .context("write artifact build-space history")?;
+    temporary
+        .as_file_mut()
+        .flush()
+        .context("flush artifact build-space history")?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o444))
+        .context("make artifact build-space history immutable")?;
+    temporary
+        .persist(&path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish artifact build-space history {}", path.display()))?;
+    Ok(())
+}
+
+fn update_build_space_high_water(namespace: &Path, record: &ArtifactTreeRecord) -> Result<()> {
+    let _lock = crate::flock::block_flock(
+        namespace.join(BUILD_SPACE_HIGH_WATER_LOCK),
+        crate::flock::FlockMode::Exclusive,
+    )?;
+    let observed = read_build_space_high_water(namespace);
+    let prior = match observed {
+        Some(high_water) => high_water,
+        None => scan_build_space_high_water(namespace)?.unwrap_or_default(),
+    };
+    let high_water = prior.max(record_build_space_bytes(record));
+    if observed != Some(high_water) {
+        write_build_space_high_water(namespace, high_water)?;
+    }
+    Ok(())
+}
+
+fn historical_build_space_reservation(namespace: &Path) -> Result<u64> {
+    if !namespace.is_dir() {
+        return Ok(LIFECYCLE_BUILD_RESERVATION_MAX);
+    }
+    let _lock = crate::flock::block_flock(
+        namespace.join(BUILD_SPACE_HIGH_WATER_LOCK),
+        crate::flock::FlockMode::Exclusive,
+    )?;
+    let Some(high_water) = read_build_space_high_water(namespace) else {
+        // Seed upgrades and recover a manually damaged sidecar from every
+        // valid retained record. This caller still takes the conservative
+        // ceiling: retained records cannot prove that a larger observation
+        // was not deleted along with the sidecar. The next caller can use the
+        // repaired high-water value in O(1).
+        if let Some(high_water) = scan_build_space_high_water(namespace)? {
+            write_build_space_high_water(namespace, high_water)?;
+        }
+        return Ok(LIFECYCLE_BUILD_RESERVATION_MAX);
+    };
+
+    // Output history predicts a producer's demand much more closely than the
+    // filesystem capacity. In particular, capacity/8 made every producer on
+    // a 1 TiB runner advertise 64 GiB, so a small storm could evict otherwise
+    // reusable closures before building sub-GiB source or scheduler trees.
+    // Keep bounded headroom for transient Cargo outputs.
+    let headroom = high_water / LIFECYCLE_BUILD_RESERVATION_HEADROOM_DIVISOR;
+    Ok(high_water.saturating_add(headroom).clamp(
+        LIFECYCLE_BUILD_RESERVATION_MIN,
+        LIFECYCLE_BUILD_RESERVATION_MAX,
+    ))
 }
 
 fn scan_lifecycle_records(root: &Path) -> Result<Vec<LifecycleRecordCandidate>> {

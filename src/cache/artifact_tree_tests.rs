@@ -1126,6 +1126,135 @@ fn build_reservation_ignores_stale_same_process_name_and_unlinks_on_drop() {
     );
 }
 
+fn write_build_history_record(namespace: &Path, identity: u64, bytes: u64) -> PathBuf {
+    ensure_cache_dirs(namespace).unwrap();
+    let mut record = ArtifactTreeRecord {
+        version: RECORD_SCHEMA,
+        identity,
+        entries: vec![RecordEntry::File {
+            path: b"target/debug/deps/harness".to_vec(),
+            mode: 0o444,
+            content_hash: identity ^ bytes,
+            len: bytes,
+        }],
+        integrity_ahash: 0,
+    };
+    record.integrity_ahash = record_integrity(&record);
+    let (record_path, _, _) = cache_paths(namespace, identity);
+    write_record(&record_path, &record).unwrap();
+    record_path
+}
+
+fn reservation_file_bytes(reservation: &BuildSpaceReservation) -> u64 {
+    std::fs::read_to_string(reservation._temporary.path())
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn build_reservation_history_is_namespace_local_and_recovers_from_deletion() {
+    let temp = tempfile::tempdir().unwrap();
+    let namespace = temp.path().join("records");
+    assert_eq!(
+        historical_build_space_reservation(&namespace).unwrap(),
+        LIFECYCLE_BUILD_RESERVATION_MAX,
+        "a cold namespace has no safe observation below the reservation ceiling",
+    );
+
+    let history_bytes = 12 << 30;
+    let record_path = write_build_history_record(&namespace, 0xb17d_5ace_0000_0001, history_bytes);
+    let other_namespace = temp.path().join("other-records");
+    write_build_history_record(&other_namespace, 0xb17d_5ace_0000_0002, 40 << 30);
+    assert_eq!(
+        historical_build_space_reservation(&namespace).unwrap(),
+        LIFECYCLE_BUILD_RESERVATION_MAX,
+        "the first migration scan must not assume retained records include every old high-water observation",
+    );
+    assert_eq!(
+        historical_build_space_reservation(&namespace).unwrap(),
+        history_bytes + history_bytes / LIFECYCLE_BUILD_RESERVATION_HEADROOM_DIVISOR,
+        "the repaired namespace-local high-water must make later reservations O(1)",
+    );
+
+    std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&record_path, b"{").unwrap();
+    assert_eq!(
+        historical_build_space_reservation(&namespace).unwrap(),
+        history_bytes + history_bytes / LIFECYCLE_BUILD_RESERVATION_HEADROOM_DIVISOR,
+        "record corruption must not erase a previously observed high water",
+    );
+    let high_water_path = namespace.join(BUILD_SPACE_HIGH_WATER);
+    std::fs::set_permissions(&high_water_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&high_water_path, b"{").unwrap();
+    assert_eq!(
+        historical_build_space_reservation(&namespace).unwrap(),
+        LIFECYCLE_BUILD_RESERVATION_MAX,
+        "wholly corrupt record and high-water history must fall back to the safe cold estimate",
+    );
+
+    let record_path = write_build_history_record(&namespace, 0xb17d_5ace_0000_0001, history_bytes);
+    assert_eq!(
+        historical_build_space_reservation(&namespace).unwrap(),
+        LIFECYCLE_BUILD_RESERVATION_MAX,
+        "repairing damaged history still reserves the conservative ceiling once",
+    );
+    assert_eq!(
+        historical_build_space_reservation(&namespace).unwrap(),
+        history_bytes + history_bytes / LIFECYCLE_BUILD_RESERVATION_HEADROOM_DIVISOR,
+    );
+    std::fs::remove_file(record_path).unwrap();
+    assert_eq!(
+        historical_build_space_reservation(&namespace).unwrap(),
+        history_bytes + history_bytes / LIFECYCLE_BUILD_RESERVATION_HEADROOM_DIVISOR,
+        "partial manual record deletion must not lower the historical high water",
+    );
+    std::fs::remove_file(high_water_path).unwrap();
+    assert_eq!(
+        historical_build_space_reservation(&namespace).unwrap(),
+        LIFECYCLE_BUILD_RESERVATION_MAX,
+        "deleting every source of history must become a safe reconstructible cold state",
+    );
+}
+
+#[test]
+fn concurrent_build_reservations_sum_observed_namespace_demand() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let namespace = temp.path().join("records");
+    let cache = ArtifactTreeCache::new(&namespace);
+    let history_bytes = 12 << 30;
+    let expected = history_bytes + history_bytes / LIFECYCLE_BUILD_RESERVATION_HEADROOM_DIVISOR;
+    let history_identity = 0xb17d_5ace_0000_0010;
+    let history_path = write_build_history_record(&namespace, history_identity, history_bytes);
+    let history = read_record_for_lifecycle(&history_path, history_identity).unwrap();
+    update_build_space_high_water(&namespace, &history).unwrap();
+    assert_eq!(
+        historical_build_space_reservation(&namespace).unwrap(),
+        expected,
+    );
+
+    let first_identity = 0xb17d_5ace_0000_0011;
+    let mut first_closure = cache.acquire_closure(first_identity).unwrap();
+    first_closure.release();
+    let first = cache.reserve_cold_build_space(&first_closure).unwrap();
+    assert_eq!(reservation_file_bytes(&first), expected);
+
+    let second_identity = 0xb17d_5ace_0000_0012;
+    let mut second_closure = cache.acquire_closure(second_identity).unwrap();
+    second_closure.release();
+    let second = cache.reserve_cold_build_space(&second_closure).unwrap();
+    assert_eq!(reservation_file_bytes(&second), expected);
+
+    let (active_bytes, active_identities) = active_build_reservations(&cache.lifecycle_root())
+        .expect("read concurrent build reservations");
+    assert_eq!(active_bytes, expected * 2);
+    assert!(active_identities.contains(&first_identity));
+    assert!(active_identities.contains(&second_identity));
+}
+
 #[test]
 fn stable_cargo_openat_fallback_stays_fd_relative_and_rejects_symlinks() {
     let temp = tempfile::tempdir().unwrap();
