@@ -1585,7 +1585,12 @@ pub(crate) fn register_intent_for_preparation(
             }
             registry::State::Waiting => {}
             registry::State::CoordinatorStandby => {
-                anyhow::bail!("new intent entered coordinator standby before ownership handoff")
+                // A process can be descheduled after registration elects it
+                // but before it enters the coordinator loop. The heartbeat
+                // lease deliberately transfers progress to a successor in
+                // that case. Stay parked as an ordinary live ticket: a later
+                // election may return this intent to COORDINATOR once the
+                // successor finishes or is itself displaced.
             }
         }
     }
@@ -2931,9 +2936,12 @@ fn drive_registered_ticket<T>(
             }
             registry::State::Waiting => {}
             registry::State::CoordinatorStandby => {
-                anyhow::bail!(
-                    "new queue ticket entered coordinator standby before owning the coordinator loop"
-                );
+                // Registration and coordinator-loop ownership are separated
+                // by arbitrary userspace scheduling. If the heartbeat lease
+                // expires in that interval, the registry safely parks this
+                // ticket and transfers progress. Keep waiting for a future
+                // election instead of treating the intended takeover state
+                // as a malformed handoff.
             }
         }
     }
