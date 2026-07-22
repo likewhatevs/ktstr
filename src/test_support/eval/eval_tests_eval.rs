@@ -3833,12 +3833,12 @@ fn not_attached_drain(reason: &str) -> crate::vmm::host_comms::BulkDrainResult {
     }
 }
 
-/// A still-in-flight enable at the last-resort wall guard under host
+/// A still-in-flight enable at the host service guard under host
 /// oversubscription (64 vCPUs on 8 allowed CPUs = 8x) is a contention SKIP.
 #[test]
 fn contention_skip_enabling_oversubscribed_skips() {
     let drain = not_attached_drain(
-        "cause=wall-guard state=enabling ops=missing wall_ms=90000 service_ms=1000",
+        "cause=host-vcpu-service-budget state=enabling ops=missing wall_ms=90000 service_ms=35000",
     );
     let reason = contention_not_attached_skip_reason(Some(&drain), 64, 8, None);
     assert!(
@@ -3855,7 +3855,7 @@ fn contention_skip_enabling_oversubscribed_skips() {
 #[test]
 fn contention_skip_enabling_fitting_host_fails() {
     let drain = not_attached_drain(
-        "cause=wall-guard state=enabling ops=missing wall_ms=90000 service_ms=1000",
+        "cause=host-vcpu-service-budget state=enabling ops=missing wall_ms=90000 service_ms=35000",
     );
     assert_eq!(
         contention_not_attached_skip_reason(Some(&drain), 8, 8, None),
@@ -3864,10 +3864,9 @@ fn contention_skip_enabling_fitting_host_fails() {
     );
 }
 
-/// CPU-service exhaustion is independent of host wall-time dilation. Even an
-/// `enabling` terminal snapshot under heavy oversubscription must fail.
+/// A stale similarly named cause must not cross the typed cancellation gate.
 #[test]
-fn contention_skip_service_budget_enabling_never_skips() {
+fn contention_skip_untyped_service_budget_enabling_never_skips() {
     let drain = not_attached_drain(
         "cause=service-budget state=enabling ops=named(\"lavd\") \
          wall_ms=120000 service_ms=35000",
@@ -3875,7 +3874,7 @@ fn contention_skip_service_budget_enabling_never_skips() {
     assert_eq!(
         contention_not_attached_skip_reason(Some(&drain), 64, 8, None),
         None,
-        "scheduler CPU-service exhaustion must FAIL, never become a host-contention skip",
+        "an untyped service-budget reason must FAIL, never become a host-contention skip",
     );
 }
 

@@ -656,16 +656,16 @@ fn overcommit_skip(
 /// Classify a no-guest-result run for the contention-`NotAttached` SKIP.
 ///
 /// Returns `Some(reason)` when the run should SKIP (a clean host-resource
-/// condition): the guest reported `SchedulerNotAttached` because the
-/// last-resort WALL guard fired while state was still `enabling`, and the host
-/// was oversubscribed. The normal attach allowance is scheduler CPU service,
-/// so host descheduling cannot consume it. Service-budget exhaustion is real
-/// scheduler work without progress and always FAILs.
+/// condition): the guest reported `SchedulerNotAttached` because the host's
+/// max-vCPU service budget fired while state was still `enabling`, and the
+/// host was oversubscribed. A cross-vCPU attach rendezvous can keep burning
+/// service on one runnable vCPU while another guest vCPU waits for host time;
+/// the same terminal state on a fitting host remains a real failure.
 ///
-/// The structured `cause=wall-guard state=enabling` tokens are produced by
-/// the guest's unified pidfd+sysfs attach wait. `SchedulerDied`, service
-/// exhaustion, observer failures, and non-enabling states are rejected before
-/// host overcommit is considered.
+/// The structured `cause=host-vcpu-service-budget state=enabling` tokens are
+/// produced by the host-authoritative attach watchdog and the guest's unified
+/// pidfd+sysfs attach wait. `SchedulerDied`, other causes, observer failures,
+/// and non-enabling states are rejected before host overcommit is considered.
 /// Pure over its inputs so the skip boundary is unit-testable without a
 /// live scheduler.
 fn contention_not_attached_skip_reason(
@@ -681,10 +681,19 @@ fn contention_not_attached_skip_reason(
         // never a contention skip.
         return None;
     };
-    // Only the last-resort WALL guard plus an in-flight enable is skippable.
-    // A service-budget hit is dilation-invariant and therefore a real defect,
-    // even if its terminal state happens to be enabling.
-    if !reason.contains("cause=wall-guard") || !reason.contains("state=enabling") {
+    // Accept only the exact typed host cancellation plus an in-flight enable.
+    // Substring matching would let a stale or future similarly named cause
+    // silently cross this fail-to-skip boundary.
+    let expected_cause = format!(
+        "cause={}",
+        crate::vmm::wire::AttachCancelCause::ServiceBudget.label()
+    );
+    let mut tokens = reason.split_ascii_whitespace();
+    if !tokens.any(|token| token == expected_cause)
+        || !reason
+            .split_ascii_whitespace()
+            .any(|token| token == "state=enabling")
+    {
         return None;
     }
     // On a fitting host a startup-budget stall is a real defect, not
