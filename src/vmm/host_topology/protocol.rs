@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v23
+//! Every ktstr process sharing a lock directory participates in one v24
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -628,6 +628,17 @@ pub(crate) fn round_trip_claim_modes_for_tests(
     watch: &ClaimSet,
 ) -> Result<(ClaimSet, ClaimSet)> {
     registry::round_trip_claim_modes_for_tests(claim, watch)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_scan_metadata_validation_for_tests()
+-> Result<registry::ScanMetadataValidationOutcome> {
+    registry::exercise_scan_metadata_validation_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_shared_watch_held_metadata_for_tests() -> Result<bool> {
+    registry::exercise_shared_watch_held_metadata_for_tests()
 }
 
 pub(crate) enum RegistryFence<T> {

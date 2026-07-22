@@ -1165,8 +1165,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v23");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v23");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v24");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v24");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1338,7 +1338,7 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v23");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v24");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
     crate::flock::materialize(wrong_registry.join("registry.turnstile"))
         .expect("materialize wrong registry writer-intent gate");
@@ -4605,6 +4605,31 @@ fn dirty_repair_preserves_exact_and_watch_cpu_modes() {
 }
 
 #[test]
+fn v24_scan_metadata_sparse_decodes_and_fails_closed() {
+    let outcome = protocol::exercise_scan_metadata_validation_for_tests()
+        .expect("exercise v24 scan metadata validation");
+    assert_eq!(outcome.layout_words, 64);
+    assert_eq!(
+        outcome.exact_word_reads, 3,
+        "one sparse exact word in each resource class must replace three 64-word scans",
+    );
+    assert!(outcome.invalid_span_rejected);
+    assert!(outcome.invalid_exact_identity_rejected);
+    assert!(outcome.invalid_flags_rejected);
+    assert!(outcome.invalid_watch_identity_rejected_by_full_decode);
+}
+
+#[test]
+fn held_transition_canonicalizes_shared_watch_metadata() {
+    let _prefixes = LockPrefixesGuard::new();
+    assert!(
+        protocol::exercise_shared_watch_held_metadata_for_tests()
+            .expect("promote a shared-mode watch and full-decode its HELD record"),
+        "HELD publication must canonicalize emptied watch modes before publishing matching v24 metadata",
+    );
+}
+
+#[test]
 fn common_watch_replan_wave_is_work_conserving_and_finite() {
     let _prefixes = LockPrefixesGuard::new();
     let waiters = 1_000usize;
@@ -4648,10 +4673,19 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
         (outcome.memo_identical_waiters, 1),
         "one grant scan must walk an identical encoded alternative watch once total for all eligible waiters",
     );
+    assert!(
+        outcome.memo_identical_layout_words >= 64,
+        "the sparse scan fixture must retain the full-width v24 registry layout",
+    );
+    assert_eq!(
+        outcome.memo_identical_exact_word_reads,
+        outcome.memo_identical_waiters + 1,
+        "one grant scan must read one nonzero exact CPU word per sparse waiter plus its coordinator, not three complete registry-width bitsets per record",
+    );
     assert_eq!(
         (outcome.memo_mixed_replans, outcome.memo_mixed_serial_walks),
         (outcome.memo_mixed_waiters, 4),
-        "full encoded words and blocker identity must form four exact memo keys: shared watch, distinct watch, and two distinct blockers",
+        "fixed watch identity and blocker identity must form four memo keys: shared watch, distinct watch, and two distinct blockers",
     );
     assert_eq!(
         (
@@ -7711,7 +7745,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v23
+    // Leave the replacement as an external, unregistered flock. A current-v24
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -8013,7 +8047,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v23 HELD lifecycle removes its registry record only after the
+    // The v24 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");

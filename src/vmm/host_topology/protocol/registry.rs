@@ -17,14 +17,15 @@ use anyhow::{Context, Result};
 use memmap2::{Mmap, MmapMut};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
+use std::hash::{BuildHasher, Hasher};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ23");
-const VERSION: u32 = 23;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ24");
+const VERSION: u32 = 24;
 #[cfg(test)]
 const RETAINED_FUTEX_WAIT_MARKER_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 #[cfg(test)]
@@ -39,8 +40,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v23-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v23-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v24-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v24-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 const WAIT_DIAGNOSTIC_BUCKET_SECS: u64 = 30;
@@ -241,7 +242,31 @@ const R_BACKFILL_CAPACITY: usize = 132;
 /// host busy only for a bounded interval; after this age expires, new
 /// conflicting grants stop and the outstanding wave drains for the head.
 const R_BACKFILL_STARTED_NS: usize = 136;
+/// Compact, transactionally published scan metadata. Grant scans validate
+/// these bounds and identities without rereading every word of the immutable
+/// watch or the zero tail of each sparse exact claim. Full record decode and
+/// dirty repair recompute the metadata from the authoritative bitmaps.
+const R_SCAN_FLAGS: usize = 144;
+const R_WATCH_CPU_COUNT: usize = 148;
+const R_WATCH_LLC_COUNT: usize = 152;
+const R_WATCH_PERMIT_COUNT: usize = 156;
+const R_WATCH_COOPERATIVE_PERMIT_COUNT: usize = 160;
+const R_CLAIM_CPU_WORD_START: usize = 164;
+const R_CLAIM_CPU_WORD_END: usize = 166;
+const R_CLAIM_LLC_WORD_START: usize = 168;
+const R_CLAIM_LLC_WORD_END: usize = 170;
+const R_CLAIM_PERMIT_WORD_START: usize = 172;
+const R_CLAIM_PERMIT_WORD_END: usize = 174;
+const R_WATCH_IDENTITY: usize = 176;
+const R_CLAIM_IDENTITY: usize = 184;
 const R_BITS: usize = RECORD_FIXED;
+
+const SCAN_FLAG_FLEXIBLE: u32 = 1 << 0;
+const SCAN_FLAG_WATCH_EMPTY: u32 = 1 << 1;
+const SCAN_FLAGS_VALID: u32 = SCAN_FLAG_FLEXIBLE | SCAN_FLAG_WATCH_EMPTY;
+const _: () = assert!(R_WATCH_IDENTITY.is_multiple_of(std::mem::align_of::<u64>()));
+const _: () = assert!(R_CLAIM_IDENTITY.is_multiple_of(std::mem::align_of::<u64>()));
+const _: () = assert!(R_CLAIM_IDENTITY + std::mem::size_of::<u64>() == R_BITS);
 
 const RB_CLAIM_CPUS: usize = 0;
 const RB_CLAIM_LLCS: usize = 1;
@@ -384,6 +409,8 @@ thread_local! {
     static FULL_WATCH_MATERIALIZATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static ENCODED_WATCH_SERIAL_WALKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static SCAN_EXACT_WORD_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static FULL_PREFIX_SNAPSHOT_PUBLISHES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -868,20 +895,14 @@ struct EncodedWatchModes {
     permit: ClaimMode,
 }
 
-/// Exact identity of one encoded alternative-watch serial query.
+/// Compact identity of one encoded alternative-watch serial query.
 ///
-/// Grant scans commonly contain hundreds of generated cells with the same
-/// host-wide alternative set. Retain the complete encoded words rather than a
-/// digest so memoization can never turn a hash collision into a missed
-/// resource-improvement observation.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// The fixed-seed AHash is persisted with the immutable watch and validated
+/// whenever a full record is decoded or repaired. Grant scans therefore avoid
+/// copying hundreds of bitmap words merely to memoize identical watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct EncodedWatchSerialMemoKey {
-    cpu_words: Vec<u64>,
-    llc_words: Vec<u64>,
-    permit_words: Vec<u64>,
-    cpu_exclusive: bool,
-    llc_exclusive: bool,
-    permit_exclusive: bool,
+    watch_identity: u64,
     blocked_on: Option<EncodedWatchSerialBlockedOn>,
 }
 
@@ -938,6 +959,7 @@ struct ScanRecord {
     ticket: u64,
     claim: ClaimSet,
     watch_modes: EncodedWatchModes,
+    watch_identity: u64,
     flexible: bool,
     blocked_on: Option<BlockedOn>,
     external_blocker: Option<ContentionMarker>,
@@ -3861,9 +3883,158 @@ pub(super) fn round_trip_claim_modes_for_tests(
         R_WATCH_PERMIT_MODE,
         u32::from(watch.permit_mode == ClaimMode::Exclusive),
     );
+    write_u32(
+        &mut bytes,
+        R_CLAIM_CLASS,
+        encode_admission_class(claim.admission_class),
+    );
+    write_u32(
+        &mut bytes,
+        R_WATCH_CLASS,
+        encode_admission_class(watch.admission_class),
+    );
     encode_claim(&mut bytes, layout, claim, watch)?;
     let record = decode_record(&bytes, layout, 0)?;
     Ok((record.claim, record.watch))
+}
+
+#[cfg(test)]
+pub(crate) struct ScanMetadataValidationOutcome {
+    pub(crate) layout_words: usize,
+    pub(crate) exact_word_reads: usize,
+    pub(crate) invalid_span_rejected: bool,
+    pub(crate) invalid_exact_identity_rejected: bool,
+    pub(crate) invalid_flags_rejected: bool,
+    pub(crate) invalid_watch_identity_rejected_by_full_decode: bool,
+}
+
+#[cfg(test)]
+pub(super) fn exercise_scan_metadata_validation_for_tests() -> Result<ScanMetadataValidationOutcome>
+{
+    let layout = HeaderLayout::new(4096)?;
+    let claim = ClaimSet::with_permits(
+        [20usize],
+        [128usize, 129],
+        1000usize..1005,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let watch = ClaimSet::with_permits(
+        0usize..24,
+        0usize..192,
+        0usize..2121,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let mut bytes = vec![0u8; layout.record_size];
+    write_u32(&mut bytes, R_STATE, STATE_WAITING);
+    write_u64(&mut bytes, R_TICKET, 1);
+    for (offset, mode) in [
+        (R_CLAIM_LLC_MODE, claim.llc_mode),
+        (R_CLAIM_CPU_MODE, claim.cpu_mode),
+        (R_CLAIM_PERMIT_MODE, claim.permit_mode),
+        (R_WATCH_LLC_MODE, watch.llc_mode),
+        (R_WATCH_CPU_MODE, watch.cpu_mode),
+        (R_WATCH_PERMIT_MODE, watch.permit_mode),
+    ] {
+        write_u32(&mut bytes, offset, u32::from(mode == ClaimMode::Exclusive));
+    }
+    write_u32(
+        &mut bytes,
+        R_CLAIM_CLASS,
+        encode_admission_class(claim.admission_class),
+    );
+    write_u32(
+        &mut bytes,
+        R_WATCH_CLASS,
+        encode_admission_class(watch.admission_class),
+    );
+    write_u32(
+        &mut bytes,
+        R_BACKFILL_CAPACITY,
+        backfill_capacity_for_watch(&watch),
+    );
+    encode_claim(&mut bytes, layout, &claim, &watch)?;
+
+    let reads_before = SCAN_EXACT_WORD_READS.with(std::cell::Cell::get);
+    decode_scan_record(&bytes, layout, 0)?;
+    let exact_word_reads = SCAN_EXACT_WORD_READS
+        .with(std::cell::Cell::get)
+        .saturating_sub(reads_before);
+
+    let mut invalid_span = bytes.clone();
+    write_u16(
+        &mut invalid_span,
+        R_CLAIM_CPU_WORD_END,
+        u16::try_from(layout.words + 1).context("test layout word count does not fit u16")?,
+    );
+    let invalid_span_rejected = decode_scan_record(&invalid_span, layout, 0).is_err();
+
+    let mut invalid_exact_identity = bytes.clone();
+    let exact_identity = read_u64(&invalid_exact_identity, R_CLAIM_IDENTITY);
+    write_u64(
+        &mut invalid_exact_identity,
+        R_CLAIM_IDENTITY,
+        exact_identity ^ 1,
+    );
+    let invalid_exact_identity_rejected =
+        decode_scan_record(&invalid_exact_identity, layout, 0).is_err();
+
+    let mut invalid_flags = bytes.clone();
+    let flags = read_u32(&invalid_flags, R_SCAN_FLAGS);
+    write_u32(&mut invalid_flags, R_SCAN_FLAGS, flags | (1 << 31));
+    let invalid_flags_rejected = decode_scan_record(&invalid_flags, layout, 0).is_err();
+
+    let mut invalid_watch_identity = bytes;
+    let watch_identity = read_u64(&invalid_watch_identity, R_WATCH_IDENTITY);
+    write_u64(
+        &mut invalid_watch_identity,
+        R_WATCH_IDENTITY,
+        watch_identity ^ 1,
+    );
+    let invalid_watch_identity_rejected_by_full_decode =
+        decode_record(&invalid_watch_identity, layout, 0).is_err();
+
+    Ok(ScanMetadataValidationOutcome {
+        layout_words: layout.words,
+        exact_word_reads,
+        invalid_span_rejected,
+        invalid_exact_identity_rejected,
+        invalid_flags_rejected,
+        invalid_watch_identity_rejected_by_full_decode,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn exercise_shared_watch_held_metadata_for_tests() -> Result<bool> {
+    let claim = ClaimSet::with_permits(
+        [1usize],
+        [2usize],
+        [3usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let mut ticket = Ticket::register(claim.clone(), claim.clone(), None)?;
+    let held_decodes_with_canonical_watch = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(ticket.slot)?
+            .ok_or_else(|| anyhow::anyhow!("shared-watch HELD fixture disappeared"))?;
+        table.promote_record_to_held(&record, &claim, &[])?;
+        table.record(ticket.slot)?.is_some_and(|record| {
+            record.state == STATE_HELD
+                && record.watch.is_empty()
+                && record.watch.cpu_mode == ClaimMode::Exclusive
+                && record.watch.llc_mode == ClaimMode::Exclusive
+                && record.watch.permit_mode == ClaimMode::Exclusive
+        })
+    };
+    ticket.finish(None)?;
+    Ok(held_decodes_with_canonical_watch)
 }
 
 #[cfg(test)]
@@ -7077,6 +7248,8 @@ pub(crate) struct ReplanTokenWaveOutcome {
     pub(crate) memo_identical_waiters: usize,
     pub(crate) memo_identical_replans: usize,
     pub(crate) memo_identical_serial_walks: usize,
+    pub(crate) memo_identical_layout_words: usize,
+    pub(crate) memo_identical_exact_word_reads: usize,
     pub(crate) memo_mixed_waiters: usize,
     pub(crate) memo_mixed_replans: usize,
     pub(crate) memo_mixed_serial_walks: usize,
@@ -7120,6 +7293,8 @@ pub(crate) struct ReplanTokenWaveOutcome {
 struct EncodedWatchSerialMemoCaseOutcome {
     initial_replans: usize,
     initial_serial_walks: usize,
+    layout_words: usize,
+    initial_exact_word_reads: usize,
     saturated_replans: usize,
     saturated_serial_walks: usize,
     closed_replans: usize,
@@ -7210,10 +7385,14 @@ fn exercise_encoded_watch_serial_memo_case_for_tests(
         table.stamp_resource_improvement(S_CPU_EX, common_cpu)?;
         table.set_pending_flag(PENDING_RESCAN);
         let walks_before = ENCODED_WATCH_SERIAL_WALKS.with(std::cell::Cell::get);
+        let exact_reads_before = SCAN_EXACT_WORD_READS.with(std::cell::Cell::get);
         table.grant_compatible()?;
         let initial_serial_walks = ENCODED_WATCH_SERIAL_WALKS
             .with(std::cell::Cell::get)
             .saturating_sub(walks_before);
+        let initial_exact_word_reads = SCAN_EXACT_WORD_READS
+            .with(std::cell::Cell::get)
+            .saturating_sub(exact_reads_before);
         let count_replans = |table: &mut Table| -> Result<usize> {
             waiters.iter().try_fold(0usize, |count, (ticket, _)| {
                 Ok(count
@@ -7266,6 +7445,8 @@ fn exercise_encoded_watch_serial_memo_case_for_tests(
         EncodedWatchSerialMemoCaseOutcome {
             initial_replans,
             initial_serial_walks,
+            layout_words: table.layout.words,
+            initial_exact_word_reads,
             saturated_replans,
             saturated_serial_walks,
             closed_replans,
@@ -8455,6 +8636,8 @@ pub(super) fn exercise_replan_token_wave_for_tests(
     )?;
     let memo_identical_replans = memo_identical.initial_replans;
     let memo_identical_serial_walks = memo_identical.initial_serial_walks;
+    let memo_identical_layout_words = memo_identical.layout_words;
+    let memo_identical_exact_word_reads = memo_identical.initial_exact_word_reads;
     let memo_mixed_waiters = 8usize;
     let memo_mixed = exercise_encoded_watch_serial_memo_case_for_tests(
         memo_mixed_waiters,
@@ -8482,6 +8665,8 @@ pub(super) fn exercise_replan_token_wave_for_tests(
         memo_identical_waiters,
         memo_identical_replans,
         memo_identical_serial_walks,
+        memo_identical_layout_words,
+        memo_identical_exact_word_reads,
         memo_mixed_waiters,
         memo_mixed_replans,
         memo_mixed_serial_walks,
@@ -12284,7 +12469,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .saturating_add(1)
         })
         .unwrap_or(0);
-    // The v23 mapping is deliberately overprovisioned once. It never needs a
+    // The v24 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
     // a disjoint internal bit range immediately after possible host CPUs.
@@ -12400,11 +12585,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-registry-v23")
+    active_protocol_dir().join("ktstr-acquire-registry-v24")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-events-v23")
+    active_protocol_dir().join("ktstr-acquire-events-v24")
 }
 
 #[cfg(test)]
@@ -12630,7 +12815,7 @@ fn lock_registry_for_initialization() -> Result<RegistryLock> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
     // Materialization order is protocol: once registry.lock is nameable, every
-    // v23 entrant must also be able to join the writer-intent gate ahead of it.
+    // v24 entrant must also be able to join the writer-intent gate ahead of it.
     let writer_intent = block_flock(registry_writer_intent_path(), FlockMode::Shared)?;
     let registry = block_flock(registry_lock_path(), FlockMode::Exclusive)?;
     let lock = finish_registry_lock(registry, writer_intent, FlockMode::Exclusive);
@@ -14445,6 +14630,7 @@ impl Table {
                 encode_admission_class(new.admission_class),
             );
             encode_exact_claim(bytes, layout, new)?;
+            ScanMetadata::for_claims(new, &prior.watch)?.write(bytes);
             write_u64(bytes, R_BLOCKED_SERIAL, 0);
             write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
             write_u32(bytes, R_BLOCK_MODE, 0);
@@ -14506,6 +14692,13 @@ impl Table {
         self.publish_claim_busy(exact)?;
         crash_at_for_tests("held_counts_before_record");
         let layout = self.layout;
+        let mut held_watch = record.watch.clone();
+        held_watch.cpus.clear();
+        held_watch.llcs.clear();
+        held_watch.permits.clear();
+        held_watch.cpu_mode = ClaimMode::Exclusive;
+        held_watch.llc_mode = ClaimMode::Exclusive;
+        held_watch.permit_mode = ClaimMode::Exclusive;
         {
             let bytes = self
                 .record_bytes_mut(record.slot)?
@@ -14518,6 +14711,9 @@ impl Table {
                 clear_record_claim_bits(bytes, layout);
             }
             clear_record_watch_bits(bytes, layout);
+            write_u32(bytes, R_WATCH_LLC_MODE, 1);
+            write_u32(bytes, R_WATCH_CPU_MODE, 1);
+            write_u32(bytes, R_WATCH_PERMIT_MODE, 1);
             crash_at_for_tests("promote_held_state_free_before_record");
             if claim_changed {
                 write_u32(
@@ -14542,6 +14738,7 @@ impl Table {
                 );
                 encode_exact_claim(bytes, layout, exact)?;
             }
+            ScanMetadata::for_claims(exact, &held_watch)?.write(bytes);
             write_u64(bytes, R_BLOCKED_SERIAL, 0);
             write_u32(bytes, R_BLOCK_KIND, BLOCK_NONE);
             write_u32(bytes, R_BLOCK_MODE, 0);
@@ -15354,6 +15551,7 @@ impl Table {
                         &mut encoded_watch_serial_memo,
                         record.slot,
                         record.watch_modes,
+                        record.watch_identity,
                         record.blocked_on,
                     )?
                 } else {
@@ -15670,7 +15868,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v23 publication validates
+            // and record states together. Current v24 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();
@@ -16148,59 +16346,29 @@ impl Table {
         Ok(serial)
     }
 
-    /// Read one ticket's encoded alternative watch without building BTreeSets.
-    fn encoded_watch_serial_memo_key(
-        &mut self,
-        slot: u64,
-        modes: EncodedWatchModes,
-        blocked_on: Option<BlockedOn>,
-    ) -> Result<EncodedWatchSerialMemoKey> {
-        let layout = self.layout;
-        let (cpu_words, llc_words, permit_words) = {
-            let bytes = self.record_bytes(slot)?.ok_or_else(|| {
-                anyhow::anyhow!("queue slot {slot} disappeared during encoded watch scan")
-            })?;
-            let copy_words = |which| {
-                let offset = record_bitset_offset(layout, which);
-                (0..layout.words)
-                    .map(|word| read_u64(bytes, offset + word * std::mem::size_of::<u64>()))
-                    .collect::<Vec<_>>()
-            };
-            (
-                copy_words(RB_WATCH_CPUS),
-                copy_words(RB_WATCH_LLCS),
-                copy_words(RB_WATCH_PERMITS),
-            )
-        };
-        Ok(EncodedWatchSerialMemoKey {
-            cpu_words,
-            llc_words,
-            permit_words,
-            cpu_exclusive: modes.cpu == ClaimMode::Exclusive,
-            llc_exclusive: modes.llc == ClaimMode::Exclusive,
-            permit_exclusive: modes.permit == ClaimMode::Exclusive,
-            blocked_on: blocked_on.map(EncodedWatchSerialBlockedOn::new),
-        })
-    }
-
     /// Return one exact encoded-watch serial query, memoized for the duration
     /// of a single grant scan. Registry EX keeps every resource serial stable
-    /// for that duration. Full key equality, including blocker identity and
-    /// its observation serial, is the correctness check; ordering is only an
-    /// index. Each record's issue serial remains outside the memo and is
-    /// compared independently with the returned maximum.
+    /// for that duration. The persisted fixed-seed watch identity includes the
+    /// complete immutable watch contents, modes, and admission class; blocker
+    /// identity and observation serial complete the key. Each record's issue
+    /// serial remains outside the memo and is compared independently with the
+    /// returned maximum.
     fn memoized_encoded_watch_serial(
         &mut self,
         memo: &mut BTreeMap<EncodedWatchSerialMemoKey, u64>,
         slot: u64,
         modes: EncodedWatchModes,
+        watch_identity: u64,
         blocked_on: Option<BlockedOn>,
     ) -> Result<u64> {
-        let key = self.encoded_watch_serial_memo_key(slot, modes, blocked_on)?;
+        let key = EncodedWatchSerialMemoKey {
+            watch_identity,
+            blocked_on: blocked_on.map(EncodedWatchSerialBlockedOn::new),
+        };
         if let Some(&serial) = memo.get(&key) {
             return Ok(serial);
         }
-        let serial = self.max_encoded_watch_serial_for_key(&key)?;
+        let serial = self.max_encoded_watch_serial(slot, modes, key.blocked_on)?;
         memo.insert(key, serial);
         Ok(serial)
     }
@@ -16208,48 +16376,67 @@ impl Table {
     /// Walk one unique encoded alternative watch's set bits. The per-scan memo
     /// makes a generated-cell storm pay this host-width cost once per exact
     /// watch/blocker identity rather than once per waiter.
-    fn max_encoded_watch_serial_for_key(&self, key: &EncodedWatchSerialMemoKey) -> Result<u64> {
+    fn max_encoded_watch_serial(
+        &mut self,
+        slot: u64,
+        modes: EncodedWatchModes,
+        blocked_on: Option<EncodedWatchSerialBlockedOn>,
+    ) -> Result<u64> {
         #[cfg(test)]
         ENCODED_WATCH_SERIAL_WALKS.with(|count| count.set(count.get().saturating_add(1)));
         let mut serial = 0u64;
-        for (word_index, mut word) in key.cpu_words.iter().copied().enumerate() {
+        for word_index in 0..self.layout.words {
+            let mut word = self.encoded_watch_word(slot, RB_WATCH_CPUS, word_index)?;
             while word != 0 {
                 let bit = word.trailing_zeros() as usize;
                 let index = word_index * 64 + bit;
                 serial = serial.max(self.resource_serial(S_CPU_SH, index)?);
-                if key.cpu_exclusive {
+                if modes.cpu == ClaimMode::Exclusive {
                     serial = serial.max(self.resource_serial(S_CPU_EX, index)?);
                 }
                 word &= word - 1;
             }
         }
-        for (word_index, mut word) in key.llc_words.iter().copied().enumerate() {
+        for word_index in 0..self.layout.words {
+            let mut word = self.encoded_watch_word(slot, RB_WATCH_LLCS, word_index)?;
             while word != 0 {
                 let bit = word.trailing_zeros() as usize;
                 let index = word_index * 64 + bit;
                 serial = serial.max(self.resource_serial(S_LLC_SH, index)?);
-                if key.llc_exclusive {
+                if modes.llc == ClaimMode::Exclusive {
                     serial = serial.max(self.resource_serial(S_LLC_EX, index)?);
                 }
                 word &= word - 1;
             }
         }
-        for (word_index, mut word) in key.permit_words.iter().copied().enumerate() {
+        for word_index in 0..self.layout.words {
+            let mut word = self.encoded_watch_word(slot, RB_WATCH_PERMITS, word_index)?;
             while word != 0 {
                 let bit = word.trailing_zeros() as usize;
                 let permit = word_index * 64 + bit;
                 let index = permit_resource_index(permit)?;
                 serial = serial.max(self.resource_serial(S_CPU_SH, index)?);
-                if key.permit_exclusive {
+                if modes.permit == ClaimMode::Exclusive {
                     serial = serial.max(self.resource_serial(S_CPU_EX, index)?);
                 }
                 word &= word - 1;
             }
         }
-        if let Some(blocked) = key.blocked_on {
+        if let Some(blocked) = blocked_on {
             serial = serial.max(self.blocker_serial(blocked.resource_key()?, blocked.mode())?);
         }
         Ok(serial)
+    }
+
+    fn encoded_watch_word(&mut self, slot: u64, which: usize, word: usize) -> Result<u64> {
+        let layout = self.layout;
+        let bytes = self.record_bytes(slot)?.ok_or_else(|| {
+            anyhow::anyhow!("queue slot {slot} disappeared during encoded watch scan")
+        })?;
+        Ok(read_u64(
+            bytes,
+            record_bitset_offset(layout, which) + word * std::mem::size_of::<u64>(),
+        ))
     }
 
     /// Highest compatibility serial that can make the coordinator's current
@@ -17710,44 +17897,285 @@ fn decode_blocked_on(bytes: &[u8], slot: u64) -> Result<Option<BlockedOn>> {
     }
 }
 
-fn encoded_bitset_equal_and_count(
-    bytes: &[u8],
-    layout: HeaderLayout,
-    left: usize,
-    right: usize,
-) -> (bool, usize) {
-    let left = record_bitset_offset(layout, left);
-    let right = record_bitset_offset(layout, right);
-    let mut equal = true;
-    let mut count = 0usize;
-    for word in 0..layout.words {
-        let offset = word * std::mem::size_of::<u64>();
-        let left_word = read_u64(bytes, left + offset);
-        let right_word = read_u64(bytes, right + offset);
-        equal &= left_word == right_word;
-        count = count.saturating_add(right_word.count_ones() as usize);
-    }
-    (equal, count)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BitsetWordSpan {
+    start: u16,
+    end: u16,
 }
 
-fn encoded_bitset_prefix_count(
+impl BitsetWordSpan {
+    fn for_indices(indices: &BTreeSet<usize>) -> Result<Self> {
+        let Some(first) = indices.iter().next().copied() else {
+            return Ok(Self { start: 0, end: 0 });
+        };
+        let last = indices
+            .iter()
+            .next_back()
+            .copied()
+            .expect("non-empty exact bitset has a last index");
+        Ok(Self {
+            start: u16::try_from(first / 64)
+                .context("exact claim first nonzero word does not fit u16")?,
+            end: u16::try_from(last / 64 + 1)
+                .context("exact claim last nonzero word does not fit u16")?,
+        })
+    }
+
+    fn validate(self, layout: HeaderLayout, slot: u64, class: &str) -> Result<()> {
+        let start = usize::from(self.start);
+        let end = usize::from(self.end);
+        if start > end || end > layout.words || (start == end && start != 0) {
+            anyhow::bail!(
+                "queue registry v{VERSION} slot {slot} has invalid {class} exact-word span {start}..{end} for {} words",
+                layout.words,
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScanMetadata {
+    flags: u32,
+    watch_cpus: u32,
+    watch_llcs: u32,
+    watch_permits: u32,
+    watch_cooperative_permits: u32,
+    claim_cpu_span: BitsetWordSpan,
+    claim_llc_span: BitsetWordSpan,
+    claim_permit_span: BitsetWordSpan,
+    watch_identity: u64,
+    claim_identity: u64,
+}
+
+fn fixed_claim_identity(claim: &ClaimSet) -> u64 {
+    fn hash_u64(hasher: &mut ahash::AHasher, value: u64) {
+        hasher.write(&value.to_le_bytes());
+    }
+
+    fn hash_indices(hasher: &mut ahash::AHasher, indices: &BTreeSet<usize>) {
+        hash_u64(hasher, indices.len() as u64);
+        for &index in indices {
+            hash_u64(hasher, index as u64);
+        }
+    }
+
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+    hash_indices(&mut hasher, &claim.cpus);
+    hash_indices(&mut hasher, &claim.llcs);
+    hash_indices(&mut hasher, &claim.permits);
+    hasher.write(&[
+        u8::from(claim.cpu_mode == ClaimMode::Exclusive),
+        u8::from(claim.llc_mode == ClaimMode::Exclusive),
+        u8::from(claim.permit_mode == ClaimMode::Exclusive),
+    ]);
+    hasher.write(&encode_admission_class(claim.admission_class).to_le_bytes());
+    hasher.finish()
+}
+
+fn scan_watch_modes(watch: &ClaimSet) -> EncodedWatchModes {
+    EncodedWatchModes {
+        cpu: if watch.cpus.is_empty() {
+            ClaimMode::Exclusive
+        } else {
+            watch.cpu_mode
+        },
+        llc: if watch.llcs.is_empty() {
+            ClaimMode::Exclusive
+        } else {
+            watch.llc_mode
+        },
+        permit: if watch.permits.is_empty() {
+            ClaimMode::Exclusive
+        } else {
+            watch.permit_mode
+        },
+    }
+}
+
+fn scan_claim_is_flexible(claim: &ClaimSet, watch: &ClaimSet) -> bool {
+    let modes = scan_watch_modes(watch);
+    claim.cpus != watch.cpus
+        || claim.llcs != watch.llcs
+        || claim.permits != watch.permits
+        || claim.cpu_mode != modes.cpu
+        || claim.llc_mode != modes.llc
+        || claim.permit_mode != modes.permit
+        || claim.admission_class != watch.admission_class
+}
+
+impl ScanMetadata {
+    fn for_claims(claim: &ClaimSet, watch: &ClaimSet) -> Result<Self> {
+        let watch_empty =
+            watch.cpus.is_empty() && watch.llcs.is_empty() && watch.permits.is_empty();
+        let mut flags = 0;
+        if scan_claim_is_flexible(claim, watch) {
+            flags |= SCAN_FLAG_FLEXIBLE;
+        }
+        if watch_empty {
+            flags |= SCAN_FLAG_WATCH_EMPTY;
+        }
+        Ok(Self {
+            flags,
+            watch_cpus: u32::try_from(watch.cpus.len())
+                .context("watch CPU cardinality does not fit u32")?,
+            watch_llcs: u32::try_from(watch.llcs.len())
+                .context("watch LLC cardinality does not fit u32")?,
+            watch_permits: u32::try_from(watch.permits.len())
+                .context("watch permit cardinality does not fit u32")?,
+            watch_cooperative_permits: u32::try_from(
+                watch
+                    .permits
+                    .range(..super::super::cooperative_cpu_permit_end())
+                    .count(),
+            )
+            .context("cooperative watch permit cardinality does not fit u32")?,
+            claim_cpu_span: BitsetWordSpan::for_indices(&claim.cpus)?,
+            claim_llc_span: BitsetWordSpan::for_indices(&claim.llcs)?,
+            claim_permit_span: BitsetWordSpan::for_indices(&claim.permits)?,
+            watch_identity: fixed_claim_identity(watch),
+            claim_identity: fixed_claim_identity(claim),
+        })
+    }
+
+    fn read(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Self> {
+        let metadata = Self {
+            flags: read_u32(bytes, R_SCAN_FLAGS),
+            watch_cpus: read_u32(bytes, R_WATCH_CPU_COUNT),
+            watch_llcs: read_u32(bytes, R_WATCH_LLC_COUNT),
+            watch_permits: read_u32(bytes, R_WATCH_PERMIT_COUNT),
+            watch_cooperative_permits: read_u32(bytes, R_WATCH_COOPERATIVE_PERMIT_COUNT),
+            claim_cpu_span: BitsetWordSpan {
+                start: read_u16(bytes, R_CLAIM_CPU_WORD_START),
+                end: read_u16(bytes, R_CLAIM_CPU_WORD_END),
+            },
+            claim_llc_span: BitsetWordSpan {
+                start: read_u16(bytes, R_CLAIM_LLC_WORD_START),
+                end: read_u16(bytes, R_CLAIM_LLC_WORD_END),
+            },
+            claim_permit_span: BitsetWordSpan {
+                start: read_u16(bytes, R_CLAIM_PERMIT_WORD_START),
+                end: read_u16(bytes, R_CLAIM_PERMIT_WORD_END),
+            },
+            watch_identity: read_u64(bytes, R_WATCH_IDENTITY),
+            claim_identity: read_u64(bytes, R_CLAIM_IDENTITY),
+        };
+        if metadata.flags & !SCAN_FLAGS_VALID != 0 {
+            anyhow::bail!(
+                "queue registry v{VERSION} slot {slot} has unknown scan flags {:#x}",
+                metadata.flags,
+            );
+        }
+        for (class, count) in [
+            ("CPU", metadata.watch_cpus),
+            ("LLC", metadata.watch_llcs),
+            ("permit", metadata.watch_permits),
+        ] {
+            if usize::try_from(count).unwrap_or(usize::MAX) > layout.bits {
+                anyhow::bail!(
+                    "queue registry v{VERSION} slot {slot} has {count} watched {class} resources for {} bits",
+                    layout.bits,
+                );
+            }
+        }
+        if metadata.watch_cooperative_permits > metadata.watch_permits
+            || usize::try_from(metadata.watch_cooperative_permits).unwrap_or(usize::MAX)
+                > super::super::cooperative_cpu_permit_end()
+        {
+            anyhow::bail!(
+                "queue registry v{VERSION} slot {slot} has invalid cooperative watch permit count {} of {}",
+                metadata.watch_cooperative_permits,
+                metadata.watch_permits,
+            );
+        }
+        let watch_empty =
+            metadata.watch_cpus == 0 && metadata.watch_llcs == 0 && metadata.watch_permits == 0;
+        if watch_empty != (metadata.flags & SCAN_FLAG_WATCH_EMPTY != 0) {
+            anyhow::bail!(
+                "queue registry v{VERSION} slot {slot} has inconsistent empty-watch scan metadata"
+            );
+        }
+        metadata.claim_cpu_span.validate(layout, slot, "CPU")?;
+        metadata.claim_llc_span.validate(layout, slot, "LLC")?;
+        metadata
+            .claim_permit_span
+            .validate(layout, slot, "permit")?;
+        Ok(metadata)
+    }
+
+    fn write(self, bytes: &mut [u8]) {
+        write_u32(bytes, R_SCAN_FLAGS, self.flags);
+        write_u32(bytes, R_WATCH_CPU_COUNT, self.watch_cpus);
+        write_u32(bytes, R_WATCH_LLC_COUNT, self.watch_llcs);
+        write_u32(bytes, R_WATCH_PERMIT_COUNT, self.watch_permits);
+        write_u32(
+            bytes,
+            R_WATCH_COOPERATIVE_PERMIT_COUNT,
+            self.watch_cooperative_permits,
+        );
+        write_u16(bytes, R_CLAIM_CPU_WORD_START, self.claim_cpu_span.start);
+        write_u16(bytes, R_CLAIM_CPU_WORD_END, self.claim_cpu_span.end);
+        write_u16(bytes, R_CLAIM_LLC_WORD_START, self.claim_llc_span.start);
+        write_u16(bytes, R_CLAIM_LLC_WORD_END, self.claim_llc_span.end);
+        write_u16(
+            bytes,
+            R_CLAIM_PERMIT_WORD_START,
+            self.claim_permit_span.start,
+        );
+        write_u16(bytes, R_CLAIM_PERMIT_WORD_END, self.claim_permit_span.end);
+        write_u64(bytes, R_WATCH_IDENTITY, self.watch_identity);
+        write_u64(bytes, R_CLAIM_IDENTITY, self.claim_identity);
+    }
+
+    fn validate_full(
+        self,
+        layout: HeaderLayout,
+        slot: u64,
+        claim: &ClaimSet,
+        watch: &ClaimSet,
+    ) -> Result<()> {
+        let expected = Self::for_claims(claim, watch)?;
+        if self != expected {
+            anyhow::bail!(
+                "queue registry v{VERSION} slot {slot} scan metadata does not match its authoritative claim/watch: stored={self:?}, expected={expected:?}"
+            );
+        }
+        self.claim_cpu_span.validate(layout, slot, "CPU")?;
+        self.claim_llc_span.validate(layout, slot, "LLC")?;
+        self.claim_permit_span.validate(layout, slot, "permit")?;
+        Ok(())
+    }
+}
+
+fn decode_bitset_span(
     bytes: &[u8],
     layout: HeaderLayout,
     which: usize,
-    end: usize,
-) -> usize {
-    let end = end.min(layout.bits);
+    span: BitsetWordSpan,
+    slot: u64,
+    class: &str,
+) -> Result<BTreeSet<usize>> {
+    span.validate(layout, slot, class)?;
+    let mut out = BTreeSet::new();
+    let start = usize::from(span.start);
+    let end = usize::from(span.end);
     let offset = record_bitset_offset(layout, which);
-    let mut count = 0usize;
-    for word in 0..end.div_ceil(64) {
-        let mut value = read_u64(bytes, offset + word * std::mem::size_of::<u64>());
-        let remaining = end.saturating_sub(word * 64);
-        if remaining < 64 {
-            value &= (1u64 << remaining) - 1;
+    for word_index in start..end {
+        #[cfg(test)]
+        SCAN_EXACT_WORD_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+        let mut word = read_u64(bytes, offset + word_index * std::mem::size_of::<u64>());
+        if (word_index == start || word_index + 1 == end) && word == 0 {
+            anyhow::bail!(
+                "queue registry v{VERSION} slot {slot} has zero boundary word in {class} exact-word span {start}..{end}"
+            );
         }
-        count = count.saturating_add(value.count_ones() as usize);
+        while word != 0 {
+            let bit = word.trailing_zeros() as usize;
+            out.insert(word_index * 64 + bit);
+            word &= word - 1;
+        }
     }
-    count
+    Ok(out)
 }
 
 fn encoded_bitset_contains(bytes: &[u8], layout: HeaderLayout, which: usize, index: usize) -> bool {
@@ -17781,27 +18209,48 @@ fn decode_scan_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<S
     let watch_cpu_mode = decode_mode(bytes, R_WATCH_CPU_MODE, slot, "CPU watch")?;
     let watch_permit_mode = decode_mode(bytes, R_WATCH_PERMIT_MODE, slot, "permit watch")?;
     let claim_class = decode_admission_class(bytes, R_CLAIM_CLASS, slot, "exact claim")?;
-    let watch_class = decode_admission_class(bytes, R_WATCH_CLASS, slot, "watch")?;
+    let metadata = ScanMetadata::read(bytes, layout, slot)?;
     let claim = ClaimSet::with_all_claim_modes(
-        decode_bitset(bytes, record_bitset_offset(layout, RB_CLAIM_LLCS), layout)?,
-        decode_bitset(bytes, record_bitset_offset(layout, RB_CLAIM_CPUS), layout)?,
-        decode_bitset(
+        decode_bitset_span(
             bytes,
-            record_bitset_offset(layout, RB_CLAIM_PERMITS),
             layout,
+            RB_CLAIM_LLCS,
+            metadata.claim_llc_span,
+            slot,
+            "LLC",
+        )?,
+        decode_bitset_span(
+            bytes,
+            layout,
+            RB_CLAIM_CPUS,
+            metadata.claim_cpu_span,
+            slot,
+            "CPU",
+        )?,
+        decode_bitset_span(
+            bytes,
+            layout,
+            RB_CLAIM_PERMITS,
+            metadata.claim_permit_span,
+            slot,
+            "permit",
         )?,
         claim_llc_mode,
         claim_cpu_mode,
         claim_permit_mode,
     )
     .with_admission_class(claim_class);
-
-    let (cpus_equal, watch_cpus) =
-        encoded_bitset_equal_and_count(bytes, layout, RB_CLAIM_CPUS, RB_WATCH_CPUS);
-    let (llcs_equal, watch_llcs) =
-        encoded_bitset_equal_and_count(bytes, layout, RB_CLAIM_LLCS, RB_WATCH_LLCS);
-    let (permits_equal, watch_permits) =
-        encoded_bitset_equal_and_count(bytes, layout, RB_CLAIM_PERMITS, RB_WATCH_PERMITS);
+    if fixed_claim_identity(&claim) != metadata.claim_identity {
+        anyhow::bail!(
+            "queue registry v{VERSION} slot {slot} sparse exact claim does not match its persisted identity"
+        );
+    }
+    let watch_cpus =
+        usize::try_from(metadata.watch_cpus).context("watch CPU cardinality does not fit usize")?;
+    let watch_llcs =
+        usize::try_from(metadata.watch_llcs).context("watch LLC cardinality does not fit usize")?;
+    let watch_permits = usize::try_from(metadata.watch_permits)
+        .context("watch permit cardinality does not fit usize")?;
     let watch_modes = EncodedWatchModes {
         cpu: if watch_cpus == 0 {
             ClaimMode::Exclusive
@@ -17819,23 +18268,13 @@ fn decode_scan_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<S
             watch_permit_mode
         },
     };
-    let flexible = !cpus_equal
-        || !llcs_equal
-        || !permits_equal
-        || claim.cpu_mode != watch_modes.cpu
-        || claim.llc_mode != watch_modes.llc
-        || claim.permit_mode != watch_modes.permit
-        || claim.admission_class != watch_class;
-    let watch_empty = watch_cpus == 0 && watch_llcs == 0 && watch_permits == 0;
+    let flexible = metadata.flags & SCAN_FLAG_FLEXIBLE != 0;
+    let watch_empty = metadata.flags & SCAN_FLAG_WATCH_EMPTY != 0;
     if read_u32(bytes, R_STATE) == STATE_PENDING && watch_empty {
         anyhow::bail!("queue registry v{VERSION} slot {slot} is PENDING with an empty watch");
     }
-    let cooperative_permits = encoded_bitset_prefix_count(
-        bytes,
-        layout,
-        RB_WATCH_PERMITS,
-        super::super::cooperative_cpu_permit_end(),
-    );
+    let cooperative_permits = usize::try_from(metadata.watch_cooperative_permits)
+        .context("cooperative watch permit cardinality does not fit usize")?;
     let maximum_backfill_capacity =
         u32::try_from(cooperative_permits.max(watch_cpus.max(watch_llcs).max(1)))
             .unwrap_or(u32::MAX);
@@ -17861,6 +18300,7 @@ fn decode_scan_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<S
         ticket: read_u64(bytes, R_TICKET),
         claim,
         watch_modes,
+        watch_identity: metadata.watch_identity,
         flexible,
         blocked_on,
         external_blocker,
@@ -17915,6 +18355,7 @@ fn decode_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<Record
         watch_permit_mode,
     )
     .with_admission_class(decode_admission_class(bytes, R_WATCH_CLASS, slot, "watch")?);
+    ScanMetadata::read(bytes, layout, slot)?.validate_full(layout, slot, &claim, &watch)?;
     let blocked_on = decode_blocked_on(bytes, slot)?;
     let backfill_capacity = read_u32(bytes, R_BACKFILL_CAPACITY);
     let maximum_backfill_capacity = backfill_capacity_for_watch(&watch);
@@ -17967,7 +18408,9 @@ fn encode_claim(
         record_bitset_offset(layout, RB_WATCH_PERMITS),
         layout,
         &watch.permits,
-    )
+    )?;
+    ScanMetadata::for_claims(claim, watch)?.write(bytes);
+    Ok(())
 }
 
 fn encode_exact_claim(bytes: &mut [u8], layout: HeaderLayout, claim: &ClaimSet) -> Result<()> {
@@ -18430,6 +18873,14 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_ne_bytes(bytes[offset..offset + 2].try_into().expect("u16 field"))
+}
+
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
