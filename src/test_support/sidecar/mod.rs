@@ -2853,11 +2853,11 @@ pub fn kernel_commit_for_resolved(raw: &str) -> Option<String> {
     source_dir_for(raw).and_then(|source| detect_kernel_commit(&source))
 }
 
-/// Pure helper for [`resolve_kernel_source_dir`] that takes the
+/// Pure helper for [`source_dir_for`] that takes the
 /// parsed `KernelId` and an opened `CacheDir`, returning the source
 /// tree path if recoverable.
 ///
-/// Split out from [`resolve_kernel_source_dir`] so tests can pin a
+/// Split out from [`source_dir_for`] so tests can pin a
 /// `CacheDir` at a tempdir root without mutating env vars (which
 /// would race other tests reading `KTSTR_KERNEL` /
 /// `KTSTR_CACHE_DIR`).
