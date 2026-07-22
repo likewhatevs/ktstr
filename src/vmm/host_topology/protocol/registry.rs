@@ -25,6 +25,8 @@ use std::time::Duration;
 
 const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ19");
 const VERSION: u32 = 19;
+#[cfg(test)]
+const RETAINED_FUTEX_WAIT_MARKER_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 const HEADER_FIXED: usize = 256;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 192;
@@ -316,6 +318,8 @@ thread_local! {
     static SHARED_STATE_READS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static SHARED_STATE_RECOVERY_UPGRADES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static TICKET_SHARED_MAPPING_BUILDS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static REGISTRY_EX_ACQUISITIONS: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
@@ -817,7 +821,7 @@ pub(super) struct Ticket {
 }
 
 pub(super) enum PendingRegistration {
-    Registered(Ticket),
+    Registered(Box<Ticket>),
     Contended(u32),
 }
 
@@ -1012,7 +1016,7 @@ pub(super) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(b
         FlockMode::Shared,
     );
     let mut ticket = match Ticket::register_pending(3, initial.clone())? {
-        PendingRegistration::Registered(ticket) => ticket,
+        PendingRegistration::Registered(ticket) => *ticket,
         PendingRegistration::Contended(_) => {
             anyhow::bail!("isolated pending activation test unexpectedly contended")
         }
@@ -1052,7 +1056,7 @@ pub(super) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(b
 #[cfg(test)]
 pub(super) fn register_pending_claim_for_tests(claim: ClaimSet) -> Result<Ticket> {
     match Ticket::register_pending(required_resource_bits(&claim), claim)? {
-        PendingRegistration::Registered(ticket) => Ok(ticket),
+        PendingRegistration::Registered(ticket) => Ok(*ticket),
         PendingRegistration::Contended(_) => {
             anyhow::bail!("isolated pending-claim test unexpectedly contended")
         }
@@ -1178,6 +1182,8 @@ impl TicketSharedMaps {
             (wake as usize).is_multiple_of(std::mem::align_of::<AtomicU32>()),
             "ticket {ticket} slot {slot} futex address is not naturally aligned",
         );
+        #[cfg(test)]
+        TICKET_SHARED_MAPPING_BUILDS.with(|count| count.set(count.get().saturating_add(1)));
         Ok(Self {
             header,
             chunk: chunk_map,
@@ -1231,6 +1237,17 @@ impl TicketSharedMaps {
     }
 
     fn wait(&self, expected: u32, timeout: Duration) -> Result<bool> {
+        #[cfg(test)]
+        let wait_marker = std::env::var_os(RETAINED_FUTEX_WAIT_MARKER_ENV);
+        #[cfg(test)]
+        if let Some(marker) = &wait_marker {
+            std::fs::write(marker, b"entered").with_context(|| {
+                format!(
+                    "publish retained-futex wait marker {}",
+                    Path::new(marker).display()
+                )
+            })?;
+        }
         let ts = libc::timespec {
             tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
             tv_nsec: timeout.subsec_nanos().into(),
@@ -1248,6 +1265,15 @@ impl TicketSharedMaps {
             )
         };
         if rc == 0 {
+            #[cfg(test)]
+            if let Some(marker) = wait_marker {
+                std::fs::write(&marker, b"woken").with_context(|| {
+                    format!(
+                        "publish retained-futex wake marker {}",
+                        Path::new(&marker).display()
+                    )
+                })?;
+            }
             return Ok(false);
         }
         let error = std::io::Error::last_os_error();
@@ -1362,7 +1388,7 @@ impl Ticket {
         drop(table);
         drop(_lock);
 
-        Ok(Some(PendingRegistration::Registered(Self {
+        Ok(Some(PendingRegistration::Registered(Box::new(Self {
             namespace,
             slot,
             ticket,
@@ -1371,7 +1397,7 @@ impl Ticket {
             shared: Some(shared),
             _interrupt_waiter: None,
             finished: false,
-        })))
+        }))))
     }
 
     /// Atomically replace this process's physical-preparation PENDING claim
@@ -2857,6 +2883,11 @@ impl Ticket {
     }
 
     #[cfg(test)]
+    pub(super) fn state_or_wait_for_tests(&self) -> Result<()> {
+        self.state_or_wait(Duration::ZERO, None).map(|_| ())
+    }
+
+    #[cfg(test)]
     fn commit_token_for_tests(&self) -> Result<CoordinatorCommitToken> {
         let _namespace = self.namespace.enter();
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
@@ -4069,6 +4100,72 @@ pub(super) fn hold_registry_exclusive_for_tests() -> Result<OwnedFd> {
 #[cfg(test)]
 pub(super) fn shared_state_read_count_for_tests() -> usize {
     SHARED_STATE_READS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn ticket_shared_mapping_build_count_for_tests() -> usize {
+    TICKET_SHARED_MAPPING_BUILDS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn exercise_retained_shared_publication_for_tests() -> Result<(bool, bool, bool)> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let waiting_claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let mut waiting = Ticket::register(waiting_claim.clone(), waiting_claim, None)?;
+    let mappings_after_registration = ticket_shared_mapping_build_count_for_tests();
+    let initially_waiting = waiting.state_shared(false, None)? == Some(State::Waiting);
+    let wake_before = waiting
+        .shared
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("WAITING ticket shared mappings disappeared"))?
+        .expected();
+
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, 1, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+    }
+
+    let wake_after = waiting
+        .shared
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("granted ticket shared mappings disappeared"))?
+        .expected();
+    let publication_visible = waiting.state_shared(false, None)? == Some(State::Granted);
+    let mapping_reused =
+        ticket_shared_mapping_build_count_for_tests() == mappings_after_registration;
+
+    waiting.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((
+        initially_waiting && publication_visible,
+        wake_after != wake_before,
+        mapping_reused,
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn exercise_retained_mapping_slot_reuse_for_tests() -> Result<(bool, bool)> {
+    let claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
+    let mut first = Ticket::register(claim.clone(), claim.clone(), None)?;
+    let first_slot = first.slot;
+    let first_ticket = first.ticket;
+    let stale = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.map_ticket_shared(first_slot, first_ticket)?
+    };
+    first.finish(None)?;
+
+    let mut replacement = Ticket::register(claim.clone(), claim, None)?;
+    let slot_reused = replacement.slot == first_slot && replacement.ticket != first_ticket;
+    let stale_mapping_rejected = stale.record_bytes(first_slot, first_ticket).is_err();
+
+    replacement.finish(None)?;
+    Ok((slot_reused, stale_mapping_rejected))
 }
 
 #[cfg(test)]

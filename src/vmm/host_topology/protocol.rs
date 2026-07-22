@@ -1110,6 +1110,10 @@ impl CoordinatorTicket {
     pub(crate) fn read_state_shared_for_tests(&self) -> Result<()> {
         self.ticket.read_state_shared_for_tests()
     }
+
+    pub(crate) fn state_or_wait_for_tests(&self) -> Result<()> {
+        self.ticket.state_or_wait_for_tests()
+    }
 }
 
 /// A physical reservation and its registry publication.
@@ -1603,7 +1607,7 @@ pub(crate) fn try_register_pending_admission(
             match registry::Ticket::try_register_pending(required, claim)? {
                 Some(registry::PendingRegistration::Registered(ticket)) => {
                     super::PreparationCandidateDecision::Accepted(pending_admission_from_parts(
-                        ticket,
+                        *ticket,
                         preparation,
                         pending_claim,
                     )?)
@@ -1635,7 +1639,7 @@ pub(crate) fn register_pending_admission(max_permit_index: usize) -> Result<Pend
         let (preparation, claim) = super::acquire_preparation_permit(rotation_bias)?;
         match registry::Ticket::register_pending(required, claim.clone())? {
             registry::PendingRegistration::Registered(ticket) => {
-                return pending_admission_from_parts(ticket, preparation, claim);
+                return pending_admission_from_parts(*ticket, preparation, claim);
             }
             registry::PendingRegistration::Contended(generation) => {
                 drop(preparation);
@@ -1667,7 +1671,7 @@ pub(crate) fn exercise_preparation_continuity_for_tests() -> Result<PreparationC
     let required =
         registry::required_bits_for_permit_index(super::admission_resource_capacity_hint()?);
     let ticket = match registry::Ticket::register_pending(required, active.clone())? {
-        registry::PendingRegistration::Registered(ticket) => ticket,
+        registry::PendingRegistration::Registered(ticket) => *ticket,
         registry::PendingRegistration::Contended(_) => {
             anyhow::bail!("isolated preparation transition unexpectedly contended")
         }
@@ -2199,6 +2203,21 @@ pub(crate) fn hold_registry_exclusive_for_tests() -> Result<OwnedFd> {
 #[cfg(test)]
 pub(crate) fn shared_state_read_count_for_tests() -> usize {
     registry::shared_state_read_count_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn ticket_shared_mapping_build_count_for_tests() -> usize {
+    registry::ticket_shared_mapping_build_count_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_retained_shared_publication_for_tests() -> Result<(bool, bool, bool)> {
+    registry::exercise_retained_shared_publication_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_retained_mapping_slot_reuse_for_tests() -> Result<(bool, bool)> {
+    registry::exercise_retained_mapping_slot_reuse_for_tests()
 }
 
 #[cfg(test)]

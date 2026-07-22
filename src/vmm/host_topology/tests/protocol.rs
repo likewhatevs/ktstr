@@ -2156,6 +2156,75 @@ fn ordinary_state_reads_overlap_registry_shared_readers() {
 }
 
 #[test]
+fn state_or_wait_reuses_one_retained_shared_mapping() {
+    let _prefixes = LockPrefixesGuard::new();
+    let claim = protocol::ClaimSet::new(
+        std::iter::empty(),
+        [1usize],
+        crate::flock::FlockMode::Exclusive,
+    );
+    let mappings_before = protocol::ticket_shared_mapping_build_count_for_tests();
+    let coordinator = match protocol::register_ticket_or_acquire(claim.clone(), claim, None, |_| {
+        Ok::<Option<()>, anyhow::Error>(None)
+    })
+    .expect("register retained-map coordinator")
+    {
+        protocol::TicketWork::Coordinator(coordinator) => coordinator,
+        protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
+    };
+    let mappings_after_registration = protocol::ticket_shared_mapping_build_count_for_tests();
+    assert_eq!(
+        mappings_after_registration - mappings_before,
+        1,
+        "one live ticket must construct exactly one retained header+chunk view",
+    );
+    for _ in 0..128 {
+        coordinator
+            .state_or_wait_for_tests()
+            .expect("read coordinator state through retained mappings");
+    }
+    assert_eq!(
+        protocol::ticket_shared_mapping_build_count_for_tests(),
+        mappings_after_registration,
+        "repeated state_or_wait reads must not reopen or remap registry files",
+    );
+    drop(coordinator);
+}
+
+#[test]
+fn writer_publication_is_visible_through_retained_readonly_shared_mapping() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (state_visible, futex_visible, mapping_reused) =
+        protocol::exercise_retained_shared_publication_for_tests()
+            .expect("publish through retained shared mappings");
+    assert!(
+        state_visible,
+        "MAP_SHARED state publication was not visible"
+    );
+    assert!(
+        futex_visible,
+        "MAP_SHARED futex publication was not visible"
+    );
+    assert!(
+        mapping_reused,
+        "observing writer publication unexpectedly rebuilt the ticket mapping",
+    );
+}
+
+#[test]
+fn reused_slot_rejects_an_old_retained_mapping_identity() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (slot_reused, stale_mapping_rejected) =
+        protocol::exercise_retained_mapping_slot_reuse_for_tests()
+            .expect("exercise retained mapping across slot reuse");
+    assert!(slot_reused, "test did not recycle the retired slot");
+    assert!(
+        stale_mapping_rejected,
+        "old retained mapping aliased the replacement ticket",
+    );
+}
+
+#[test]
 fn targeted_broker_wake_cancels_one_registry_waiter() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
@@ -4609,6 +4678,8 @@ const TICKET_HELPER_AFTER_ACQUIRE_ENTERED: &str = "KTSTR_TEST_TICKET_AFTER_ACQUI
 const TICKET_HELPER_BEFORE_COORDINATOR_GATE: &str = "KTSTR_TEST_TICKET_BEFORE_COORDINATOR_GATE";
 const TICKET_HELPER_COORDINATOR_ENTERED: &str = "KTSTR_TEST_TICKET_COORDINATOR_ENTERED";
 const TICKET_HELPER_COORDINATOR_WAITING: &str = "KTSTR_TEST_TICKET_COORDINATOR_WAITING";
+const TICKET_HELPER_MAPPING_COUNT: &str = "KTSTR_TEST_TICKET_MAPPING_COUNT";
+const RETAINED_FUTEX_WAIT_MARKER: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 
 const PENDING_V3_LLC_PREFIX: &str = "KTSTR_TEST_PENDING_V3_LLC_PREFIX";
 const PENDING_V3_CPU_PREFIX: &str = "KTSTR_TEST_PENDING_V3_CPU_PREFIX";
@@ -4699,9 +4770,16 @@ fn pending_exec_v3_import_process_helper() {
         }
     });
     barrier.wait();
+    let mappings_before_import = protocol::ticket_shared_mapping_build_count_for_tests();
     let imported = protocol::take_pending_exec_handoff()
         .expect("validate pending v3 handoff while another thread reads the environment")
         .expect("wrapper supplied pending v3 handoff");
+    let mappings_after_import = protocol::ticket_shared_mapping_build_count_for_tests();
+    assert_eq!(
+        mappings_after_import - mappings_before_import,
+        1,
+        "exec import must reconstruct exactly one validated retained mapping",
+    );
     reader.join().expect("environment reader thread");
     assert!(
         protocol::take_pending_exec_handoff()
@@ -4723,6 +4801,11 @@ fn pending_exec_v3_import_process_helper() {
     let (_, imported_watch) = pending
         .pending_claim_watch_for_tests()
         .expect("read imported selected-intent watch");
+    assert_eq!(
+        protocol::ticket_shared_mapping_build_count_for_tests(),
+        mappings_after_import,
+        "validated exec-import mapping must remain retained by the pending owner",
+    );
     let (_, preparation_fds) = pending
         .preparation_handoff_parts()
         .expect("imported preparation descriptors");
@@ -5110,6 +5193,13 @@ fn ticket_registry_process_helper() {
             Ok(None)
         })
         .expect("helper queue");
+    if let Some(path) = std::env::var_os(TICKET_HELPER_MAPPING_COUNT) {
+        std::fs::write(
+            path,
+            protocol::ticket_shared_mapping_build_count_for_tests().to_string(),
+        )
+        .expect("publish helper retained mapping count");
+    }
 
     let (index, locks) = match queue {
         protocol::TicketWork::Acquired(acquired) => {
@@ -5184,6 +5274,7 @@ struct TicketChild {
     release: std::path::PathBuf,
     stdout: std::path::PathBuf,
     stderr: std::path::PathBuf,
+    mapping_count: Option<std::path::PathBuf>,
 }
 
 #[derive(Default)]
@@ -5197,6 +5288,8 @@ struct TicketSpawnOptions<'a> {
     after_acquire_gate: Option<(&'a std::path::Path, &'a std::path::Path)>,
     before_coordinator_gate: Option<(&'a std::path::Path, &'a std::path::Path)>,
     coordinator_waiting: Option<&'a std::path::Path>,
+    record_mapping_count: bool,
+    retained_futex_wait_marker: Option<&'a std::path::Path>,
 }
 
 impl TicketChild {
@@ -5323,6 +5416,24 @@ impl TicketChild {
         )
     }
 
+    fn spawn_recording_retained_wait(
+        marker_dir: &std::path::Path,
+        label: &str,
+        candidates: &str,
+        futex_wait_marker: &std::path::Path,
+    ) -> Self {
+        Self::spawn_with_options(
+            marker_dir,
+            label,
+            candidates,
+            TicketSpawnOptions {
+                record_mapping_count: true,
+                retained_futex_wait_marker: Some(futex_wait_marker),
+                ..TicketSpawnOptions::default()
+            },
+        )
+    }
+
     fn spawn_with_options(
         marker_dir: &std::path::Path,
         label: &str,
@@ -5341,6 +5452,9 @@ impl TicketChild {
         let service_tid = marker_dir.join(format!("{label}.service-tid"));
         let stdout = marker_dir.join(format!("{label}.stdout"));
         let stderr = marker_dir.join(format!("{label}.stderr"));
+        let mapping_count = options
+            .record_mapping_count
+            .then(|| marker_dir.join(format!("{label}.mapping-count")));
         let mut command =
             std::process::Command::new(std::env::current_exe().expect("current test executable"));
         command
@@ -5397,6 +5511,12 @@ impl TicketChild {
         if let Some(waiting) = options.coordinator_waiting {
             command.env(TICKET_HELPER_COORDINATOR_WAITING, waiting);
         }
+        if let Some(mapping_count) = &mapping_count {
+            command.env(TICKET_HELPER_MAPPING_COUNT, mapping_count);
+        }
+        if let Some(marker) = options.retained_futex_wait_marker {
+            command.env(RETAINED_FUTEX_WAIT_MARKER, marker);
+        }
         let child = command.spawn().expect("spawn ticket helper");
         let pid = child.id();
         TICKET_HELPER_LOGS.with(|logs| {
@@ -5419,6 +5539,7 @@ impl TicketChild {
             release,
             stdout,
             stderr,
+            mapping_count,
         }
     }
 
@@ -5440,6 +5561,17 @@ impl TicketChild {
 
     fn wait_for_acquired(&self) {
         self.wait_for_path(&self.acquired, "acquired marker");
+    }
+
+    fn wait_for_mapping_count(&self, expected: usize) {
+        let path = self
+            .mapping_count
+            .as_ref()
+            .expect("ticket helper did not record retained mapping count");
+        self.wait_for_observation("retained mapping count", || {
+            let count = std::fs::read_to_string(path).ok()?.parse::<usize>().ok()?;
+            (count == expected).then_some(())
+        });
     }
 
     fn release_and_wait(self) {
@@ -5748,6 +5880,51 @@ fn disjoint_ticket_bypasses_a_blocked_coordinator() {
     disjoint.release_and_wait();
 
     drop(blocker);
+    coordinator.wait_for_acquired();
+    coordinator.release_and_wait();
+}
+
+#[test]
+fn retained_shared_mapping_wakes_waiter_across_processes() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let coordinator_blocker =
+        crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
+            .expect("open coordinator blocker")
+            .expect("hold coordinator blocker");
+    let waiter_blocker =
+        crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
+            .expect("open waiter blocker")
+            .expect("hold waiter blocker");
+    let coordinator = TicketChild::spawn(markers.path(), "coordinator", "1", false);
+    coordinator.wait_for_probe();
+
+    let futex_wait_marker = markers.path().join("waiter.futex-wait");
+    let waiter = TicketChild::spawn_recording_retained_wait(
+        markers.path(),
+        "retained-map-waiter",
+        "2",
+        &futex_wait_marker,
+    );
+    waiter.wait_for_path(&futex_wait_marker, "retained FUTEX_WAIT entry");
+    waiter.wait_for_observation("retained-map waiter publication", || {
+        protocol::ticket_is_waiting_for_tests(waiter.pid)
+            .expect("read retained-map waiter state")
+            .then_some(())
+    });
+
+    // This close wakes the coordinator process, which publishes GRANTED and
+    // FUTEX_WAKEs the different process already sleeping on its retained
+    // read-only MAP_SHARED record view.
+    drop(waiter_blocker);
+    waiter.wait_for_acquired();
+    waiter.wait_for_observation("successful retained FUTEX_WAKE", || {
+        (std::fs::read(&futex_wait_marker).ok()?.as_slice() == b"woken").then_some(())
+    });
+    waiter.wait_for_mapping_count(1);
+    waiter.release_and_wait();
+
+    drop(coordinator_blocker);
     coordinator.wait_for_acquired();
     coordinator.release_and_wait();
 }
