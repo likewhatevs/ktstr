@@ -1165,8 +1165,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v22");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v22");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v23");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v23");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1338,7 +1338,7 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v22");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v23");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
     crate::flock::materialize(wrong_registry.join("registry.turnstile"))
         .expect("materialize wrong registry writer-intent gate");
@@ -4605,7 +4605,7 @@ fn changed_replan_completions_coalesce_one_authoritative_scan() {
     assert_eq!(outcome.callbacks, callbacks);
     assert_eq!(
         outcome.intermediate_notify_delta, 0,
-        "the first N-1 completions must leave transport batching to the live coordinator heartbeat",
+        "the first N-1 completions must leave transport batching to the persisted deadline and coordinator heartbeat",
     );
     assert_eq!(
         (
@@ -4646,6 +4646,41 @@ fn changed_replan_completions_coalesce_one_authoritative_scan() {
 }
 
 #[test]
+fn deferred_replan_rescans_survive_event_storms_and_flush_at_hard_boundaries() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_deferred_rescan_policy_for_tests()
+        .expect("exercise deferred speculative rescan policy");
+    assert!(
+        outcome.registration_and_teardown_coalesced,
+        "registration and teardown traffic must not consume a live wave's deferred scan",
+    );
+    assert!(
+        outcome.known_free_release_preserved_deferred_fast_path,
+        "deferred-only work must preserve the SH known-free release fast path without consuming its deadline",
+    );
+    assert!(
+        outcome.ordinary_turn_preserved_deadline,
+        "ordinary schedule turns must preserve the first absolute deferred deadline",
+    );
+    assert!(
+        outcome.heartbeat_promoted_before_deadline,
+        "the next heartbeat must promote an unnotified deferred completion even just before its deadline",
+    );
+    assert!(
+        outcome.observation_survived_promotion_and_scan,
+        "deferred promotion and grant scanning must preserve independent observation work",
+    );
+    assert!(
+        outcome.exact_deadline_promoted,
+        "continuous ordinary wakes must neither flush early nor postpone the exact deferred deadline",
+    );
+    assert!(
+        outcome.final_drain_promoted,
+        "the final speculative completion must bypass batching and publish an urgent scan",
+    );
+}
+
+#[test]
 fn completed_replan_replacement_grants_before_straggler_wave_drains() {
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_replan_straggler_progress_for_tests()
@@ -4656,8 +4691,8 @@ fn completed_replan_replacement_grants_before_straggler_wave_drains() {
         "a partial speculative wave must not target-wake its live coordinator per callback",
     );
     assert!(
-        outcome.heartbeat_observed_pending,
-        "the coordinator heartbeat must observe and consume a partial batch behind a straggler",
+        outcome.deferred_not_due_early && outcome.deferred_due_at_deadline,
+        "the persisted partial-wave deadline must neither flush early nor slide past its exact bound",
     );
     assert_eq!(
         (
@@ -4668,8 +4703,12 @@ fn completed_replan_replacement_grants_before_straggler_wave_drains() {
         "a callback completion must publish O(1) state without scanning or globally waking a live coordinator",
     );
     assert!(
-        outcome.edge_coalesced_with_straggler && outcome.later_grant_fenced_until_scan,
-        "the completion must publish one rescan edge and conservatively suppress a later grant until that edge is consumed",
+        outcome.edge_coalesced_with_straggler,
+        "the partial completion must remain deferred while its unrelated speculative callback is live",
+    );
+    assert!(
+        outcome.later_grant_fenced_until_scan && outcome.later_grant_demotion_promoted_urgent,
+        "a previously granted dirty suffix must self-demote and promote the deferred edge for an immediate authoritative scan",
     );
     assert_eq!(
         outcome.authoritative_scan_delta, 1,
@@ -7394,7 +7433,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v22
+    // Leave the replacement as an external, unregistered flock. A current-v23
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -7696,7 +7735,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v22 HELD lifecycle removes its registry record only after the
+    // The v23 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");

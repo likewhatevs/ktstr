@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ22");
-const VERSION: u32 = 22;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ23");
+const VERSION: u32 = 23;
 #[cfg(test)]
 const RETAINED_FUTEX_WAIT_MARKER_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 const HEADER_FIXED: usize = 256;
@@ -35,8 +35,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v22-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v22-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v23-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v23-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 const WAIT_DIAGNOSTIC_BUCKET_SECS: u64 = 30;
@@ -181,6 +181,10 @@ const H_REPLAN_WAVE_DEADLINE_NS: usize = 232;
 /// bounded by the exact CPU/memory/token claims: this limits only parallel
 /// placement computation, whose callbacks otherwise form a process herd.
 const H_REPLAN_CAPACITY: usize = 240;
+/// Absolute monotonic deadline for flushing a coalesced REPLAN rescan. Unlike
+/// the coordinator heartbeat, ordinary event turns never renew this value, so
+/// a continuous inotify stream cannot postpone a partial planning wave.
+const H_DEFERRED_RESCAN_DEADLINE_NS: usize = 248;
 const _: () = assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
 const _: () = assert!(H_GENERATION_WAKE.is_multiple_of(std::mem::align_of::<AtomicU32>()));
 const _: () = assert!(H_REPLAN_CURSOR.is_multiple_of(std::mem::align_of::<u64>()));
@@ -189,6 +193,7 @@ const _: () = assert!(H_REPLAN_OUTSTANDING.is_multiple_of(std::mem::align_of::<u
 const _: () = assert!(H_REPLAN_WAVE_STARTED_NS.is_multiple_of(std::mem::align_of::<u64>()));
 const _: () = assert!(H_REPLAN_WAVE_DEADLINE_NS.is_multiple_of(std::mem::align_of::<u64>()));
 const _: () = assert!(H_REPLAN_CAPACITY.is_multiple_of(std::mem::align_of::<u64>()));
+const _: () = assert!(H_DEFERRED_RESCAN_DEADLINE_NS.is_multiple_of(std::mem::align_of::<u64>()));
 
 const R_STATE: usize = 0;
 const R_WAKE: usize = 4;
@@ -280,6 +285,10 @@ const BLOCK_PERMIT: u32 = 3;
 
 const PENDING_RESCAN: u64 = 1 << 0;
 const PENDING_OBSERVATION: u64 = 1 << 1;
+/// A rescan publication which is safe to coalesce while speculative planners
+/// from the current wave are live. Urgent structural/resource work remains in
+/// `PENDING_RESCAN` and is never delayed by this flag.
+const PENDING_REPLAN_RESCAN: u64 = 1 << 2;
 
 const B_CLAIM_CPUS: usize = 0;
 const B_CLAIM_CPU_EXCLUSIVE: usize = 1;
@@ -332,6 +341,7 @@ const LIVENESS_SWEEP_INTERVAL_NS: u64 = 30_000_000_000;
 const COORDINATOR_HEARTBEAT_INTERVAL_NS: u64 = 1_000_000_000;
 pub(super) const COORDINATOR_HEARTBEAT_INTERVAL: Duration =
     Duration::from_nanos(COORDINATOR_HEARTBEAT_INTERVAL_NS);
+const DEFERRED_RESCAN_INTERVAL_NS: u64 = 1_000_000_000;
 /// Eight missed one-second heartbeats are enough to transfer progress to the
 /// oldest waiter. The displaced live coordinator is parked, so a false
 /// positive under extreme descheduling is safe and does not weaken physical
@@ -418,6 +428,9 @@ pub(super) struct ScheduleSnapshot {
     /// full liveness reconciliation: an idle healthy coordinator only updates
     /// one header word at this deadline.
     pub heartbeat_due_in: Duration,
+    /// Absolute, non-renewing flush deadline for coalesced speculative-planner
+    /// publications. `None` means there is no deferred rescan work.
+    pub deferred_rescan_due_in: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1897,7 +1910,6 @@ impl Ticket {
         )?;
         if needs_initial_replan {
             table.invalidate_record_prefix(slot)?;
-            table.set_pending_flag(PENDING_RESCAN);
         }
         table.append_active(slot)?;
         crash_at_for_tests("register_record_before_counts");
@@ -1920,6 +1932,9 @@ impl Ticket {
                 .ok_or_else(|| anyhow::anyhow!("queue ticket id overflow"))?,
         );
         table.bump_generation()?;
+        if needs_initial_replan {
+            table.schedule_deferred_replan_rescan_in_transaction()?;
+        }
         if initial_state == STATE_WAITING {
             table.elect_coordinator_in_transaction()?;
         }
@@ -1931,7 +1946,14 @@ impl Ticket {
         // the writable contention witness before waking the coordinator so it
         // cannot consume this edge while the resource still appears busy.
         drop(initial_contention);
-        notify_coordinator();
+        // A WAITING registration changes the aggregate watch even when its
+        // speculative rescan is coalesced. Wake the coordinator to install
+        // that watch/observation state, but let the central scan policy retain
+        // the deferred edge. An immediately GRANTED tail needs no coordinator
+        // work and no transport edge.
+        if initial_state == STATE_WAITING {
+            notify_coordinator();
+        }
 
         Ok(Self {
             namespace,
@@ -2724,9 +2746,10 @@ impl Ticket {
         Ok(GrantResult::Requeued)
     }
 
-    /// Renew only the coordinator progress heartbeat. Unlike [`Self::schedule`],
-    /// this path never observes resources, scans grants, refreshes prefixes,
-    /// or changes allocation. If another waiter already displaced this ticket,
+    /// Renew the coordinator progress heartbeat and promote deferred rescan
+    /// metadata when needed. Unlike [`Self::schedule`], this path never
+    /// observes resources, scans grants, refreshes prefixes, or changes
+    /// allocation. If another waiter already displaced this ticket,
     /// `open_coordinator_table` parks it until a later election before the
     /// heartbeat can be renewed.
     pub(super) fn heartbeat(&self, cancelled: Option<&AtomicBool>) -> Result<HeartbeatStatus> {
@@ -2742,13 +2765,20 @@ impl Ticket {
         let mut parked = false;
         let mut on_park = || parked = true;
         let (_lock, mut table) = self.open_coordinator_table(cancelled, &mut on_park)?;
-        table.touch_coordinator_heartbeat_at(match now {
+        let now = match now {
             Some(now) => now,
             None => monotonic_now_ns()?,
-        });
+        };
+        // A completion can publish immediately after the coordinator captured
+        // a snapshot with no deferred deadline and deliberately omit transport
+        // notification. The next already-scheduled heartbeat is therefore the
+        // causal fallback: promote any deferred edge here rather than waiting
+        // for a deadline this loop has not observed yet.
+        let rescan_pending = table.promote_deferred_rescan()?;
+        table.touch_coordinator_heartbeat_at(now);
         Ok(HeartbeatStatus {
             parked,
-            rescan_pending: table.pending_flags() & PENDING_RESCAN != 0,
+            rescan_pending,
         })
     }
 
@@ -2863,7 +2893,7 @@ impl Ticket {
             table.bump_generation()?;
             table.finish_transaction()?;
         }
-        let should_scan = table.pending_flags() & PENDING_RESCAN != 0;
+        let should_scan = table.prepare_grant_scan()?;
         let (watch, coordinator_prefix_changed) = if should_scan {
             table.grant_compatible()?
         } else {
@@ -2874,6 +2904,7 @@ impl Ticket {
         let observation = table.observation_request()?;
         table.touch_coordinator_heartbeat()?;
         let heartbeat_due_in = table.coordinator_heartbeat_due_in()?;
+        let deferred_rescan_due_in = table.deferred_rescan_due_in()?;
         Ok(ScheduleSnapshot {
             watch,
             candidate_claim,
@@ -2888,6 +2919,7 @@ impl Ticket {
             observation,
             liveness_due_in: table.liveness_due_in()?,
             heartbeat_due_in,
+            deferred_rescan_due_in,
         })
     }
 
@@ -2992,7 +3024,7 @@ impl Ticket {
         let header = &shared.header;
         let now = monotonic_now_ns()?;
         if atomic_u64(header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0
-            || read_u64(header, H_PENDING_FLAGS) != 0
+            || read_u64(header, H_PENDING_FLAGS) & !PENDING_REPLAN_RESCAN != 0
             || replan_wave_requires_recovery_from_header(header, now)
             || read_u64(header, H_COORDINATOR) != self.ticket
             || read_u64(header, H_COORDINATOR_SLOT) != self.slot
@@ -3118,6 +3150,7 @@ impl Ticket {
             observation: None,
             liveness_due_in: liveness_due_in_from_header(header, now),
             heartbeat_due_in: coordinator_heartbeat_due_in_from_header(header, now),
+            deferred_rescan_due_in: deferred_rescan_due_in_from_header(header, now),
         }))
     }
 
@@ -3159,7 +3192,7 @@ impl Ticket {
         if let Some(release) = release_proofs.take() {
             release();
         }
-        let (watch, coordinator_prefix_changed) = if table.pending_flags() & PENDING_RESCAN != 0 {
+        let (watch, coordinator_prefix_changed) = if table.prepare_grant_scan()? {
             table.grant_compatible()?
         } else {
             (table.aggregate_watch()?, false)
@@ -3170,6 +3203,7 @@ impl Ticket {
         let liveness_due_in = table.liveness_due_in()?;
         table.touch_coordinator_heartbeat()?;
         let heartbeat_due_in = table.coordinator_heartbeat_due_in()?;
+        let deferred_rescan_due_in = table.deferred_rescan_due_in()?;
         Ok(ScheduleSnapshot {
             watch,
             candidate_claim: record.claim,
@@ -3184,6 +3218,7 @@ impl Ticket {
             observation,
             liveness_due_in,
             heartbeat_due_in,
+            deferred_rescan_due_in,
         })
     }
 
@@ -3310,7 +3345,8 @@ impl Ticket {
             drop(_lock);
             anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
         }
-        let reconciled_dirty_suffix = table.min_changed_ticket() < record.ticket;
+        let reconciled_dirty_suffix = table.min_changed_ticket() < record.ticket
+            || table.pending_flags() & (PENDING_RESCAN | PENDING_REPLAN_RESCAN) != 0;
         if reconciled_dirty_suffix {
             // This is the elected coordinator's authoritative commit path, so
             // reconcile the dirty predecessor suffix here. Exact cached-prefix
@@ -3410,7 +3446,8 @@ impl Ticket {
             drop(_lock);
             anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
         }
-        let reconciled_dirty_suffix = table.min_changed_ticket() < record.ticket;
+        let reconciled_dirty_suffix = table.min_changed_ticket() < record.ticket
+            || table.pending_flags() & (PENDING_RESCAN | PENDING_REPLAN_RESCAN) != 0;
         if reconciled_dirty_suffix {
             table.grant_compatible()?;
             record = table
@@ -6827,6 +6864,17 @@ pub(crate) struct ReplanChangedWaveOutcome {
 }
 
 #[cfg(test)]
+pub(crate) struct DeferredRescanPolicyOutcome {
+    pub(crate) registration_and_teardown_coalesced: bool,
+    pub(crate) known_free_release_preserved_deferred_fast_path: bool,
+    pub(crate) ordinary_turn_preserved_deadline: bool,
+    pub(crate) heartbeat_promoted_before_deadline: bool,
+    pub(crate) observation_survived_promotion_and_scan: bool,
+    pub(crate) exact_deadline_promoted: bool,
+    pub(crate) final_drain_promoted: bool,
+}
+
+#[cfg(test)]
 pub(crate) struct BoundedReplanWindowOutcome {
     pub(crate) capacity: usize,
     pub(crate) peak_outstanding: usize,
@@ -6838,11 +6886,13 @@ pub(crate) struct BoundedReplanWindowOutcome {
 pub(crate) struct ReplanStragglerProgressOutcome {
     pub(crate) completion_requeued: bool,
     pub(crate) callback_notify_delta: u64,
-    pub(crate) heartbeat_observed_pending: bool,
+    pub(crate) deferred_not_due_early: bool,
+    pub(crate) deferred_due_at_deadline: bool,
     pub(crate) callback_scan_delta: u64,
     pub(crate) callback_generation_wake_delta: u32,
     pub(crate) edge_coalesced_with_straggler: bool,
     pub(crate) later_grant_fenced_until_scan: bool,
+    pub(crate) later_grant_demotion_promoted_urgent: bool,
     pub(crate) later_disjoint_grant_regranted_after_scan: bool,
     pub(crate) authoritative_scan_delta: u64,
     pub(crate) completed_replacement_granted: bool,
@@ -8091,7 +8141,10 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
                 .wrapping_sub(notify_before),
             read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before),
             table.generation_wake().wrapping_sub(generation_wake_before),
-            table.replan_outstanding() == 1 && table.pending_flags() & PENDING_RESCAN != 0,
+            table.replan_outstanding() == 1
+                && table.pending_flags() & PENDING_REPLAN_RESCAN != 0
+                && table.pending_flags() & PENDING_RESCAN == 0
+                && table.deferred_rescan_deadline_ns() != 0,
         )
     };
 
@@ -8137,12 +8190,16 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
             .wrapping_sub(notify_before);
         let final_generation_wake_delta =
             table.generation_wake().wrapping_sub(generation_wake_before);
-        let final_rescan_edge =
-            table.replan_outstanding() == 0 && table.pending_flags() & PENDING_RESCAN != 0;
+        let final_rescan_edge = table.replan_outstanding() == 0
+            && table.pending_flags() & PENDING_RESCAN != 0
+            && table.pending_flags() & PENDING_REPLAN_RESCAN == 0
+            && table.deferred_rescan_deadline_ns() == 0;
         table.grant_compatible()?;
         let authoritative_scan_delta =
             read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
-        let authoritative_flags_clear = table.pending_flags() & PENDING_RESCAN == 0;
+        let authoritative_flags_clear =
+            table.pending_flags() & (PENDING_RESCAN | PENDING_REPLAN_RESCAN) == 0
+                && table.deferred_rescan_deadline_ns() == 0;
         let replacements_preserved = callbacks.iter().all(|(ticket, _, replacement)| {
             table
                 .record(ticket.slot)
@@ -8178,6 +8235,215 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
         authoritative_scan_delta,
         authoritative_flags_clear,
         replacements_preserved,
+    })
+}
+
+/// Exercise every deferred-rescan consumer with one real live REPLAN owner.
+/// Registrations and removals create ordinary event traffic, while injected
+/// monotonic times prove both the heartbeat causal fallback and exact absolute
+/// deadline without sleeping.
+#[cfg(test)]
+pub(super) fn exercise_deferred_rescan_policy_for_tests() -> Result<DeferredRescanPolicyOutcome> {
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [1_800usize], FlockMode::Exclusive);
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
+    let designated = ClaimSet::new(std::iter::empty(), [1_801usize], FlockMode::Exclusive);
+    let replacement = ClaimSet::new(std::iter::empty(), [1_802usize], FlockMode::Exclusive);
+    let watch = ClaimSet::new(
+        std::iter::empty(),
+        [1_801usize, 1_802usize],
+        FlockMode::Exclusive,
+    );
+    let mut callback = Ticket::register(designated.clone(), watch, None)?;
+    let scans_before = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.set_replan_capacity_for_tests(1)?;
+        for cpu in [1_800usize, 1_801, 1_802] {
+            set_cpu_free_for_tests(&mut table, cpu, false)?;
+        }
+        table.set_urgent_rescan();
+        table.grant_compatible()?;
+        anyhow::ensure!(
+            table.replan_outstanding() == 1
+                && table
+                    .record(callback.slot)?
+                    .is_some_and(|record| record.state == STATE_REPLAN),
+            "deferred-rescan fixture did not publish its live REPLAN callback",
+        );
+        read_u64(&table.header, H_GRANT_SCANS)
+    };
+
+    let mut arrivals = Vec::new();
+    for index in 0..24usize {
+        let exact_cpu = 1_900 + index * 2;
+        let alternative_cpu = exact_cpu + 1;
+        let exact = ClaimSet::new(std::iter::empty(), [exact_cpu], FlockMode::Exclusive);
+        let watch = ClaimSet::new(
+            std::iter::empty(),
+            [exact_cpu, alternative_cpu],
+            FlockMode::Exclusive,
+        );
+        arrivals.push(Ticket::register(exact, watch, None)?);
+    }
+    let (first_deadline, registration_coalesced) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        (
+            table.deferred_rescan_deadline_ns(),
+            table.pending_flags() & PENDING_REPLAN_RESCAN != 0
+                && table.pending_flags() & PENDING_RESCAN == 0
+                && read_u64(&table.header, H_GRANT_SCANS) == scans_before,
+        )
+    };
+    for ticket in arrivals.iter_mut().take(12) {
+        ticket.finish(None)?;
+    }
+    let registration_and_teardown_coalesced = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        registration_coalesced
+            && table.deferred_rescan_deadline_ns() == first_deadline
+            && read_u64(&table.header, H_GRANT_SCANS) == scans_before
+    };
+
+    // A deferred edge is not structural dirty work. Prove through the public
+    // coordinator turn that a known-free release remains SH-only and carries
+    // the absolute deadline forward for the protocol loop to honor.
+    let (fast_path_deadline, fast_path_scans_before) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.begin_transaction()?;
+        set_cpu_free_for_tests(&mut table, 1_800, true)?;
+        table.clear_pending_flag(PENDING_RESCAN | PENDING_OBSERVATION);
+        if table.pending_flags() & PENDING_REPLAN_RESCAN == 0 {
+            table.schedule_deferred_replan_rescan_in_transaction()?;
+        }
+        table.finish_transaction()?;
+        (
+            table.deferred_rescan_deadline_ns(),
+            read_u64(&table.header, H_GRANT_SCANS),
+        )
+    };
+    let ex_before = REGISTRY_EX_ACQUISITIONS.with(std::cell::Cell::get);
+    let released_cpu = BTreeSet::from([1_800usize]);
+    let empty = BTreeSet::new();
+    let release_snapshot = coordinator.schedule(
+        None,
+        &released_cpu,
+        &empty,
+        &empty,
+        false,
+        &[],
+        &[],
+        false,
+        None,
+        false,
+        None,
+    )?;
+    let ex_after = REGISTRY_EX_ACQUISITIONS.with(std::cell::Cell::get);
+    let known_free_release_preserved_deferred_fast_path = {
+        let _lock = lock_registry_existing(FlockMode::Shared)?;
+        let table = Table::open_existing()?;
+        ex_after == ex_before
+            && read_u64(&table.header, H_GRANT_SCANS) == fast_path_scans_before
+            && table.pending_flags() & PENDING_REPLAN_RESCAN != 0
+            && table.pending_flags() & (PENDING_RESCAN | PENDING_OBSERVATION) == 0
+            && table.deferred_rescan_deadline_ns() == fast_path_deadline
+            && fast_path_deadline != 0
+            && release_snapshot.deferred_rescan_due_in.is_some()
+            && release_snapshot.observation.is_none()
+            && !release_snapshot.should_step
+    };
+
+    let ordinary_turn_preserved_deadline = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        !table.prepare_grant_scan_at(first_deadline.saturating_sub(1))?
+            && table.deferred_rescan_deadline_ns() == first_deadline
+            && table.deferred_rescan_due_in_at(first_deadline.saturating_sub(1))
+                == Some(Duration::from_nanos(1))
+            && read_u64(&table.header, H_GRANT_SCANS) == scans_before
+    };
+
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.set_pending_flag(PENDING_OBSERVATION);
+    }
+    let heartbeat = coordinator.heartbeat_at(Some(first_deadline.saturating_sub(1)), None)?;
+    let (heartbeat_promoted_before_deadline, observation_survived_promotion_and_scan) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let promoted = heartbeat.rescan_pending
+            && table.pending_flags() & PENDING_RESCAN != 0
+            && table.pending_flags() & PENDING_REPLAN_RESCAN == 0
+            && table.deferred_rescan_deadline_ns() == 0
+            && read_u64(&table.header, H_GRANT_SCANS) == scans_before;
+        table.grant_compatible_at(first_deadline.saturating_sub(1))?;
+        (
+            promoted,
+            table.pending_flags() & PENDING_OBSERVATION != 0
+                && table.pending_flags() & (PENDING_RESCAN | PENDING_REPLAN_RESCAN) == 0,
+        )
+    };
+
+    let exact_deadline_promoted = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.begin_transaction()?;
+        table.schedule_deferred_replan_rescan_in_transaction()?;
+        table.finish_transaction()?;
+        let deadline = table.deferred_rescan_deadline_ns();
+        let before = !table.prepare_grant_scan_at(deadline.saturating_sub(1))?;
+        let due = table.prepare_grant_scan_at(deadline)?;
+        let promoted = table.pending_flags() & PENDING_RESCAN != 0
+            && table.pending_flags() & PENDING_REPLAN_RESCAN == 0;
+        table.grant_compatible_at(deadline)?;
+        before && due && promoted
+    };
+
+    let result = callback.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &designated,
+                "deferred-rescan fixture received the wrong callback publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: replacement,
+                contention: None,
+            })
+        },
+    )?;
+    let final_drain_promoted = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        matches!(result, GrantResult::Requeued)
+            && table.replan_outstanding() == 0
+            && table.pending_flags() & PENDING_RESCAN != 0
+            && table.pending_flags() & PENDING_REPLAN_RESCAN == 0
+            && table.deferred_rescan_deadline_ns() == 0
+    };
+
+    for ticket in arrivals.iter_mut().rev() {
+        if !ticket.finished {
+            ticket.finish(None)?;
+        }
+    }
+    callback.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(DeferredRescanPolicyOutcome {
+        registration_and_teardown_coalesced,
+        known_free_release_preserved_deferred_fast_path,
+        ordinary_turn_preserved_deadline,
+        heartbeat_promoted_before_deadline,
+        observation_survived_promotion_and_scan,
+        exact_deadline_promoted,
+        final_drain_promoted,
     })
 }
 
@@ -8285,8 +8551,27 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
     let callback_notify_delta = NOTIFY_CALLS
         .with(std::cell::Cell::get)
         .wrapping_sub(notify_before);
-    let heartbeat = coordinator.heartbeat_at(None, None)?;
-    let heartbeat_observed_pending = !heartbeat.parked && heartbeat.rescan_pending;
+    let (
+        deferred_not_due_early,
+        deferred_due_at_deadline,
+        deferred_deadline_ns,
+        edge_coalesced_with_straggler,
+    ) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let deadline = table.deferred_rescan_deadline_ns();
+        (
+            deadline != 0 && !table.deferred_rescan_due_at(deadline.saturating_sub(1)),
+            deadline != 0 && table.deferred_rescan_due_at(deadline),
+            deadline,
+            table.replan_outstanding() == 1
+                && table.pending_flags() & PENDING_REPLAN_RESCAN != 0
+                && table.pending_flags() & PENDING_RESCAN == 0
+                && table
+                    .record(straggler.slot)?
+                    .is_some_and(|record| record.state == STATE_REPLAN),
+        )
+    };
 
     let mut dirty_later_callback_ran = false;
     let dirty_later_result = later_grant.run_granted(
@@ -8312,7 +8597,7 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
     let (
         callback_scan_delta,
         callback_generation_wake_delta,
-        edge_coalesced_with_straggler,
+        later_grant_demotion_promoted_urgent,
         authoritative_scan_delta,
         completed_replacement_granted,
         straggler_still_replan,
@@ -8323,15 +8608,16 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
         let callback_scan_delta = read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
         let callback_generation_wake_delta =
             table.generation_wake().wrapping_sub(generation_wake_before);
-        let edge_coalesced_with_straggler = table.replan_outstanding() == 1
+        let later_grant_demotion_promoted_urgent = table.replan_outstanding() == 1
+            && table.pending_flags() & PENDING_REPLAN_RESCAN == 0
             && table.pending_flags() & PENDING_RESCAN != 0
             && table
                 .record(straggler.slot)?
                 .is_some_and(|record| record.state == STATE_REPLAN);
         set_cpu_free_for_tests(&mut table, first_replacement_cpu, true)?;
         set_cpu_free_for_tests(&mut table, later_grant_cpu, true)?;
-        let before_deadline = wave_deadline_ns.saturating_sub(1).max(1);
-        table.grant_compatible_at(before_deadline)?;
+        table.prepare_grant_scan_at(deferred_deadline_ns)?;
+        table.grant_compatible_at(deferred_deadline_ns)?;
         let authoritative_scan_delta =
             read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
         let completed_replacement_granted = table.record(first.slot)?.is_some_and(|record| {
@@ -8342,11 +8628,11 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
             .is_some_and(|record| record.state == STATE_REPLAN)
             && table.replan_outstanding() == 1;
         let wave_deadline_not_reached = table.replan_wave_deadline_ns() == wave_deadline_ns
-            && before_deadline < wave_deadline_ns;
+            && deferred_deadline_ns < wave_deadline_ns;
         (
             callback_scan_delta,
             callback_generation_wake_delta,
-            edge_coalesced_with_straggler,
+            later_grant_demotion_promoted_urgent,
             authoritative_scan_delta,
             completed_replacement_granted,
             straggler_still_replan,
@@ -8382,11 +8668,13 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
     Ok(ReplanStragglerProgressOutcome {
         completion_requeued,
         callback_notify_delta,
-        heartbeat_observed_pending,
+        deferred_not_due_early,
+        deferred_due_at_deadline,
         callback_scan_delta,
         callback_generation_wake_delta,
         edge_coalesced_with_straggler,
         later_grant_fenced_until_scan,
+        later_grant_demotion_promoted_urgent,
         later_disjoint_grant_regranted_after_scan,
         authoritative_scan_delta,
         completed_replacement_granted,
@@ -11503,7 +11791,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .saturating_add(1)
         })
         .unwrap_or(0);
-    // The v22 mapping is deliberately overprovisioned once. It never needs a
+    // The v23 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
     // a disjoint internal bit range immediately after possible host CPUs.
@@ -11619,11 +11907,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-registry-v22")
+    active_protocol_dir().join("ktstr-acquire-registry-v23")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-events-v22")
+    active_protocol_dir().join("ktstr-acquire-events-v23")
 }
 
 #[cfg(test)]
@@ -11837,7 +12125,7 @@ fn lock_registry_for_initialization() -> Result<RegistryLock> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
     // Materialization order is protocol: once registry.lock is nameable, every
-    // v22 entrant must also be able to join the writer-intent gate ahead of it.
+    // v23 entrant must also be able to join the writer-intent gate ahead of it.
     let writer_intent = block_flock(registry_writer_intent_path(), FlockMode::Shared)?;
     let registry = block_flock(registry_lock_path(), FlockMode::Exclusive)?;
     let lock = finish_registry_lock(registry, writer_intent, FlockMode::Exclusive);
@@ -12518,6 +12806,87 @@ impl Table {
         write_u64(&mut self.header, H_PENDING_FLAGS, flags);
     }
 
+    fn deferred_rescan_deadline_ns(&self) -> u64 {
+        read_u64(&self.header, H_DEFERRED_RESCAN_DEADLINE_NS)
+    }
+
+    fn clear_deferred_rescan(&mut self) {
+        self.clear_pending_flag(PENDING_REPLAN_RESCAN);
+        write_u64(&mut self.header, H_DEFERRED_RESCAN_DEADLINE_NS, 0);
+    }
+
+    fn set_urgent_rescan(&mut self) {
+        self.clear_deferred_rescan();
+        self.set_pending_flag(PENDING_RESCAN);
+    }
+
+    fn deferred_rescan_due_at(&self, now: u64) -> bool {
+        if self.pending_flags() & PENDING_REPLAN_RESCAN == 0 {
+            return false;
+        }
+        let deadline = self.deferred_rescan_deadline_ns();
+        // Zero is a torn/legacy publication. A deadline more than one complete
+        // interval ahead can only have crossed a monotonic-clock epoch. Both
+        // cases flush now instead of stranding authoritative work.
+        deadline == 0
+            || deadline <= now
+            || deadline > now.saturating_add(DEFERRED_RESCAN_INTERVAL_NS)
+    }
+
+    fn deferred_rescan_due_in_at(&self, now: u64) -> Option<Duration> {
+        if self.pending_flags() & PENDING_REPLAN_RESCAN == 0 {
+            return None;
+        }
+        if self.deferred_rescan_due_at(now) {
+            return Some(Duration::ZERO);
+        }
+        Some(Duration::from_nanos(
+            self.deferred_rescan_deadline_ns().saturating_sub(now),
+        ))
+    }
+
+    fn deferred_rescan_due_in(&self) -> Result<Option<Duration>> {
+        Ok(self.deferred_rescan_due_in_at(monotonic_now_ns()?))
+    }
+
+    fn prepare_grant_scan(&mut self) -> Result<bool> {
+        self.prepare_grant_scan_at(monotonic_now_ns()?)
+    }
+
+    fn prepare_grant_scan_at(&mut self, now: u64) -> Result<bool> {
+        if self.pending_flags() & PENDING_RESCAN != 0 {
+            return Ok(true);
+        }
+        if self.pending_flags() & PENDING_REPLAN_RESCAN == 0
+            || (self.replan_outstanding() != 0 && !self.deferred_rescan_due_at(now))
+        {
+            return Ok(false);
+        }
+
+        self.promote_deferred_rescan()
+    }
+
+    fn promote_deferred_rescan(&mut self) -> Result<bool> {
+        if self.pending_flags() & PENDING_RESCAN != 0 {
+            return Ok(true);
+        }
+        if self.pending_flags() & PENDING_REPLAN_RESCAN == 0 {
+            return Ok(false);
+        }
+        // Promote the edge in its own crash-recoverable transaction. An
+        // interrupted coordinator therefore leaves either the durable
+        // deferred edge or a durable urgent edge; it can never clear the only
+        // publication in the gap before `grant_compatible` starts its scan.
+        self.begin_transaction()?;
+        if self.pending_flags() & PENDING_RESCAN == 0
+            && self.pending_flags() & PENDING_REPLAN_RESCAN != 0
+        {
+            self.set_urgent_rescan();
+        }
+        self.finish_transaction()?;
+        Ok(self.pending_flags() & PENDING_RESCAN != 0)
+    }
+
     /// Publish one coordinator-consumed rescan edge while registry EX and a
     /// dirty transaction are held. Concurrent callback completions serialize
     /// here: only the first clear -> set transition requests a new transport
@@ -12527,8 +12896,13 @@ impl Table {
     /// clears the bit publishes the next transport edge.
     fn schedule_rescan_edge_in_transaction(&mut self) -> Result<bool> {
         let new_edge = self.pending_flags() & PENDING_RESCAN == 0;
+        // Urgent work subsumes every deferred mutation visible under this EX
+        // fence. Removing the deferred deadline here prevents a stale timer
+        // from manufacturing a second scan after the urgent one completes.
         if new_edge {
-            self.set_pending_flag(PENDING_RESCAN);
+            self.set_urgent_rescan();
+        } else {
+            self.clear_deferred_rescan();
         }
         let coordinator_before = self.coordinator_ticket();
         if self.coordinator_ticket() == 0 {
@@ -12541,16 +12915,42 @@ impl Table {
         Ok(new_edge || coordinator_elected)
     }
 
+    /// Coalesce a tail registration or REPLAN -> WAITING publication into the
+    /// current speculative wave. The first deferred edge arms one absolute
+    /// deadline; later producers never renew it. Without a live wave or
+    /// coordinator, ordinary urgent publication/election preserves progress.
+    fn schedule_deferred_replan_rescan_in_transaction(&mut self) -> Result<bool> {
+        if self.replan_outstanding() == 0 || self.coordinator_ticket() == 0 {
+            return self.schedule_rescan_edge_in_transaction();
+        }
+        if self.pending_flags() & PENDING_RESCAN != 0 {
+            return Ok(false);
+        }
+        if self.pending_flags() & PENDING_REPLAN_RESCAN == 0 {
+            let now = monotonic_now_ns()?.max(1);
+            self.set_pending_flag(PENDING_REPLAN_RESCAN);
+            write_u64(
+                &mut self.header,
+                H_DEFERRED_RESCAN_DEADLINE_NS,
+                now.saturating_add(DEFERRED_RESCAN_INTERVAL_NS),
+            );
+        }
+        Ok(false)
+    }
+
     /// Publish the authoritative scan edge for one REPLAN -> WAITING
     /// completion without waking the same live coordinator once per callback.
-    /// The coordinator's one-second heartbeat observes a pending partial wave;
+    /// The coordinator's next heartbeat promotes an unnotified partial wave;
     /// draining the wave or electing a missing coordinator remains an immediate
-    /// targeted wake even when another completion already set the edge.
+    /// targeted wake even when another completion already set the deferred edge.
     fn schedule_replan_completion_edge_in_transaction(&mut self) -> Result<bool> {
-        let coordinator_before = self.coordinator_ticket();
-        self.schedule_rescan_edge_in_transaction()?;
-        let coordinator_elected = coordinator_before == 0 && self.coordinator_ticket() != 0;
-        Ok(self.replan_outstanding() == 0 || coordinator_elected)
+        let drained = self.replan_outstanding() == 0;
+        let notify = self.schedule_deferred_replan_rescan_in_transaction()?;
+        // A drained wave is always promoted to the urgent transport above.
+        // Return it explicitly even when an older urgent edge already exists:
+        // the final callback is the drop-order boundary which guarantees its
+        // payload/proof OFDs have closed before the coordinator samples them.
+        Ok(drained || notify)
     }
 
     fn observation_request_serial(&self) -> u64 {
@@ -12616,10 +13016,15 @@ impl Table {
         write_u64(&mut self.header, H_MIN_CHANGED_TICKET, minimum);
     }
 
-    fn mark_claim_changed(&mut self, ticket: u64) -> Result<()> {
+    fn mark_claim_changed_metadata(&mut self, ticket: u64) -> Result<()> {
         self.advance_claim_epoch()?;
         self.mark_suffix_dirty(ticket);
-        self.set_pending_flag(PENDING_RESCAN);
+        Ok(())
+    }
+
+    fn mark_claim_changed(&mut self, ticket: u64) -> Result<()> {
+        self.mark_claim_changed_metadata(ticket)?;
+        self.set_urgent_rescan();
         Ok(())
     }
 
@@ -13626,7 +14031,6 @@ impl Table {
         }
         if claim_changed {
             self.mark_claim_changed(record.ticket)?;
-            self.set_pending_flag(PENDING_RESCAN);
         }
         if self.coordinator_ticket() == record.ticket {
             self.set_coordinator(0, NONE_SLOT)?;
@@ -13749,7 +14153,6 @@ impl Table {
             write_u32(bytes, R_STATE, STATE_PENDING);
         }
         self.mark_claim_changed(record.ticket)?;
-        self.set_pending_flag(PENDING_RESCAN);
         if self.coordinator_ticket() == record.ticket {
             self.set_coordinator(0, NONE_SLOT)?;
             self.elect_coordinator_in_transaction()?;
@@ -13767,14 +14170,32 @@ impl Table {
         }
         self.remove_record_in_transaction(record, acquired)?;
         if !acquired {
-            self.mark_claim_changed(record.ticket)?;
+            // Removal is a monotonic prefix relaxation. Preserve its claim
+            // epoch/suffix fence immediately, but coalesce the O(N) scan while
+            // an existing speculative wave is still live. Physical release
+            // proof is independently observed and promotes urgent work.
+            self.mark_claim_changed_metadata(record.ticket)?;
         }
         crash_at_for_tests("remove_record_before_election");
         if removed_coordinator {
             self.elect_coordinator_in_transaction()?;
         }
         if !acquired {
-            self.set_pending_flag(PENDING_RESCAN);
+            if removed_coordinator {
+                // The explicit election above already searched once. Publish
+                // the urgent scan edge without repeating the full active-list
+                // walk when that search found no successor.
+                self.set_urgent_rescan();
+            } else if self.replan_outstanding() != 0 && self.coordinator_ticket() != 0 {
+                self.schedule_deferred_replan_rescan_in_transaction()?;
+            } else {
+                // Preserve the old callback-only drain invariant: publishing
+                // urgent work does not need to search a shrinking active list
+                // for a coordinator which is known not to exist. Normal drop
+                // still emits the transport edge, while future registration
+                // or crash repair owns coordinator election.
+                self.set_urgent_rescan();
+            }
         }
         self.finish_transaction()?;
         Ok(())
@@ -14576,7 +14997,8 @@ impl Table {
             self.note_queue_progress()?;
         }
         self.finish_claim_scan();
-        self.clear_pending_flag(PENDING_RESCAN);
+        self.clear_pending_flag(PENDING_RESCAN | PENDING_REPLAN_RESCAN);
+        write_u64(&mut self.header, H_DEFERRED_RESCAN_DEADLINE_NS, 0);
         let watch = self.aggregate_watch()?;
         self.finish_transaction()?;
         Ok((watch, coordinator_prefix_changed))
@@ -14598,6 +15020,9 @@ impl Table {
         // prefix after job cancellation. Free the whole batch in one dirty
         // transaction, then scan/elect once instead of repeatedly electing the
         // next corpse and degenerating to O(N²).
+        let removed_coordinator = dead
+            .iter()
+            .any(|record| record.ticket == self.coordinator_ticket());
         self.begin_transaction()?;
         for record in &dead {
             // Each unlink mutates its neighbours' prev/next fields. Re-read
@@ -14611,10 +15036,17 @@ impl Table {
             }
         }
         if let Some(first) = dead.iter().map(|record| record.ticket).min() {
-            self.mark_claim_changed(first)?;
+            self.mark_claim_changed_metadata(first)?;
         }
         crash_at_for_tests("remove_record_before_election");
         self.elect_coordinator_in_transaction()?;
+        if removed_coordinator {
+            self.set_urgent_rescan();
+        } else if self.replan_outstanding() != 0 && self.coordinator_ticket() != 0 {
+            self.schedule_deferred_replan_rescan_in_transaction()?;
+        } else {
+            self.set_urgent_rescan();
+        }
         self.bump_generation()?;
         self.finish_transaction()?;
         for record in dead {
@@ -14636,6 +15068,9 @@ impl Table {
         if dead.is_empty() {
             return Ok(());
         }
+        let removed_coordinator = dead
+            .iter()
+            .any(|record| record.ticket == self.coordinator_ticket());
         self.begin_transaction()?;
         for record in &dead {
             if let Some(current) = self
@@ -14646,9 +15081,16 @@ impl Table {
             }
         }
         if let Some(first) = dead.iter().map(|record| record.ticket).min() {
-            self.mark_claim_changed(first)?;
+            self.mark_claim_changed_metadata(first)?;
         }
         self.elect_coordinator_in_transaction()?;
+        if removed_coordinator {
+            self.set_urgent_rescan();
+        } else if self.replan_outstanding() != 0 && self.coordinator_ticket() != 0 {
+            self.schedule_deferred_replan_rescan_in_transaction()?;
+        } else {
+            self.set_urgent_rescan();
+        }
         self.bump_generation()?;
         self.finish_transaction()?;
         for record in dead {
@@ -14701,7 +15143,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v22 publication validates
+            // and record states together. Current v23 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();
@@ -15599,7 +16041,7 @@ impl Table {
             self.bump_observation_request()?;
         }
         if compatibility_improved {
-            self.set_pending_flag(PENDING_RESCAN);
+            self.set_urgent_rescan();
         }
         self.refresh_pending_observation_flag()?;
         Ok(())
@@ -15826,7 +16268,7 @@ impl Table {
         }
         self.refresh_pending_observation_flag()?;
         if improved {
-            self.set_pending_flag(PENDING_RESCAN);
+            self.set_urgent_rescan();
         }
         Ok(improved)
     }
@@ -16202,6 +16644,7 @@ impl Table {
             self.header[requests..requests + self.layout.bits * 8].fill(0);
         }
         write_u64(&mut self.header, H_PENDING_FLAGS, PENDING_RESCAN);
+        write_u64(&mut self.header, H_DEFERRED_RESCAN_DEADLINE_NS, 0);
         for record in &records {
             self.adjust_claim_counts(&record.claim, true)?;
             if record.state == STATE_HELD {
@@ -16252,7 +16695,7 @@ impl Table {
             .flat_map(|record| record.watch.permits.iter().copied())
             .collect();
         self.mark_unknown(&watched_cpus, &watched_llcs, &watched_permits)?;
-        self.set_pending_flag(PENDING_RESCAN);
+        self.set_urgent_rescan();
         let previous = self.coordinator_ticket();
         let coordinator = records
             .iter()
@@ -16470,6 +16913,7 @@ fn initialize_header_file(path: &PathBuf, layout: HeaderLayout) -> Result<File> 
         write_u64(&mut header, H_REPLAN_OUTSTANDING, 0);
         write_u64(&mut header, H_REPLAN_WAVE_STARTED_NS, 0);
         write_u64(&mut header, H_REPLAN_WAVE_DEADLINE_NS, 0);
+        write_u64(&mut header, H_DEFERRED_RESCAN_DEADLINE_NS, 0);
         write_u64(
             &mut header,
             H_REPLAN_CAPACITY,
@@ -17316,6 +17760,21 @@ fn coordinator_heartbeat_due_in_from_header(header: &[u8], now: u64) -> Duration
         return Duration::ZERO;
     }
     Duration::from_nanos(COORDINATOR_HEARTBEAT_INTERVAL_NS.saturating_sub(now - heartbeat))
+}
+
+fn deferred_rescan_due_in_from_header(header: &[u8], now: u64) -> Option<Duration> {
+    if read_u64(header, H_PENDING_FLAGS) & PENDING_REPLAN_RESCAN == 0 {
+        return None;
+    }
+    let deadline = read_u64(header, H_DEFERRED_RESCAN_DEADLINE_NS);
+    if deadline == 0
+        || deadline <= now
+        || deadline > now.saturating_add(DEFERRED_RESCAN_INTERVAL_NS)
+    {
+        Some(Duration::ZERO)
+    } else {
+        Some(Duration::from_nanos(deadline - now))
+    }
 }
 
 fn liveness_due_in_from_last(last: u64, now: u64) -> Duration {

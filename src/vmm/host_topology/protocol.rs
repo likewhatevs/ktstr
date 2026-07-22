@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v22
+//! Every ktstr process sharing a lock directory participates in one v23
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -2099,6 +2099,12 @@ pub(crate) fn exercise_changed_replan_wave_completions_for_tests(
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_deferred_rescan_policy_for_tests()
+-> Result<registry::DeferredRescanPolicyOutcome> {
+    registry::exercise_deferred_rescan_policy_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_replan_straggler_progress_for_tests()
 -> Result<registry::ReplanStragglerProgressOutcome> {
     registry::exercise_replan_straggler_progress_for_tests()
@@ -3659,6 +3665,9 @@ fn acquire_as_coordinator_impl<T>(
         retry_due = false;
         let mut liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
         let mut heartbeat_deadline = std::time::Instant::now() + snapshot.heartbeat_due_in;
+        let mut deferred_rescan_deadline = snapshot
+            .deferred_rescan_due_in
+            .map(|due_in| std::time::Instant::now() + due_in);
         watched_resources = event_watch(snapshot.watch.clone());
         let mut should_step = first || force_step || snapshot.should_step;
         force_step = false;
@@ -3675,6 +3684,9 @@ fn acquire_as_coordinator_impl<T>(
             )?;
             liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
             heartbeat_deadline = std::time::Instant::now() + snapshot.heartbeat_due_in;
+            deferred_rescan_deadline = snapshot
+                .deferred_rescan_due_in
+                .map(|due_in| std::time::Instant::now() + due_in);
             watched_resources = event_watch(snapshot.watch.clone());
             should_step |= snapshot.should_step;
         }
@@ -3882,6 +3894,9 @@ fn acquire_as_coordinator_impl<T>(
                     );
                     liveness_deadline = std::time::Instant::now() + snapshot.liveness_due_in;
                     heartbeat_deadline = std::time::Instant::now() + snapshot.heartbeat_due_in;
+                    deferred_rescan_deadline = snapshot
+                        .deferred_rescan_due_in
+                        .map(|due_in| std::time::Instant::now() + due_in);
                     watched_resources = event_watch(snapshot.watch);
                     if retry_before_sleep {
                         // A predecessor can release after this coordinator's
@@ -3912,9 +3927,12 @@ fn acquire_as_coordinator_impl<T>(
         let now = std::time::Instant::now();
         retry_deadline = retry_deadline.min(now + retry_interval);
         loop {
-            let wake_deadline = retry_deadline
+            let mut wake_deadline = retry_deadline
                 .min(liveness_deadline)
                 .min(heartbeat_deadline);
+            if let Some(deferred) = deferred_rescan_deadline {
+                wake_deadline = wake_deadline.min(deferred);
+            }
             let wait_now = std::time::Instant::now();
             let semantic_wait = wake_deadline.saturating_duration_since(wait_now);
             let syscall_wait = super::reservation_wait_progress_poll()
@@ -3932,6 +3950,14 @@ fn acquire_as_coordinator_impl<T>(
                         // inside the same semantic watch wait: do not take the
                         // registry lock or run another schedule pass.
                         continue;
+                    }
+                    if deferred_rescan_deadline.is_some_and(|deadline| deadline <= now) {
+                        // This absolute persisted deadline is never renewed by
+                        // ordinary event turns. Re-enter schedule directly so
+                        // it atomically promotes and consumes the deferred
+                        // edge; do not disguise this semantic flush as a
+                        // lightweight heartbeat renewal.
+                        break;
                     }
                     if heartbeat_deadline <= now && retry_deadline > now && liveness_deadline > now
                     {
