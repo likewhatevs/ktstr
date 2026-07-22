@@ -1631,6 +1631,22 @@ fn repeated_coordinator_lease_takeover_prefers_a_fresh_waiter_before_standby() {
 }
 
 #[test]
+fn coordinator_lease_takeover_skips_a_dead_higher_priority_waiter() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (transferred_to_live, dead_skipped, targeted_wakes) =
+        protocol::exercise_dead_waiter_takeover_skip_for_tests()
+            .expect("exercise coordinator takeover past a dead waiter");
+    assert!(
+        transferred_to_live && dead_skipped,
+        "stale coordinator recovery must skip the dead oldest waiter and transfer directly to its live successor",
+    );
+    assert!(
+        targeted_wakes,
+        "the direct transfer must target both the displaced coordinator and promoted live successor",
+    );
+}
+
+#[test]
 fn stalled_takeover_wakes_and_parks_the_displaced_coordinator() {
     let _prefixes = LockPrefixesGuard::new();
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");

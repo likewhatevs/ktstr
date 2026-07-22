@@ -4498,6 +4498,86 @@ pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
     })
 }
 
+/// A dead WAITING record retains ticket priority until liveness recovery sees
+/// it, but it must never receive a live coordinator lease ahead of the next
+/// live waiter.
+#[cfg(test)]
+pub(super) fn exercise_dead_waiter_takeover_skip_for_tests() -> Result<(bool, bool, bool)> {
+    let claim_a = ClaimSet::new(std::iter::empty(), [21usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(claim_a.clone(), claim_a, None)?;
+    let dead_claim = ClaimSet::new(std::iter::empty(), [22usize], FlockMode::Exclusive);
+    let dead = Ticket::register(dead_claim.clone(), dead_claim, None)?;
+    let dead_slot = dead.slot;
+    let dead_ticket = dead.ticket;
+    let live_claim = ClaimSet::new(std::iter::empty(), [23usize], FlockMode::Exclusive);
+    let mut live = Ticket::register(live_claim.clone(), live_claim, None)?;
+    dead.abandon_for_tests();
+
+    let wake_a_before = coordinator
+        .shared
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("dead-skip coordinator wake mapping disappeared"))?
+        .expected();
+    let wake_live_before = live
+        .shared
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("dead-skip live waiter wake mapping disappeared"))?
+        .expected();
+    let (transferred_to_live, coherent_states, dead_skipped) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.repair_consistency_if_needed()?;
+        anyhow::ensure!(
+            table.coordinator_ticket() == coordinator.ticket
+                && table.record(dead_slot)?.is_some_and(|record| {
+                    record.ticket == dead_ticket && record.state == STATE_WAITING
+                })
+                && table.record(live.slot)?.is_some_and(|record| {
+                    record.ticket == live.ticket && record.state == STATE_WAITING
+                }),
+            "dead-skip fixture did not stage a dead waiter before its live successor",
+        );
+        write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+        write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
+        table.recover_coordinator_if_dead_at(
+            monotonic_now_ns()?.max(COORDINATOR_HEARTBEAT_LEASE_NS),
+        )?;
+        let transferred_to_live =
+            table.coordinator_ticket() == live.ticket && table.coordinator_slot()? == live.slot;
+        let coherent_states = table.record(coordinator.slot)?.is_some_and(|record| {
+            record.ticket == coordinator.ticket && record.state == STATE_COORDINATOR_STANDBY
+        }) && table.record(live.slot)?.is_some_and(|record| {
+            record.ticket == live.ticket && record.state == STATE_COORDINATOR
+        });
+        let dead_skipped = table.coordinator_ticket() != dead_ticket
+            && !table
+                .record(dead_slot)?
+                .is_some_and(|record| record.state == STATE_COORDINATOR);
+        table.prune_dead()?;
+        (transferred_to_live, coherent_states, dead_skipped)
+    };
+    let targeted_wakes = coordinator
+        .shared
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("parked dead-skip coordinator wake mapping disappeared"))?
+        .expected()
+        != wake_a_before
+        && live
+            .shared
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("promoted live waiter wake mapping disappeared"))?
+            .expected()
+            != wake_live_before;
+
+    live.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((
+        transferred_to_live && coherent_states,
+        dead_skipped,
+        targeted_wakes,
+    ))
+}
+
 /// Exercise two consecutive live-coordinator lease transfers. Ticket C is
 /// deliberately registered between A and B and kept GRANTED: B -> A must
 /// dirty the suffix from the older successor A, not merely from the displaced
