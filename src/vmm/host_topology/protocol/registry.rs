@@ -4266,6 +4266,55 @@ pub(super) fn exercise_replan_capacity_validation_for_tests() -> Result<(bool, b
 }
 
 #[cfg(test)]
+pub(super) fn exercise_generation_timeout_takeover_for_tests() -> Result<(bool, bool)> {
+    let blocked_claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    let disjoint_claim = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(blocked_claim.clone(), blocked_claim.clone(), None)?;
+    let mut successor = Ticket::register(blocked_claim.clone(), blocked_claim, None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        write_u64(&mut table.header, H_COORDINATOR_HEARTBEAT_NS, 0);
+        write_u64(&mut table.header, H_LAST_PROGRESS_NS, 0);
+    }
+
+    // A normal mutation may prune a dead identity but must not interpret a
+    // stale heartbeat as permission to displace a live pre-loop owner.
+    let mut mutation = Ticket::register(disjoint_claim.clone(), disjoint_claim, None)?;
+    let (mutation_retained_owner, expected_generation) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        (
+            table.coordinator_ticket() == coordinator.ticket
+                && table.coordinator_slot()? == coordinator.slot,
+            table.generation_wake(),
+        )
+    };
+
+    // The no-ticket pending-admission fallback has now completed a real
+    // bounded wait. Its timeout is the semantic license to transfer the stale
+    // live lease to the already-published successor.
+    wait_for_generation_change(expected_generation, Duration::ZERO)?;
+    let timeout_transferred = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.coordinator_ticket() == successor.ticket
+            && table.coordinator_slot()? == successor.slot
+            && table
+                .record(coordinator.slot)?
+                .is_some_and(|record| record.state == STATE_COORDINATOR_STANDBY)
+            && table
+                .record(successor.slot)?
+                .is_some_and(|record| record.state == STATE_COORDINATOR)
+    };
+
+    mutation.finish(None)?;
+    successor.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((mutation_retained_owner, timeout_transferred))
+}
+
+#[cfg(test)]
 pub(super) fn diagnostics_for_tests() -> Result<String> {
     let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Exclusive)? else {
         return Ok(if registry_lock_path().exists() {
@@ -7225,8 +7274,7 @@ pub(super) fn exercise_bounded_replan_window_for_tests(
     let fixed_cpu = common_cpu + 1;
     let coordinator_claim =
         ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
-    let mut coordinator =
-        Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     let mut claims = Vec::with_capacity(waiter_count);
     let mut waiters = Vec::with_capacity(waiter_count);
     for index in 0..waiter_count {
@@ -11494,6 +11542,27 @@ fn host_cpu_resource_bits() -> usize {
     })
 }
 
+fn host_planner_capacity() -> usize {
+    static CAPACITY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        std::fs::read_to_string("/sys/devices/system/cpu/possible")
+            .ok()
+            .and_then(|text| {
+                text.trim().split(',').try_fold(0usize, |total, range| {
+                    let (start, end) = range
+                        .split_once('-')
+                        .map_or((range, range), |(start, end)| (start, end));
+                    let start = start.parse::<usize>().ok()?;
+                    let end = end.parse::<usize>().ok()?;
+                    total.checked_add(end.checked_sub(start)?.checked_add(1)?)
+                })
+            })
+            .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
+            .unwrap_or(1)
+            .max(1)
+    })
+}
+
 fn registry_lock_path() -> PathBuf {
     registry_data_dir().join("registry.lock")
 }
@@ -12258,7 +12327,8 @@ impl Table {
             "test planner capacity {capacity} is outside 1..={}",
             self.layout.bits,
         );
-        let encoded = u64::try_from(capacity).context("test planner capacity does not fit header")?;
+        let encoded =
+            u64::try_from(capacity).context("test planner capacity does not fit header")?;
         anyhow::ensure!(
             self.replan_outstanding() <= encoded,
             "cannot shrink test planner capacity below outstanding callbacks",
@@ -16352,7 +16422,7 @@ fn initialize_header_file(path: &PathBuf, layout: HeaderLayout) -> Result<File> 
         write_u64(
             &mut header,
             H_REPLAN_CAPACITY,
-            u64::try_from(host_cpu_resource_bits().max(1))
+            u64::try_from(host_planner_capacity())
                 .context("host planner capacity does not fit queue header")?,
         );
         write_u64(&mut header, H_LAST_PROGRESS_NS, monotonic_now_ns()?);

@@ -2087,6 +2087,11 @@ pub(crate) fn exercise_replan_capacity_validation_for_tests() -> Result<(bool, b
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_generation_timeout_takeover_for_tests() -> Result<(bool, bool)> {
+    registry::exercise_generation_timeout_takeover_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_changed_replan_wave_completions_for_tests(
     callbacks: usize,
 ) -> Result<registry::ReplanChangedWaveOutcome> {

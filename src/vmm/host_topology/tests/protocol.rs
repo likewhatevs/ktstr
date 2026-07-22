@@ -4566,11 +4566,33 @@ fn planner_capacity_is_immutable_across_repair_and_validated() {
     let (preserved, zero_rejected, oversized_rejected) =
         protocol::exercise_replan_capacity_validation_for_tests()
             .expect("exercise planner-capacity repair and validation");
-    assert!(preserved, "dirty repair must preserve immutable host capacity");
-    assert!(zero_rejected, "a zero planner capacity must fail validation");
+    assert!(
+        preserved,
+        "dirty repair must preserve immutable host capacity"
+    );
+    assert!(
+        zero_rejected,
+        "a zero planner capacity must fail validation"
+    );
     assert!(
         oversized_rejected,
         "a planner capacity larger than the registry layout must fail validation",
+    );
+}
+
+#[test]
+fn only_a_completed_bounded_wait_transfers_a_stale_live_coordinator() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (mutation_retained_owner, timeout_transferred) =
+        protocol::exercise_generation_timeout_takeover_for_tests()
+            .expect("exercise no-ticket bounded-wait coordinator recovery");
+    assert!(
+        mutation_retained_owner,
+        "ordinary registration must not displace a merely stale live coordinator",
+    );
+    assert!(
+        timeout_transferred,
+        "the generation-futex timeout must transfer a stale lease to its live waiter",
     );
 }
 
