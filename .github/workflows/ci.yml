@@ -124,6 +124,9 @@ jobs:
     env:
       KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
       KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-test-x64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
+      # Host tests are kernel-independent. Run them in the 7.1 lanes; the
+      # 6.14 lanes retain every VM/resource cell through its assigned group.
+      KTSTR_TEST_FILTER: ${{ matrix.kernel-version == '6.14' && 'group(@global)' || '' }}
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v7.0.0
@@ -135,7 +138,7 @@ jobs:
       - uses: taiki-e/install-action@v2.83.3
         with:
           tool: cargo-nextest
-      - run: just test ${{ matrix.kernel-version }} ${{ matrix.features }}
+      - run: just test "${{ matrix.kernel-version }}" "${{ matrix.features }}" "${KTSTR_TEST_FILTER}"
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - if: ${{ !cancelled() }}
@@ -178,6 +181,9 @@ jobs:
       CARGO_BUILD_JOBS: "32"
       KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
       KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-test-arm64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
+      # Host tests are kernel-independent. Run them in the 7.1 lanes; the
+      # 6.14 lanes retain every VM/resource cell through its assigned group.
+      KTSTR_TEST_FILTER: ${{ matrix.kernel-version == '6.14' && 'group(@global)' || '' }}
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v7.0.0
@@ -189,7 +195,7 @@ jobs:
       - uses: taiki-e/install-action@v2.83.3
         with:
           tool: cargo-nextest
-      - run: just test ${{ matrix.kernel-version }} ${{ matrix.features }}
+      - run: just test "${{ matrix.kernel-version }}" "${{ matrix.features }}" "${KTSTR_TEST_FILTER}"
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - if: ${{ !cancelled() }}
