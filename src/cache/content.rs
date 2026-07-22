@@ -1786,10 +1786,10 @@ fn cached_file_digest_in(
     let lock_name = digest_lock_name(&format!("{identity_key:016x}"));
     let before_lookup = source_identity_before_cache_lookup(file, identity, "file digest")?;
     let digest = load_or_build_content(
-        &dirs,
+        dirs,
         &lock_name,
         &format!("file digest {}", record_path.display()),
-        || read_file_digest_record_at(&dirs, &record_name, identity),
+        || read_file_digest_record_at(dirs, &record_name, identity),
         || {
             let digest = hash_pinned_file(file, identity)?;
             let mut bytes = Vec::with_capacity(FILE_DIGEST_RECORD_LEN);
@@ -1817,7 +1817,7 @@ fn cached_file_digest_in(
                     mode: 0o600,
                     subject: "file digest memo",
                 },
-                || validate_content_cache_dirs_reachable(&dirs),
+                || validate_content_cache_dirs_reachable(dirs),
             )?;
             Ok(digest)
         },
