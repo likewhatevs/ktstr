@@ -6120,11 +6120,35 @@ pub(crate) struct ReplanStragglerProgressOutcome {
     pub(crate) callback_scan_delta: u64,
     pub(crate) callback_generation_wake_delta: u32,
     pub(crate) edge_coalesced_with_straggler: bool,
+    pub(crate) dirty_later_grant_suppressed: bool,
     pub(crate) later_disjoint_grant_remained_current: bool,
     pub(crate) authoritative_scan_delta: u64,
     pub(crate) completed_replacement_granted: bool,
     pub(crate) straggler_still_replan: bool,
     pub(crate) wave_deadline_not_reached: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct PendingReplanGrantRaceOutcome {
+    pub(crate) entry_callback_suppressed: bool,
+    pub(crate) entry_conflict_blocked_after_scan: bool,
+    pub(crate) entry_authoritative_scan_delta: u64,
+    pub(crate) commit_callback_entered: bool,
+    pub(crate) commit_rejected: bool,
+    pub(crate) commit_conflict_blocked_after_scan: bool,
+    pub(crate) commit_authoritative_scan_delta: u64,
+}
+
+#[cfg(test)]
+pub(crate) struct CoordinatorPendingReplanOutcome {
+    pub(crate) acquisition_conflict_rejected: bool,
+    pub(crate) acquisition_disjoint_preserved: bool,
+    pub(crate) preparation_conflict_rejected: bool,
+    pub(crate) preparation_disjoint_preserved: bool,
+    pub(crate) acquisition_conflict_scan_delta: u64,
+    pub(crate) acquisition_disjoint_scan_delta: u64,
+    pub(crate) preparation_conflict_scan_delta: u64,
+    pub(crate) preparation_disjoint_scan_delta: u64,
 }
 
 #[cfg(test)]
@@ -7311,11 +7335,11 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
     )?;
     let completion_requeued = matches!(callback_result, GrantResult::Requeued);
 
-    let mut later_callback_ran = false;
-    let later_result = later_grant.run_granted(
+    let mut dirty_later_callback_ran = false;
+    let dirty_later_result = later_grant.run_granted(
         None,
         |current, _watch, acquisition_allowed, _predecessors, _availability| {
-            later_callback_ran = true;
+            dirty_later_callback_ran = true;
             anyhow::ensure!(
                 acquisition_allowed && current == &later_grant_claim,
                 "later disjoint grant received the wrong publication",
@@ -7329,8 +7353,8 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
             })
         },
     )?;
-    let later_disjoint_grant_remained_current =
-        later_callback_ran && matches!(later_result, GrantResult::Requeued);
+    let dirty_later_grant_suppressed =
+        !dirty_later_callback_ran && matches!(dirty_later_result, GrantResult::LostGrant);
 
     let (
         callback_scan_delta,
@@ -7352,6 +7376,7 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
                 .record(straggler.slot)?
                 .is_some_and(|record| record.state == STATE_REPLAN);
         set_cpu_free_for_tests(&mut table, first_replacement_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, later_grant_cpu, true)?;
         let before_deadline = wave_deadline_ns.saturating_sub(1).max(1);
         table.grant_compatible_at(before_deadline)?;
         let authoritative_scan_delta =
@@ -7376,6 +7401,27 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
         )
     };
 
+    let mut later_callback_ran = false;
+    let later_result = later_grant.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            later_callback_ran = true;
+            anyhow::ensure!(
+                acquisition_allowed && current == &later_grant_claim,
+                "rescanned disjoint grant received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: later_grant_claim.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let later_disjoint_grant_remained_current =
+        later_callback_ran && matches!(later_result, GrantResult::Requeued);
+
     later_grant.finish(None)?;
     straggler.finish(None)?;
     first.finish(None)?;
@@ -7385,11 +7431,193 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
         callback_scan_delta,
         callback_generation_wake_delta,
         edge_coalesced_with_straggler,
+        dirty_later_grant_suppressed,
         later_disjoint_grant_remained_current,
         authoritative_scan_delta,
         completed_replacement_granted,
         straggler_still_replan,
         wave_deadline_not_reached,
+    })
+}
+
+#[cfg(test)]
+fn exercise_pending_replan_grant_race_case(
+    offset: usize,
+    complete_during_callback: bool,
+) -> Result<(bool, bool, bool, u64)> {
+    let coordinator_cpu = offset;
+    let earlier_designated_cpu = offset + 1;
+    let conflicting_cpu = offset + 2;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let earlier_designated = ClaimSet::new(
+        std::iter::empty(),
+        [earlier_designated_cpu],
+        FlockMode::Exclusive,
+    );
+    let earlier_replacement =
+        ClaimSet::new(std::iter::empty(), [conflicting_cpu], FlockMode::Exclusive);
+    let earlier_watch = ClaimSet::new(
+        std::iter::empty(),
+        [earlier_designated_cpu, conflicting_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut earlier = Ticket::register(earlier_designated.clone(), earlier_watch, None)?;
+    let later_claim =
+        ClaimSet::new(std::iter::empty(), [conflicting_cpu], FlockMode::Exclusive);
+    let mut later = Ticket::register(later_claim.clone(), later_claim.clone(), None)?;
+
+    let scans_before = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, earlier_designated_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, conflicting_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        anyhow::ensure!(
+            table
+                .record(earlier.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(later.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            "pending-edge race fixture did not publish REPLAN before its conflicting later grant",
+        );
+        read_u64(&table.header, H_GRANT_SCANS)
+    };
+
+    let mut callback_entered = false;
+    let mut earlier_completed = false;
+    let later_result = if complete_during_callback {
+        later.run_granted(
+            None,
+            |current, _watch, acquisition_allowed, _predecessors, _availability| {
+                callback_entered = true;
+                anyhow::ensure!(
+                    acquisition_allowed && current == &later_claim,
+                    "pending-edge completion fixture received the wrong later grant",
+                );
+                let result = earlier.run_granted(
+                    None,
+                    |current, _watch, acquisition_allowed, _predecessors, _availability| {
+                        anyhow::ensure!(
+                            !acquisition_allowed && current == &earlier_designated,
+                            "pending-edge completion fixture received the wrong earlier REPLAN",
+                        );
+                        Ok(GrantAttempt::<()> {
+                            acquired: None,
+                            preparation_claim: None,
+                            preparation_contention: None,
+                            next_claim: earlier_replacement.clone(),
+                            contention: None,
+                        })
+                    },
+                )?;
+                earlier_completed = matches!(result, GrantResult::Requeued);
+                Ok(GrantAttempt {
+                    acquired: Some(()),
+                    preparation_claim: None,
+                    preparation_contention: None,
+                    next_claim: current.clone(),
+                    contention: None,
+                })
+            },
+        )?
+    } else {
+        let result = earlier.run_granted(
+            None,
+            |current, _watch, acquisition_allowed, _predecessors, _availability| {
+                anyhow::ensure!(
+                    !acquisition_allowed && current == &earlier_designated,
+                    "pending-edge entry fixture received the wrong earlier REPLAN",
+                );
+                Ok(GrantAttempt::<()> {
+                    acquired: None,
+                    preparation_claim: None,
+                    preparation_contention: None,
+                    next_claim: earlier_replacement.clone(),
+                    contention: None,
+                })
+            },
+        )?;
+        earlier_completed = matches!(result, GrantResult::Requeued);
+        later.run_granted(
+            None,
+            |current, _watch, acquisition_allowed, _predecessors, _availability| {
+                callback_entered = true;
+                anyhow::ensure!(
+                    acquisition_allowed && current == &later_claim,
+                    "pending-edge entry fixture received the wrong later grant",
+                );
+                Ok(GrantAttempt {
+                    acquired: Some(()),
+                    preparation_claim: None,
+                    preparation_contention: None,
+                    next_claim: current.clone(),
+                    contention: None,
+                })
+            },
+        )?
+    };
+    let rejected = match later_result {
+        GrantResult::LostGrant => true,
+        GrantResult::Acquired((), held) => {
+            drop(held);
+            false
+        }
+        GrantResult::Prepared((), _) | GrantResult::Requeued => false,
+    };
+
+    let (conflict_blocked_after_scan, scan_delta) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        // A rejected physical result publishes UNKNOWN until its opaque
+        // payload closes. Model the coordinator's post-drop observation before
+        // consuming the authoritative edge.
+        set_cpu_free_for_tests(&mut table, conflicting_cpu, true)?;
+        table.grant_compatible()?;
+        let earlier_granted = table
+            .record(earlier.slot)?
+            .is_some_and(|record| record.state == STATE_GRANTED);
+        let later_blocked = table
+            .record(later.slot)?
+            .is_some_and(|record| record.state != STATE_GRANTED);
+        (
+            earlier_granted && later_blocked,
+            read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before),
+        )
+    };
+
+    later.finish(None)?;
+    earlier.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((
+        callback_entered,
+        earlier_completed && rejected,
+        conflict_blocked_after_scan,
+        scan_delta,
+    ))
+}
+
+/// A completed non-fencing replacement dirties the suffix even though it does
+/// not advance the public claim epoch. A later exact grant must therefore be
+/// rejected both before callback entry and at the callback commit boundary.
+#[cfg(test)]
+pub(super) fn exercise_pending_replan_grant_races_for_tests()
+-> Result<PendingReplanGrantRaceOutcome> {
+    let entry = exercise_pending_replan_grant_race_case(1_300, false)?;
+    let commit = exercise_pending_replan_grant_race_case(1_310, true)?;
+    Ok(PendingReplanGrantRaceOutcome {
+        entry_callback_suppressed: !entry.0 && entry.1,
+        entry_conflict_blocked_after_scan: entry.2,
+        entry_authoritative_scan_delta: entry.3,
+        commit_callback_entered: commit.0,
+        commit_rejected: commit.1,
+        commit_conflict_blocked_after_scan: commit.2,
+        commit_authoritative_scan_delta: commit.3,
     })
 }
 
@@ -7768,7 +7996,7 @@ pub(crate) struct GranularPrefixInvalidationOutcome {
     pub(crate) completion_unchanged_kept: bool,
     pub(crate) completion_changed_deferred: bool,
     pub(crate) coordinator_completion_unchanged_kept: bool,
-    pub(crate) coordinator_completion_changed_rejected: bool,
+    pub(crate) coordinator_completion_disjoint_change_kept: bool,
 }
 
 #[cfg(test)]
@@ -8206,18 +8434,10 @@ fn exercise_coordinator_suffix_reconciliation_case(
     }
 
     let result = target.finish_acquired(&target_claim, token, &[], None)?;
-    let kept_or_rejected = match result {
-        FinishAcquireResult::Committed(held) if !real_prefix_change => {
-            drop(held);
-            true
-        }
-        FinishAcquireResult::Stale if real_prefix_change => {
-            target.finish(None)?;
-            true
-        }
+    let kept = match result {
         FinishAcquireResult::Committed(held) => {
             drop(held);
-            false
+            true
         }
         FinishAcquireResult::Stale => {
             target.finish(None)?;
@@ -8227,7 +8447,160 @@ fn exercise_coordinator_suffix_reconciliation_case(
     duplicate_b.finish(None)?;
     duplicate_a.finish(None)?;
     changing.finish(None)?;
-    Ok(kept_or_rejected)
+    Ok(kept)
+}
+
+#[cfg(test)]
+fn exercise_coordinator_pending_replan_case(
+    offset: usize,
+    preparation_commit: bool,
+    conflicting: bool,
+) -> Result<(bool, u64)> {
+    let coordinator_cpu = offset;
+    let earlier_designated_cpu = offset + 1;
+    let disjoint_replacement_cpu = offset + 2;
+    let selected_final_cpu = offset + 3;
+    let preparation_cpu = offset + 4;
+    let replacement_cpu = if conflicting {
+        if preparation_commit {
+            preparation_cpu
+        } else {
+            selected_final_cpu
+        }
+    } else {
+        disjoint_replacement_cpu
+    };
+
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator =
+        Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let earlier_designated = ClaimSet::new(
+        std::iter::empty(),
+        [earlier_designated_cpu],
+        FlockMode::Exclusive,
+    );
+    let earlier_replacement =
+        ClaimSet::new(std::iter::empty(), [replacement_cpu], FlockMode::Exclusive);
+    let earlier_watch = ClaimSet::new(
+        std::iter::empty(),
+        [earlier_designated_cpu, replacement_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut earlier = Ticket::register(earlier_designated.clone(), earlier_watch, None)?;
+    let selected_final =
+        ClaimSet::new(std::iter::empty(), [selected_final_cpu], FlockMode::Exclusive);
+    let mut target = Ticket::register(selected_final.clone(), selected_final.clone(), None)?;
+    let preparation =
+        ClaimSet::new(std::iter::empty(), [preparation_cpu], FlockMode::Exclusive);
+
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, earlier_designated_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, selected_final_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, preparation_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, disjoint_replacement_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        anyhow::ensure!(
+            table
+                .record(earlier.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(target.slot)?
+                    .is_some_and(|record| record.state == STATE_WAITING),
+            "coordinator pending-edge fixture did not stage REPLAN before a waiting successor",
+        );
+    }
+    coordinator.finish(None)?;
+
+    let scans_before = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, selected_final_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, preparation_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, replacement_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        anyhow::ensure!(
+            table.record(target.slot)?.is_some_and(|record| {
+                record.state == STATE_COORDINATOR && record.prefix_epoch != 0
+            }) && table
+                .record(earlier.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN),
+            "coordinator pending-edge fixture did not publish a coherent commit token",
+        );
+        read_u64(&table.header, H_GRANT_SCANS)
+    };
+    let token = target.commit_token_for_tests()?;
+
+    let completion = earlier.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &earlier_designated,
+                "coordinator pending-edge fixture received the wrong REPLAN publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: earlier_replacement.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    anyhow::ensure!(
+        matches!(completion, GrantResult::Requeued),
+        "coordinator pending-edge fixture did not publish its replacement",
+    );
+
+    let matched = if preparation_commit {
+        match target.finish_preparation(&selected_final, &preparation, token, &[], None)? {
+            FinishPreparationResult::Committed(_) if !conflicting => true,
+            FinishPreparationResult::Stale if conflicting => true,
+            FinishPreparationResult::Committed(_) | FinishPreparationResult::Stale => false,
+        }
+    } else {
+        match target.finish_acquired(&selected_final, token, &[], None)? {
+            FinishAcquireResult::Committed(held) if !conflicting => {
+                drop(held);
+                true
+            }
+            FinishAcquireResult::Stale if conflicting => true,
+            FinishAcquireResult::Committed(held) => {
+                drop(held);
+                false
+            }
+            FinishAcquireResult::Stale => false,
+        }
+    };
+    let scan_delta = diagnostic_counter_for_tests(H_GRANT_SCANS)?.wrapping_sub(scans_before);
+
+    target.finish(None)?;
+    earlier.finish(None)?;
+    Ok((matched, scan_delta))
+}
+
+#[cfg(test)]
+pub(super) fn exercise_coordinator_pending_replan_for_tests()
+-> Result<CoordinatorPendingReplanOutcome> {
+    let acquisition_conflict = exercise_coordinator_pending_replan_case(1_400, false, true)?;
+    let acquisition_disjoint = exercise_coordinator_pending_replan_case(1_410, false, false)?;
+    let preparation_conflict = exercise_coordinator_pending_replan_case(1_420, true, true)?;
+    let preparation_disjoint = exercise_coordinator_pending_replan_case(1_430, true, false)?;
+    Ok(CoordinatorPendingReplanOutcome {
+        acquisition_conflict_rejected: acquisition_conflict.0,
+        acquisition_disjoint_preserved: acquisition_disjoint.0,
+        preparation_conflict_rejected: preparation_conflict.0,
+        preparation_disjoint_preserved: preparation_disjoint.0,
+        acquisition_conflict_scan_delta: acquisition_conflict.1,
+        acquisition_disjoint_scan_delta: acquisition_disjoint.1,
+        preparation_conflict_scan_delta: preparation_conflict.1,
+        preparation_disjoint_scan_delta: preparation_disjoint.1,
+    })
 }
 
 #[cfg(test)]
@@ -8257,7 +8630,7 @@ pub(super) fn exercise_granular_prefix_invalidation_for_tests()
         completion_unchanged_kept: completion_unchanged,
         completion_changed_deferred: completion_changed,
         coordinator_completion_unchanged_kept: coordinator_completion_unchanged,
-        coordinator_completion_changed_rejected: coordinator_completion_changed,
+        coordinator_completion_disjoint_change_kept: coordinator_completion_changed,
     })
 }
 

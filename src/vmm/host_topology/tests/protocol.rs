@@ -4391,8 +4391,8 @@ fn completed_replan_replacement_grants_before_straggler_wave_drains() {
         "a callback completion must publish O(1) state without scanning or globally waking a live coordinator",
     );
     assert!(
-        outcome.edge_coalesced_with_straggler && outcome.later_disjoint_grant_remained_current,
-        "the completion must publish one rescan edge without invalidating a later disjoint grant while its peer remains outstanding",
+        outcome.edge_coalesced_with_straggler && outcome.dirty_later_grant_suppressed,
+        "the completion must publish one rescan edge and conservatively suppress a later grant until that edge is consumed",
     );
     assert_eq!(
         outcome.authoritative_scan_delta, 1,
@@ -4400,9 +4400,60 @@ fn completed_replan_replacement_grants_before_straggler_wave_drains() {
     );
     assert!(
         outcome.completed_replacement_granted
+            && outcome.later_disjoint_grant_remained_current
             && outcome.straggler_still_replan
             && outcome.wave_deadline_not_reached,
-        "completed compatible work must grant before the unrelated callback returns or its finite-wave lease expires",
+        "the authoritative scan must grant completed compatible work and restore the disjoint later grant before the unrelated callback returns or its finite-wave lease expires",
+    );
+}
+
+#[test]
+fn pending_replan_edge_suppresses_conflicting_later_grant_at_entry_and_commit() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_pending_replan_grant_races_for_tests()
+        .expect("exercise pending REPLAN edge against a conflicting later grant");
+    assert!(
+        outcome.entry_callback_suppressed && outcome.entry_conflict_blocked_after_scan,
+        "an earlier non-fencing replacement must suppress an unentered conflicting grant and win the authoritative scan",
+    );
+    assert_eq!(
+        outcome.entry_authoritative_scan_delta, 1,
+        "entry rejection must leave exactly one authoritative suffix scan",
+    );
+    assert!(
+        outcome.commit_callback_entered
+            && outcome.commit_rejected
+            && outcome.commit_conflict_blocked_after_scan,
+        "an earlier non-fencing replacement published during a physical probe must reject that stale success and win the authoritative scan",
+    );
+    assert_eq!(
+        outcome.commit_authoritative_scan_delta, 1,
+        "commit rejection must leave exactly one authoritative suffix scan",
+    );
+}
+
+#[test]
+fn coordinator_commit_reconciles_pending_replan_edge_by_physical_conflict() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_coordinator_pending_replan_for_tests()
+        .expect("exercise coordinator commit across pending REPLAN edges");
+    assert!(
+        outcome.acquisition_conflict_rejected && outcome.acquisition_disjoint_preserved,
+        "coordinator acquisition must reject physical success claimed by an earlier replacement while preserving disjoint success",
+    );
+    assert!(
+        outcome.preparation_conflict_rejected && outcome.preparation_disjoint_preserved,
+        "coordinator preparation must apply the same exact physical-conflict rule, including preparation outside the final-run watch",
+    );
+    assert_eq!(
+        (
+            outcome.acquisition_conflict_scan_delta,
+            outcome.acquisition_disjoint_scan_delta,
+            outcome.preparation_conflict_scan_delta,
+            outcome.preparation_disjoint_scan_delta,
+        ),
+        (1, 1, 1, 1),
+        "each coordinator commit must consume its pending non-fencing replacement with one authoritative scan",
     );
 }
 
@@ -4566,9 +4617,9 @@ fn callback_tokens_change_only_when_their_exact_prefix_or_watch_changes() {
     );
     assert!(
         outcome.coordinator_completion_unchanged_kept
-            && outcome.coordinator_completion_changed_rejected,
+            && outcome.coordinator_completion_disjoint_change_kept,
         "coordinator commit must likewise retain physical success across aggregate-equivalent \
-         predecessor churn and reject it after a real prefix change",
+         predecessor churn and a real but physically disjoint prefix change",
     );
 }
 

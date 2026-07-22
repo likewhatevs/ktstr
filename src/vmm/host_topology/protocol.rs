@@ -1945,6 +1945,18 @@ pub(crate) fn exercise_replan_straggler_progress_for_tests()
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_pending_replan_grant_races_for_tests()
+-> Result<registry::PendingReplanGrantRaceOutcome> {
+    registry::exercise_pending_replan_grant_races_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_coordinator_pending_replan_for_tests()
+-> Result<registry::CoordinatorPendingReplanOutcome> {
+    registry::exercise_coordinator_pending_replan_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_replan_completion_election_for_tests() -> Result<bool> {
     registry::exercise_replan_completion_election_for_tests()
 }
