@@ -2563,6 +2563,16 @@ impl Ticket {
             .record(self.slot)?
             .filter(|record| record.ticket == self.ticket)
             .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
+        // The claim physically backing `result.acquired`: a same-wake
+        // re-designation (a no-license REPLAN wake that acquired a different
+        // claim than the scan published) holds `next_claim`; every other
+        // acquire holds the published designation. Each release site still
+        // prefers a preparation footprint when the acquire produced one.
+        let acquired_designation = if !acquisition_allowed && result.next_claim != designated {
+            result.next_claim.clone()
+        } else {
+            designated.clone()
+        };
         if record.state == STATE_REPLAN_EXPIRED {
             let blocked = if result.acquired.is_none() {
                 if let Some(evidence) = result.contention.as_ref() {
@@ -2587,7 +2597,10 @@ impl Ticket {
                 // ownership. Keep this defensive path ordered anyway: make
                 // the footprint unknown before dropping opaque caller state,
                 // then acknowledge only after those OFDs are gone.
-                let released_claim = result.preparation_claim.as_ref().unwrap_or(&designated);
+                let released_claim = result
+                    .preparation_claim
+                    .as_ref()
+                    .unwrap_or(&acquired_designation);
                 table.begin_transaction()?;
                 table.mark_unknown(
                     &released_claim.cpus,
@@ -2651,7 +2664,10 @@ impl Ticket {
             table.set_record_state(self.slot, STATE_WAITING)?;
             table.clear_record_blocked(self.slot)?;
             if released_acquired {
-                let released_claim = result.preparation_claim.as_ref().unwrap_or(&designated);
+                let released_claim = result
+                    .preparation_claim
+                    .as_ref()
+                    .unwrap_or(&acquired_designation);
                 table.mark_unknown(
                     &released_claim.cpus,
                     &released_claim.llcs,
@@ -2673,6 +2689,38 @@ impl Ticket {
             if notify || released_acquired {
                 notify_coordinator();
             }
+            return Ok(GrantResult::LostGrant);
+        }
+        // Fairness fence for a same-wake re-designation. Its physical acquire
+        // ran with the registry unlocked against the predecessor snapshot taken
+        // above, so an earlier ticket may have changed its exact claim in that
+        // window. Reuse the exact suffix watermark the GRANTED dirty path uses:
+        // any earlier ticket's change advances `min_changed_ticket` below this
+        // one, so release the just-acquired alternative and requeue rather than
+        // committing ahead of an older waiter that may need this rotation.
+        let dirty_redesignation = !acquisition_allowed
+            && record.state == STATE_REPLAN
+            && result.acquired.is_some()
+            && result.next_claim != designated
+            && table.min_changed_ticket() < record.ticket;
+        if dirty_redesignation {
+            table.begin_transaction()?;
+            // REPLAN -> WAITING drains this ring slot through set_record_state.
+            table.set_record_state(self.slot, STATE_WAITING)?;
+            table.clear_record_blocked(self.slot)?;
+            table.mark_unknown(
+                &result.next_claim.cpus,
+                &result.next_claim.llcs,
+                &result.next_claim.permits,
+            )?;
+            let _edge = table.schedule_replan_completion_edge_in_transaction()?;
+            table.finish_transaction()?;
+            drop(table);
+            drop(lock);
+            drop(result);
+            // Released capacity cannot be observed until the physical payload
+            // closes; target the coordinator after that drop.
+            notify_coordinator();
             return Ok(GrantResult::LostGrant);
         }
         if record.state == STATE_REVOKED {
@@ -2701,7 +2749,10 @@ impl Ticket {
                 None
             };
             if released_acquired {
-                let released_claim = result.preparation_claim.as_ref().unwrap_or(&designated);
+                let released_claim = result
+                    .preparation_claim
+                    .as_ref()
+                    .unwrap_or(&acquired_designation);
                 table.begin_transaction()?;
                 table.mark_unknown(
                     &released_claim.cpus,
@@ -2813,7 +2864,10 @@ impl Ticket {
                 // coordinator's observation turn publishes the eventual
                 // availability/global wake after the payload closes; the
                 // callback itself only needs one coalesced rescan edge.
-                let released_claim = result.preparation_claim.as_ref().unwrap_or(&designated);
+                let released_claim = result
+                    .preparation_claim
+                    .as_ref()
+                    .unwrap_or(&acquired_designation);
                 table.mark_unknown(
                     &released_claim.cpus,
                     &released_claim.llcs,
@@ -2841,9 +2895,19 @@ impl Ticket {
         check_cancelled(cancelled)?;
 
         if let Some(acquired) = result.acquired.take() {
+            // A no-license REPLAN wake may only return a payload when it
+            // physically completed a re-designation (a different claim than the
+            // one the scan published); the licensed GRANTED wake keeps
+            // acquiring exactly its designation.
             anyhow::ensure!(
-                acquisition_allowed,
-                "replan-only queue wake returned an acquired payload for ticket {}",
+                acquisition_allowed || result.next_claim != designated,
+                "replan-only queue wake returned an acquired payload without \
+                 re-designation for ticket {}",
+                self.ticket
+            );
+            anyhow::ensure!(
+                acquisition_allowed || result.preparation_claim.is_none(),
+                "same-wake re-designation cannot carry a preparation claim for ticket {}",
                 self.ticket
             );
             if let Some(preparation_claim) = result.preparation_claim.take() {
@@ -2897,8 +2961,11 @@ impl Ticket {
             // The physical resource flocks in `acquired` are already held.
             // Convert this exact queue claim into a live HELD publication
             // before exposing success, preserving one uninterrupted registry
-            // fence across the state transition.
-            table.promote_record_to_held(&record, &designated, &[])?;
+            // fence across the state transition. `next_claim` equals the
+            // designation on a licensed grant and carries the re-designated
+            // claim a REPLAN wake physically acquired; `promote_record_to_held`
+            // adjusts the claim counts across that difference.
+            table.promote_record_to_held(&record, &result.next_claim, &[])?;
             let held = HeldClaim::from_ticket(self)?;
             drop(table);
             drop(lock);
@@ -9135,6 +9202,272 @@ pub(super) fn exercise_changed_replan_wave_completions_for_tests(
     })
 }
 
+/// Register a coordinator plus one flexible waiter (designated `designated_cpu`,
+/// alternative `replacement_cpu`, host-wide watch over both) and drive one
+/// authoritative scan that leaves the waiter in REPLAN because its designation
+/// is unavailable. Shared setup for the same-wake re-designation exercises.
+#[cfg(test)]
+fn stage_same_wake_replan_waiter(
+    coordinator_cpu: usize,
+    designated_cpu: usize,
+    replacement_cpu: usize,
+    replacement_free: bool,
+) -> Result<(Ticket, Ticket, ClaimSet, ClaimSet, u64)> {
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let designated = ClaimSet::new(std::iter::empty(), [designated_cpu], FlockMode::Exclusive);
+    let replacement = ClaimSet::new(std::iter::empty(), [replacement_cpu], FlockMode::Exclusive);
+    let watch = ClaimSet::new(
+        std::iter::empty(),
+        [designated_cpu, replacement_cpu],
+        FlockMode::Exclusive,
+    );
+    let waiter = Ticket::register(designated.clone(), watch, None)?;
+    let scans_before = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.set_replan_capacity_for_tests(1)?;
+        table.restage_coordinator_for_tests(&coordinator, std::iter::once(&waiter))?;
+        set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, designated_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, replacement_cpu, replacement_free)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible()?;
+        anyhow::ensure!(
+            table.replan_outstanding() == 1
+                && table
+                    .record(waiter.slot)?
+                    .is_some_and(|record| record.state == STATE_REPLAN),
+            "same-wake exercise did not REPLAN its blocked flexible waiter",
+        );
+        read_u64(&table.header, H_GRANT_SCANS)
+    };
+    Ok((coordinator, waiter, designated, replacement, scans_before))
+}
+
+/// Outcome of the same-wake re-designation grant exercise.
+#[cfg(test)]
+pub(crate) struct SameWakeRedesignationOutcome {
+    pub granted: bool,
+    pub held_claim_is_replacement: bool,
+    pub replan_drained: bool,
+    pub no_second_grant_scan: bool,
+}
+
+/// A REPLAN wake whose designation is blocked but whose watch alternative is
+/// free acquires that alternative in the same wake: the record commits HELD with
+/// the re-designated claim, its ring slot drains, and NO additional
+/// authoritative scan runs between the REPLAN publication and HELD.
+#[cfg(test)]
+pub(super) fn exercise_same_wake_redesignation_grant_for_tests()
+-> Result<SameWakeRedesignationOutcome> {
+    let (mut coordinator, mut waiter, designated, replacement, scans_before) =
+        stage_same_wake_replan_waiter(900, 1_000, 1_001, true)?;
+    let designated_for_wake = designated.clone();
+    let replacement_for_wake = replacement.clone();
+    let result = waiter.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &designated_for_wake,
+                "same-wake callback received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: Some(()),
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: replacement_for_wake.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let held = match result {
+        GrantResult::Acquired((), held) => held,
+        _ => anyhow::bail!("same-wake re-designation did not commit acquisition"),
+    };
+    let (held_claim_is_replacement, replan_drained, no_second_grant_scan) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(waiter.slot)?
+            .ok_or_else(|| anyhow::anyhow!("same-wake held record disappeared"))?;
+        (
+            record.state == STATE_HELD && record.claim == replacement,
+            table.replan_outstanding() == 0,
+            read_u64(&table.header, H_GRANT_SCANS) == scans_before,
+        )
+    };
+    drop(held);
+    coordinator.finish(None)?;
+    waiter.finish(None)?;
+    Ok(SameWakeRedesignationOutcome {
+        granted: true,
+        held_claim_is_replacement,
+        replan_drained,
+        no_second_grant_scan,
+    })
+}
+
+/// When no watch alternative is free the REPLAN callback cannot complete in the
+/// wake and falls back to publishing a WAITING replacement (`Requeued`), leaving
+/// its ring slot drained for a later authoritative scan — the pre-existing
+/// re-plan contract, preserved.
+#[cfg(test)]
+pub(super) fn exercise_same_wake_redesignation_fallback_for_tests() -> Result<(bool, bool, bool)> {
+    let (mut coordinator, mut waiter, designated, replacement, _scans_before) =
+        stage_same_wake_replan_waiter(900, 1_000, 1_001, false)?;
+    let designated_for_wake = designated.clone();
+    let replacement_for_wake = replacement.clone();
+    let result = waiter.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &designated_for_wake,
+                "fallback callback received the wrong publication",
+            );
+            // Nothing free: reserve the alternative, exactly as the acquirer's
+            // fallback does after a failed re-designation probe.
+            Ok(GrantAttempt::<()> {
+                acquired: None,
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: replacement_for_wake.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let requeued = matches!(result, GrantResult::Requeued);
+    let (waiting_replacement, replan_drained) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(waiter.slot)?
+            .ok_or_else(|| anyhow::anyhow!("fallback waiter record disappeared"))?;
+        (
+            record.state == STATE_WAITING && record.claim == replacement,
+            table.replan_outstanding() == 0,
+        )
+    };
+    coordinator.finish(None)?;
+    waiter.finish(None)?;
+    Ok((requeued, waiting_replacement, replan_drained))
+}
+
+/// A same-wake re-designation that physically acquired an alternative against a
+/// predecessor snapshot which an older ticket has since invalidated must NOT
+/// overtake that older ticket. The scan's exact suffix watermark
+/// (`min_changed_ticket`) below this ticket forces the acquired alternative to
+/// be released and the ticket requeued, exactly as the GRANTED dirty path does.
+#[cfg(test)]
+pub(super) fn exercise_same_wake_redesignation_older_fence_for_tests() -> Result<(bool, bool, bool)>
+{
+    let (mut coordinator, mut waiter, designated, replacement, _scans_before) =
+        stage_same_wake_replan_waiter(900, 1_000, 1_001, true)?;
+    // Simulate an older ticket changing its exact claim after this callback's
+    // predecessor snapshot: advance the suffix watermark below this ticket
+    // without touching the claim epoch, so the callback still runs and this
+    // ticket's own dirty fence — not the epoch staleness guard — releases it.
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.mark_suffix_dirty(coordinator.ticket);
+        anyhow::ensure!(
+            table.min_changed_ticket() < waiter.ticket,
+            "older-ticket fence exercise did not stage a preceding change",
+        );
+    }
+    let designated_for_wake = designated.clone();
+    let replacement_for_wake = replacement.clone();
+    let result = waiter.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &designated_for_wake,
+                "older-fence callback received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: Some(()),
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: replacement_for_wake.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    // Released, not granted: the fence returns LostGrant and the record stays on
+    // its published designation rather than committing the alternative.
+    let released = matches!(result, GrantResult::LostGrant);
+    let (not_committed, replan_drained) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(waiter.slot)?
+            .ok_or_else(|| anyhow::anyhow!("older-fence waiter record disappeared"))?;
+        (
+            record.state != STATE_HELD && record.claim != replacement,
+            table.replan_outstanding() == 0,
+        )
+    };
+    coordinator.finish(None)?;
+    waiter.finish(None)?;
+    Ok((released, not_committed, replan_drained))
+}
+
+/// A REPLAN wave that expires while a same-wake re-designation callback holds a
+/// freshly-acquired alternative must RELEASE that physical alternative, not
+/// silently commit it: the expired-replan path marks the acquired footprint
+/// unknown and returns the ticket to WAITING.
+#[cfg(test)]
+pub(super) fn exercise_same_wake_redesignation_expired_release_for_tests()
+-> Result<(bool, bool, bool)> {
+    let (mut coordinator, mut waiter, designated, replacement, _scans_before) =
+        stage_same_wake_replan_waiter(900, 1_000, 1_001, true)?;
+    let designated_for_wake = designated.clone();
+    let replacement_for_wake = replacement.clone();
+    let result = waiter.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &designated_for_wake,
+                "expired-release callback received the wrong publication",
+            );
+            // Expire the live wave mid-acquire: the physical alternative is held
+            // (below), but the registry re-lock will quarantine this callback.
+            {
+                let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+                let mut table = Table::open_existing()?;
+                // Drive the live wave's clock fully into the past (valid and
+                // due) so the registry re-lock quarantines this callback.
+                write_u64(&mut table.header, H_REPLAN_WAVE_STARTED_NS, 1);
+                write_u64(&mut table.header, H_REPLAN_WAVE_DEADLINE_NS, 1);
+            }
+            Ok(GrantAttempt::<()> {
+                acquired: Some(()),
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: replacement_for_wake.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let lost_grant = matches!(result, GrantResult::LostGrant);
+    let (released_to_waiting, replan_drained) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(waiter.slot)?
+            .ok_or_else(|| anyhow::anyhow!("expired-release waiter record disappeared"))?;
+        (
+            record.state == STATE_WAITING && record.claim != replacement,
+            table.replan_outstanding() == 0,
+        )
+    };
+    coordinator.finish(None)?;
+    waiter.finish(None)?;
+    Ok((lost_grant, released_to_waiting, replan_drained))
+}
+
 /// Prove that a physical GRANTED callback batch publishes one short absolute
 /// rescan deadline instead of handing registry EX back to the coordinator
 /// between individual negative completions.
@@ -15076,6 +15409,11 @@ impl Table {
         self.begin_transaction()?;
         self.mark_blockers_unknown(contention)?;
         self.clear_record_blocked(record.slot)?;
+        // A same-wake re-designation promotes directly from REPLAN to HELD, so
+        // this drains its speculative-callback ring slot in the same
+        // transaction that publishes ownership. Non-REPLAN callers (GRANTED /
+        // COORDINATOR promotions) take the no-op early return.
+        self.transition_replan_state(record.state, STATE_HELD)?;
         let claim_changed = record.claim != *exact;
         if claim_changed {
             self.adjust_claim_counts(&record.claim, false)?;
@@ -15139,6 +15477,7 @@ impl Table {
             write_u64(bytes, R_BLOCK_INDEX, 0);
             write_u32(bytes, R_STATE, STATE_HELD);
         }
+        self.finish_replan_state_publication(record.state, STATE_HELD);
         if claim_changed {
             self.mark_claim_changed(record.ticket)?;
         }

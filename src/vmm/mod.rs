@@ -2775,11 +2775,33 @@ impl KtstrVm {
                 else {
                     break;
                 };
-                let claim = claim_for(&candidates[next], &permits);
-                if probe.candidate_ready(&claim)? {
-                    probe.reserve(&claim)?;
-                    return Ok(None);
+                let redesignated = &candidates[next];
+                let claim = claim_for(redesignated, &permits);
+                if !probe.candidate_ready(&claim)? {
+                    continue;
                 }
+                // Same-wake re-designation: on a no-license REPLAN wake, acquire
+                // this free alternative now instead of publishing a replacement
+                // and waiting for a second authoritative-scan grant cycle. This
+                // is default's shared fallback footprint, so it commits through
+                // the shared-run path exactly like the exact-miss fallback. On a
+                // licensed GRANTED wake `try_acquire_redesignation` is a no-op
+                // and the reserve-and-wait path below is unchanged.
+                let all_permits = permits.all_permits();
+                if let Some(locks) = probe.try_acquire_redesignation(&claim, || {
+                    host_topology::acquire_resources_with_permits_granted_reusing(
+                        &redesignated.shared_llcs,
+                        host_topology::LlcLockMode::Shared,
+                        &redesignated.shared_cpus,
+                        crate::flock::FlockMode::Shared,
+                        &all_permits,
+                        &reusable_permits,
+                    )
+                })? {
+                    return Ok(Some((next, false, locks)));
+                }
+                probe.reserve(&claim)?;
+                return Ok(None);
             }
             probe.reserve(&designated)?;
             Ok(None)

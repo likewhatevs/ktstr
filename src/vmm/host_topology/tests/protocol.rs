@@ -8935,3 +8935,175 @@ fn herd_800_cells() {
 fn herd_2400_cells() {
     run_and_report_herd(2400);
 }
+
+// Default-mode sharing headroom (Q1). The CI queue-wait census shows every
+// generated cell's concrete claim is `cpu_mode: Shared` / `llc_mode: Shared`
+// with exclusive *permits* — never a hard CPU-EX flock. This test proves the
+// consequence at the flock-acquire seam the real default path uses
+// (`acquire_resource_locks_waiting_impl`): N default-shaped CPU-SH claims over
+// the SAME physical CPUs all hold simultaneously (legal concurrency == N),
+// while the identical footprint claimed CPU-EX admits exactly one. So on any
+// contended CPU the default claim's exclusion is soft: only an EX (performance)
+// peer defers it, exactly as the owner's model requires. The queue's real
+// capacity gate is therefore the exclusive weighted permit pool, not the
+// 192-wide physical CPU set.
+#[test]
+fn default_shared_claims_overlap_where_exclusive_would_serialize() {
+    let _broker = InterruptibleFlockBrokerGuard::start();
+    let _prefixes = LockPrefixesGuard::new();
+
+    // Contended footprint every cell rotates onto: two CPUs in one shared LLC.
+    let llcs = [3usize];
+    let cpus = [24usize, 25usize];
+    const N: usize = 16;
+
+    // Shared regime: N default-shaped CPU-SH/LLC-SH claims on the SAME CPUs.
+    // Each is a non-waiting fast-path acquire; SH never conflicts with SH, so
+    // all N coexist. Hold every prior claim while taking the next so the peak
+    // count is genuinely simultaneous, not sequential reuse.
+    let mut shared_held = Vec::with_capacity(N);
+    for cell in 0..N {
+        match acquire_resource_locks_waiting_impl(
+            &llcs,
+            LlcLockMode::Shared,
+            &cpus,
+            FlockMode::Shared,
+            false,
+            None,
+        ) {
+            Ok(LockOutcome::Acquired { locks, .. }) => shared_held.push(locks),
+            other => panic!(
+                "default-shaped CPU-SH cell {cell} could not overlap {} prior holders \
+                 on the same CPUs: {other:?}",
+                shared_held.len()
+            ),
+        }
+    }
+    let observed_shared_concurrency = shared_held.len();
+    assert_eq!(
+        observed_shared_concurrency, N,
+        "expected legal concurrency {N} for default CPU-SH claims on shared CPUs, observed {observed_shared_concurrency}"
+    );
+    drop(shared_held);
+
+    // Exclusive regime: the identical footprint claimed CPU-EX. The first holds;
+    // a second non-waiting EX request on the same CPUs is turned away, so the
+    // exclusive concurrency ceiling is one.
+    let first_ex = match acquire_resource_locks_waiting_impl(
+        &llcs,
+        LlcLockMode::Shared,
+        &cpus,
+        FlockMode::Exclusive,
+        false,
+        None,
+    ) {
+        Ok(LockOutcome::Acquired { locks, .. }) => locks,
+        other => panic!("first CPU-EX cell must acquire the free footprint: {other:?}"),
+    };
+    let second_ex = acquire_resource_locks_waiting_impl(
+        &llcs,
+        LlcLockMode::Shared,
+        &cpus,
+        FlockMode::Exclusive,
+        false,
+        None,
+    );
+    let exclusive_concurrency = match second_ex {
+        Ok(LockOutcome::Unavailable(_)) => 1,
+        Ok(LockOutcome::Acquired { .. }) => 2,
+        Err(error) => panic!("non-waiting EX probe errored unexpectedly: {error:#}"),
+    };
+    drop(first_ex);
+    assert_eq!(
+        exclusive_concurrency, 1,
+        "CPU-EX claims on the same footprint must serialize to one holder"
+    );
+
+    // The point: on the identical contended footprint, default's shared claim
+    // legally packs N cells where an exclusive claim packs one.
+    assert!(
+        observed_shared_concurrency > exclusive_concurrency,
+        "default CPU-SH sharing must exceed the exclusive ceiling ({observed_shared_concurrency} vs {exclusive_concurrency})"
+    );
+}
+
+// Same-wake re-designation (acquirer-side option 1): a flexible waiter woken to
+// re-plan acquires a free alternative in the REPLAN wake instead of publishing a
+// replacement and waiting for a second authoritative-scan grant cycle.
+
+#[test]
+fn same_wake_redesignation_grants_without_a_second_scan_cycle() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_same_wake_redesignation_grant_for_tests()
+        .expect("drive same-wake re-designation grant");
+    assert!(outcome.granted, "the REPLAN wake must commit acquisition");
+    assert!(
+        outcome.held_claim_is_replacement,
+        "the record must be HELD on the re-designated alternative, not its blocked designation",
+    );
+    assert!(
+        outcome.replan_drained,
+        "REPLAN -> HELD must drain the speculative-callback ring slot",
+    );
+    assert!(
+        outcome.no_second_grant_scan,
+        "no authoritative grant scan may run between the REPLAN publication and HELD",
+    );
+}
+
+#[test]
+fn same_wake_redesignation_falls_back_to_replacement_when_capacity_is_full() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (requeued, waiting_replacement, replan_drained) =
+        protocol::exercise_same_wake_redesignation_fallback_for_tests()
+            .expect("drive same-wake re-designation fallback");
+    assert!(
+        requeued,
+        "with nothing free the wake must fall back to publishing a replacement",
+    );
+    assert!(
+        waiting_replacement,
+        "the fallback must leave a WAITING replacement for a later scan",
+    );
+    assert!(
+        replan_drained,
+        "the ring slot must drain on REPLAN -> WAITING"
+    );
+}
+
+#[test]
+fn same_wake_redesignation_does_not_overtake_an_older_ticket() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (released, not_committed, replan_drained) =
+        protocol::exercise_same_wake_redesignation_older_fence_for_tests()
+            .expect("drive same-wake re-designation older-ticket fence");
+    assert!(
+        released,
+        "a change to an older ticket must release the optimistically-acquired alternative",
+    );
+    assert!(
+        not_committed,
+        "the fenced ticket must not commit HELD on the alternative an older ticket may need",
+    );
+    assert!(
+        replan_drained,
+        "the released ticket must drain its ring slot"
+    );
+}
+
+#[test]
+fn same_wake_redesignation_releases_a_physically_acquired_alternative_on_wave_expiry() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (lost_grant, released_to_waiting, replan_drained) =
+        protocol::exercise_same_wake_redesignation_expired_release_for_tests()
+            .expect("drive same-wake re-designation expired-mid-acquire release");
+    assert!(
+        lost_grant,
+        "an expired wave must reject a mid-acquire re-designation",
+    );
+    assert!(
+        released_to_waiting,
+        "the expired path must release the acquired alternative and return the ticket to WAITING",
+    );
+    assert!(replan_drained, "wave expiry must drain the ring slot");
+}

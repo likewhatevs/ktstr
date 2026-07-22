@@ -1207,6 +1207,45 @@ impl GrantedProbe {
         }
     }
 
+    /// Same-wake re-designation for a flexible waiter woken to re-plan.
+    ///
+    /// A REPLAN wake carries no grant license (`acquisition_allowed` is false),
+    /// so [`Self::try_acquire`] is inert and the closure would otherwise only
+    /// [`Self::reserve`] a replacement and wait for a second authoritative-scan
+    /// grant cycle. When an alternative candidate is free and does not conflict
+    /// with any older ticket's reservation, acquire it physically now and let
+    /// the wake publish HELD directly. The fence is exactly the one an ordinary
+    /// grant applies ([`Self::candidate_ready`]: predecessor prefix +
+    /// mode-aware availability), so an earlier ticket is never overtaken. A
+    /// licensed GRANTED wake is unaffected and keeps acquiring only its own
+    /// designation through [`Self::try_acquire`].
+    pub(crate) fn try_acquire_redesignation<T, O: IntoProbeOutcome<T>>(
+        &mut self,
+        candidate: &ClaimSet,
+        acquire: impl FnOnce() -> Result<O>,
+    ) -> Result<Option<T>> {
+        if self.acquisition_allowed {
+            // A licensed grant acquires its designation through `try_acquire`;
+            // re-designation is exclusively the no-license REPLAN optimisation.
+            return Ok(None);
+        }
+        if !self.candidate_ready(candidate)? {
+            return Ok(None);
+        }
+        match acquire()?.into_probe_outcome() {
+            ProbeOutcome::Acquired(value) => {
+                // The wake publishes HELD with the claim we physically hold.
+                self.next_claim = candidate.clone();
+                Ok(Some(value))
+            }
+            ProbeOutcome::Contended(evidence) => {
+                self.contention = Some(evidence);
+                Ok(None)
+            }
+            ProbeOutcome::Unavailable => Ok(None),
+        }
+    }
+
     pub(crate) fn reserve(&mut self, candidate: &ClaimSet) -> Result<()> {
         if candidate.is_empty() {
             anyhow::bail!("a queued waiter cannot reserve an empty claim");
@@ -2169,6 +2208,29 @@ pub(crate) fn exercise_changed_replan_wave_completions_for_tests(
     callbacks: usize,
 ) -> Result<registry::ReplanChangedWaveOutcome> {
     registry::exercise_changed_replan_wave_completions_for_tests(callbacks)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_same_wake_redesignation_grant_for_tests()
+-> Result<registry::SameWakeRedesignationOutcome> {
+    registry::exercise_same_wake_redesignation_grant_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_same_wake_redesignation_fallback_for_tests() -> Result<(bool, bool, bool)> {
+    registry::exercise_same_wake_redesignation_fallback_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_same_wake_redesignation_older_fence_for_tests() -> Result<(bool, bool, bool)>
+{
+    registry::exercise_same_wake_redesignation_older_fence_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_same_wake_redesignation_expired_release_for_tests()
+-> Result<(bool, bool, bool)> {
+    registry::exercise_same_wake_redesignation_expired_release_for_tests()
 }
 
 #[cfg(test)]
