@@ -5311,6 +5311,7 @@ const TICKET_HELPER_BEFORE_COORDINATOR_GATE: &str = "KTSTR_TEST_TICKET_BEFORE_CO
 const TICKET_HELPER_COORDINATOR_ENTERED: &str = "KTSTR_TEST_TICKET_COORDINATOR_ENTERED";
 const TICKET_HELPER_COORDINATOR_WAITING: &str = "KTSTR_TEST_TICKET_COORDINATOR_WAITING";
 const TICKET_HELPER_MAPPING_COUNT: &str = "KTSTR_TEST_TICKET_MAPPING_COUNT";
+const TICKET_HELPER_PENDING_ACTIVATE_GATE: &str = "KTSTR_TEST_TICKET_PENDING_ACTIVATE_GATE";
 const RETAINED_FUTEX_WAIT_MARKER: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 
 const PENDING_V3_LLC_PREFIX: &str = "KTSTR_TEST_PENDING_V3_LLC_PREFIX";
@@ -5776,6 +5777,23 @@ fn ticket_registry_process_helper() {
         .collect();
     let watch_claim = ticket_claim(&candidates.iter().flatten().copied().collect::<Vec<_>>());
 
+    if let Some(gate) = std::env::var_os(TICKET_HELPER_PENDING_ACTIVATE_GATE) {
+        assert_eq!(
+            claims.len(),
+            1,
+            "pending activation crash helper needs one exact claim",
+        );
+        let pending = protocol::register_pending_claim_for_tests(claims[0].clone())
+            .expect("register crash-test PENDING claim");
+        std::fs::write(&probed_path, b"pending\n")
+            .expect("publish pending activation crash-test readiness");
+        wait_for_ticket_path(std::path::Path::new(&gate));
+        pending
+            .activate_for_tests(claims[0].clone(), claims[0].clone(), claims[0].clone())
+            .expect("activate crash-test PENDING claim");
+        panic!("pending activation crash hook did not terminate the helper");
+    }
+
     let queue =
         protocol::register_ticket_or_acquire(claims[0].clone(), watch_claim, None, |probe| {
             let mut probe_log = std::fs::OpenOptions::new()
@@ -5922,6 +5940,7 @@ struct TicketSpawnOptions<'a> {
     coordinator_waiting: Option<&'a std::path::Path>,
     record_mapping_count: bool,
     retained_futex_wait_marker: Option<&'a std::path::Path>,
+    pending_activate_gate: Option<&'a std::path::Path>,
 }
 
 impl TicketChild {
@@ -5954,6 +5973,24 @@ impl TicketChild {
             candidates,
             TicketSpawnOptions {
                 crash_point: Some(crash_point),
+                ..TicketSpawnOptions::default()
+            },
+        )
+    }
+
+    fn spawn_pending_activation_crashing(
+        marker_dir: &std::path::Path,
+        label: &str,
+        candidates: &str,
+        gate: &std::path::Path,
+    ) -> Self {
+        Self::spawn_with_options(
+            marker_dir,
+            label,
+            candidates,
+            TicketSpawnOptions {
+                crash_point: Some("activate_pending_state_free_before_record"),
+                pending_activate_gate: Some(gate),
                 ..TicketSpawnOptions::default()
             },
         )
@@ -6148,6 +6185,9 @@ impl TicketChild {
         }
         if let Some(marker) = options.retained_futex_wait_marker {
             command.env(RETAINED_FUTEX_WAIT_MARKER, marker);
+        }
+        if let Some(gate) = options.pending_activate_gate {
+            command.env(TICKET_HELPER_PENDING_ACTIVATE_GATE, gate);
         }
         let child = command.spawn().expect("spawn ticket helper");
         let pid = child.id();
@@ -7344,6 +7384,60 @@ fn register_crash_before_state_publish_leaves_no_partial_active_ticket() {
             .is_empty(),
         "dirty repair must discard a record killed before active-state publication",
     );
+}
+
+#[test]
+fn activate_pending_crash_after_state_free_is_repaired_by_surviving_ticket() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let activate = markers.path().join("activate");
+    let pending = TicketChild::spawn_pending_activation_crashing(
+        markers.path(),
+        "pending-activation",
+        "1",
+        &activate,
+    );
+    pending.wait_for_probe();
+
+    let survivor = TicketChild::spawn(markers.path(), "pending-survivor", "1", false);
+    wait_for_ticket_pids(&[pending.pid, survivor.pid]);
+    std::fs::write(&activate, b"activate").expect("release pending activation crash helper");
+    pending.wait_for_injected_crash();
+
+    survivor.wait_for_acquired();
+    survivor.release_and_wait();
+}
+
+#[test]
+fn promote_held_crash_after_state_free_is_repaired_by_surviving_ticket() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let markers = tempfile::TempDir::new().expect("marker dir");
+    let blocker = crate::flock::try_flock(cpu_lock_path(1), crate::flock::FlockMode::Exclusive)
+        .expect("open crash-test CPU blocker")
+        .expect("lock crash-test CPU blocker");
+    let commit = markers.path().join("commit");
+    let acquired = markers.path().join("commit.entered");
+    let crashing = TicketChild::spawn_with_options(
+        markers.path(),
+        "held-promotion",
+        "1",
+        TicketSpawnOptions {
+            crash_point: Some("promote_held_state_free_before_record"),
+            after_acquire_gate: Some((&commit, &acquired)),
+            ..TicketSpawnOptions::default()
+        },
+    );
+    wait_for_ticket_pids(&[crashing.pid]);
+    let survivor = TicketChild::spawn(markers.path(), "held-survivor", "1", false);
+    wait_for_ticket_pids(&[crashing.pid, survivor.pid]);
+
+    drop(blocker);
+    crashing.wait_for_path(&acquired, "pre-commit acquisition marker");
+    std::fs::write(&commit, b"commit").expect("release HELD promotion crash helper");
+    crashing.wait_for_injected_crash();
+
+    survivor.wait_for_acquired();
+    survivor.release_and_wait();
 }
 
 #[test]

@@ -1733,6 +1733,18 @@ pub(crate) struct PendingClaimForTests {
 
 #[cfg(test)]
 impl PendingClaimForTests {
+    pub(crate) fn activate_for_tests(
+        mut self,
+        expected_pending: ClaimSet,
+        claim: ClaimSet,
+        watch: ClaimSet,
+    ) -> Result<()> {
+        self.ticket
+            .as_mut()
+            .expect("test pending claim was already consumed")
+            .activate_pending(&expected_pending, claim, watch, None)
+    }
+
     pub(crate) fn retire_synchronously(mut self) -> Result<()> {
         self.ticket
             .as_mut()
