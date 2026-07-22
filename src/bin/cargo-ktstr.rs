@@ -160,6 +160,9 @@ fn main() {
     if interrupt::run_anchor_mode_if_requested() {
         return;
     }
+    if interrupt::run_command_pair_coordinator_if_requested() {
+        return;
+    }
     interrupt::run_startup_supervision();
 
     ktstr::host_heap::mark_jemalloc_global_allocator();

@@ -34,6 +34,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{
     Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio,
@@ -59,6 +60,22 @@ const STARTUP_PARENT_PID_ENV: &str = "__KTSTR_STARTUP_PARENT_PID";
 const STARTUP_OWNER_FD_ENV: &str = "__KTSTR_STARTUP_OWNER_FD";
 const STARTUP_REPORT_FD_ENV: &str = "__KTSTR_STARTUP_REPORT_FD";
 const STARTUP_WORKER_FD_ENV: &str = "__KTSTR_STARTUP_WORKER_FD";
+
+// Private re-exec protocol used by one parent-owned command to run two Cargo
+// readers/builders concurrently. The coordinator itself remains the only
+// child visible to the ordinary anchored runner; its two independently
+// killable process groups stay below that exact ancestry owner.
+const COMMAND_PAIR_ROLE_ENV: &str = "__KTSTR_COMMAND_PAIR_ROLE";
+const COMMAND_PAIR_SPEC_FD_ENV: &str = "__KTSTR_COMMAND_PAIR_SPEC_FD";
+const COMMAND_PAIR_SECONDARY_STDOUT_FD_ENV: &str = "__KTSTR_COMMAND_PAIR_SECONDARY_STDOUT_FD";
+const COMMAND_PAIR_SECONDARY_STDERR_FD_ENV: &str = "__KTSTR_COMMAND_PAIR_SECONDARY_STDERR_FD";
+const COMMAND_PAIR_RESULT_FD_ENV: &str = "__KTSTR_COMMAND_PAIR_RESULT_FD";
+const COMMAND_PAIR_ROLE: &str = "coordinator-v1";
+
+static COMMAND_PAIR_FIRST_SIGNAL: AtomicI32 = AtomicI32::new(0);
+static COMMAND_PAIR_PRIMARY_PGID: AtomicI32 = AtomicI32::new(0);
+static COMMAND_PAIR_SECONDARY_PGID: AtomicI32 = AtomicI32::new(0);
+static COMMAND_PAIR_HANDLERS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 const STARTUP_TEST_MODE_ENV: &str = "__KTSTR_TEST_STARTUP_MODE";
@@ -2465,6 +2482,768 @@ pub(crate) fn run_output(mut command: Command) -> io::Result<Output> {
     run_capture(command, true)
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReexecCommandSpec {
+    program: Vec<u8>,
+    arguments: Vec<Vec<u8>>,
+    environment: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    current_dir: Option<Vec<u8>>,
+}
+
+impl ReexecCommandSpec {
+    fn capture(command: &Command) -> Self {
+        Self {
+            program: command.get_program().as_bytes().to_vec(),
+            arguments: command
+                .get_args()
+                .map(|argument| argument.as_bytes().to_vec())
+                .collect(),
+            environment: command
+                .get_envs()
+                .map(|(name, value)| {
+                    (
+                        name.as_bytes().to_vec(),
+                        value.map(|value| value.as_bytes().to_vec()),
+                    )
+                })
+                .collect(),
+            current_dir: command
+                .get_current_dir()
+                .map(|directory| directory.as_os_str().as_bytes().to_vec()),
+        }
+    }
+
+    fn into_command(self) -> Command {
+        let mut command = Command::new(std::ffi::OsString::from_vec(self.program));
+        command.args(self.arguments.into_iter().map(std::ffi::OsString::from_vec));
+        if let Some(directory) = self.current_dir {
+            command.current_dir(std::ffi::OsString::from_vec(directory));
+        }
+        for (name, value) in self.environment {
+            let name = std::ffi::OsString::from_vec(name);
+            match value {
+                Some(value) => {
+                    command.env(name, std::ffi::OsString::from_vec(value));
+                }
+                None => {
+                    command.env_remove(name);
+                }
+            }
+        }
+        for name in command_pair_private_environment() {
+            command.env_remove(name);
+        }
+        command
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CommandPairSide {
+    Primary,
+    Secondary,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CommandPairSpec {
+    primary: ReexecCommandSpec,
+    secondary: ReexecCommandSpec,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CommandPairResult {
+    primary_status: Option<libc::c_int>,
+    secondary_status: Option<libc::c_int>,
+    failed_first: Option<CommandPairSide>,
+    coordinator_error: Option<String>,
+}
+
+/// Captured output from two commands owned by one private re-exec coordinator.
+///
+/// `primary` is streamed through the supplied observer while both processes
+/// run. `secondary` remains private until completion, which is the shape Cargo
+/// metadata needs while the primary Cargo build keeps its ordinary live
+/// progress and machine-output contract.
+pub(crate) struct CommandOutputPair {
+    pub(crate) primary: Output,
+    pub(crate) secondary: Output,
+    pub(crate) failed_first: Option<CommandPairSide>,
+}
+
+fn command_pair_private_environment() -> [&'static str; 5] {
+    [
+        COMMAND_PAIR_ROLE_ENV,
+        COMMAND_PAIR_SPEC_FD_ENV,
+        COMMAND_PAIR_SECONDARY_STDOUT_FD_ENV,
+        COMMAND_PAIR_SECONDARY_STDERR_FD_ENV,
+        COMMAND_PAIR_RESULT_FD_ENV,
+    ]
+}
+
+fn command_pair_tempfile() -> io::Result<std::fs::File> {
+    tempfile::tempfile()
+}
+
+fn write_command_pair_spec(file: &mut std::fs::File, spec: &CommandPairSpec) -> io::Result<()> {
+    use std::io::{Seek as _, SeekFrom};
+
+    serde_json::to_writer(&mut *file, spec).map_err(io::Error::other)?;
+    file.flush()?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
+fn read_command_pair_file(file: &mut std::fs::File) -> io::Result<Vec<u8>> {
+    use std::io::{Seek as _, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn inherit_command_pair_fds(command: &mut Command, fds: &[libc::c_int]) {
+    let fds = fds.to_vec();
+    // SAFETY: the closure performs only async-signal-safe fcntl and signal-mask
+    // operations between fork and exec. Each descriptor is owned by the
+    // parent until the anchored coordinator has exited. Blocking terminal
+    // signals here closes the exec/bootstrap window; coordinator startup
+    // installs its forwarding handlers before unblocking the retained signal.
+    unsafe {
+        command.pre_exec(move || {
+            for fd in &fds {
+                let flags = libc::fcntl(*fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            let mut terminal: libc::sigset_t = std::mem::zeroed();
+            if libc::sigemptyset(&mut terminal) != 0
+                || libc::sigaddset(&mut terminal, libc::SIGINT) != 0
+                || libc::sigaddset(&mut terminal, libc::SIGTERM) != 0
+                || libc::sigprocmask(libc::SIG_BLOCK, &terminal, std::ptr::null_mut()) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn command_pair_coordinator_command() -> io::Result<Command> {
+    #[cfg(not(test))]
+    {
+        // Re-exec the running inode. A concurrent Cargo build is allowed to
+        // replace the on-disk target path while this process is alive.
+        Ok(Command::new("/proc/self/exe"))
+    }
+    #[cfg(test)]
+    {
+        // libtest owns the executable entry point. Re-enter the exact current
+        // test, whose first operation dispatches the private coordinator role.
+        let current_thread = std::thread::current();
+        let test_name = current_thread
+            .name()
+            .ok_or_else(|| io::Error::other("command-pair test thread has no name"))?;
+        let mut command = Command::new(std::env::current_exe()?);
+        command.arg("--exact").arg(test_name).arg("--nocapture");
+        Ok(command)
+    }
+}
+
+/// Run two commands concurrently below one ordinary anchored child owner.
+///
+/// The private coordinator places each payload in its own process group,
+/// forwards the first terminal signal, cancels the sibling on either failure,
+/// retains each published group through a time-separated closure fence, and
+/// reaps both leaders plus their adopted same-group descendants before
+/// returning. The outer anchored runner remains the ancestry/subreaper
+/// authority for every descendant shape, including process-group and session
+/// escapes which the coordinator deliberately does not classify as closure.
+pub(crate) fn run_output_pair_observed<O>(
+    primary: Command,
+    secondary: Command,
+    observer: O,
+) -> io::Result<CommandOutputPair>
+where
+    O: StdoutObserver,
+{
+    let mut spec_file = command_pair_tempfile()?;
+    let mut secondary_stdout = command_pair_tempfile()?;
+    let mut secondary_stderr = command_pair_tempfile()?;
+    let mut result_file = command_pair_tempfile()?;
+    write_command_pair_spec(
+        &mut spec_file,
+        &CommandPairSpec {
+            primary: ReexecCommandSpec::capture(&primary),
+            secondary: ReexecCommandSpec::capture(&secondary),
+        },
+    )?;
+
+    let fds = [
+        spec_file.as_raw_fd(),
+        secondary_stdout.as_raw_fd(),
+        secondary_stderr.as_raw_fd(),
+        result_file.as_raw_fd(),
+    ];
+    let mut coordinator = command_pair_coordinator_command()?;
+    coordinator
+        .env(COMMAND_PAIR_ROLE_ENV, COMMAND_PAIR_ROLE)
+        .env(COMMAND_PAIR_SPEC_FD_ENV, fds[0].to_string())
+        .env(COMMAND_PAIR_SECONDARY_STDOUT_FD_ENV, fds[1].to_string())
+        .env(COMMAND_PAIR_SECONDARY_STDERR_FD_ENV, fds[2].to_string())
+        .env(COMMAND_PAIR_RESULT_FD_ENV, fds[3].to_string());
+    inherit_command_pair_fds(&mut coordinator, &fds);
+
+    let coordinator_output = run_output_observed_anchored(coordinator, observer)?;
+    let result_bytes = read_command_pair_file(&mut result_file)?;
+    let result: CommandPairResult = serde_json::from_slice(&result_bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "command-pair coordinator returned {} without a valid result: {error}",
+                coordinator_output.status,
+            ),
+        )
+    })?;
+    if let Some(error) = result.coordinator_error {
+        return Err(io::Error::other(error));
+    }
+    let primary_status = result.primary_status.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing primary command status")
+    })?;
+    let secondary_status = result.secondary_status.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing secondary command status",
+        )
+    })?;
+    Ok(CommandOutputPair {
+        primary: Output {
+            status: ExitStatus::from_raw(primary_status),
+            stdout: coordinator_output.stdout,
+            stderr: coordinator_output.stderr,
+        },
+        secondary: Output {
+            status: ExitStatus::from_raw(secondary_status),
+            stdout: read_command_pair_file(&mut secondary_stdout)?,
+            stderr: read_command_pair_file(&mut secondary_stderr)?,
+        },
+        failed_first: result.failed_first,
+    })
+}
+
+struct CommandPairFiles {
+    spec: std::fs::File,
+    secondary_stdout: std::fs::File,
+    secondary_stderr: std::fs::File,
+    result: std::fs::File,
+}
+
+fn command_pair_fd_from_env(name: &str) -> io::Result<libc::c_int> {
+    let value = std::env::var(name)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("{name}: {error}")))?;
+    let fd = value.parse::<libc::c_int>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} is not a descriptor: {error}"),
+        )
+    })?;
+    if fd <= libc::STDERR_FILENO {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} aliases a standard stream"),
+        ));
+    }
+    Ok(fd)
+}
+
+fn set_command_pair_fd_cloexec(fd: libc::c_int) -> io::Result<()> {
+    // SAFETY: fd came from the validated private re-exec environment.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn take_command_pair_files() -> io::Result<CommandPairFiles> {
+    let raw = [
+        command_pair_fd_from_env(COMMAND_PAIR_SPEC_FD_ENV)?,
+        command_pair_fd_from_env(COMMAND_PAIR_SECONDARY_STDOUT_FD_ENV)?,
+        command_pair_fd_from_env(COMMAND_PAIR_SECONDARY_STDERR_FD_ENV)?,
+        command_pair_fd_from_env(COMMAND_PAIR_RESULT_FD_ENV)?,
+    ];
+    let unique: HashSet<_> = raw.iter().copied().collect();
+    if unique.len() != raw.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command-pair protocol descriptors are not distinct",
+        ));
+    }
+    for fd in raw {
+        set_command_pair_fd_cloexec(fd)?;
+    }
+    // SAFETY: the private parent transferred one distinct inherited reference
+    // to each descriptor. This coordinator assumes their unique ownership.
+    Ok(unsafe {
+        CommandPairFiles {
+            spec: std::fs::File::from_raw_fd(raw[0]),
+            secondary_stdout: std::fs::File::from_raw_fd(raw[1]),
+            secondary_stderr: std::fs::File::from_raw_fd(raw[2]),
+            result: std::fs::File::from_raw_fd(raw[3]),
+        }
+    })
+}
+
+extern "C" fn command_pair_signal_handler(signal: libc::c_int) {
+    COMMAND_PAIR_HANDLERS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    let _ =
+        COMMAND_PAIR_FIRST_SIGNAL.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+    for pgid in [
+        COMMAND_PAIR_PRIMARY_PGID.load(Ordering::SeqCst),
+        COMMAND_PAIR_SECONDARY_PGID.load(Ordering::SeqCst),
+    ] {
+        if pgid > 0 {
+            // SAFETY: a positive value is published only after the kernel has
+            // established the payload's independent process group.
+            unsafe {
+                libc::kill(-pgid, signal);
+            }
+        }
+    }
+    COMMAND_PAIR_HANDLERS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn initialize_command_pair_signal_state() -> io::Result<()> {
+    COMMAND_PAIR_FIRST_SIGNAL.store(0, Ordering::SeqCst);
+    COMMAND_PAIR_PRIMARY_PGID.store(0, Ordering::SeqCst);
+    COMMAND_PAIR_SECONDARY_PGID.store(0, Ordering::SeqCst);
+    COMMAND_PAIR_HANDLERS_IN_FLIGHT.store(0, Ordering::SeqCst);
+    set_child_subreaper(true)?;
+    // This private coordinator is a freshly exec'd single-threaded process.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = command_pair_signal_handler as *const () as usize;
+        if libc::sigemptyset(&mut action.sa_mask) != 0
+            || libc::sigaddset(&mut action.sa_mask, libc::SIGINT) != 0
+            || libc::sigaddset(&mut action.sa_mask, libc::SIGTERM) != 0
+            || libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0
+            || libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut child_action: libc::sigaction = std::mem::zeroed();
+        child_action.sa_sigaction = libc::SIG_DFL;
+        if libc::sigemptyset(&mut child_action.sa_mask) != 0
+            || libc::sigaction(libc::SIGCHLD, &child_action, std::ptr::null_mut()) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut unblock: libc::sigset_t = std::mem::zeroed();
+        if libc::sigemptyset(&mut unblock) != 0
+            || libc::sigaddset(&mut unblock, libc::SIGINT) != 0
+            || libc::sigaddset(&mut unblock, libc::SIGTERM) != 0
+            || libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut()) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+struct CommandPairChild {
+    side: CommandPairSide,
+    child: Child,
+    pgid: libc::pid_t,
+    status: Option<ExitStatus>,
+    leader_status_raw: Option<libc::c_int>,
+    group_empty_since: Option<Instant>,
+    published: bool,
+}
+
+impl CommandPairChild {
+    fn spawn(
+        side: CommandPairSide,
+        spec: ReexecCommandSpec,
+        stdout: Stdio,
+        stderr: Stdio,
+    ) -> io::Result<Self> {
+        let mut command = spec.into_command();
+        command.stdout(stdout).stderr(stderr).process_group(0);
+        let owner = ArmedChild::new(command.spawn()?);
+        let pgid = libc::pid_t::try_from(owner.child().id())
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| io::Error::other("command-pair child has an invalid pid"))?;
+        let published = match side {
+            CommandPairSide::Primary => &COMMAND_PAIR_PRIMARY_PGID,
+            CommandPairSide::Secondary => &COMMAND_PAIR_SECONDARY_PGID,
+        };
+        published.store(pgid, Ordering::SeqCst);
+        let pending = COMMAND_PAIR_FIRST_SIGNAL.load(Ordering::SeqCst);
+        if pending != 0 {
+            // A handler can run before publication. Replaying the retained
+            // first signal closes that handoff race without blocking spawn.
+            // SAFETY: process_group(0) established this exact child's group
+            // before spawn returned, and the unreaped child pins its id.
+            unsafe {
+                libc::kill(-pgid, pending);
+            }
+        }
+        Ok(Self {
+            side,
+            child: owner.into_child(),
+            pgid,
+            status: None,
+            leader_status_raw: None,
+            group_empty_since: None,
+            published: true,
+        })
+    }
+
+    fn published_pgid(&self) -> &'static AtomicI32 {
+        match self.side {
+            CommandPairSide::Primary => &COMMAND_PAIR_PRIMARY_PGID,
+            CommandPairSide::Secondary => &COMMAND_PAIR_SECONDARY_PGID,
+        }
+    }
+
+    fn observe_leader_exit(&mut self) -> io::Result<()> {
+        if self.leader_status_raw.is_some() {
+            return Ok(());
+        }
+        // SAFETY: zero is the valid initial state for waitid's output record.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            // WNOWAIT observes the terminal child without consuming it. The
+            // resulting zombie pins both pid and process-group id until this
+            // owner has hidden publication and drained every handler which
+            // could still have loaded the old value.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pgid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                // SAFETY: successful waitid initialized the SIGCHLD view.
+                let observed = unsafe { info.si_pid() };
+                if observed == 0 {
+                    return Ok(());
+                }
+                if observed != self.pgid {
+                    return Err(io::Error::other(format!(
+                        "command-pair waitid observed pid {observed}, expected {}",
+                        self.pgid,
+                    )));
+                }
+                // SAFETY: successful WEXITED waitid initialized si_status.
+                let status = unsafe { info.si_status() };
+                let raw = match info.si_code {
+                    libc::CLD_EXITED => (status & 0xff) << 8,
+                    libc::CLD_KILLED => status & 0x7f,
+                    libc::CLD_DUMPED => (status & 0x7f) | 0x80,
+                    code => {
+                        return Err(io::Error::other(format!(
+                            "command-pair waitid returned unexpected si_code {code}",
+                        )));
+                    }
+                };
+                self.leader_status_raw = Some(raw);
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    fn hide_publication(&mut self) {
+        if !self.published {
+            return;
+        }
+        let hidden = self.published_pgid().compare_exchange(
+            self.pgid,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        if hidden != Ok(self.pgid) {
+            fail_closed_child_ownership();
+        }
+        self.published = false;
+        if drain_command_pair_handlers_bounded().is_err() {
+            fail_closed_child_ownership();
+        }
+    }
+
+    fn poll(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.status.is_some() {
+            return Ok(self.status);
+        }
+        self.observe_leader_exit()?;
+        if self.leader_status_raw.is_none() {
+            return Ok(None);
+        }
+        let members = snapshot_command_pair_group(self.pgid, self.pgid)?;
+        reap_command_pair_group_zombies(&members)?;
+        if !members.is_empty() {
+            self.group_empty_since = None;
+            return Ok(None);
+        }
+        let now = Instant::now();
+        let empty_since = self.group_empty_since.get_or_insert(now);
+        if now.saturating_duration_since(*empty_since) < GROUP_SCAN_INTERVAL {
+            return Ok(None);
+        }
+        self.hide_publication();
+        let status = self.child.wait()?;
+        if status.into_raw() != self.leader_status_raw.expect("leader exit was observed") {
+            return Err(io::Error::other(format!(
+                "command-pair {:?} leader status changed between WNOWAIT and reap",
+                self.side,
+            )));
+        }
+        self.status = Some(status);
+        Ok(self.status)
+    }
+
+    fn failure_observed(&self) -> bool {
+        self.leader_status_raw
+            .is_some_and(|raw| !ExitStatus::from_raw(raw).success())
+    }
+
+    fn signal_if_running(&self, signal: libc::c_int) {
+        if self.status.is_none() && self.published {
+            // SAFETY: publication remains visible, so this unreaped child
+            // still pins the exact process-group id against reuse.
+            unsafe {
+                libc::kill(-self.pgid, signal);
+            }
+        }
+    }
+
+    fn cancel_and_reap(&mut self) -> io::Result<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
+        self.signal_if_running(libc::SIGTERM);
+        let started = Instant::now();
+        let mut forced = false;
+        loop {
+            if self.poll()?.is_some() {
+                return Ok(());
+            }
+            if !forced && started.elapsed() >= ANCHOR_COOPERATIVE_EXIT_GRACE {
+                self.signal_if_running(libc::SIGKILL);
+                forced = true;
+            }
+            if started.elapsed() >= ANCHOR_COOPERATIVE_EXIT_GRACE + FORCED_GROUP_REAP_BACKSTOP {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "command-pair {:?} child did not become reapable after SIGKILL",
+                        self.side,
+                    ),
+                ));
+            }
+            std::thread::sleep(GROUP_SCAN_INTERVAL);
+        }
+    }
+
+    fn raw_status(&self) -> Option<libc::c_int> {
+        self.status.map(ExitStatusExt::into_raw)
+    }
+}
+
+impl Drop for CommandPairChild {
+    fn drop(&mut self) {
+        if self.cancel_and_reap().is_err() {
+            fail_closed_child_ownership();
+        }
+    }
+}
+
+fn drain_command_pair_handlers_bounded() -> io::Result<()> {
+    let deadline = Instant::now() + HANDLER_DRAIN_BACKSTOP;
+    loop {
+        if COMMAND_PAIR_HANDLERS_IN_FLIGHT.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "command-pair signal handlers did not drain",
+            ));
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn wait_command_pair_children(
+    primary: &mut CommandPairChild,
+    secondary: &mut CommandPairChild,
+) -> io::Result<Option<CommandPairSide>> {
+    let mut failed_first = None;
+    let mut cancellation_started = None::<Instant>;
+    let mut forced = false;
+    loop {
+        let primary_failure_was_observed = primary.failure_observed();
+        let secondary_failure_was_observed = secondary.failure_observed();
+        primary.poll()?;
+        secondary.poll()?;
+        let new_primary_failure = !primary_failure_was_observed && primary.failure_observed();
+        let new_secondary_failure = !secondary_failure_was_observed && secondary.failure_observed();
+        if failed_first.is_none() && (new_primary_failure || new_secondary_failure) {
+            let side = if new_primary_failure {
+                CommandPairSide::Primary
+            } else {
+                CommandPairSide::Secondary
+            };
+            failed_first = Some(side);
+            cancellation_started = Some(Instant::now());
+            primary.signal_if_running(libc::SIGTERM);
+            secondary.signal_if_running(libc::SIGTERM);
+        }
+        if primary.status.is_some() && secondary.status.is_some() {
+            return Ok(failed_first);
+        }
+
+        if COMMAND_PAIR_FIRST_SIGNAL.load(Ordering::SeqCst) != 0 && cancellation_started.is_none() {
+            cancellation_started = Some(Instant::now());
+        }
+        if !forced
+            && cancellation_started
+                .is_some_and(|started| started.elapsed() >= ANCHOR_COOPERATIVE_EXIT_GRACE)
+        {
+            primary.signal_if_running(libc::SIGKILL);
+            secondary.signal_if_running(libc::SIGKILL);
+            forced = true;
+        }
+        if forced
+            && cancellation_started.is_some_and(|started| {
+                started.elapsed() >= ANCHOR_COOPERATIVE_EXIT_GRACE + FORCED_GROUP_REAP_BACKSTOP
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "command-pair children did not become reapable after SIGKILL",
+            ));
+        }
+        std::thread::sleep(GROUP_SCAN_INTERVAL);
+    }
+}
+
+fn write_command_pair_result(
+    file: &mut std::fs::File,
+    result: &CommandPairResult,
+) -> io::Result<()> {
+    use std::io::{Seek as _, SeekFrom};
+
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    serde_json::to_writer(&mut *file, result).map_err(io::Error::other)?;
+    file.flush()
+}
+
+fn run_command_pair_coordinator_inner(
+    files: CommandPairFiles,
+) -> (CommandPairResult, std::fs::File) {
+    let CommandPairFiles {
+        mut spec,
+        secondary_stdout,
+        secondary_stderr,
+        result,
+    } = files;
+    let operation = (|| -> io::Result<(libc::c_int, libc::c_int, Option<CommandPairSide>)> {
+        let pair: CommandPairSpec = serde_json::from_reader(&mut spec).map_err(io::Error::other)?;
+        drop(spec);
+        initialize_command_pair_signal_state()?;
+
+        let mut primary = CommandPairChild::spawn(
+            CommandPairSide::Primary,
+            pair.primary,
+            Stdio::inherit(),
+            Stdio::inherit(),
+        )?;
+        let mut secondary = match CommandPairChild::spawn(
+            CommandPairSide::Secondary,
+            pair.secondary,
+            Stdio::from(secondary_stdout),
+            Stdio::from(secondary_stderr),
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                primary.signal_if_running(libc::SIGTERM);
+                return Err(error);
+            }
+        };
+        let failed_first = wait_command_pair_children(&mut primary, &mut secondary)?;
+        Ok((
+            primary.raw_status().expect("primary child was reaped"),
+            secondary.raw_status().expect("secondary child was reaped"),
+            failed_first,
+        ))
+    })();
+
+    let pair_result = match operation {
+        Ok((primary_status, secondary_status, failed_first)) => CommandPairResult {
+            primary_status: Some(primary_status),
+            secondary_status: Some(secondary_status),
+            failed_first,
+            coordinator_error: None,
+        },
+        Err(error) => CommandPairResult {
+            primary_status: None,
+            secondary_status: None,
+            failed_first: None,
+            coordinator_error: Some(error.to_string()),
+        },
+    };
+    (pair_result, result)
+}
+
+/// Enter the hidden two-command coordinator role before startup supervision.
+pub(crate) fn run_command_pair_coordinator_if_requested() -> bool {
+    match std::env::var(COMMAND_PAIR_ROLE_ENV) {
+        Ok(role) if role == COMMAND_PAIR_ROLE => {
+            let files = match take_command_pair_files() {
+                Ok(files) => files,
+                Err(error) => {
+                    eprintln!("cargo ktstr: invalid command-pair protocol: {error}");
+                    std::process::exit(125);
+                }
+            };
+            let (result, mut result_file) = run_command_pair_coordinator_inner(files);
+            let exit_code = if result.coordinator_error.is_none()
+                && result
+                    .primary_status
+                    .is_some_and(|raw| ExitStatus::from_raw(raw).success())
+                && result
+                    .secondary_status
+                    .is_some_and(|raw| ExitStatus::from_raw(raw).success())
+            {
+                0
+            } else {
+                1
+            };
+            if let Err(error) = write_command_pair_result(&mut result_file, &result) {
+                eprintln!("cargo ktstr: write command-pair result: {error}");
+                std::process::exit(125);
+            }
+            std::process::exit(exit_code);
+        }
+        Ok(_) | Err(std::env::VarError::NotUnicode(_)) => fail_closed_child_ownership(),
+        Err(std::env::VarError::NotPresent) => false,
+    }
+}
+
 /// Observe a child from the synchronous process-owner loop.
 ///
 /// The observer runs synchronously on the child-owning thread. Its periodic
@@ -3019,6 +3798,7 @@ struct ProcessIdentity {
 struct GroupMember {
     identity: ProcessIdentity,
     ppid: libc::pid_t,
+    pgrp: libc::pid_t,
     cpu_ticks: u64,
     state: u8,
 }
@@ -3072,6 +3852,8 @@ fn parse_process_stat(pid: libc::pid_t, stat: &[u8]) -> io::Result<GroupMember> 
         .ok_or_else(|| invalid_proc_stat(pid, "state"))?;
     let ppid = parse_proc_stat_number::<libc::pid_t>(fields[1])
         .ok_or_else(|| invalid_proc_stat(pid, "parent pid"))?;
+    let pgrp = parse_proc_stat_number::<libc::pid_t>(fields[2])
+        .ok_or_else(|| invalid_proc_stat(pid, "process group"))?;
     let utime =
         parse_proc_stat_number::<u64>(fields[11]).ok_or_else(|| invalid_proc_stat(pid, "utime"))?;
     let stime =
@@ -3084,6 +3866,7 @@ fn parse_process_stat(pid: libc::pid_t, stat: &[u8]) -> io::Result<GroupMember> 
             starttime_ticks,
         },
         ppid,
+        pgrp,
         cpu_ticks: utime.saturating_add(stime),
         state,
     })
@@ -3139,6 +3922,84 @@ fn verified_process_children(member: GroupMember) -> io::Result<Vec<libc::pid_t>
         return Ok(Vec::new());
     }
     Ok(children)
+}
+
+#[derive(Clone, Copy)]
+struct CommandPairGroupMember {
+    member: GroupMember,
+    direct: bool,
+}
+
+/// Snapshot descendants which still belong to one paired payload group.
+///
+/// The coordinator is a subreaper, so after the payload leader exits each
+/// surviving tree has a direct adopted root. Walking all exact coordinator
+/// descendants also covers the interval before that reparent completes. A
+/// time-separated empty fence in [`CommandPairChild::poll`] closes the final
+/// exit/fork/reparent race without a host-wide process-table scan.
+fn snapshot_command_pair_group(
+    pgid: libc::pid_t,
+    leader_pid: libc::pid_t,
+) -> io::Result<Vec<CommandPairGroupMember>> {
+    // SAFETY: getpid has no arguments and cannot fail.
+    let own_pid = unsafe { libc::getpid() };
+    let mut queued = HashSet::<(libc::pid_t, libc::pid_t)>::new();
+    let mut queue = VecDeque::<(libc::pid_t, libc::pid_t, bool)>::new();
+    for pid in startup_direct_children()? {
+        if queued.insert((pid, own_pid)) {
+            queue.push_back((pid, own_pid, true));
+        }
+    }
+
+    let mut members = HashMap::<ProcessIdentity, CommandPairGroupMember>::new();
+    while let Some((pid, expected_ppid, direct)) = queue.pop_front() {
+        let Some((member, pidfd)) = open_verified_descendant(pid, expected_ppid)? else {
+            continue;
+        };
+        drop(pidfd);
+        for child in verified_process_children(member)? {
+            if queued.insert((child, member.identity.pid)) {
+                queue.push_back((child, member.identity.pid, false));
+            }
+        }
+        if member.identity.pid != leader_pid && member.pgrp == pgid {
+            members
+                .entry(member.identity)
+                .and_modify(|existing| existing.direct |= direct)
+                .or_insert(CommandPairGroupMember { member, direct });
+        }
+    }
+    let mut members: Vec<_> = members.into_values().collect();
+    members.sort_by_key(|member| member.member.identity.pid);
+    Ok(members)
+}
+
+fn reap_command_pair_group_zombies(members: &[CommandPairGroupMember]) -> io::Result<()> {
+    for member in members
+        .iter()
+        .filter(|member| member.direct && matches!(member.member.state, b'Z' | b'X'))
+    {
+        let expected = member.member.identity.pid;
+        let mut raw = 0;
+        loop {
+            // SAFETY: this exact terminal pid is a direct child of the
+            // coordinator subreaper; WNOHANG cannot consume another child.
+            let observed = unsafe { libc::waitpid(expected, &mut raw, libc::WNOHANG) };
+            if observed == expected || observed == 0 {
+                break;
+            }
+            if observed > 0 {
+                return Err(io::Error::other(format!(
+                    "command-pair descendant reap observed pid {observed}, expected {expected}",
+                )));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -4327,6 +5188,264 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const STARTUP_TEST_OWNER_ENV: &str = "__KTSTR_TEST_STARTUP_OWNER";
+
+    fn output_contains(output: &[u8], needle: &[u8]) -> bool {
+        output.windows(needle.len()).any(|window| window == needle)
+    }
+
+    #[test]
+    fn command_pair_runs_both_payloads_concurrently_and_preserves_streams() {
+        if run_command_pair_coordinator_if_requested() {
+            return;
+        }
+        let _serial = test_serial_guard();
+        let root = tempfile::tempdir().expect("command-pair concurrency tempdir");
+        let primary_ready = root.path().join("primary.ready");
+        let secondary_ready = root.path().join("secondary.ready");
+        let mut primary = Command::new("/bin/sh");
+        primary
+            .arg("-c")
+            .arg(
+                "printf ready > \"$PRIMARY_READY\"; i=0; \
+                 while [ ! -e \"$SECONDARY_READY\" ] && [ \"$i\" -lt 500 ]; do \
+                   i=$((i + 1)); sleep 0.01; \
+                 done; \
+                 test -e \"$SECONDARY_READY\" || exit 91; \
+                 printf primary-output; printf primary-error >&2",
+            )
+            .env("PRIMARY_READY", &primary_ready)
+            .env("SECONDARY_READY", &secondary_ready);
+        let mut secondary = Command::new("/bin/sh");
+        secondary
+            .arg("-c")
+            .arg(
+                "printf ready > \"$SECONDARY_READY\"; i=0; \
+                 while [ ! -e \"$PRIMARY_READY\" ] && [ \"$i\" -lt 500 ]; do \
+                   i=$((i + 1)); sleep 0.01; \
+                 done; \
+                 test -e \"$PRIMARY_READY\" || exit 92; \
+                 printf secondary-output; printf secondary-error >&2",
+            )
+            .env("PRIMARY_READY", &primary_ready)
+            .env("SECONDARY_READY", &secondary_ready);
+
+        let output = run_output_pair_observed(primary, secondary, SilentObserver)
+            .expect("run concurrent command pair");
+
+        assert!(output.primary.status.success());
+        assert!(output.secondary.status.success());
+        assert_eq!(output.failed_first, None);
+        assert!(output_contains(&output.primary.stdout, b"primary-output"));
+        assert!(output_contains(&output.primary.stderr, b"primary-error"));
+        assert_eq!(output.secondary.stdout, b"secondary-output");
+        assert_eq!(output.secondary.stderr, b"secondary-error");
+        assert_eq!(active_group_for_test(), IDLE);
+    }
+
+    #[test]
+    fn command_pair_child_unpublishes_before_exact_reap() {
+        let _serial = test_serial_guard();
+        assert_eq!(COMMAND_PAIR_PRIMARY_PGID.load(Ordering::SeqCst), 0);
+        assert_eq!(COMMAND_PAIR_HANDLERS_IN_FLIGHT.load(Ordering::SeqCst), 0);
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("exit 23");
+        let mut child = CommandPairChild::spawn(
+            CommandPairSide::Primary,
+            ReexecCommandSpec::capture(&command),
+            Stdio::null(),
+            Stdio::null(),
+        )
+        .expect("spawn directly observed command-pair child");
+
+        while child.leader_status_raw.is_none() {
+            child
+                .observe_leader_exit()
+                .expect("observe pair child without reaping");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            COMMAND_PAIR_PRIMARY_PGID.load(Ordering::SeqCst),
+            child.pgid,
+            "WNOWAIT keeps the exact group id published while its zombie pins reuse",
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = child.poll().expect("unpublish and reap pair child") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "time-separated empty-group fence did not settle",
+            );
+            std::thread::sleep(GROUP_SCAN_INTERVAL);
+        };
+
+        assert_eq!(status.code(), Some(23));
+        assert!(!child.published);
+        assert_eq!(COMMAND_PAIR_PRIMARY_PGID.load(Ordering::SeqCst), 0);
+        assert_eq!(COMMAND_PAIR_HANDLERS_IN_FLIGHT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn command_pair_clean_success_waits_for_same_group_descendant() {
+        if run_command_pair_coordinator_if_requested() {
+            return;
+        }
+        let _serial = test_serial_guard();
+        let root = tempfile::tempdir().expect("command-pair descendant tempdir");
+        let completed = root.path().join("descendant.completed");
+        let mut primary = Command::new("/bin/sh");
+        primary
+            .arg("-c")
+            .arg(
+                "( trap '' HUP; sleep 0.2; printf complete > \"$COMPLETED\" ) & \
+                 exit 0",
+            )
+            .env("COMPLETED", &completed);
+        let secondary = Command::new("/bin/true");
+
+        let started = Instant::now();
+        let output = run_output_pair_observed(primary, secondary, SilentObserver)
+            .expect("wait for clean same-group descendant");
+
+        assert!(output.primary.status.success());
+        assert!(output.secondary.status.success());
+        assert!(
+            completed.exists(),
+            "pair returned before the successful leader's group closed",
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "pair did not retain the payload group through descendant completion",
+        );
+    }
+
+    #[test]
+    fn command_pair_later_failure_cancels_post_leader_group_descendant() {
+        if run_command_pair_coordinator_if_requested() {
+            return;
+        }
+        let _serial = test_serial_guard();
+        let root = tempfile::tempdir().expect("command-pair retained-group tempdir");
+        let ready = root.path().join("descendant.ready");
+        let cancelled = root.path().join("descendant.cancelled");
+        let leader_pid = root.path().join("leader.pid");
+        let mut primary = Command::new("/bin/sh");
+        primary
+            .arg("-c")
+            .arg(
+                "printf '%s' \"$$\" > \"$LEADER_PID\"; \
+                 ( trap 'printf cancelled > \"$CANCELLED\"; exit 0' TERM; \
+                    printf ready > \"$READY\"; \
+                    while :; do sleep 1; done \
+                 ) & \
+                 exit 0",
+            )
+            .env("READY", &ready)
+            .env("CANCELLED", &cancelled)
+            .env("LEADER_PID", &leader_pid);
+        let mut secondary = Command::new("/bin/sh");
+        secondary
+            .arg("-c")
+            .arg(
+                "i=0; while { [ ! -e \"$READY\" ] || [ ! -e \"$LEADER_PID\" ]; } \
+                               && [ \"$i\" -lt 500 ]; do \
+                   i=$((i + 1)); sleep 0.01; \
+                 done; \
+                 test -e \"$READY\" && test -e \"$LEADER_PID\" || exit 92; \
+                 leader=$(cat \"$LEADER_PID\"); i=0; state=; \
+                 while [ \"$i\" -lt 500 ]; do \
+                   stat=$(cat \"/proc/$leader/stat\" 2>/dev/null) || exit 93; \
+                   state=${stat#*) }; state=${state%% *}; \
+                   [ \"$state\" = Z ] && break; \
+                   i=$((i + 1)); sleep 0.01; \
+                 done; \
+                 test \"$state\" = Z || exit 94; \
+                 exit 17",
+            )
+            .env("READY", &ready)
+            .env("LEADER_PID", &leader_pid);
+
+        let started = Instant::now();
+        let output = run_output_pair_observed(primary, secondary, SilentObserver)
+            .expect("cancel retained same-group descendant");
+
+        assert!(output.primary.status.success());
+        assert_eq!(output.secondary.status.code(), Some(17));
+        assert_eq!(output.failed_first, Some(CommandPairSide::Secondary));
+        assert!(
+            cancelled.exists(),
+            "later sibling failure did not reach the successful leader's retained group",
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "pair deferred retained-group cancellation to the outer tail backstop",
+        );
+    }
+
+    #[test]
+    fn command_pair_secondary_failure_cancels_and_reaps_primary_group() {
+        if run_command_pair_coordinator_if_requested() {
+            return;
+        }
+        let _serial = test_serial_guard();
+        let root = tempfile::tempdir().expect("command-pair cancellation tempdir");
+        let ready = root.path().join("primary.ready");
+        let descendant_pid = root.path().join("primary-descendant.pid");
+        let mut primary = Command::new("/bin/sh");
+        primary
+            .arg("-c")
+            .arg(
+                "child=; \
+                 trap 'kill -TERM \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; \
+                       printf primary-cancelled >&2; exit 42' TERM; \
+                 sleep 300 & child=$!; \
+                 printf '%s' \"$child\" > \"$DESCENDANT_PID\"; \
+                 printf ready > \"$PRIMARY_READY\"; \
+                 wait \"$child\"",
+            )
+            .env("PRIMARY_READY", &ready)
+            .env("DESCENDANT_PID", &descendant_pid);
+        let mut secondary = Command::new("/bin/sh");
+        secondary
+            .arg("-c")
+            .arg(
+                "i=0; while [ ! -e \"$PRIMARY_READY\" ] && [ \"$i\" -lt 500 ]; do \
+                   i=$((i + 1)); sleep 0.01; \
+                 done; \
+                 test -e \"$PRIMARY_READY\" || exit 92; \
+                 printf metadata-failed >&2; exit 17",
+            )
+            .env("PRIMARY_READY", &ready);
+
+        let started = Instant::now();
+        let output = run_output_pair_observed(primary, secondary, SilentObserver)
+            .expect("return both failed command outputs");
+
+        assert_eq!(output.failed_first, Some(CommandPairSide::Secondary));
+        assert_eq!(output.secondary.status.code(), Some(17));
+        assert!(!output.primary.status.success());
+        assert_eq!(output.secondary.stderr, b"metadata-failed");
+        assert!(output_contains(
+            &output.primary.stderr,
+            b"primary-cancelled"
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "sibling cancellation and reap remain prompt",
+        );
+        let descendant: libc::pid_t = std::fs::read_to_string(descendant_pid)
+            .expect("read cancelled descendant pid")
+            .parse()
+            .expect("parse cancelled descendant pid");
+        // SAFETY: signal zero probes existence without delivering a signal.
+        assert_ne!(
+            unsafe { libc::kill(descendant, 0) },
+            0,
+            "cancelled primary group left no live descendant",
+        );
+        assert_eq!(active_group_for_test(), IDLE);
+    }
 
     fn test_pidfd_open(pid: libc::pid_t) -> OwnedFd {
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) as libc::c_int };

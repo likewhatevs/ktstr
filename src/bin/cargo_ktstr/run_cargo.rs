@@ -3561,12 +3561,12 @@ fn nextest_binary_list_command(
     command
 }
 
-fn cargo_metadata_json(
+fn cargo_metadata_command(
     stable_workspace: &Path,
     output_target: &Path,
     build_args: &[String],
     producer_environment: &[(OsString, OsString)],
-) -> Result<Vec<u8>, String> {
+) -> Command {
     let mut options = crate::feature_discovery::metadata_passthrough_options(build_args);
     options.extend(crate::feature_discovery::metadata_resolution_options(
         build_args,
@@ -3579,8 +3579,10 @@ fn cargo_metadata_json(
         .env("CARGO_TARGET_DIR", output_target);
     apply_command_envs(&mut command, producer_environment);
     sanitize_cached_cargo_build_child_environment(&mut command);
-    let output = crate::interrupt::run_output(command)
-        .map_err(|error| format!("run Cargo metadata for nextest reuse: {error}"))?;
+    command
+}
+
+fn cargo_metadata_json_from_output(output: &std::process::Output) -> Result<Vec<u8>, String> {
     if !output.status.success() {
         return Err(format!(
             "Cargo metadata for nextest reuse failed with {}: {}",
@@ -3588,7 +3590,34 @@ fn cargo_metadata_json(
             String::from_utf8_lossy(&output.stderr).trim(),
         ));
     }
-    Ok(output.stdout)
+    Ok(output.stdout.clone())
+}
+
+fn validate_nextest_producer_pair(
+    output: &crate::interrupt::CommandOutputPair,
+    cli_label: &str,
+) -> Result<Vec<u8>, String> {
+    let build_failure = || {
+        format!(
+            "{cli_label}: nextest binary-only build failed ({}) — see Cargo output above",
+            output
+                .primary
+                .status
+                .code()
+                .map_or("signal".to_string(), |code| code.to_string()),
+        )
+    };
+    if output.failed_first == Some(crate::interrupt::CommandPairSide::Secondary) {
+        let metadata = cargo_metadata_json_from_output(&output.secondary)?;
+        if !output.primary.status.success() {
+            return Err(build_failure());
+        }
+        return Ok(metadata);
+    }
+    if !output.primary.status.success() {
+        return Err(build_failure());
+    }
+    cargo_metadata_json_from_output(&output.secondary)
 }
 
 /// Select one compile-time BTF for all guest-kernel lanes on this host/arch.
@@ -3753,12 +3782,12 @@ pub(crate) fn load_or_build_nextest_artifacts(
                 &producer_environment,
             )?);
         }
-        let cargo_metadata = cargo_metadata_json(
+        let metadata_command = cargo_metadata_command(
             &stable_invocation_dir,
             output_target,
             &build_args,
             &environment,
-        )?;
+        );
         let command = nextest_binary_list_command(
             &stable_invocation_dir,
             output_target,
@@ -3766,33 +3795,28 @@ pub(crate) fn load_or_build_nextest_artifacts(
             release,
             &environment,
         );
-        run_reserved_build_output_under_lease(
+        run_reserved_build_output_pair_under_lease(
             command,
+            metadata_command,
             cli_label,
             "nextest binary-only build with reusable artifact capture",
             crate::reserved_build_progress::ReservedBuildOutputKind::Opaque,
             output_target,
-            |build| {
-                if !build.status.success() {
-                    return Err(format!(
-                        "{cli_label}: nextest binary-only build failed ({}) — see Cargo output above",
-                        build
-                            .status
-                            .code()
-                            .map_or("signal".to_string(), |code| code.to_string()),
-                    ));
-                }
+            |output| {
+                let cargo_metadata = validate_nextest_producer_pair(output, cli_label)?;
+                let build = &output.primary;
                 if mode == CachedNextestMode::Coverage {
                     let producer_profdata = compact_coverage_producer_profiles(
                         &stable_invocation_dir,
                         &environment,
                         output_target,
                     )?;
-                    let source = crate::nextest_artifact_cache::capture_source_with_producer_profdata(
-                        &build.stdout,
-                        &cargo_metadata,
-                        producer_profdata.as_deref(),
-                    )?;
+                    let source =
+                        crate::nextest_artifact_cache::capture_source_with_producer_profdata(
+                            &build.stdout,
+                            &cargo_metadata,
+                            producer_profdata.as_deref(),
+                        )?;
                     let cleanup = remove_cached_profraw_shards(output_target);
                     if let Some(error) = cleanup.failure_message(output_target) {
                         return Err(error);
@@ -5354,6 +5378,35 @@ fn run_prepared_reserved_build_output(
     Ok(output)
 }
 
+fn run_prepared_reserved_build_output_pair(
+    primary: Command,
+    secondary: Command,
+    cli_label: &str,
+    description: &str,
+    output_kind: crate::reserved_build_progress::ReservedBuildOutputKind,
+) -> Result<crate::interrupt::CommandOutputPair, String> {
+    tracing::debug!("{cli_label}: reserved {description} with concurrent Cargo metadata");
+    let progress = crate::reserved_build_progress::ReservedBuildProgress::start(
+        cli_label,
+        description,
+        output_kind,
+    );
+    let output = crate::interrupt::run_output_pair_observed(primary, secondary, progress)
+        .map_err(|error| format!("{cli_label}: spawn {description}: {error}"))?;
+    if let Err(error) = persist_reserved_build_diagnostics(&output.primary, cli_label, description)
+    {
+        eprintln!("{cli_label}: could not preserve reserved-build diagnostics: {error}");
+    }
+    if let Err(error) = persist_reserved_build_diagnostics(
+        &output.secondary,
+        cli_label,
+        "concurrent Cargo metadata",
+    ) {
+        eprintln!("{cli_label}: could not preserve Cargo-metadata diagnostics: {error}");
+    }
+    Ok(output)
+}
+
 const BUILD_DIAGNOSTICS_DIR_ENV: &str = "KTSTR_BUILD_DIAGNOSTICS_DIR";
 const BUILD_DIAGNOSTIC_STREAM_LIMIT: usize = 16 * 1024 * 1024;
 static BUILD_DIAGNOSTIC_SEQUENCE: std::sync::atomic::AtomicU64 =
@@ -5487,6 +5540,36 @@ pub(crate) fn run_reserved_build_output_under_lease<T>(
         "{cli_label}: acquired Cargo build-output ownership",
     );
     let output = run_prepared_reserved_build_output(command, cli_label, description, output_kind)?;
+    let processed = postprocess(&output);
+    drop(reservation);
+    drop(lease);
+    processed
+}
+
+fn run_reserved_build_output_pair_under_lease<T>(
+    mut primary: Command,
+    secondary: Command,
+    cli_label: &str,
+    description: &str,
+    output_kind: crate::reserved_build_progress::ReservedBuildOutputKind,
+    target_dir: &std::path::Path,
+    postprocess: impl FnOnce(&crate::interrupt::CommandOutputPair) -> Result<T, String>,
+) -> Result<T, String> {
+    let (lease, reservation) = acquire_cargo_build_resources(
+        || acquire_cargo_build_output_lease(target_dir, cli_label),
+        || prepare_reserved_prebuild(&mut primary, cli_label),
+    )?;
+    tracing::debug!(
+        target_dir = %lease.target_dir().display(),
+        "{cli_label}: acquired Cargo build-output ownership",
+    );
+    let output = run_prepared_reserved_build_output_pair(
+        primary,
+        secondary,
+        cli_label,
+        description,
+        output_kind,
+    )?;
     let processed = postprocess(&output);
     drop(reservation);
     drop(lease);
@@ -9415,6 +9498,61 @@ path = "junit.xml"
                 "{runtime} must be absent from the Cargo child",
             );
         }
+    }
+
+    fn producer_pair_output(
+        primary_raw_status: libc::c_int,
+        secondary_raw_status: libc::c_int,
+        failed_first: Option<crate::interrupt::CommandPairSide>,
+    ) -> crate::interrupt::CommandOutputPair {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        crate::interrupt::CommandOutputPair {
+            primary: std::process::Output {
+                status: std::process::ExitStatus::from_raw(primary_raw_status),
+                stdout: b"nextest-json".to_vec(),
+                stderr: b"build failed".to_vec(),
+            },
+            secondary: std::process::Output {
+                status: std::process::ExitStatus::from_raw(secondary_raw_status),
+                stdout: b"cargo-metadata-json".to_vec(),
+                stderr: b"metadata failed".to_vec(),
+            },
+            failed_first,
+        }
+    }
+
+    #[test]
+    fn paired_nextest_producer_returns_successful_metadata_bytes() {
+        let output = producer_pair_output(0, 0, None);
+        assert_eq!(
+            validate_nextest_producer_pair(&output, "cargo ktstr test").unwrap(),
+            b"cargo-metadata-json",
+        );
+    }
+
+    #[test]
+    fn paired_nextest_producer_reports_the_failure_that_cancelled_its_sibling() {
+        let metadata_first = producer_pair_output(
+            libc::SIGTERM,
+            17 << 8,
+            Some(crate::interrupt::CommandPairSide::Secondary),
+        );
+        let metadata_error =
+            validate_nextest_producer_pair(&metadata_first, "cargo ktstr test").unwrap_err();
+        assert!(metadata_error.contains("Cargo metadata for nextest reuse failed"));
+        assert!(metadata_error.contains("metadata failed"));
+        assert!(!metadata_error.contains("binary-only build failed"));
+
+        let build_first = producer_pair_output(
+            19 << 8,
+            libc::SIGTERM,
+            Some(crate::interrupt::CommandPairSide::Primary),
+        );
+        let build_error =
+            validate_nextest_producer_pair(&build_first, "cargo ktstr test").unwrap_err();
+        assert!(build_error.contains("nextest binary-only build failed (19)"));
+        assert!(!build_error.contains("metadata failed"));
     }
 
     #[test]
