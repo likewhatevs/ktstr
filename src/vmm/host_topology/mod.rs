@@ -265,7 +265,7 @@ pub struct PinningPlan {
     /// Held flock fds for resource reservation. Dropped when the plan
     /// (and the KtstrVm holding it) is dropped, releasing all locks.
     #[allow(dead_code)] // RAII: flock fds released on Drop, not read after construction.
-    pub(crate) locks: protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
+    pub(crate) locks: protocol::Acquired<Vec<protocol::AdmissionFlock>>,
 }
 
 /// Which run path is asking the shared topology planner for placements.
@@ -1673,7 +1673,7 @@ pub enum LockOutcome {
         /// LLC offset consumed; read only by the locking test fixtures.
         #[allow(dead_code)]
         llc_offset: usize,
-        locks: protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
+        locks: protocol::Acquired<Vec<protocol::AdmissionFlock>>,
     },
     /// Resources busy. The inner string carries the diagnostic reason
     /// surfaced to test fixtures; production callers only match the
@@ -1926,7 +1926,7 @@ pub(crate) fn permit_lock_path(permit: usize) -> String {
 /// Claim-aware: an incompatible live ticket claim fails the attempt before
 /// touching its reserved lockfiles.
 pub(crate) enum TryAcquireAll {
-    Acquired(protocol::Acquired<Vec<std::os::fd::OwnedFd>>),
+    Acquired(protocol::Acquired<Vec<protocol::AdmissionFlock>>),
     Contended {
         reason: String,
         evidence: Option<protocol::ContentionEvidence>,
@@ -1934,7 +1934,7 @@ pub(crate) enum TryAcquireAll {
 }
 
 enum RawAcquireAll {
-    Acquired(Vec<std::os::fd::OwnedFd>),
+    Acquired(Vec<protocol::AdmissionFlock>),
     Contended {
         reason: String,
         evidence: Option<protocol::ContentionEvidence>,
@@ -2020,7 +2020,7 @@ fn try_acquire_resources_unfenced_with_permits_reusing(
     cpus: &[usize],
     cpu_mode: FlockMode,
     permits: &[usize],
-    reusable_permits: &[(usize, std::os::fd::OwnedFd)],
+    reusable_permits: &[(usize, protocol::AdmissionFlock)],
 ) -> Result<RawAcquireAll> {
     let target = protocol::canonical_lock_order_with_permits(
         llc_indices,
@@ -2034,7 +2034,7 @@ fn try_acquire_resources_unfenced_with_permits_reusing(
 
 fn try_acquire_lock_target_unfenced_reusing(
     target: &[protocol::ResourceLock],
-    reusable_permits: &[(usize, std::os::fd::OwnedFd)],
+    reusable_permits: &[(usize, protocol::AdmissionFlock)],
 ) -> Result<RawAcquireAll> {
     let mut locks = Vec::with_capacity(target.len());
     for lock in target {
@@ -2043,15 +2043,16 @@ fn try_acquire_lock_target_unfenced_reusing(
                 .iter()
                 .find(|(candidate, _)| *candidate == permit)
         {
-            // dup(2) retains the same open-file description and therefore the
-            // already-held flock.  The duplicate becomes part of the exact
-            // reservation; the preparation owner can close its copy only
-            // after the registry publishes HELD.
+            // Reuse shares the same logical owner. The exact reservation keeps
+            // that owner alive after preparation releases its reference, and
+            // the final reference performs unlock-before-close.
             locks.push(fd.try_clone()?);
             continue;
         }
         match try_flock_with_witness(&lock.path, lock.mode)? {
-            TryFlockOutcome::Acquired(fd) => locks.push(fd),
+            TryFlockOutcome::Acquired(fd) => {
+                locks.push(protocol::AdmissionFlock::from_acquired(fd));
+            }
             // Dropping `locks` on return releases everything taken
             // so far — the all-or-nothing contract.
             TryFlockOutcome::Contended(witness) => {
@@ -2076,7 +2077,7 @@ pub(crate) fn acquire_resources_with_permits_granted(
     cpus: &[usize],
     cpu_mode: FlockMode,
     permits: &[usize],
-) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
+) -> Result<protocol::ProbeOutcome<Vec<protocol::AdmissionFlock>>> {
     acquire_resources_with_permits_granted_reusing(
         llc_indices,
         llc_mode,
@@ -2093,8 +2094,8 @@ pub(crate) fn acquire_resources_with_permits_granted_reusing(
     cpus: &[usize],
     cpu_mode: FlockMode,
     permits: &[usize],
-    reusable_permits: &[(usize, std::os::fd::OwnedFd)],
-) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
+    reusable_permits: &[(usize, protocol::AdmissionFlock)],
+) -> Result<protocol::ProbeOutcome<Vec<protocol::AdmissionFlock>>> {
     Ok(
         match try_acquire_resources_unfenced_with_permits_reusing(
             llc_indices,
@@ -2163,7 +2164,7 @@ pub(crate) fn acquire_default_exact_footprint_with_permits_granted(
     shared_cpus: &[usize],
     exact_cpus: &[usize],
     permits: &[usize],
-) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
+) -> Result<protocol::ProbeOutcome<Vec<protocol::AdmissionFlock>>> {
     acquire_default_exact_footprint_with_permits_granted_reusing(
         shared_llcs,
         shared_cpus,
@@ -2178,8 +2179,8 @@ pub(crate) fn acquire_default_exact_footprint_with_permits_granted_reusing(
     shared_cpus: &[usize],
     exact_cpus: &[usize],
     permits: &[usize],
-    reusable_permits: &[(usize, std::os::fd::OwnedFd)],
-) -> Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
+    reusable_permits: &[(usize, protocol::AdmissionFlock)],
+) -> Result<protocol::ProbeOutcome<Vec<protocol::AdmissionFlock>>> {
     let target = default_exact_footprint_lock_order_with_permits(
         shared_llcs,
         shared_cpus,
@@ -2202,7 +2203,7 @@ pub(crate) fn acquire_default_exact_footprint_with_permits_granted_reusing(
 
 pub(crate) fn convert_default_exact_locks(
     target: &[protocol::ResourceLock],
-    locks: &[std::os::fd::OwnedFd],
+    locks: &[protocol::AdmissionFlock],
 ) -> Result<()> {
     use rustix::fs::{FlockOperation, flock};
 
@@ -2609,10 +2610,10 @@ pub(crate) struct LlcSnapshot {
 /// `cpuset.mems` so memory allocations respect the same NUMA locality
 /// the CPU reservation already implies.
 ///
-/// `locks` holds the RAII file descriptors whose `OwnedFd::drop`
-/// releases the kernel-side flock; the field is `pub(crate)` because
-/// direct manipulation from outside the crate would defeat the drop
-/// guarantee.
+/// `locks` holds shared admission owners whose final logical drop explicitly
+/// unlocks the kernel-side flock before closing its descriptor; the field is
+/// `pub(crate)` because direct manipulation from outside the crate would
+/// defeat that release-order guarantee.
 #[derive(Debug)]
 pub struct LlcPlan {
     /// Selected host LLC indices, sorted ASCENDING. Acquire order
@@ -2645,7 +2646,7 @@ pub struct LlcPlan {
     /// RAII flock holders. Dropped when the plan goes out of scope,
     /// releasing each LLC's `LOCK_SH` in declared order.
     #[allow(dead_code)] // RAII only — Drop releases flocks, no reads.
-    pub(crate) locks: protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
+    pub(crate) locks: protocol::Acquired<Vec<protocol::AdmissionFlock>>,
 }
 
 /// Maximum TOCTOU retry budget for the DISCOVER → PLAN → ACQUIRE
@@ -3249,7 +3250,7 @@ fn avoid_preceding_claims_when_possible(
 }
 
 enum LlcLockAttempt {
-    Acquired(Vec<std::os::fd::OwnedFd>),
+    Acquired(Vec<protocol::AdmissionFlock>),
     Contended(protocol::ContentionEvidence),
     #[cfg(test)]
     Unavailable,
@@ -3266,7 +3267,7 @@ impl IntoLlcLockAttempt for LlcLockAttempt {
 }
 
 #[cfg(test)]
-impl IntoLlcLockAttempt for Option<Vec<std::os::fd::OwnedFd>> {
+impl IntoLlcLockAttempt for Option<Vec<protocol::AdmissionFlock>> {
     fn into_llc_lock_attempt(self) -> LlcLockAttempt {
         self.map_or(LlcLockAttempt::Unavailable, LlcLockAttempt::Acquired)
     }
@@ -3288,10 +3289,12 @@ fn try_acquire_llc_plan_locks_with_evidence(
         cpus,
         FlockMode::Shared,
     );
-    let mut locks: Vec<std::os::fd::OwnedFd> = Vec::with_capacity(target.len());
+    let mut locks: Vec<protocol::AdmissionFlock> = Vec::with_capacity(target.len());
     for lock in target {
         match try_flock_with_witness(&lock.path, lock.mode)? {
-            TryFlockOutcome::Acquired(fd) => locks.push(fd),
+            TryFlockOutcome::Acquired(fd) => {
+                locks.push(protocol::AdmissionFlock::from_acquired(fd));
+            }
             TryFlockOutcome::Contended(witness) => {
                 // Drop previously-held fds so the peer racing us sees
                 // a consistent post-bail state, then signal "retry".
@@ -3580,11 +3583,11 @@ pub(super) struct PreparationPermit {
     pub(super) token_permit: usize,
     pub(super) cpu_permits: Vec<usize>,
     pub(super) memory_permits: Vec<usize>,
-    pub(super) permit_fds: Vec<(usize, std::os::fd::OwnedFd)>,
+    pub(super) permit_fds: Vec<(usize, protocol::AdmissionFlock)>,
     /// One real CPU-SH owner matching `affinity_cpu`. The PENDING claim
     /// publishes the same CPU, so a performance reservation cannot enter
     /// between placement and `sched_setaffinity`.
-    affinity_lock: Option<std::os::fd::OwnedFd>,
+    affinity_lock: Option<protocol::AdmissionFlock>,
     affinity_cpu: usize,
     original_affinity: Vec<usize>,
     affinity_constrained: bool,
@@ -3627,7 +3630,7 @@ impl PreparationPermit {
         )
     }
 
-    pub(super) fn clone_permit_fds(&self) -> Result<Vec<(usize, std::os::fd::OwnedFd)>> {
+    pub(super) fn clone_permit_fds(&self) -> Result<Vec<(usize, protocol::AdmissionFlock)>> {
         anyhow::ensure!(
             self.all_permits().len() == self.permit_fds.len(),
             "preparation permit {} has inconsistent resource/fd counts",
@@ -3734,9 +3737,9 @@ impl PreparationPermit {
         token_permit: usize,
         cpu_permits: Vec<usize>,
         memory_permits: Vec<usize>,
-        permit_fds: Vec<(usize, std::os::fd::OwnedFd)>,
+        permit_fds: Vec<(usize, protocol::AdmissionFlock)>,
         affinity_cpu: usize,
-        affinity_lock: std::os::fd::OwnedFd,
+        affinity_lock: protocol::AdmissionFlock,
         original_affinity: Vec<usize>,
     ) -> Self {
         Self {
@@ -3903,7 +3906,7 @@ fn build_permit_range(cpu_count: usize) -> Result<std::ops::Range<usize>> {
 /// and preparation cooperatively overlaps the least-held CPU instead of
 /// stalling an otherwise runnable host.
 enum PreparationAffinityAttempt {
-    Acquired(usize, std::os::fd::OwnedFd),
+    Acquired(usize, protocol::AdmissionFlock),
     Contended(std::path::PathBuf, Option<protocol::ContentionEvidence>),
 }
 
@@ -3964,7 +3967,10 @@ fn try_acquire_preparation_affinity_cpu(
         }
         match try_flock_with_witness(cpu_lock_path(cpu), FlockMode::Shared)? {
             TryFlockOutcome::Acquired(fd) => {
-                return Ok(PreparationAffinityAttempt::Acquired(cpu, fd));
+                return Ok(PreparationAffinityAttempt::Acquired(
+                    cpu,
+                    protocol::AdmissionFlock::from_acquired(fd),
+                ));
             }
             TryFlockOutcome::Contended(witness) => {
                 first_contended.get_or_insert((
@@ -4006,7 +4012,10 @@ fn try_acquire_selected_preparation_affinity_cpu(
         let path = std::path::PathBuf::from(cpu_lock_path(cpu));
         match try_flock_with_witness(cpu_lock_path(cpu), FlockMode::Shared)? {
             TryFlockOutcome::Acquired(fd) => {
-                return Ok(PreparationAffinityAttempt::Acquired(cpu, fd));
+                return Ok(PreparationAffinityAttempt::Acquired(
+                    cpu,
+                    protocol::AdmissionFlock::from_acquired(fd),
+                ));
             }
             TryFlockOutcome::Contended(witness) => {
                 first.get_or_insert((
@@ -4058,7 +4067,7 @@ fn try_acquire_preparation_permit_at(
     index: usize,
     token_permit: usize,
     rotation: usize,
-    preheld_token: Option<std::os::fd::OwnedFd>,
+    preheld_token: Option<protocol::AdmissionFlock>,
     wait_for_registry: bool,
     affinity_candidates: Option<&[usize]>,
 ) -> Result<PreparationPermitAttempt> {
@@ -4068,10 +4077,10 @@ fn try_acquire_preparation_permit_at(
     let mut permit_fds = Vec::with_capacity(1 + PREPARATION_CPU_PERMITS + memory_required);
 
     let acquire_one = |permit| -> Result<
-        std::result::Result<std::os::fd::OwnedFd, protocol::ContentionEvidence>,
+        std::result::Result<protocol::AdmissionFlock, protocol::ContentionEvidence>,
     > {
         match try_flock_with_witness(permit_lock_path(permit), FlockMode::Exclusive)? {
-            TryFlockOutcome::Acquired(fd) => Ok(Ok(fd)),
+            TryFlockOutcome::Acquired(fd) => Ok(Ok(protocol::AdmissionFlock::from_acquired(fd))),
             TryFlockOutcome::Contended(witness) => Ok(Err(protocol::ContentionEvidence {
                 blocker: protocol::ResourceKey::Permit(permit),
                 mode: FlockMode::Exclusive,
@@ -4328,11 +4337,14 @@ pub(super) fn acquire_preparation_permit(
                 return Ok((preparation, claim));
             }
             PreparationPermitAttempt::ResourceContended { path, mode, .. } => {
-                drop(block_flock_deadline(
-                    path,
-                    mode,
-                    std::time::Instant::now() + std::time::Duration::from_secs(2),
-                )?);
+                drop(
+                    block_flock_deadline(
+                        path,
+                        mode,
+                        std::time::Instant::now() + std::time::Duration::from_secs(2),
+                    )?
+                    .map(protocol::AdmissionFlock::from_acquired),
+                );
             }
             PreparationPermitAttempt::TokenContended {
                 index,
@@ -4343,6 +4355,7 @@ pub(super) fn acquire_preparation_permit(
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 if let Some(token_fd) = block_flock_deadline(path, FlockMode::Exclusive, deadline)?
                 {
+                    let token_fd = protocol::AdmissionFlock::from_acquired(token_fd);
                     match try_acquire_preparation_permit_at(
                         index,
                         token_permit,
@@ -4360,11 +4373,14 @@ pub(super) fn acquire_preparation_permit(
                             // resource that prevented a complete preparation set;
                             // granting it is only a wake event, so release it before
                             // the next all-token scan.
-                            drop(block_flock_deadline(
-                                path,
-                                mode,
-                                std::time::Instant::now() + std::time::Duration::from_secs(2),
-                            )?);
+                            drop(
+                                block_flock_deadline(
+                                    path,
+                                    mode,
+                                    std::time::Instant::now() + std::time::Duration::from_secs(2),
+                                )?
+                                .map(protocol::AdmissionFlock::from_acquired),
+                            );
                         }
                         PreparationPermitAttempt::TokenContended { .. } => {
                             unreachable!("a preheld preparation token cannot be contended")
@@ -4400,13 +4416,11 @@ pub(super) fn preparation_resource_watch() -> Result<protocol::ClaimSet> {
 
 pub(super) fn validate_preparation_permit(
     index: usize,
-    permit_fds: Vec<(usize, std::os::fd::OwnedFd)>,
+    permit_fds: Vec<(usize, protocol::AdmissionFlock)>,
     affinity_cpu: usize,
-    affinity_lock: std::os::fd::OwnedFd,
+    affinity_lock: protocol::AdmissionFlock,
     original_affinity: Vec<usize>,
 ) -> Result<PreparationPermit> {
-    use std::os::unix::fs::MetadataExt;
-
     let tokens = preparation_token_range()?;
     let token_permit = tokens
         .clone()
@@ -4454,25 +4468,22 @@ pub(super) fn validate_preparation_permit(
         "inherited preparation affinity CPU {affinity_cpu} is outside its original mask",
     );
     for (permit, fd) in &permit_fds {
-        let actual = std::fs::File::from(fd.try_clone()?)
-            .metadata()
-            .context("stat inherited preparation permit")?;
+        let actual = rustix::fs::fstat(fd).context("stat inherited preparation permit")?;
         let expected_path = permit_lock_path(*permit);
-        let expected = std::fs::metadata(&expected_path)
+        let expected = rustix::fs::stat(&expected_path)
             .with_context(|| format!("stat preparation permit {expected_path}"))?;
         anyhow::ensure!(
-            actual.dev() == expected.dev() && actual.ino() == expected.ino(),
+            actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino,
             "inherited descriptor does not name preparation permit resource {permit}",
         );
     }
-    let actual = std::fs::File::from(affinity_lock.try_clone()?)
-        .metadata()
-        .context("stat inherited preparation CPU lock")?;
+    let actual =
+        rustix::fs::fstat(&affinity_lock).context("stat inherited preparation CPU lock")?;
     let expected_path = cpu_lock_path(affinity_cpu);
-    let expected = std::fs::metadata(&expected_path)
+    let expected = rustix::fs::stat(&expected_path)
         .with_context(|| format!("stat preparation CPU lock {expected_path}"))?;
     anyhow::ensure!(
-        actual.dev() == expected.dev() && actual.ino() == expected.ino(),
+        actual.st_dev == expected.st_dev && actual.st_ino == expected.st_ino,
         "inherited descriptor does not name preparation CPU resource {affinity_cpu}",
     );
     Ok(PreparationPermit::imported(
@@ -5050,7 +5061,7 @@ fn acquire_llc_plan_with_acquire_fn<F>(
     acquire_fn: F,
 ) -> Result<LlcPlan>
 where
-    F: FnMut(&[usize], &[usize], &[LlcSnapshot]) -> Result<Option<Vec<std::os::fd::OwnedFd>>>,
+    F: FnMut(&[usize], &[usize], &[LlcSnapshot]) -> Result<Option<Vec<protocol::AdmissionFlock>>>,
 {
     acquire_llc_plan_with_acquire_fn_impl(
         LlcPlanAcquireRequest {
@@ -6590,7 +6601,7 @@ fn plan_mems(cpus: &[usize], topo: &HostTopology) -> std::collections::BTreeSet<
 fn materialize_llc_plan(
     selected: Vec<usize>,
     snapshots: Vec<LlcSnapshot>,
-    locks: protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
+    locks: protocol::Acquired<Vec<protocol::AdmissionFlock>>,
     cpus: Vec<usize>,
     permits: Vec<usize>,
     _memory_permits: Vec<usize>,

@@ -6,7 +6,7 @@
 //! mask. No exact VM topology exists until the test finishes preparing
 //! immutable artifacts and activates the record.
 
-use super::{PendingAdmission, registry};
+use super::{AdmissionFlock, PendingAdmission, registry};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Write;
@@ -242,14 +242,18 @@ pub(crate) fn take_pending_exec_handoff() -> Result<Option<ImportedPendingExecHa
     // of the complete set before any later fallible validation, so every error
     // closes every inherited owner rather than leaking a partial handoff.
     let liveness = unsafe { OwnedFd::from_raw_fd(header.liveness_fd) };
-    let affinity_lock = unsafe { OwnedFd::from_raw_fd(header.affinity_fd) };
+    let affinity_lock =
+        AdmissionFlock::from_acquired(unsafe { OwnedFd::from_raw_fd(header.affinity_fd) });
     let preparation_fds = header
         .preparation_fds
         .iter()
         .map(|(permit, fd)| {
             // SAFETY: the sealed one-shot descriptor transfers sole ownership
             // of every distinct inherited preparation descriptor.
-            (*permit, unsafe { OwnedFd::from_raw_fd(*fd) })
+            (
+                *permit,
+                AdmissionFlock::from_acquired(unsafe { OwnedFd::from_raw_fd(*fd) }),
+            )
         })
         .collect::<Vec<_>>();
     set_fd_flags(

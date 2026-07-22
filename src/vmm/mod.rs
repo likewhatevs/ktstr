@@ -651,7 +651,7 @@ pub struct KtstrVm {
 
 struct RunLocks {
     #[allow(dead_code)]
-    locks: host_topology::protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
+    locks: host_topology::protocol::Acquired<Vec<host_topology::protocol::AdmissionFlock>>,
     pinning_plan: Option<host_topology::PinningPlan>,
     /// Run-time shared CPU pool admitted for either explicit no-perf mode or
     /// default's best-effort fallback. Every mask consumer uses this exact
@@ -1976,9 +1976,9 @@ impl KtstrVm {
     /// resources after immutable image preparation but before KVM VM creation
     /// and kernel load, so a cell parked in the
     /// admission registry is cheap (one fixed ticket/futex; only the
-    /// coordinator owns inotify; no guest memory). The returned `Vec<OwnedFd>`
-    /// is dropped at the end of the run, releasing every run-scoped lock for
-    /// concurrent peers.
+    /// coordinator owns inotify; no guest memory). The returned admission
+    /// owners are dropped at the end of the run, explicitly unlocking every
+    /// run-scoped resource before its descriptor closes.
     ///
     /// `wait` selects the contention policy: the test path
     /// ([`Self::run`]) passes `true`, so a contended reservation joins
@@ -2060,9 +2060,9 @@ impl KtstrVm {
                     if !fresh.locks.is_empty() {
                         host_topology::warn_if_cross_node_spill(&fresh, host_topo);
                     }
-                    // Move the RAII fds into `RunLocks` so they release at
-                    // end-of-run, and carry the refreshed CPUs so the mask
-                    // consumers bind to exactly these locked LLCs.
+                    // Move the admission owners into `RunLocks` so they
+                    // release at end-of-run, and carry the refreshed CPUs so
+                    // the mask consumers bind to exactly these locked LLCs.
                     let host_topology::LlcPlan { cpus, locks, .. } = fresh;
                     Ok(RunLocks {
                         locks,
@@ -2984,7 +2984,7 @@ impl KtstrVm {
         cancelled: Option<&AtomicBool>,
     ) -> Result<(
         Vec<usize>,
-        host_topology::protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
+        host_topology::protocol::Acquired<Vec<host_topology::protocol::AdmissionFlock>>,
     )> {
         use host_topology::protocol;
 
@@ -3207,7 +3207,7 @@ impl KtstrVm {
     fn build_default_shared_run_locks(
         cpus: Vec<usize>,
         vcpus: usize,
-        locks: host_topology::protocol::Acquired<Vec<std::os::fd::OwnedFd>>,
+        locks: host_topology::protocol::Acquired<Vec<host_topology::protocol::AdmissionFlock>>,
     ) -> RunLocks {
         if let Some(w) = host_topology::overcommit_warning(cpus.len(), vcpus, false) {
             eprintln!("{w}");

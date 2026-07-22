@@ -1373,7 +1373,7 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
             } else {
                 // Attempt 1: peer released, acquire succeeds
                 // with an empty fd set (production would have
-                // actual OwnedFd values; the LlcPlan RAII
+                // actual admission owners; the LlcPlan RAII
                 // contract is exercised elsewhere).
                 Ok(Some(Vec::new()))
             }
@@ -1381,7 +1381,7 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
     )
     .expect("retry on attempt 1 must succeed");
     // Attempt 1 produced locks (empty vec is fine — the plan
-    // constructor accepts any Vec<OwnedFd>).
+    // constructor accepts an empty admission-owner vector).
     assert_eq!(counter.get(), 2, "acquire_fn called exactly twice");
     // 30% of 2 allowed CPUs = ceil(0.6) = 1 CPU → pick 1 LLC
     // (seed-node first: LLC 0). `selected` holds only LLC 0;

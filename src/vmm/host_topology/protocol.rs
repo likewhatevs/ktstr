@@ -32,8 +32,9 @@
 
 use anyhow::Result;
 use std::collections::BTreeSet;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -71,6 +72,108 @@ pub(crate) struct ResourceLock {
     pub(crate) path: String,
     pub(crate) mode: FlockMode,
     pub(crate) resource: ResourceKey,
+}
+
+/// Shared ownership of one long-lived host-admission flock.
+///
+/// Linux reports `IN_CLOSE_WRITE` before implicit flock teardown during the
+/// final `close(2)`. Explicitly unlocking while the descriptor is still open
+/// reverses that ordering for admission owners: every writable close event is
+/// emitted only after the resource is physically available. Clones share the
+/// same userspace ownership boundary, so the final logical owner is known and
+/// performs the one explicit unlock before the underlying fd closes.
+#[derive(Clone)]
+pub(crate) struct AdmissionFlock(Arc<AdmissionFlockInner>);
+
+struct AdmissionFlockInner {
+    fd: OwnedFd,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ADMISSION_FLOCK_UNLOCK_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_admission_flock_unlock_hook_for_tests(hook: impl FnOnce() + 'static) {
+    ADMISSION_FLOCK_UNLOCK_HOOK.with(|slot| {
+        let previous = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            previous.is_none(),
+            "admission-flock unlock test hook was already installed",
+        );
+    });
+}
+
+#[cfg(test)]
+fn run_admission_flock_unlock_hook_for_tests() {
+    ADMISSION_FLOCK_UNLOCK_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_admission_flock_unlock_hook_for_tests() {}
+
+impl AdmissionFlock {
+    pub(crate) fn from_acquired(fd: OwnedFd) -> Self {
+        Self(Arc::new(AdmissionFlockInner { fd }))
+    }
+
+    /// Preserve the fallible `OwnedFd::try_clone` call shape at reuse sites,
+    /// while sharing the one physical lock owner and unlock-before-close edge.
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(self.clone())
+    }
+}
+
+impl AsFd for AdmissionFlock {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.fd.as_fd()
+    }
+}
+
+impl AsRawFd for AdmissionFlock {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.fd.as_raw_fd()
+    }
+}
+
+impl std::fmt::Debug for AdmissionFlock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdmissionFlock")
+            .field("fd", &self.as_raw_fd())
+            .field("owners", &Arc::strong_count(&self.0))
+            .finish()
+    }
+}
+
+impl Drop for AdmissionFlockInner {
+    fn drop(&mut self) {
+        use rustix::fs::{FlockOperation, flock};
+
+        loop {
+            match flock(&self.fd, FlockOperation::Unlock) {
+                Ok(()) => break,
+                Err(error) if error == rustix::io::Errno::INTR => continue,
+                Err(error) => {
+                    tracing::error!(
+                        fd = self.fd.as_raw_fd(),
+                        %error,
+                        "failed to explicitly unlock host-admission flock before close",
+                    );
+                    break;
+                }
+            }
+        }
+        run_admission_flock_unlock_hook_for_tests();
+        // `fd` closes only after this Drop implementation returns.
+    }
 }
 
 /// Exact evidence retained from a failed nonblocking resource probe.
@@ -632,6 +735,11 @@ impl LockDirEvents {
     }
 
     #[cfg(test)]
+    pub(crate) fn contains_cpu_close(&self, cpu: usize) -> bool {
+        self.cpu_closes.contains(&cpu)
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_backlog(&self) -> bool {
         self.backlog
     }
@@ -962,7 +1070,7 @@ pub(crate) struct GrantedProbe {
     contention: Option<ContentionEvidence>,
     predecessors: registry::AggregateSnapshot,
     availability: registry::AvailabilitySnapshot,
-    reusable_permits: Vec<(usize, OwnedFd)>,
+    reusable_permits: Vec<(usize, AdmissionFlock)>,
 }
 
 impl GrantedProbe {
@@ -977,7 +1085,7 @@ impl GrantedProbe {
         &self.designated
     }
 
-    pub(crate) fn clone_reusable_permits(&self) -> Result<Vec<(usize, OwnedFd)>> {
+    pub(crate) fn clone_reusable_permits(&self) -> Result<Vec<(usize, AdmissionFlock)>> {
         self.reusable_permits
             .iter()
             .map(|(permit, fd)| Ok((*permit, fd.try_clone()?)))
@@ -1245,7 +1353,7 @@ impl Drop for PendingAdmission {
 /// reuse the preparation owner's permit OFDs, but cannot queue or retry.
 pub(crate) struct PendingOneShotProbe<'a> {
     registry: &'a registry::PendingOneShotProbe<'a>,
-    reusable_permits: &'a [(usize, OwnedFd)],
+    reusable_permits: &'a [(usize, AdmissionFlock)],
 }
 
 impl PendingOneShotProbe<'_> {
@@ -1253,7 +1361,7 @@ impl PendingOneShotProbe<'_> {
         self.registry.candidate_ready(candidate)
     }
 
-    pub(crate) fn clone_reusable_permits(&self) -> Result<Vec<(usize, OwnedFd)>> {
+    pub(crate) fn clone_reusable_permits(&self) -> Result<Vec<(usize, AdmissionFlock)>> {
         self.reusable_permits
             .iter()
             .map(|(permit, fd)| Ok((*permit, fd.try_clone()?)))
@@ -2220,7 +2328,7 @@ fn exercise_coordinator_prepare_notify_case(
         token_permit: permit,
         cpu_permits: Vec::new(),
         memory_permits: Vec::new(),
-        permit_fds: vec![(permit, permit_fd)],
+        permit_fds: vec![(permit, AdmissionFlock::from_acquired(permit_fd))],
         affinity_lock: None,
         affinity_cpu: 0,
         original_affinity: Vec::new(),
@@ -2331,7 +2439,7 @@ fn token_only_preparation_for_tests(token: usize) -> Result<super::PreparationPe
         token_permit: token,
         cpu_permits: Vec::new(),
         memory_permits: Vec::new(),
-        permit_fds: vec![(token, token_fd)],
+        permit_fds: vec![(token, AdmissionFlock::from_acquired(token_fd))],
         affinity_lock: None,
         affinity_cpu: 0,
         original_affinity: Vec::new(),
@@ -3043,7 +3151,7 @@ impl HeldLocks {
         self.preparation_contention.insert(evidence);
     }
 
-    pub(crate) fn clone_reusable_permits(&self) -> Result<Vec<(usize, OwnedFd)>> {
+    pub(crate) fn clone_reusable_permits(&self) -> Result<Vec<(usize, AdmissionFlock)>> {
         self.preparation
             .as_ref()
             .map(super::PreparationPermit::clone_permit_fds)
@@ -3057,7 +3165,7 @@ impl HeldLocks {
         &mut self,
         claim: &ClaimSet,
         target: &[ResourceLock],
-    ) -> Result<Option<Vec<OwnedFd>>> {
+    ) -> Result<Option<Vec<AdmissionFlock>>> {
         validate_probe_target(claim, target)?;
         if !self.candidate_ready(claim)? {
             return Ok(None);
@@ -3075,7 +3183,7 @@ impl HeldLocks {
         &mut self,
         published_claim: &ClaimSet,
         target: &[ResourceLock],
-    ) -> Result<Option<Vec<OwnedFd>>> {
+    ) -> Result<Option<Vec<AdmissionFlock>>> {
         anyhow::ensure!(
             published_claim.cpu_mode == ClaimMode::Shared,
             "default exact probe requires a shared published CPU claim",
@@ -3128,7 +3236,7 @@ impl HeldLocks {
     pub(crate) fn probe_complete(
         &mut self,
         candidate: &[ResourceLock],
-    ) -> Result<Option<Vec<OwnedFd>>> {
+    ) -> Result<Option<Vec<AdmissionFlock>>> {
         self.probe_complete_inner(candidate, true)
     }
 
@@ -3136,7 +3244,7 @@ impl HeldLocks {
         &mut self,
         candidate: &[ResourceLock],
         retain_contention: bool,
-    ) -> Result<Option<Vec<OwnedFd>>> {
+    ) -> Result<Option<Vec<AdmissionFlock>>> {
         let mut fresh = Vec::with_capacity(candidate.len());
         let mut reusable = self
             .clone_reusable_permits()?
@@ -3150,7 +3258,7 @@ impl HeldLocks {
                 continue;
             }
             match try_flock_with_witness(&lock.path, lock.mode)? {
-                TryFlockOutcome::Acquired(fd) => fresh.push(fd),
+                TryFlockOutcome::Acquired(fd) => fresh.push(AdmissionFlock::from_acquired(fd)),
                 TryFlockOutcome::Contended(witness) => {
                     drop(fresh);
                     let evidence = ContentionEvidence {

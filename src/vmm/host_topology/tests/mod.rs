@@ -242,7 +242,10 @@ impl Drop for AllowedCpusGuard {
 fn unwrap_acquired(
     outcome: LockOutcome,
     ctx: Option<&str>,
-) -> (usize, super::protocol::Acquired<Vec<std::os::fd::OwnedFd>>) {
+) -> (
+    usize,
+    super::protocol::Acquired<Vec<super::protocol::AdmissionFlock>>,
+) {
     match outcome {
         LockOutcome::Acquired { llc_offset, locks } => (llc_offset, locks),
         LockOutcome::Unavailable(reason) => {

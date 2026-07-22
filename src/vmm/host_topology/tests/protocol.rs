@@ -918,52 +918,151 @@ fn recv_from_service_thread<T, U>(
     recv_with_task_service(receiver, context, std::slice::from_ref(&worker.service))
 }
 
-/// EMPIRICAL verification of the inotify wake contract the coordinator
-/// engine sleeps on: releasing a flock (dropping the fd — the only
-/// release path in this codebase) closes an `O_RDWR` fd and must fire
-/// `IN_CLOSE_WRITE` on the lockfile's name in the watched directory.
-/// The protocol intentionally watches that writable-close edge only, so
-/// read-only liveness probes never enter its queue. This test pins that
-/// holder release remains observable — if a kernel/library change stopped it,
-/// coordinators would degrade to the 30 s missed-event maintenance wake
-/// (correct but slower),
-/// and this test would catch the regression loudly instead.
+/// Pin the release ordering on which the coordinator wake contract depends:
+/// the resource must already be physically flock-free while the final owner
+/// is paused before close, and `IN_CLOSE_WRITE` must arrive only after that
+/// owner is allowed to close its writable descriptor.
 #[test]
-fn flock_release_fires_in_close_event() {
-    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let ino = Inotify::init(InitFlags::IN_NONBLOCK).expect("inotify init");
-    ino.add_watch(
-        tmp.path(),
-        AddWatchFlags::IN_CLOSE_WRITE | AddWatchFlags::IN_CLOSE_NOWRITE,
-    )
-    .expect("add watch");
-
-    let lockfile = tmp.path().join("release-edge.lock");
-    let fd = crate::flock::try_flock(&lockfile, crate::flock::FlockMode::Exclusive)
-        .expect("open")
-        .expect("EX on fresh file");
-    // Drain the open/create noise, then release and observe.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let _ = ino.read_events();
-    drop(fd);
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let mut saw_close = false;
-    while std::time::Instant::now() < deadline && !saw_close {
-        if let Ok(events) = ino.read_events() {
-            for ev in events {
-                if ev.name.as_deref() == Some(std::ffi::OsStr::new("release-edge.lock")) {
-                    saw_close = true;
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+fn admission_flock_unlocks_before_its_close_wake() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let cpu = 1usize;
+    let path = cpu_lock_path(cpu);
+    let owner = protocol::AdmissionFlock::from_acquired(
+        crate::flock::try_flock(&path, crate::flock::FlockMode::Exclusive)
+            .expect("open admission resource")
+            .expect("acquire fresh admission resource"),
+    );
+    let watched = protocol::ClaimSet::new(
+        std::iter::empty(),
+        [cpu],
+        crate::flock::FlockMode::Exclusive,
+    );
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
     assert!(
-        saw_close,
-        "dropping a flock fd must fire an IN_CLOSE_* event for the \
-         lockfile — the coordinator's wake mechanism depends on it",
+        !watch
+            .drain(&watched)
+            .expect("drain coordinator watch")
+            .contains_cpu_close(cpu),
+        "installing the watch must not synthesize a resource close",
+    );
+
+    let (unlocked_tx, unlocked_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = TestServiceThread::spawn(move || {
+        protocol::set_admission_flock_unlock_hook_for_tests(move || {
+            let physically_free = matches!(
+                crate::flock::primitives::probe_flock_existing_read_only(
+                    &path,
+                    crate::flock::FlockMode::Exclusive,
+                )
+                .expect("probe explicitly unlocked resource"),
+                Some(crate::flock::TryFlockOutcome::Acquired(_)),
+            );
+            unlocked_tx
+                .send(physically_free)
+                .expect("publish unlock observation");
+            resume_rx
+                .recv()
+                .expect("resume final admission-owner close");
+        });
+        drop(owner);
+    });
+    let physically_free =
+        recv_from_service_thread(&unlocked_rx, "admission unlock-before-close hook", &worker);
+    let before_close = watch.drain(&watched);
+    resume_tx.send(()).expect("release final close hook");
+    worker.join().expect("final admission-owner drop");
+    assert!(
+        physically_free.expect("observe physical unlock"),
+        "the resource must be physically acquirable before the writable owner closes",
+    );
+    assert!(
+        !before_close
+            .expect("probe coordinator watch before close")
+            .contains_cpu_close(cpu),
+        "explicit unlock must not publish the close wake before the fd closes",
+    );
+    assert!(
+        watch
+            .wait(std::time::Duration::from_secs(2), &watched)
+            .expect("wait for final writable close")
+            .is_some_and(|events| events.contains_cpu_close(cpu)),
+        "the final close must wake coordinators after physical unlock",
+    );
+}
+
+#[test]
+fn admission_flock_clone_unlocks_and_closes_only_after_last_owner() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let cpu = 1usize;
+    let path = cpu_lock_path(cpu);
+    let owner = protocol::AdmissionFlock::from_acquired(
+        crate::flock::try_flock(&path, crate::flock::FlockMode::Exclusive)
+            .expect("open admission resource")
+            .expect("acquire fresh admission resource"),
+    );
+    let clone = owner.try_clone().expect("clone logical admission owner");
+    let watched = protocol::ClaimSet::new(
+        std::iter::empty(),
+        [cpu],
+        crate::flock::FlockMode::Exclusive,
+    );
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
+    watch.drain(&watched).expect("drain coordinator watch");
+
+    let unlocks = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let hook_unlocks = std::rc::Rc::clone(&unlocks);
+    protocol::set_admission_flock_unlock_hook_for_tests(move || {
+        hook_unlocks.set(hook_unlocks.get() + 1);
+    });
+    drop(clone);
+    assert_eq!(
+        unlocks.get(),
+        0,
+        "dropping a non-final logical owner must not unlock the resource",
+    );
+    assert!(
+        !watch
+            .drain(&watched)
+            .expect("probe watch after non-final drop")
+            .contains_cpu_close(cpu),
+        "dropping a non-final logical owner must not close the resource fd",
+    );
+    assert!(
+        matches!(
+            crate::flock::primitives::probe_flock_existing_read_only(
+                &path,
+                crate::flock::FlockMode::Exclusive,
+            )
+            .expect("probe live logical owner"),
+            Some(crate::flock::TryFlockOutcome::Contended(_)),
+        ),
+        "the resource must remain physically held by the surviving owner",
+    );
+
+    drop(owner);
+    assert_eq!(
+        unlocks.get(),
+        1,
+        "the final logical owner must execute exactly one explicit unlock",
+    );
+    assert!(
+        watch
+            .wait(std::time::Duration::from_secs(2), &watched)
+            .expect("wait for final logical-owner close")
+            .is_some_and(|events| events.contains_cpu_close(cpu)),
+        "the final logical owner must produce the coordinator close wake",
+    );
+    assert!(
+        matches!(
+            crate::flock::primitives::probe_flock_existing_read_only(
+                &path,
+                crate::flock::FlockMode::Exclusive,
+            )
+            .expect("probe released logical owner"),
+            Some(crate::flock::TryFlockOutcome::Acquired(_)),
+        ),
+        "the final logical owner must leave the resource immediately acquirable",
     );
 }
 
@@ -2027,7 +2126,7 @@ fn live_build_and_default_borrower_may_share_but_perf_ex_remains_a_hard_fence() 
             .expect("query compatible default-borrow claim"),
         "build demand is a placement preference, not a hard fence for default CPU-SH work",
     );
-    let default_held = protocol::publish_acquired(&default, Vec::<std::os::fd::OwnedFd>::new())
+    let default_held = protocol::publish_acquired(&default, Vec::<protocol::AdmissionFlock>::new())
         .expect("publish compatible default borrower");
     let snapshot =
         protocol::registered_claim_snapshot(&build).expect("read aggregate with live build claim");
@@ -5160,7 +5259,7 @@ fn coordinator_commit_is_terminal_even_if_cancellation_arrives_afterward() {
         claim.clone(),
         claim.clone(),
         Some(&cancelled),
-        |_| Ok::<Option<Vec<std::os::fd::OwnedFd>>, anyhow::Error>(None),
+        |_| Ok::<Option<Vec<protocol::AdmissionFlock>>, anyhow::Error>(None),
     )
     .expect("register terminal-commit coordinator")
     {
@@ -5233,7 +5332,7 @@ fn granted_commit_is_terminal_even_if_cancellation_arrives_afterward() {
                 claim.clone(),
                 claim.clone(),
                 None,
-                |_| Ok::<Option<Vec<std::os::fd::OwnedFd>>, anyhow::Error>(None),
+                |_| Ok::<Option<Vec<protocol::AdmissionFlock>>, anyhow::Error>(None),
             )? {
                 protocol::TicketWork::Coordinator(coordinator) => coordinator,
                 protocol::TicketWork::Acquired(_) => {
@@ -5789,14 +5888,16 @@ fn ticket_claim(cpus: &[usize]) -> protocol::ClaimSet {
 
 fn try_ticket_candidate(
     cpus: &[usize],
-) -> anyhow::Result<protocol::ProbeOutcome<Vec<std::os::fd::OwnedFd>>> {
+) -> anyhow::Result<protocol::ProbeOutcome<Vec<protocol::AdmissionFlock>>> {
     let mut locks = Vec::with_capacity(cpus.len());
     for &cpu in cpus {
         match crate::flock::try_flock_with_witness(
             cpu_lock_path(cpu),
             crate::flock::FlockMode::Exclusive,
         )? {
-            crate::flock::TryFlockOutcome::Acquired(lock) => locks.push(lock),
+            crate::flock::TryFlockOutcome::Acquired(lock) => {
+                locks.push(protocol::AdmissionFlock::from_acquired(lock));
+            }
             crate::flock::TryFlockOutcome::Contended(witness) => {
                 drop(locks);
                 return Ok(protocol::ProbeOutcome::Contended(

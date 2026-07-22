@@ -20373,7 +20373,9 @@ mod run_vm_thread_guard_tests {
             freeze_coord: None,
             watchdog: None,
             run_locks: Some(super::super::RunLocks {
-                locks: super::super::host_topology::protocol::Acquired::untracked(vec![held]),
+                locks: super::super::host_topology::protocol::Acquired::untracked(vec![
+                    super::super::host_topology::protocol::AdmissionFlock::from_acquired(held),
+                ]),
                 pinning_plan: None,
                 shared_cpu_mask: None,
                 default_shared_cpu_claim: false,
