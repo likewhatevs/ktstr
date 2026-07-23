@@ -2940,9 +2940,18 @@ impl IdentityPlan {
         let stable_source = self.stable_source(progress_label)?;
         let cache_root = ktstr::cache::cargo_artifact_tree_cache_root()
             .map_err(|error| format!("resolve Cargo artifact cache root: {error:#}"))?;
+        // Under cold-build disk pressure, reclaim lease-free shared
+        // build-scratch buckets (pure caches lifecycle GC never sees) rather
+        // than let a stale GITHUB_SHA-era or retired-config bucket fill the
+        // runner until the 14-day idle sweep. The bucket THIS build will lease
+        // is exempted — it has not taken its lease yet at reservation time.
+        let exempt_bucket = self.build_bucket;
         let cache = ktstr::cache::artifact_tree::ArtifactTreeCache::new(
             cache_root.join("nextest-build-records-v1"),
-        );
+        )
+        .with_build_space_reclaimer(Box::new(move |shortfall| {
+            crate::run_cargo::reclaim_shared_build_scratch_under_pressure(shortfall, exempt_bucket)
+        }));
         let tree = cache
             .load_or_build_with_stable_cargo_output_validators(
                 self.identity,

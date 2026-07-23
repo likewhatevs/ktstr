@@ -986,10 +986,25 @@ fn diagnostic_component(value: &str) -> String {
     out
 }
 
+/// Best-effort disk-pressure reclaimer invoked at the cold-build reservation
+/// boundary when the filesystem is below its build-space reserve even after
+/// lifecycle collection ran.
+///
+/// Given the shortfall in bytes, it frees pure-cache scratch space owned by the
+/// caller (worst case one cold rebuild) and returns the bytes it reclaimed.
+/// Installed via [`ArtifactTreeCache::with_build_space_reclaimer`]; the library
+/// stays agnostic to the caller's scratch layout and locking scheme. Must not
+/// touch the output the pending build is about to use — the caller exempts it.
+pub type BuildSpaceReclaimer = Box<dyn Fn(u64) -> u64 + Send + Sync>;
+
 /// Cross-process cache for immutable, relocatable artifact trees.
 #[doc(hidden)]
 pub struct ArtifactTreeCache {
     root: PathBuf,
+    /// Optional caller hook, run only when a cold-build reservation still finds
+    /// the filesystem below its reserve after collection. See
+    /// [`BuildSpaceReclaimer`].
+    build_space_reclaimer: Option<BuildSpaceReclaimer>,
 }
 
 /// Deterministic persistent Cargo output pathname for one artifact identity.
@@ -1008,7 +1023,19 @@ impl ArtifactTreeCache {
     /// Use an explicit record/election root. Content bytes still converge in
     /// ktstr's ordinary machine-wide content CAS.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            build_space_reclaimer: None,
+        }
+    }
+
+    /// Install a [`BuildSpaceReclaimer`] hook run at the cold-build reservation
+    /// boundary when the filesystem remains below its build-space reserve after
+    /// lifecycle collection. Additive builder: cold builds through a cache
+    /// without one keep the historical warn-only behavior.
+    pub fn with_build_space_reclaimer(mut self, reclaimer: BuildSpaceReclaimer) -> Self {
+        self.build_space_reclaimer = Some(reclaimer);
+        self
     }
 
     fn lifecycle_root(&self) -> PathBuf {
@@ -1165,11 +1192,34 @@ impl ArtifactTreeCache {
             crate::flock::FlockMode::Shared,
         )?;
         let (active_reservations, _) = active_build_reservations(&closure.lifecycle_root)?;
-        let after = lifecycle_filesystem_space(&closure.lifecycle_root)?;
+        let mut after = lifecycle_filesystem_space(&closure.lifecycle_root)?;
         drop(global);
         let required = LIFECYCLE_MIN_FREE_RESERVE
             .max(after.capacity / LIFECYCLE_FREE_RESERVE_DIVISOR)
             .saturating_add(active_reservations);
+        // Lifecycle collection reclaims only the managed closure/content cache.
+        // A caller (e.g. the Cargo producer) may own a separate pure-cache
+        // scratch space on the same filesystem whose orphans lifecycle GC never
+        // sees. When the reserve is still short after collection, invoke the
+        // caller's reclaimer so this disk-pressure event drives that cleanup at
+        // the same reservation boundary the lifecycle GC uses — rather than
+        // waiting for the scratch's own slow idle timer.
+        if after.available < required
+            && let Some(reclaimer) = &self.build_space_reclaimer
+        {
+            let shortfall = required - after.available;
+            let reclaimed = reclaimer(shortfall);
+            if reclaimed > 0 {
+                after = lifecycle_filesystem_space(&closure.lifecycle_root)?;
+                tracing::info!(
+                    shortfall_bytes = shortfall,
+                    reclaimed_bytes = reclaimed,
+                    available_bytes = after.available,
+                    required_bytes = required,
+                    "reclaimed caller scratch space under cold-build disk pressure",
+                );
+            }
+        }
         if after.available < required {
             tracing::warn!(
                 available_bytes = after.available,

@@ -5539,14 +5539,10 @@ fn gc_stale_shared_build_scratch_in(
     }
 }
 
-/// Whether every recorded timestamp under a bucket is older than the idle
-/// threshold. Uses the newest mtime of the bucket root and its immediate
-/// children (Cargo touches the per-profile subdirectories on every build), so
-/// an in-progress or recently completed build keeps the bucket.
-fn shared_build_scratch_bucket_is_idle(
-    bucket: &std::path::Path,
-    now: std::time::SystemTime,
-) -> bool {
+/// Newest mtime of a bucket root and its immediate children. Cargo touches the
+/// per-profile subdirectories on every build, so this rises whenever a build
+/// ran; a still-building or recently-finished bucket reports a recent time.
+fn bucket_newest_modified(bucket: &std::path::Path) -> Option<std::time::SystemTime> {
     let mut newest = std::fs::symlink_metadata(bucket)
         .ok()
         .and_then(|metadata| metadata.modified().ok());
@@ -5557,13 +5553,168 @@ fn shared_build_scratch_bucket_is_idle(
             }
         }
     }
-    match newest {
+    newest
+}
+
+/// Whether every recorded timestamp under a bucket is older than the idle
+/// threshold, used by the no-pressure [`SHARED_BUILD_SCRATCH_MAX_IDLE`] sweep.
+fn shared_build_scratch_bucket_is_idle(
+    bucket: &std::path::Path,
+    now: std::time::SystemTime,
+) -> bool {
+    match bucket_newest_modified(bucket) {
         Some(newest) => now
             .duration_since(newest)
             .map(|idle| idle >= SHARED_BUILD_SCRATCH_MAX_IDLE)
             .unwrap_or(false),
         None => false,
     }
+}
+
+/// Total bytes of the regular files under a bucket (symlinks are not followed),
+/// used to estimate how much a pressure sweep reclaimed by removing it.
+fn bucket_size_bytes(bucket: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![bucket.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                stack.push(entry.path());
+            } else if kind.is_file()
+                && let Ok(metadata) = entry.metadata()
+            {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
+}
+
+/// Reclaim lease-free shared build-scratch buckets under cold-build disk
+/// pressure, oldest-idle first, until `shortfall_bytes` is covered or no
+/// unleased bucket remains — regardless of [`SHARED_BUILD_SCRATCH_MAX_IDLE`].
+///
+/// Installed as the [`ktstr::cache::artifact_tree::BuildSpaceReclaimer`] on the
+/// nextest cold-build cache: when `reserve_cold_build_space` finds the
+/// filesystem below its reserve after lifecycle collection, this frees the
+/// pure-cache Cargo scratch dirs that lifecycle GC never sees (a stale
+/// GITHUB_SHA-era bucket, a retired toolchain/feature bucket). Worst case is one
+/// cold rebuild of a reclaimed configuration. The 14-day
+/// [`gc_stale_shared_build_scratch`] sweep still covers the no-pressure case.
+///
+/// `exempt_bucket` is the bucket the pending build is about to lease; it is
+/// never a candidate (the build has not taken its lease yet when the reservation
+/// runs, so a non-blocking lock would otherwise succeed and delete it).
+pub(crate) fn reclaim_shared_build_scratch_under_pressure(
+    shortfall_bytes: u64,
+    exempt_bucket: u64,
+) -> u64 {
+    let Ok(parent) = crate::nextest_artifact_cache::shared_build_scratch_dir(0)
+        .map(|bucket_zero| bucket_zero.parent().map(std::path::Path::to_path_buf))
+    else {
+        return 0;
+    };
+    let Some(parent) = parent else {
+        return 0;
+    };
+    let lock_root = match ktstr::cache::cargo_build_output_lock_root() {
+        Ok(root) => root,
+        Err(_) => return 0,
+    };
+    reclaim_shared_build_scratch_under_pressure_in(
+        &parent,
+        &lock_root,
+        shortfall_bytes,
+        Some(exempt_bucket),
+    )
+}
+
+fn reclaim_shared_build_scratch_under_pressure_in(
+    parent: &std::path::Path,
+    lock_root: &std::path::Path,
+    shortfall_bytes: u64,
+    exempt_bucket: Option<u64>,
+) -> u64 {
+    if shortfall_bytes == 0 {
+        return 0;
+    }
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    // (newest_mtime, path, bucket_id) for every reclaimable bucket except the
+    // one the pending build will use. Ordered oldest-idle first so the
+    // least-recently-built configurations go before hotter ones.
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(bucket_id) = entry.file_name().to_str().and_then(|name| {
+            (name.len() == 16 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then(|| u64::from_str_radix(name, 16).ok())
+                .flatten()
+        }) else {
+            continue;
+        };
+        if exempt_bucket == Some(bucket_id) {
+            continue;
+        }
+        let path = entry.path();
+        let newest = bucket_newest_modified(&path).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        candidates.push((newest, path, bucket_id));
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2)));
+
+    let mut reclaimed = 0u64;
+    for (_, bucket, bucket_id) in candidates {
+        if reclaimed >= shortfall_bytes {
+            break;
+        }
+        let Ok(canonical) = std::fs::canonicalize(&bucket) else {
+            continue;
+        };
+        let lock_path = cargo_build_output_lock_path(lock_root, &canonical);
+        // Non-blocking: a live builder holding this lease keeps its bucket.
+        let Ok(Some(_lease)) =
+            ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive)
+        else {
+            continue;
+        };
+        // Re-check under the lease: a builder may have taken and released this
+        // bucket between the directory scan and the lock.
+        if !bucket.is_dir() {
+            continue;
+        }
+        let size = bucket_size_bytes(&bucket);
+        match std::fs::remove_dir_all(&bucket) {
+            Ok(()) => {
+                reclaimed = reclaimed.saturating_add(size);
+                tracing::info!(
+                    bucket = %format!("{bucket_id:016x}"),
+                    reclaimed_bytes = size,
+                    cumulative_reclaimed_bytes = reclaimed,
+                    shortfall_bytes,
+                    "reclaimed lease-free shared build-scratch bucket under cold-build disk pressure",
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    bucket = %format!("{bucket_id:016x}"),
+                    error = %error,
+                    "could not reclaim shared build-scratch bucket under disk pressure",
+                );
+            }
+        }
+    }
+    reclaimed
 }
 
 pub(crate) fn acquire_cargo_build_output_lease(
@@ -7389,6 +7540,111 @@ mod tests {
         assert!(
             leased.exists(),
             "a bucket under an active build-output lease must never be deleted",
+        );
+    }
+
+    #[test]
+    fn reclaim_sweeps_oldest_unleased_scratch_until_shortfall_clears() {
+        let temp = tempfile::tempdir().expect("scratch parent");
+        let parent = temp.path().join("shared-build-scratch-v1");
+        let lock_root = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_root).unwrap();
+        let now = std::time::SystemTime::now();
+        let make = |name: &str, bytes: usize, age_secs: u64| -> std::path::PathBuf {
+            let bucket = parent.join(name);
+            std::fs::create_dir_all(&bucket).unwrap();
+            let marker = bucket.join("obj.o");
+            std::fs::write(&marker, vec![0u8; bytes]).unwrap();
+            let target = now - std::time::Duration::from_secs(age_secs);
+            std::fs::File::options()
+                .write(true)
+                .open(&marker)
+                .unwrap()
+                .set_modified(target)
+                .unwrap();
+            // Set the bucket dir mtime LAST: adding the marker bumped it to ~now,
+            // which would otherwise dominate `bucket_newest_modified`.
+            std::fs::File::open(&bucket)
+                .unwrap()
+                .set_modified(target)
+                .unwrap();
+            bucket
+        };
+        let old = make("aaaaaaaaaaaaaaaa", 4096, 300);
+        let mid = make("bbbbbbbbbbbbbbbb", 4096, 200);
+        let new = make("cccccccccccccccc", 4096, 100);
+
+        // A one-byte shortfall reclaims exactly the single oldest idle bucket and
+        // then stops — proving both the oldest-first order and the bounded sweep.
+        let reclaimed =
+            reclaim_shared_build_scratch_under_pressure_in(&parent, &lock_root, 1, None);
+        assert!(
+            reclaimed >= 4096,
+            "reclaimed at least the oldest bucket's bytes: {reclaimed}"
+        );
+        assert!(
+            !old.exists(),
+            "the oldest idle bucket is swept first under pressure"
+        );
+        assert!(
+            mid.exists() && new.exists(),
+            "the sweep stops once the shortfall is covered",
+        );
+    }
+
+    #[test]
+    fn reclaim_spares_leased_and_exempt_buckets_and_no_ops_without_shortfall() {
+        let temp = tempfile::tempdir().expect("scratch parent");
+        let parent = temp.path().join("shared-build-scratch-v1");
+        let lock_root = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_root).unwrap();
+        let make = |name: &str| -> std::path::PathBuf {
+            let bucket = parent.join(name);
+            std::fs::create_dir_all(&bucket).unwrap();
+            std::fs::write(bucket.join("obj.o"), vec![0u8; 4096]).unwrap();
+            bucket
+        };
+        let leased = make("aaaaaaaaaaaaaaaa");
+        let exempt = make("bbbbbbbbbbbbbbbb");
+        let free = make("cccccccccccccccc");
+
+        // No shortfall: never sweep, even with reclaimable buckets present.
+        assert_eq!(
+            reclaim_shared_build_scratch_under_pressure_in(&parent, &lock_root, 0, None),
+            0,
+            "a zero shortfall must not sweep anything",
+        );
+        assert!(leased.exists() && exempt.exists() && free.exists());
+
+        // Hold the build-output lease on `leased` and exempt `exempt` (the
+        // pending build's own bucket). Even an unbounded shortfall may reclaim
+        // only `free`.
+        let canonical_leased = std::fs::canonicalize(&leased).unwrap();
+        let held = ktstr::flock::try_flock(
+            cargo_build_output_lock_path(&lock_root, &canonical_leased),
+            ktstr::flock::FlockMode::Exclusive,
+        )
+        .unwrap()
+        .expect("hold bucket lease for the test");
+        let reclaimed = reclaim_shared_build_scratch_under_pressure_in(
+            &parent,
+            &lock_root,
+            u64::MAX,
+            Some(0xbbbb_bbbb_bbbb_bbbb),
+        );
+        drop(held);
+        assert!(
+            !free.exists(),
+            "an unleased, non-exempt bucket is reclaimed under pressure",
+        );
+        assert!(reclaimed >= 4096);
+        assert!(
+            leased.exists(),
+            "a bucket under an active build-output lease is never swept",
+        );
+        assert!(
+            exempt.exists(),
+            "the pending build's own bucket is exempt from the sweep",
         );
     }
 
