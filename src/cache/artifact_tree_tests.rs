@@ -956,6 +956,101 @@ fn stable_cargo_output_is_hashed_once_before_sealing_changes_ctime() {
     );
 }
 
+/// Round-trips a producer whose record carries a `build/**` closure (as the
+/// nextest producer captures) written outside the stable root — the shared,
+/// non-source-keyed Cargo scratch — through both the cold and the reuse branch.
+///
+/// The cold branch must distill and seal without resolving a physical `build/`
+/// under the stable root (Cargo never writes it there anymore), the per-source
+/// materialized tree must still carry the `build/` closure (rebased from the CAS
+/// — this is what nextest's build-dir-remap resolves at test time), and the seal
+/// must own only `target/`. The reuse branch must serve the same closure from
+/// the record without invoking the builder. This is the round trip that
+/// regressed when `build/` was still treated as stable-root output.
+#[test]
+fn stable_cargo_build_closure_outside_root_round_trips_cold_and_reuse() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let cache = ArtifactTreeCache::new(temp.path().join("records"));
+    let stable_parent = temp.path().join("stable");
+    let materializations = temp.path().join("materializations");
+    // The shared Cargo build scratch lives outside the stable root.
+    let shared_scratch = temp.path().join("shared-build-scratch");
+    let identity = 0x5ea1_c105_u64;
+
+    let build = |cache: &ArtifactTreeCache| {
+        cache
+            .load_or_build_with_stable_cargo_output(
+                identity,
+                &stable_parent,
+                &materializations,
+                "stable-cargo-build-closure-roundtrip",
+                || Ok(true),
+                || false,
+                |stable| {
+                    // Final artifact under the sealed per-source target dir.
+                    let artifact = stable.target_directory.join("release/harness");
+                    std::fs::create_dir_all(artifact.parent().unwrap())?;
+                    std::fs::write(&artifact, b"final artifact")?;
+                    // Build-script OUT_DIR written to the shared scratch, never
+                    // under the stable root.
+                    let out_dir = shared_scratch.join("release/build/dep-abcd/out");
+                    std::fs::create_dir_all(&out_dir)?;
+                    std::fs::write(out_dir.join("generated.rs"), b"embedded OUT_DIR payload")?;
+                    let mut source = ArtifactTreeSource::new();
+                    source.insert_file("target/release/harness", &artifact)?;
+                    source.insert_immutable_tree("build", shared_scratch.join("release/build"))?;
+                    Ok(source)
+                },
+            )
+            .unwrap()
+    };
+
+    // Cold branch: must succeed even though `build/` is not under the stable root.
+    let cold = build(&cache);
+    assert!(!cold.cache_hit());
+    assert_eq!(
+        std::fs::read(cold.root().join("target/release/harness")).unwrap(),
+        b"final artifact",
+    );
+    assert_eq!(
+        std::fs::read(cold.root().join("build/dep-abcd/out/generated.rs")).unwrap(),
+        b"embedded OUT_DIR payload",
+        "the nextest build closure must be materialized into the per-source tree",
+    );
+    let sealed = stable_parent.join(format!("{identity:016x}"));
+    assert!(sealed.join("target/release/harness").is_file());
+    assert!(
+        !sealed.join("build").exists(),
+        "the shared build closure is never sealed under the stable root",
+    );
+    drop(cold);
+
+    // Reuse branch: same identity must serve the closure without the builder.
+    let reuse = cache
+        .load_or_build_with_stable_cargo_output(
+            identity,
+            &stable_parent,
+            &materializations,
+            "stable-cargo-build-closure-roundtrip",
+            || Ok(true),
+            || false,
+            |_stable| panic!("a stable-cargo-output reuse must not invoke the builder"),
+        )
+        .unwrap();
+    assert!(reuse.cache_hit());
+    assert_eq!(
+        std::fs::read(reuse.root().join("target/release/harness")).unwrap(),
+        b"final artifact",
+    );
+    assert_eq!(
+        std::fs::read(reuse.root().join("build/dep-abcd/out/generated.rs")).unwrap(),
+        b"embedded OUT_DIR payload",
+        "reuse must serve the build closure from the record",
+    );
+}
+
 #[test]
 fn lifecycle_reserves_before_closure_ex_and_does_not_invert_waiter_order() {
     let _environment = lock_env();
@@ -1560,16 +1655,19 @@ fn stable_cargo_distillation_preserves_exact_closure_without_following_outside_l
         std::fs::read(stable_root.join("target/debug/deps/harness")).unwrap(),
         b"recorded-harness",
     );
-    assert_eq!(
-        std::fs::read(stable_root.join("build/package/out/generated")).unwrap(),
-        b"recorded-out-dir",
+    // The Cargo build closure (`build/`) is a private-execution artifact, not
+    // part of the absolute-anchored stable root: distillation prunes it here
+    // even when the producer wrote it under the root, and it is served from the
+    // materialized tree instead (asserted below), exactly like `meta/`.
+    assert!(
+        !stable_root.join("build").exists(),
+        "the build closure must not be sealed under the absolute Cargo anchor",
     );
     assert_eq!(
         std::fs::read_link(stable_root.join("target/debug/deps/current")).unwrap(),
         Path::new("harness"),
     );
     assert!(!stable_root.join("target/debug/incremental").exists());
-    assert!(!stable_root.join("build/unrelated").exists());
     assert!(!stable_root.join("target/outside-link").exists());
     assert_eq!(
         std::fs::read(outside.join("sentinel")).unwrap(),

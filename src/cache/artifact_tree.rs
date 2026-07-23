@@ -2720,8 +2720,20 @@ fn prepare_stable_cargo_build(root: &Path) -> Result<StableCargoBuild> {
     })
 }
 
+/// Whether a recorded path is a Cargo output the sealed stable root physically
+/// owns (retains, rebases from the CAS, and validates in place).
+///
+/// Only `target/` — the final artifacts whose absolute pathnames may be embedded
+/// (e.g. `CARGO_BIN_EXE_*`) — is sealed under the per-source stable root. The
+/// Cargo build closure (`build/`: dependency intermediates and build-script
+/// `OUT_DIR`s) is written to a persistent, non-source-keyed scratch directory
+/// shared across digests, never under the stable root, so the distillation walk
+/// must not expect a physical `build/` here. Any `build/**` record entries the
+/// nextest producer captures are still materialized into the per-source private
+/// tree from the CAS by `materialize`, which is what nextest's build-dir-remap
+/// resolves at test-execution time — the stable root plays no part in that.
 fn stable_cargo_output_path(path: &Path) -> bool {
-    path.starts_with("target") || path.starts_with("build")
+    path.starts_with("target")
 }
 
 fn open_stable_cargo_directory_at(
