@@ -25,6 +25,45 @@ use super::symbols::{
     start_kernel_map_for_tcr, text_kva_to_pa_with_base,
 };
 
+/// Emit the aarch64 address-derivation snapshot once per process.
+///
+/// The freeze-coordinator guest reads (probe `.bss` counters,
+/// `*scx_root->exit_kind`) go through the aarch64 TTBR1 page-table
+/// walk, which fails uniformly on arm64 + guest-kernel 7.1 and leaves
+/// every capture at the `maps:[]` placeholder. The static VA-layout
+/// formulas are identical between the working (6.14) and broken (7.1)
+/// kernels, so the discriminator is the live `TCR_EL1` — see
+/// `symbols::arm64_derivation_diag`. Emitting it at `warn` once per process
+/// puts the granule / VA width / LPA2(DS) / walk-supportability into
+/// every lane's log so a single ARM run confirms or refutes the
+/// LPA2-rejection hypothesis. No-op on x86_64 (the walk uses CR3, not
+/// this derivation) to keep the x86 lanes quiet.
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+fn emit_arm64_derivation_diag_once(
+    tcr_el1: u64,
+    cr3_pa: u64,
+    start_kernel_map: u64,
+    page_offset: u64,
+    phys_base: u64,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "{}",
+                super::symbols::arm64_derivation_diag(
+                    tcr_el1,
+                    cr3_pa,
+                    start_kernel_map,
+                    page_offset,
+                    phys_base,
+                )
+            );
+        });
+    }
+}
+
 /// Host-side accessor for kernel memory in a running guest VM.
 ///
 /// Resolves ELF symbols and paging configuration once at construction.
@@ -281,6 +320,13 @@ impl GuestKernel {
         };
         let page_offset =
             resolve_page_offset_with_tcr(&mem, kern_syms, start_kernel_map, tcr_el1, phys_base);
+        emit_arm64_derivation_diag_once(
+            tcr_el1,
+            walk_cr3,
+            start_kernel_map,
+            page_offset,
+            phys_base,
+        );
         let aarch64_params = decode_aarch64_params(tcr_el1);
         Ok(Self {
             mem,
@@ -417,6 +463,13 @@ impl GuestKernel {
 
         let page_offset =
             resolve_page_offset_with_tcr(&mem, &kern_syms, start_kernel_map, tcr_el1, phys_base);
+        emit_arm64_derivation_diag_once(
+            tcr_el1,
+            walk_cr3,
+            start_kernel_map,
+            page_offset,
+            phys_base,
+        );
 
         // Cache the decoded aarch64 walk parameters once. On x86_64
         // the helper's `from_tcr_el1` returns None; the cache stays
