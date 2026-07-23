@@ -1097,5 +1097,22 @@ SCX_OPS_DEFINE(ktstr_ops,
 	       .dump_task	= (void *)ktstr_dump_task,
 	       .init		= (void *)ktstr_init,
 	       .exit		= (void *)ktstr_exit,
-	       .timeout_ms	= 20000,
+	       /* Runnable-timeout watchdog budget baked into the scheduler at
+		* enable. The host lowers the LIVE timeout to ~5s post-attach
+		* (the timestamp-forge / watchdog-override path in
+		* monitor::reader), so steady-state scenarios are governed by
+		* that override, not this value; nothing depends on a longer
+		* baked budget (scx-ktstr dispatches promptly and only the
+		* deliberate `stall` path holds a task undispatched). This value
+		* governs only the pre-override window. On kernels where the
+		* timeout lives inside the per-scheduler struct (arms at enable,
+		* before the host can deref the scheduler root to override it),
+		* a 20s bake made the kernel watchdog kworker first fire at
+		* timeout/2 = 10s, so an intentional `--stall-after` eviction
+		* landed ~10s in — racing the bounded teardown AP-kill under
+		* host load and flaking the cast-analysis expect_err tests. 4s
+		* arms a ~2s kworker cadence so the deliberate stall evicts in
+		* ~2-4s, matching the prompt, stable eviction the static-global
+		* override kernels already get. */
+	       .timeout_ms	= 4000,
 	       .name		= "ktstr");
