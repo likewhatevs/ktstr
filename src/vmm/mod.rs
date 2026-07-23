@@ -1723,6 +1723,33 @@ pub(crate) fn debug_logging_enabled() -> bool {
     })
 }
 
+/// Process-wide wall clock anchored at the earliest point of a
+/// `#[ktstr_test]` run — BEFORE the in-process admission wait, so its elapsed
+/// time tracks the SAME span nextest's per-test `terminate-after` counts
+/// (which includes the admission queue). The VM's own `run_start` begins only
+/// after admission and can lag this by hundreds of seconds when a cell queues
+/// behind the rest of the VM suite (observed: a cell whose VM-relative
+/// deadline expired at 126 s had a 672 s nextest wall — a ~546 s queue). The
+/// last-resort watchdog wall net anchors its absolute ceiling here so it can
+/// fire inside nextest's rail regardless of the queue; every guest-derived /
+/// VM-relative deadline (the tiers, the deadman, the wall net's deadline
+/// term) stays on `run_start`.
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Record the process/admission-start anchor for [`process_start_elapsed`].
+/// Idempotent (first call wins); call as early as possible in a `#[ktstr_test]`
+/// run, before any admission wait, so the anchor precedes the queue.
+pub(crate) fn record_process_start() {
+    let _ = PROCESS_START.get_or_init(std::time::Instant::now);
+}
+
+/// Elapsed wall since [`record_process_start`], or `None` if it was never
+/// recorded (a code path that did not enter through the test harness). The
+/// watchdog falls back to its VM-relative `run_start` clock in that case.
+pub(crate) fn process_start_elapsed() -> Option<std::time::Duration> {
+    PROCESS_START.get().map(std::time::Instant::elapsed)
+}
+
 /// Human-readable summary of device-IRQ routing-install failures, for
 /// `run_interactive`'s teardown. `None` when there were none. `n` is a count of
 /// `KVM_SET_GSI_ROUTING` installs that errored, each leaving a device IRQ

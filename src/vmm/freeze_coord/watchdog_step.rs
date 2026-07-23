@@ -337,8 +337,8 @@ pub(crate) const fn deadman_cpu_budget_exhausted(
 /// starved cell becomes a witnessed Tier-3 SKIP, the designed degradation).
 pub(crate) const WALL_NET_DEADLINE_MULT: u64 = 4;
 
-/// Absolute, dilation-INDEPENDENT total-VM-wall ceiling for the wall net
-/// (run-start-relative nanoseconds).
+/// Absolute, dilation-INDEPENDENT ceiling for the wall net, measured on the
+/// PROCESS-start clock (nanoseconds since [`crate::vmm::record_process_start`]).
 ///
 /// The [`WALL_NET_DEADLINE_MULT`] term above is measured against
 /// `effective_deadline_budget_ns`, which is itself dilation-scaled: the
@@ -349,46 +349,51 @@ pub(crate) const WALL_NET_DEADLINE_MULT: u64 = 4;
 /// milestones so late that the effective deadline balloons to ~1000 s, so
 /// `4x` lands well past the outer nextest terminate-after — the multiple term
 /// alone cannot fire in time and the wedge escapes to a dumpless SIGKILL.
+///
 /// This ceiling is a FIXED wall bound, independent of any guest-derived or
-/// dilation-scaled quantity, chosen to land inside the ~1260 s outer rail with
-/// margin for the kill + teardown to complete. An outer rail that INCLUDES
-/// unbounded admission-queue time cannot be strictly beaten in theory
-/// (`now_wall` is post-admission and excludes queue); on the post-same-wake
-/// x64 admission path the per-cell queue wait is ~0, so this ceiling wins in
-/// practice. Only consulted together with the wedge-signature gate in
-/// [`wall_net_tripped`] (a phase stalled past its own wall backstop), so a
-/// legitimately-dilated cell still making milestone progress — including a
-/// long idle Body, exempt via its `u64::MAX` backstop — is untouched.
+/// dilation-scaled quantity. CRITICALLY it is measured on the process clock,
+/// NOT the VM's `run_start`: nextest's per-test `terminate-after` counts the
+/// in-process admission wait, and on a queued lane (ARM: a cell whose
+/// VM-relative deadline expired at 126 s had a 672 s nextest wall — a ~546 s
+/// queue) the post-admission `run_start.elapsed()` never reaches a
+/// ~1000 s ceiling before the 1260 s SIGKILL. Anchoring on the same clock
+/// nextest counts makes the ceiling reachable regardless of the queue, with
+/// margin for the kill + teardown to complete. Only consulted together with
+/// the wedge-signature gate in [`wall_net_tripped`] (a phase stalled past its
+/// own wall backstop), so a legitimately-dilated cell still making milestone
+/// progress — including a long idle Body, exempt via its `u64::MAX` backstop —
+/// is untouched.
 pub(crate) const WALL_NET_ABSOLUTE_CEILING_NS: u64 = 1_000_000_000_000; // 1000 s
 
 /// Whether the liveness-independent Tier-3 wall net has tripped. Two terms,
 /// either sufficient:
 ///   - the deadline-relative term: the phase has sat `wall_in_phase_ns`
-///     (measured from the last milestone; run-start-relative, so
-///     admission-queue time is excluded) past [`WALL_NET_DEADLINE_MULT`]x the
-///     effective-deadline budget. A zero budget (deadline unset) disables this
-///     term.
-///   - the absolute-ceiling term: the WHOLE VM has run past
-///     [`WALL_NET_ABSOLUTE_CEILING_NS`] of run-start-relative wall AND the
-///     current phase has stalled past its own `phase_wall_backstop_ns` (the
-///     wedge signature). This dilation-independent backstop catches a wedge
-///     whose effective deadline was inflated past the outer rail by a
-///     dilation-scaled reset. The backstop gate keeps it off a Body phase
-///     (`u64::MAX` backstop) and off a phase that only just re-anchored a
-///     milestone (a legitimately-slow cell making forward progress), so it
-///     fires only on a genuinely stalled INFRA phase.
+///     (measured from the last milestone; run-start-relative) past
+///     [`WALL_NET_DEADLINE_MULT`]x the effective-deadline budget. A zero budget
+///     (deadline unset) disables this term.
+///   - the absolute-ceiling term: the process has run past
+///     [`WALL_NET_ABSOLUTE_CEILING_NS`] of `now_process_ns` (process-start
+///     relative, so it INCLUDES the admission queue and tracks nextest's rail)
+///     AND the current phase has stalled past its own `phase_wall_backstop_ns`
+///     (the wedge signature; `wall_in_phase_ns` stays VM-relative). This
+///     dilation-independent backstop catches a wedge whose effective deadline
+///     was inflated past the outer rail by a dilation-scaled reset. The
+///     backstop gate keeps it off a Body phase (`u64::MAX` backstop) and off a
+///     phase that only just re-anchored a milestone (a legitimately-slow cell
+///     making forward progress), so it fires only on a genuinely stalled
+///     INFRA phase.
 ///
 /// Strict `>` throughout.
 pub(crate) const fn wall_net_tripped(
     wall_in_phase_ns: u64,
     effective_deadline_budget_ns: u64,
-    now_wall_ns: u64,
+    now_process_ns: u64,
     phase_wall_backstop_ns: u64,
 ) -> bool {
     let deadline_term = effective_deadline_budget_ns != 0
         && wall_in_phase_ns > effective_deadline_budget_ns.saturating_mul(WALL_NET_DEADLINE_MULT);
     let absolute_term =
-        now_wall_ns > WALL_NET_ABSOLUTE_CEILING_NS && wall_in_phase_ns > phase_wall_backstop_ns;
+        now_process_ns > WALL_NET_ABSOLUTE_CEILING_NS && wall_in_phase_ns > phase_wall_backstop_ns;
     deadline_term || absolute_term
 }
 
@@ -1817,7 +1822,7 @@ mod tests {
 
     #[test]
     fn wall_net_never_trips_on_an_unset_deadline() {
-        // A zero budget disables the deadline term; with now_wall below the
+        // A zero budget disables the deadline term; with the process clock below the
         // ceiling the net must never fire however large the in-phase wall.
         assert!(!wall_net_tripped(u64::MAX, 0, 0, u64::MAX));
     }
@@ -1834,9 +1839,11 @@ mod tests {
         // scenario-start reset inflates the effective deadline to ~the dilated
         // boot wall, so the deadline term (`4x`) lands far past the outer rail
         // and never fires. The absolute ceiling is dilation-independent: once
-        // the whole VM has run past the ceiling AND the phase has stalled past
-        // its own wall backstop, the net fires regardless of the (huge)
-        // deadline budget.
+        // the PROCESS clock (3rd arg — queue-inclusive, tracking nextest's
+        // rail; the caller passes process-start-relative wall, which on a
+        // queued lane runs hundreds of seconds AHEAD of the VM's own run_start)
+        // is past the ceiling AND the phase has stalled past its own wall
+        // backstop, the net fires regardless of the (huge) deadline budget.
         let teardown_backstop = 15 * S;
         let huge_budget = 100_000 * S; // 4x is astronomically beyond the rail
         // Just past the ceiling AND past the phase backstop: fires.

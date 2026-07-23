@@ -15331,19 +15331,24 @@ impl KtstrVm {
                     // defer, so a wedge whose fast tiers are suppressed under
                     // host load can never reach the outer nextest
                     // terminate-after without a ktstr kill + failure dump.
-                    // `wall_since_milestone_ns` is run-start-relative, so
-                    // admission-queue time cannot trip it. Unconditional — NOT
-                    // gated on `ordinary_overlay_active`, since the overlays
-                    // fail-closed on their own far-shorter budgets long before
-                    // this and a stuck overlay must not defeat the net. The
-                    // absolute-ceiling term (dilation-independent) needs the
-                    // wall since VM start and the current phase's own wall
-                    // backstop as the wedge-signature gate (`u64::MAX` for
-                    // Body, exempting a long idle Body).
+                    // Unconditional — NOT gated on `ordinary_overlay_active`,
+                    // since the overlays fail-closed on their own far-shorter
+                    // budgets long before this and a stuck overlay must not
+                    // defeat the net. The absolute-ceiling term is measured on
+                    // the PROCESS clock (`now_process_ns`), which includes the
+                    // in-process admission wait and so tracks nextest's rail —
+                    // the VM-relative `now_wall_ns` can lag it by hundreds of
+                    // seconds on a queued lane, leaving a ~1000 s ceiling
+                    // unreachable before the 1260 s SIGKILL. The
+                    // wedge-signature gate (`wall_since_milestone_ns` past the
+                    // phase's own backstop, `u64::MAX` for Body) stays
+                    // VM-relative.
+                    let now_process_ns = crate::vmm::process_start_elapsed()
+                        .map_or(now_wall_ns, |d| d.as_nanos().min(u64::MAX as u128) as u64);
                     let wall_net_fire = watchdog_step::wall_net_tripped(
                         wall_since_milestone_ns,
                         effective_deadline_budget_ns,
-                        now_wall_ns,
+                        now_process_ns,
                         crate::test_support::runtime::phase_wall_backstop_ns(
                             snapshot.phase,
                             vcpus_for_wd,
@@ -15661,6 +15666,25 @@ impl KtstrVm {
                         eprintln!(
                             "  timeout={timeout:?}, workload_duration={:?}",
                             workload_duration_for_wd
+                        );
+                        // Wall-net inputs. `now_process` (process-start clock,
+                        // queue-inclusive, tracks nextest's rail) vs
+                        // `now_wall` (VM run_start, post-admission) — a large
+                        // gap is admission-queue time and is why the absolute
+                        // ceiling anchors on the process clock. `wall_net_fire`
+                        // records whether the last-resort net was the cause.
+                        eprintln!(
+                            "  wall_net: fire={wall_net_fire}, now_process={:?}, \
+                             now_wall={:?}, ceiling={:?}, wall_in_phase={:?} vs \
+                             phase_backstop={:?}",
+                            Duration::from_nanos(now_process_ns),
+                            Duration::from_nanos(now_wall_ns),
+                            Duration::from_nanos(watchdog_step::WALL_NET_ABSOLUTE_CEILING_NS),
+                            Duration::from_nanos(wall_since_milestone_ns),
+                            Duration::from_nanos(crate::test_support::runtime::phase_wall_backstop_ns(
+                                snapshot.phase,
+                                vcpus_for_wd,
+                            )),
                         );
                         if hard_timeout_fired
                             && snapshot.phase

@@ -177,6 +177,10 @@ pub(crate) fn run_ktstr_test_inner(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
 ) -> Result<AssertResult> {
+    // Anchor the process/admission-start clock BEFORE the impl runs its
+    // admission wait, so the watchdog wall net's absolute ceiling tracks the
+    // queue-inclusive nextest rail rather than the post-admission VM clock.
+    crate::vmm::record_process_start();
     let result = run_ktstr_test_inner_impl(entry, topo);
     if let Err(ref e) = result
         && let Some(host_skip_class) = super::host_skip_class(e)
