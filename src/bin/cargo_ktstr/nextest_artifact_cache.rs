@@ -98,6 +98,16 @@ pub(crate) struct MaterializedNextestArtifacts {
     // Retain the stable source owner until the nextest child (and a possible
     // llvm-cov report child) has exited.
     _stable_source: StableCargoSource,
+    // Shared lease on the persistent build-scratch bucket, held for the whole
+    // run. The test binaries resolve build-script `OUT_DIR` artifacts (e.g. the
+    // compiled BPF `probe.o`) from that bucket AT RUNTIME via baked
+    // `env!("OUT_DIR")` absolute paths, which nextest's build-dir remap cannot
+    // rewrite. The build held it EXCLUSIVE only for the build; this SHARED hold
+    // keeps the pressure sweep and aged GC (both take a non-blocking EXCLUSIVE
+    // lease) off the bucket until every test process using it has exited. `None`
+    // when the bucket was absent (a hit whose scratch was already reclaimed —
+    // nothing left to protect).
+    _runtime_bucket_lease: Option<crate::run_cargo::CargoBuildOutputLease>,
 }
 
 pub(crate) use ktstr::cache::artifact_tree::StableCargoBuild;
@@ -109,6 +119,16 @@ impl MaterializedNextestArtifacts {
 
     pub(crate) fn stable_source(&self) -> &StableCargoSource {
         &self._stable_source
+    }
+
+    /// Attach the shared build-scratch runtime lease (see the field doc). Held
+    /// for the artifacts' whole lifetime, which the caller keeps alive across
+    /// the nextest run.
+    pub(crate) fn set_runtime_bucket_lease(
+        &mut self,
+        lease: crate::run_cargo::CargoBuildOutputLease,
+    ) {
+        self._runtime_bucket_lease = Some(lease);
     }
 
     /// Install the complete instrumented closure in a persistent coverage
@@ -646,6 +666,7 @@ pub(crate) fn finish_materialization(
         scheduler_stamps: stamps.binaries,
         tree,
         _stable_source: stable_source,
+        _runtime_bucket_lease: None,
     })
 }
 

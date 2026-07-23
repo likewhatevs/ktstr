@@ -3746,7 +3746,7 @@ pub(crate) fn load_or_build_nextest_artifacts(
     let shared_build_dir =
         crate::nextest_artifact_cache::shared_build_scratch_dir(plan.build_bucket)?;
     gc_stale_shared_build_scratch(std::time::SystemTime::now());
-    plan.load_or_build(cli_label, |stable, stable_build| {
+    let mut materialized = plan.load_or_build(cli_label, |stable, stable_build| {
         let stable_invocation_dir = stable.invocation_root.clone();
         let build_args = stable.remap_cargo_args(build_args);
         let build_args = remap_cached_build_paths(
@@ -3846,7 +3846,25 @@ pub(crate) fn load_or_build_nextest_artifacts(
                 }
             },
         )
-    })
+    })?;
+    // The test binaries resolve build-script `OUT_DIR` artifacts (notably the
+    // compiled BPF `probe.o`) from this scratch bucket AT RUNTIME through
+    // `env!("OUT_DIR")` absolute paths baked in at compile time — nextest's
+    // build-dir remap redirects only runtime `OUT_DIR` env lookups, not baked
+    // literals, so the materialized tree does not cover them. The build's
+    // EXCLUSIVE lease was released when its closure returned; take a SHARED
+    // lease now and hand it to the artifacts so it is held for the entire
+    // nextest run. The pressure sweep and aged GC take a non-blocking EXCLUSIVE
+    // lease, which fails against this SHARED hold, so neither reclaims the
+    // bucket mid-run. Skip when the bucket is absent (a hit whose scratch was
+    // already reclaimed): there is nothing left to protect, and locking would
+    // only resurrect an empty directory. The bucket this run just built is
+    // present; a hit reuses the same deterministic bucket path when it survives.
+    if shared_build_dir.is_dir() {
+        let runtime_lease = acquire_cargo_build_output_lease_shared(&shared_build_dir, cli_label)?;
+        materialized.set_runtime_bucket_lease(runtime_lease);
+    }
+    Ok(materialized)
 }
 
 const NEXTEST_ARCHIVE_BINARIES_METADATA: &str = "target/nextest/binaries-metadata.json";
@@ -5726,6 +5744,30 @@ pub(crate) fn acquire_cargo_build_output_lease(
     acquire_cargo_build_output_lease_at_root(
         target_dir,
         &root,
+        ktstr::flock::FlockMode::Exclusive,
+        cli_label,
+        &crate::interrupt::INTERRUPTED,
+    )
+}
+
+/// Acquire a SHARED build-output lease on a scratch bucket, held for the whole
+/// run as a runtime dependency guard (see
+/// [`crate::nextest_artifact_cache::MaterializedNextestArtifacts`]'s
+/// `_runtime_bucket_lease`). Multiple runs across colocated lanes coexist under
+/// SHARED; a concurrent builder's EXCLUSIVE lease still parks this until the
+/// build finishes, and the reclamation paths' non-blocking EXCLUSIVE attempts
+/// fail against this SHARED hold, so the bucket survives while its baked
+/// `env!("OUT_DIR")` artifacts are in use.
+pub(crate) fn acquire_cargo_build_output_lease_shared(
+    target_dir: &std::path::Path,
+    cli_label: &str,
+) -> Result<CargoBuildOutputLease, String> {
+    let root = ktstr::cache::cargo_build_output_lock_root()
+        .map_err(|error| format!("{cli_label}: resolve Cargo output lock root: {error:#}"))?;
+    acquire_cargo_build_output_lease_at_root(
+        target_dir,
+        &root,
+        ktstr::flock::FlockMode::Shared,
         cli_label,
         &crate::interrupt::INTERRUPTED,
     )
@@ -5734,6 +5776,7 @@ pub(crate) fn acquire_cargo_build_output_lease(
 fn acquire_cargo_build_output_lease_at_root(
     target_dir: &std::path::Path,
     root: &std::path::Path,
+    mode: ktstr::flock::FlockMode,
     cli_label: &str,
     interrupted: &std::sync::atomic::AtomicBool,
 ) -> Result<CargoBuildOutputLease, String> {
@@ -5754,15 +5797,13 @@ fn acquire_cargo_build_output_lease_at_root(
                 canonical_target_dir.display()
             ));
         }
-        match ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive).map_err(
-            |error| {
-                format!(
-                    "{cli_label}: lock Cargo output directory {} via {}: {error:#}",
-                    canonical_target_dir.display(),
-                    lock_path.display(),
-                )
-            },
-        )? {
+        match ktstr::flock::try_flock(&lock_path, mode).map_err(|error| {
+            format!(
+                "{cli_label}: lock Cargo output directory {} via {}: {error:#}",
+                canonical_target_dir.display(),
+                lock_path.display(),
+            )
+        })? {
             Some(lock) => {
                 return Ok(CargoBuildOutputLease {
                     _lock: lock,
@@ -7648,6 +7689,60 @@ mod tests {
         );
     }
 
+    /// A runtime dependent (a live nextest test process reading `probe.o` from
+    /// the bucket's baked `env!("OUT_DIR")`) holds the build-output lease SHARED
+    /// for the whole run. Both reclaimers take a non-blocking EXCLUSIVE lease,
+    /// which fails against that SHARED hold, so neither the pressure sweep nor
+    /// the aged GC may reclaim the bucket until the run ends and the lease drops.
+    #[test]
+    fn shared_runtime_lease_shields_bucket_from_pressure_sweep_and_aged_gc() {
+        let temp = tempfile::tempdir().expect("scratch parent");
+        let parent = temp.path().join("shared-build-scratch-v1");
+        let lock_root = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_root).unwrap();
+        let bucket = parent.join("aaaaaaaaaaaaaaaa");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(bucket.join("obj.o"), vec![0u8; 4096]).unwrap();
+
+        // Hold the bucket's build-output lease SHARED, as the run does for the
+        // lifetime of the test binaries built from it.
+        let canonical = std::fs::canonicalize(&bucket).unwrap();
+        let lock_path = cargo_build_output_lock_path(&lock_root, &canonical);
+        let runtime = ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Shared)
+            .unwrap()
+            .expect("hold the shared runtime lease");
+
+        // Pressure sweep: an unbounded shortfall still cannot take the bucket.
+        assert_eq!(
+            reclaim_shared_build_scratch_under_pressure_in(&parent, &lock_root, u64::MAX, None),
+            0,
+            "a SHARED-leased bucket is never swept under disk pressure",
+        );
+        assert!(bucket.exists());
+
+        // Aged GC: even far past the idle window the SHARED hold blocks it.
+        let far_future = std::time::SystemTime::now()
+            + SHARED_BUILD_SCRATCH_MAX_IDLE
+            + std::time::Duration::from_secs(60);
+        gc_stale_shared_build_scratch_in(&parent, &lock_root, far_future);
+        assert!(
+            bucket.exists(),
+            "a SHARED-leased bucket is never reclaimed by the aged GC",
+        );
+
+        // Once the run ends and the lease drops, both reclaimers may take it.
+        drop(runtime);
+        assert!(
+            reclaim_shared_build_scratch_under_pressure_in(&parent, &lock_root, u64::MAX, None)
+                >= 4096,
+            "an unleased bucket is reclaimed under pressure",
+        );
+        assert!(
+            !bucket.exists(),
+            "the bucket is reclaimable once no runtime lease remains",
+        );
+    }
+
     /// Metadata with one workspace member (`scx-ktstr`, `source == null`) and
     /// one registry dependency (`serde`, `source != null`), so a member purge
     /// has both something to remove and something it must keep.
@@ -7735,6 +7830,7 @@ mod tests {
         let lease = acquire_cargo_build_output_lease_at_root(
             &bucket,
             &lock_root,
+            ktstr::flock::FlockMode::Exclusive,
             "coverage producer",
             &interrupted,
         )
@@ -7851,6 +7947,7 @@ mod tests {
         let first = acquire_cargo_build_output_lease_at_root(
             &target_dir,
             &lock_root,
+            ktstr::flock::FlockMode::Exclusive,
             "first writer",
             &interrupted,
         )
@@ -7878,6 +7975,7 @@ mod tests {
             let _second = acquire_cargo_build_output_lease_at_root(
                 &target_for_thread,
                 &lock_root_for_thread,
+                ktstr::flock::FlockMode::Exclusive,
                 "second writer",
                 &interrupted_for_thread,
             )
