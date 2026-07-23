@@ -3583,10 +3583,9 @@ impl KtstrVm {
                 )
             })
             .collect();
-        // The shared AP spawner gates each AP progressively before creating
-        // the next one, including on the interactive path. This keeps a large
-        // shell topology from recreating the same host-thread thundering herd
-        // as a test VM. There is no separate outer all-AP gate here: every
+        // The shared AP spawner creates every AP host thread and then gates on
+        // all of their boot latches before returning, including on the
+        // interactive path. There is no separate outer all-AP gate here: every
         // latch has already fired when `spawn_ap_threads` returns.
         let ap_boot_latches: Vec<Arc<crate::sync::Latch>> = (0..n_aps)
             .map(|_| Arc::new(crate::sync::Latch::new()))

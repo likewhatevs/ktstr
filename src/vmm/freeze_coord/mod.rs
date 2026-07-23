@@ -5558,24 +5558,24 @@ impl KtstrVm {
         // Per-AP boot-ordering latches — each AP fires its latch at the
         // instant it is about to enter `vcpu_run_loop_unified` (after
         // signal-handler registration, affinity, and RT-prio setup,
-        // immediately before its first KVM_RUN). `spawn_ap_threads` waits
-        // progressively after each spawn; the BSP also checks the complete
-        // set below before it starts executing guest code.
+        // immediately before its first KVM_RUN). `spawn_ap_threads` waits on
+        // every latch before it returns; the debug-invariant check below
+        // re-asserts that every latch is set before the BSP executes guest
+        // code.
         //
         // Why this gate exists: the guest kernel's `do_boot_cpu` brings APs
         // up strictly sequentially, INIT-SIPI'ing each one and then waiting a
         // bounded ~10s for it to check in before moving on. KVM buffers the
         // INIT/SIPI for a vCPU already blocked in KVM_RUN with
         // MP_STATE_UNINITIALIZED, so an AP that is inside its run loop cannot
-        // miss its wakeup. Creating the whole host-thread set at once can
-        // starve later AP closures behind the already-running prefix on an
-        // oversubscribed host; an AP that has not reached KVM_RUN when its
-        // INIT-SIPI arrives misses the window, and the guest marks that CPU
-        // present-but-offline (observed in CI as 128-vCPU guests
-        // intermittently losing 1-2 mid-range CPUs). Progressive spawn waits
-        // on each one-shot latch under delivered-service accounting, so every
-        // AP reaches KVM_RUN before guest boot without charging host
-        // descheduling.
+        // miss its wakeup. An AP that has not yet reached KVM_RUN when its
+        // INIT-SIPI arrives would miss the window, and the guest would mark
+        // that CPU present-but-offline (observed in CI as 128-vCPU guests
+        // intermittently losing 1-2 mid-range CPUs). `spawn_ap_threads` closes
+        // that race by not returning until EVERY AP is past its latch (blocked
+        // in KVM_RUN) under delivered-service accounting; the BSP's guest boot
+        // — the only source of INIT/SIPI — starts only after it returns, so no
+        // AP can be caught mid-setup regardless of the order latches fire.
         let ap_boot_latches: Vec<Arc<crate::sync::Latch>> = (0..vcpus.len())
             .map(|_| Arc::new(crate::sync::Latch::new()))
             .collect();
@@ -16268,12 +16268,35 @@ impl KtstrVm {
         let mut freeze_parked: Vec<Arc<AtomicBool>> = Vec::with_capacity(n);
         let mut freeze_regs: Vec<Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>> =
             Vec::with_capacity(n);
-        // Bring APs up progressively: after spawning vCPU N, wait until its
-        // boot latch fires before creating vCPU N+1. One delivered-service
-        // budget is shared across the loop, so topology width cannot multiply
-        // it and host descheduling cannot consume it. Any gate error returns
-        // while `spawn_guard` still owns every partial thread, preserving its
-        // kill/kick/join teardown before the caller can drop guest memory.
+        // Two-phase bring-up: create every AP host thread up front (loop
+        // below), then wait on all boot latches together (second loop). The
+        // correctness invariant is unchanged and unconditional: this function
+        // does not return until EVERY AP's one-shot boot latch is set, and the
+        // BSP run loop starts only after it returns. Each AP fires its latch as
+        // the last statement before its first `KVM_RUN`, so "all latches set"
+        // means "all APs blocked in KVM_RUN with MP_STATE_UNINITIALIZED" — the
+        // state in which KVM buffers the guest's later INIT/SIPI. No INIT/SIPI
+        // can be delivered before that point because the guest BSP has not yet
+        // executed a single instruction, so the lost-CPU race the outer gate
+        // was built to close cannot depend on the ORDER in which APs reach the
+        // latch — only on all of them reaching it before guest boot.
+        //
+        // The former serial shape (spawn N, wait N's latch, spawn N+1) was an
+        // artifact of the old wall-clock deadline: keeping one AP "in flight"
+        // stopped topology width from dividing a fixed 30s cap. Commit
+        // "Make AP bring-up gates starvation-invariant" replaced that cap with
+        // a delivered-service (AP pthread CPU-time) budget that host
+        // descheduling cannot consume, so overlapping the wall-time bring-up
+        // neither multiplies the budget (total AP setup CPU service is the same
+        // whether spawned serially or at once) nor risks a false trip. Serial
+        // host spawn instead multiplied the guest's own serial secondary
+        // bring-up (arm64 PSCI CPU_ON; no HOTPLUG_PARALLEL) by an extra
+        // per-AP scheduler timeslice under colocated load — O(vCPUs) latency
+        // this removes. Any gate error in the second loop returns while
+        // `spawn_guard` still owns every spawned thread, preserving its
+        // kill/kick/join teardown before the caller can drop guest memory; a
+        // spawn failure in the first loop tears down the partial set the same
+        // way (kick+join works whether or not a thread reached its latch).
         let ap_gate_start = Instant::now();
         let mut ap_service_budget = ApBootServiceBudget::default();
         for (i, vcpu) in vcpus.into_iter().enumerate() {
@@ -16492,10 +16515,18 @@ impl KtstrVm {
             });
             freeze_parked.push(parked);
             freeze_regs.push(regs);
-            let thread = spawn_guard
-                .ap_threads
-                .last()
-                .expect("just-spawned AP remains owned by partial-spawn guard");
+        }
+        // All AP threads spawned and running concurrently. Now prove each one
+        // reached its pre-KVM_RUN latch before this function returns (and thus
+        // before the BSP boots the guest). The one delivered-service budget is
+        // shared across the whole slice, so topology width cannot multiply it
+        // and host descheduling cannot consume it; a fresh thread is typically
+        // already at its latch by the time its turn comes, so this loop mostly
+        // observes already-set latches. Any gate error returns while
+        // `spawn_guard` still owns every thread, preserving its kill/kick/join
+        // teardown before the caller can drop guest memory.
+        for i in 0..n {
+            let thread = &spawn_guard.ap_threads[i];
             wait_for_ap_boot_gate(
                 ap_boot_latches[i].as_ref(),
                 ap_tid_slots[i].0.as_ref(),
