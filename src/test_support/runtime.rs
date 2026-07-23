@@ -496,12 +496,56 @@ pub(crate) fn checked_verifier_preset_memory_min_mib(
     checked_cpu_scaled_memory_mib(cpus).map(|scaled| scaled.min(preset_cap))
 }
 
-/// Minimum guest memory required by a stamped wprof attachment.
+/// wprof BPF ringbuf sizing baked into `WprofConfig::default_args`.
 ///
-/// This constant is always compiled because the cargo-ktstr admission runner
-/// can read an ELF built with a different feature set from its own. The public
-/// wprof API remains feature-gated and aliases this value.
-pub(crate) const WPROF_MIN_MEMORY_MIB: u32 = 2048;
+/// wprof allocates `WPROF_DEFAULT_RINGBUF_CNT` BPF ring buffers, each
+/// `--ringbuf-size` KiB rounded up to a power-of-two byte size; the
+/// tracer faults the whole arena in on capture, so guest RAM must
+/// cover it. These two constants are the single source of truth:
+/// `crate::vmm::wprof::WprofConfig::default_args` renders them into
+/// the `--ringbuf-size=`/`--ringbuf-cnt=` flags AND
+/// [`WPROF_MIN_MEMORY_MIB`] derives the guest-memory floor from them,
+/// so changing the sizing here moves the flags and the floor together.
+///
+/// The default is deliberately minimal — a single 16 MiB ring buffer,
+/// which is wprof's own per-buffer default (`DEFAULT_RINGBUF_SZ`) and
+/// comfortably holds the short sched-event captures ktstr's wprof
+/// tests run. ktstr only tests that wprof writes valid data
+/// end-to-end; oversizing merely inflates the per-cell fault-in cost.
+/// Larger captures pass their own `#[ktstr_test(wprof_args = "...")]`
+/// and, if the resulting arena exceeds the guest's normal memory,
+/// their own `memory_mib`.
+pub(crate) const WPROF_DEFAULT_RINGBUF_SIZE_KB: u32 = 16 * 1024;
+pub(crate) const WPROF_DEFAULT_RINGBUF_CNT: u32 = 1;
+
+/// Guest-memory floor (MiB) for a stamped wprof attachment, derived
+/// from the default ringbuf arena above.
+///
+/// Always compiled because the cargo-ktstr admission runner reads a
+/// stamped wprof bit from an ELF built with a different feature set
+/// than its own, so this projection cannot be `wprof`-gated. The
+/// public wprof API remains feature-gated and aliases this value.
+///
+/// At the minimal default the arena (16 MiB) sits below the universal
+/// 256 MiB memory floor from [`cpu_scaled_memory_mib`], so this floor
+/// is subsumed and never bumps a real VM; it re-engages only if the
+/// default ringbuf sizing above ever grows the arena past that floor.
+pub(crate) const WPROF_MIN_MEMORY_MIB: u32 = {
+    let per_rb_bytes = wprof_next_pow2_u64(WPROF_DEFAULT_RINGBUF_SIZE_KB as u64 * 1024);
+    let arena_bytes = per_rb_bytes * WPROF_DEFAULT_RINGBUF_CNT as u64;
+    (arena_bytes / (1024 * 1024)) as u32
+};
+
+/// Round `n` up to the next power of two, mirroring wprof's
+/// `round_pow_of_2` on the ringbuf byte size. `const fn` so the
+/// memory floor is a compile-time constant.
+const fn wprof_next_pow2_u64(n: u64) -> u64 {
+    let mut p: u64 = 1;
+    while p < n {
+        p <<= 1;
+    }
+    p
+}
 
 /// Apply the feature-independent memory floor encoded by a stamped wprof bit.
 pub(crate) fn apply_wprof_memory_floor(raw_mib: u32, wprof: bool) -> u32 {
@@ -1831,22 +1875,26 @@ mod tests {
 
     #[cfg(feature = "wprof")]
     #[test]
-    fn resolve_vm_topology_wprof_floors_memory_on_entry_path() {
-        // Entry with wprof=true and memory below the wprof floor.
-        // The entry-derived path must raise memory to WPROF_MIN_MEMORY_MIB.
+    fn resolve_vm_topology_wprof_does_not_oversize_at_minimal_default() {
+        // wprof=true with the minimal default arena must NOT oversize:
+        // the derived wprof floor (16 MiB) is below the entry's own
+        // memory, so the entry-derived path sizes the VM exactly like
+        // the same non-wprof entry. Guards against restoring a
+        // multi-GiB wprof floor that pinned every wprof cell high.
         let entry = KtstrTestEntry {
-            name: "wprof_floor",
+            name: "wprof_minimal",
             memory_mib: 512,
             wprof: true,
             ..KtstrTestEntry::DEFAULT
         };
+        // Compile-time invariant: at the minimal default the wprof
+        // floor stays at/under the universal 256 MiB floor, so it is
+        // subsumed and cannot oversize a VM.
+        const { assert!(crate::vmm::wprof::WPROF_MIN_MEMORY_MIB <= 256) };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
         assert_eq!(
-            mem,
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
-            "wprof=true must bump memory to >= WPROF_MIN_MEMORY_MIB \
-             ({}), got {mem}",
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+            mem, 512,
+            "wprof must not oversize past the entry's own 512 MiB; got {mem}"
         );
     }
 
@@ -1915,10 +1963,27 @@ mod tests {
 
     #[test]
     fn stamped_wprof_memory_floor_is_feature_independent() {
+        // The floor is applied by value, not by cfg!(feature = "wprof"):
+        // a below-floor raw is bumped, an at/above-floor raw passes
+        // through — identically whether or not the reader binary was
+        // built with wprof.
         assert_eq!(
-            derive_test_memory_min_mib(2, 768, true),
+            apply_wprof_memory_floor(WPROF_MIN_MEMORY_MIB - 1, true),
             WPROF_MIN_MEMORY_MIB,
+            "a raw below the derived floor must be bumped up to it",
         );
+        assert_eq!(
+            apply_wprof_memory_floor(WPROF_MIN_MEMORY_MIB, true),
+            WPROF_MIN_MEMORY_MIB,
+            "a raw at the floor passes through (strict-less-than)",
+        );
+        assert_eq!(apply_wprof_memory_floor(4096, true), 4096);
+        assert_eq!(apply_wprof_memory_floor(4096, false), 4096);
+        // At the minimal default arena the floor (16 MiB) is far below
+        // the universal 256 MiB floor, so admission sizing is dominated
+        // by the latter regardless of the wprof bit — the whole point
+        // of the minimal default is that wprof no longer oversizes.
+        assert_eq!(derive_test_memory_min_mib(2, 768, true), 768);
         assert_eq!(derive_test_memory_min_mib(2, 768, false), 768);
     }
 
@@ -1961,14 +2026,12 @@ mod tests {
 
     #[cfg(feature = "wprof")]
     #[test]
-    fn resolve_vm_topology_wprof_no_bump_at_exact_floor() {
-        // Boundary case: derived memory equals WPROF_MIN_MEMORY_MIB
-        // exactly. The handler uses strict `<` so 2048 passes through
-        // unchanged. A regression that flipped to `<=` would be a
-        // 2048→2048 no-op (still unobservable), but a regression
-        // that flipped to `>` (or `>= ... { raw } else { FLOOR }`)
-        // would catastrophically floor every test. This test pins
-        // the strict-less-than direction.
+    fn resolve_vm_topology_wprof_universal_floor_dominates_tiny_arena() {
+        // With the minimal default arena the wprof floor is far below
+        // the universal 256 MiB floor, so the latter dominates even
+        // when the entry declares exactly WPROF_MIN_MEMORY_MIB. The
+        // strict-less-than direction of the floor condition itself is
+        // pinned directly in `stamped_wprof_memory_floor_is_feature_independent`.
         let entry = KtstrTestEntry {
             name: "wprof_exact",
             memory_mib: crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
@@ -1977,21 +2040,18 @@ mod tests {
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
         assert_eq!(
-            mem,
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
-            "memory_mib equal to WPROF_MIN_MEMORY_MIB must pass \
-             through unchanged (strict-less-than floor condition); \
-             got {mem}"
+            mem, 256,
+            "universal 256 MiB floor dominates the tiny wprof arena; got {mem}"
         );
     }
 
     #[cfg(feature = "wprof")]
     #[test]
-    fn resolve_vm_topology_wprof_floors_zero_entry_memory_mib() {
+    fn resolve_vm_topology_wprof_zero_entry_memory_mib_uses_universal_floor() {
         // Edge case: entry.memory_mib=0 with wprof=true. The raw
         // derivation `max(cpus*64, 256, 0)` resolves to 256 on the
-        // default 1-CPU topology, which is well below the floor.
-        // wprof must bump to WPROF_MIN_MEMORY_MIB.
+        // default 1-CPU topology; the minimal wprof arena is below
+        // that, so the universal 256 MiB floor is what the VM gets.
         let entry = KtstrTestEntry {
             name: "wprof_zero_mib",
             memory_mib: 0,
@@ -2000,11 +2060,9 @@ mod tests {
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
         assert_eq!(
-            mem,
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
-            "entry.memory_mib=0 with wprof=true must floor to \
-             WPROF_MIN_MEMORY_MIB ({}); got {mem}",
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+            mem, 256,
+            "entry.memory_mib=0 with wprof=true resolves to the \
+             universal 256 MiB floor; got {mem}"
         );
     }
 
@@ -2028,9 +2086,9 @@ mod tests {
         };
         let mem = derive_test_memory_mib(2, &entry);
         assert_eq!(
-            mem,
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
-            "helper must floor wprof memory regardless of caller; got {mem}"
+            mem, 256,
+            "helper applies the wprof floor (16 MiB) but it is subsumed \
+             by the universal 256 MiB floor for a 2-cpu VM; got {mem}"
         );
         assert_eq!(
             derive_test_memory_min_mib(2, entry.memory_mib, entry.wprof),

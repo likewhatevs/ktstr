@@ -2726,7 +2726,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_pre_exec_lookup_applies_stamped_wprof_floor_independent_of_reader_features() {
+    fn exact_pre_exec_lookup_reads_wprof_bit_independent_of_reader_features() {
         const ENTRY: &str = "__unit_test_admission_guest__";
 
         let (executable, mut mapping) = map_current_test_executable_copy();
@@ -2738,11 +2738,22 @@ mod tests {
             read_admission_cell_stamp_from_reader(&reader, &executable, &format!("ktstr/{ENTRY}"))
                 .expect("read stamped wprof descriptor")
                 .expect("generated ktstr descriptor");
+        // The wprof bit is read from the ELF, not from the reader
+        // binary's own feature set.
         assert!(descriptor.wprof);
+        // The entry declares memory_mib = 768; the minimal default
+        // wprof arena floor (16 MiB) is subsumed by it, so the stamped
+        // floor equals the feature-independent derivation and is
+        // unchanged by the wprof bit.
         assert_eq!(
             descriptor.memory_min_mib,
-            crate::test_support::runtime::WPROF_MIN_MEMORY_MIB,
-            "the ELF's wprof bit, not the reader binary's feature set, owns the floor",
+            crate::test_support::runtime::derive_test_memory_min_mib(
+                descriptor.topology.total_cpus() as u32,
+                768,
+                true,
+            ),
+            "the ELF's stamped wprof bit + topology, not the reader binary's \
+             feature set, own the floor",
         );
     }
 
@@ -2796,10 +2807,10 @@ mod tests {
         assert_eq!(guest.mode, AdmissionMode::Performance);
         assert_eq!(guest.kernel.as_deref(), Some("kernel_7_3"));
         assert_eq!(guest.wprof, cfg!(feature = "wprof"));
-        assert_eq!(
-            guest.memory_min_mib,
-            if cfg!(feature = "wprof") { 2048 } else { 768 }
-        );
+        // The entry declares memory_mib = 768. The minimal default
+        // wprof arena (16 MiB) is far below that, so the wprof bit no
+        // longer bumps memory — the value is 768 with or without wprof.
+        assert_eq!(guest.memory_min_mib, 768);
 
         let gauntlet = read_admission_cell_stamp(
             &executable,

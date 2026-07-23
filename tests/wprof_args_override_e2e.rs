@@ -58,10 +58,16 @@ const KTSTR_SCHED: Scheduler =
 /// kernel cmdline. `-d 100` differs from the default `-d 500`,
 /// `-e tidpid` differs from the default `-e sched` (both are
 /// valid `--emit-feature` values per `wprof --help`), and the
-/// shorter ringbuf sizing differs from the default
-/// `--ringbuf-size=256000 --ringbuf-cnt=8`. Any one of these
-/// differences would suffice; the combination makes accidental
-/// substring overlap with the default-args signature impossible.
+/// ringbuf sizing (`--ringbuf-size=8192 --ringbuf-cnt=2`) differs
+/// from the default `--ringbuf-size=16384 --ringbuf-cnt=1`. Any one
+/// of these differences would suffice; the combination makes
+/// accidental substring overlap with the default-args signature
+/// impossible.
+///
+/// The override arena (round-pow-2(8192 KiB) × 2 = 16 MiB) stays
+/// under the guest's universal 256 MiB memory floor, so this test
+/// needs no `memory_mib` override — the tiny default wprof floor no
+/// longer pins every wprof cell at 2 GiB.
 ///
 /// MUST match the `wprof_args = "..."` literal in the attribute
 /// below. The macro accepts either a `Lit::Str` or a path to a
@@ -76,8 +82,8 @@ const OVERRIDE_ARGS: &[&str] = &[
     "100",
     "-e",
     "tidpid",
-    "--ringbuf-size=128000",
-    "--ringbuf-cnt=4",
+    "--ringbuf-size=8192",
+    "--ringbuf-cnt=2",
 ];
 
 /// Per-arg delimiter used on the kernel cmdline. The framework
@@ -98,7 +104,7 @@ const WPROF_ARGS_CMDLINE_DELIM: char = '\x1F';
     duration_s = 3,
     watchdog_timeout_s = 15,
     wprof,
-    wprof_args = "-d 100 -e tidpid --ringbuf-size=128000 --ringbuf-cnt=4",
+    wprof_args = "-d 100 -e tidpid --ringbuf-size=8192 --ringbuf-cnt=2",
     auto_repro = false,
     post_vm = VmResult::assert_wprof_pb_landed,
 )]
