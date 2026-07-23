@@ -25,19 +25,26 @@ use super::symbols::{
     start_kernel_map_for_tcr, text_kva_to_pa_with_base,
 };
 
-/// Emit the aarch64 address-derivation snapshot once per process.
+/// Append the aarch64 address-derivation snapshot to the build
+/// diagnostics dir once per process.
 ///
 /// The freeze-coordinator guest reads (probe `.bss` counters,
 /// `*scx_root->exit_kind`) go through the aarch64 TTBR1 page-table
-/// walk, which fails uniformly on arm64 + guest-kernel 7.1 and leaves
-/// every capture at the `maps:[]` placeholder. The static VA-layout
+/// walk, which fails on the arm64 + guest-kernel 7.1 lanes and leaves
+/// those captures at the `maps:[]` placeholder. The static VA-layout
 /// formulas are identical between the working (6.14) and broken (7.1)
 /// kernels, so the discriminator is the live `TCR_EL1` — see
-/// `symbols::arm64_derivation_diag`. Emitting it at `warn` once per process
-/// puts the granule / VA width / LPA2(DS) / walk-supportability into
-/// every lane's log so a single ARM run confirms or refutes the
-/// LPA2-rejection hypothesis. No-op on x86_64 (the walk uses CR3, not
-/// this derivation) to keep the x86 lanes quiet.
+/// `symbols::arm64_derivation_diag`.
+///
+/// An earlier revision emitted this at `tracing::warn`, but the failing
+/// lanes' captured output carried zero `arm64-derivation` lines — the
+/// warn never reached any captured sink. This uses the file-based
+/// build-diagnostics idiom the sibling channels already rely on
+/// (`exit_timing`, admission-timing, coordinator-wakes): append one
+/// line to `${KTSTR_BUILD_DIAGNOSTICS_DIR}/arm64-derivation-<pid>.log`.
+/// Entirely inert unless the env var is set (CI only); best-effort,
+/// `O_APPEND`, and gated once per process so a lane emits exactly one
+/// line. No-op on x86_64 (the walk uses CR3, not this derivation).
 #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
 fn emit_arm64_derivation_diag_once(
     tcr_el1: u64,
@@ -48,10 +55,21 @@ fn emit_arm64_derivation_diag_once(
 ) {
     #[cfg(target_arch = "aarch64")]
     {
+        use std::io::Write as _;
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            tracing::warn!(
-                "{}",
+            let Some(dir) = std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+            else {
+                return;
+            };
+            if std::fs::create_dir_all(&dir).is_err() {
+                return;
+            }
+            let pid = std::process::id();
+            let line = format!(
+                "{}\n",
                 super::symbols::arm64_derivation_diag(
                     tcr_el1,
                     cr3_pa,
@@ -60,6 +78,13 @@ fn emit_arm64_derivation_diag_once(
                     phys_base,
                 )
             );
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("arm64-derivation-{pid}.log")))
+            {
+                let _ = file.write_all(line.as_bytes());
+            }
         });
     }
 }

@@ -928,8 +928,8 @@ pub(crate) fn start_kernel_map_for_tcr(tcr_el1: u64) -> Option<u64> {
 ///
 /// Background: the freeze coordinator reads guest kernel state
 /// (probe `.bss` counters, `*scx_root->exit_kind`) through the
-/// aarch64 TTBR1 page-table walk. On arm64 + guest-kernel 7.1 that
-/// walk fails uniformly, so every capture renders the `maps:[]`
+/// aarch64 TTBR1 page-table walk. On the arm64 + guest-kernel 7.1
+/// lanes that walk can fail and leave the capture at the `maps:[]`
 /// placeholder. Every static arm64 VA-layout formula this code
 /// derives (`KIMAGE_VADDR`, `PAGE_OFFSET`, `VA_BITS_MIN`,
 /// `MODULES_VADDR`, the direct-map inversion) is byte-identical
@@ -938,22 +938,31 @@ pub(crate) fn start_kernel_map_for_tcr(tcr_el1: u64) -> Option<u64> {
 /// linear-map / `memstart_addr` randomization (commit
 /// `1db780bafa4c arm64/mm: Remove randomization of the linear map`)
 /// — is absorbed by reading the runtime `memstart_addr`. So the
-/// break is NOT in a static formula: it is a runtime property of the
-/// 7.1 boot that only the guest's live `TCR_EL1` can reveal.
+/// break is NOT in a static formula.
 ///
-/// The single highest-signal unknown is whether the guest boots with
-/// `TCR_EL1.DS=1` (FEAT_LPA2). The walker
-/// (`Aarch64WalkParams::from_tcr_el1` in `super::reader`) rejects DS=1
-/// outright — it cannot recover the LPA2 output-address splice — so a
-/// 7.1 boot that newly activates LPA2 (or any granule / T1SZ the
-/// decoder rejects) makes every walk return `None`, which is exactly
-/// the observed uniform-per-boot failure. This helper decodes the raw
-/// `TCR_EL1` into the facts that settle it in one run: granule, VA
-/// width, the DS bit, and whether [`start_kernel_map_for_tcr`] +
-/// `from_tcr_el1` accept the configuration.
+/// The failure is also NOT uniform per kernel boot: on the run that
+/// added this diagnostic, `test-arm64` (7.1) PASSED the probe-counter
+/// read while `7.1-wprof` and `coverage-arm64` failed it. That
+/// per-lane / load-dependent split weakens the static-`TCR_EL1`
+/// hypothesis (a fixed FEAT_LPA2 / granule config would fail every 7.1
+/// lane alike) and points instead at a timing-sensitive read-path race
+/// whose window the two lanes' timeout signatures (`7.1-wprof` ~126.5s,
+/// `coverage-arm64` ~12.6s) bracket.
+///
+/// This snapshot is the right first data either way: if a failing lane
+/// ever records `walk_supported=false` (`lpa2(ds)=1`, or an unexpected
+/// granule / T1SZ the walker's `Aarch64WalkParams::from_tcr_el1` in
+/// `super::reader` rejects), a static config-rejection is confirmed; if
+/// every lane — passing and failing — records the SAME
+/// `walk_supported=true` line with identical bases, the config is
+/// exonerated and the race hypothesis stands, redirecting the next step
+/// to per-level walk-failure instrumentation. It decodes the raw
+/// `TCR_EL1` into granule, VA width, the DS bit, and whether
+/// [`start_kernel_map_for_tcr`] + `from_tcr_el1` accept the config.
 ///
 /// Pure and arch-independent (raw bit math on `tcr_el1`) so it is unit
-/// testable on the x86_64 CI host; the caller emits it once per freeze.
+/// testable on the x86_64 CI host; the caller writes it once per
+/// process to the build-diagnostics file.
 /// On x86_64 the sole production caller
 /// (`GuestKernel::emit_arm64_derivation_diag_once`) compiles to an
 /// empty body, so the function is reachable only from tests there —
