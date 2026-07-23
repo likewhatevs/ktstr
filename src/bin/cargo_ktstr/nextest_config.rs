@@ -526,7 +526,7 @@ mod tests {
     fn repository_resource_users_share_the_full_drain_timeout_filter() {
         const CONFIG: &str = include_str!("../../../.config/nextest.toml");
         const FULL_DRAIN_TIMEOUT: &str =
-            "slow-timeout = { period = \"180s\", terminate-after = 7 }";
+            "slow-timeout = { period = \"180s\", terminate-after = 12 }";
 
         let default_blocks = profile_override_blocks(CONFIG, "default");
         let resource = default_blocks
