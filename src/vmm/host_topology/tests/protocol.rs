@@ -1110,6 +1110,55 @@ fn coordinator_watch_filters_registry_self_closes_without_spinning() {
     );
 }
 
+// Regression for the disjoint-release wake. A release for a resource the
+// coordinator is not currently focused on must still wake its watch. The
+// classifier previously filtered resource closes by the live watch set and
+// DISCARDED such an edge; because a flock release is single-shot, a later scan
+// that armed a narrow watch after the edge had already fired never saw it and
+// rode the 30s COORDINATOR_WAKE_FALLBACK instead of granting the disjoint
+// waiter at once (CI: coordinator stalled with free capacity, grant_scans=1).
+#[test]
+fn disjoint_resource_close_wakes_coordinator_watch_regardless_of_focus() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let focused = 6usize; // the resource the coordinator's current claim watches
+    let disjoint = 5usize; // an unrelated held resource that will release
+    let watched = protocol::ClaimSet::new(
+        std::iter::empty(),
+        [focused],
+        crate::flock::FlockMode::Exclusive,
+    );
+    // A peer holds the disjoint CPU through a writable owner — the real-release
+    // fd shape (O_RDWR, so its close is the IN_CLOSE_WRITE a holder emits).
+    let holder = protocol::AdmissionFlock::from_acquired(
+        crate::flock::try_flock(cpu_lock_path(disjoint), crate::flock::FlockMode::Exclusive)
+            .expect("open disjoint resource")
+            .expect("acquire fresh disjoint resource"),
+    );
+    let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
+    // Baseline drain while focused on `focused`; no close has happened yet.
+    assert!(
+        !watch
+            .drain(&watched)
+            .expect("baseline drain")
+            .contains_cpu_close(disjoint),
+        "installing the watch must not synthesize a resource close",
+    );
+    // The disjoint holder releases while the coordinator is still focused on a
+    // different resource.
+    drop(holder);
+    // The very next watch turn — still carrying the narrow `focused` set — must
+    // observe the disjoint release event-drivenly, far under the 30s fallback.
+    let woke = watch
+        .wait(std::time::Duration::from_secs(2), &watched)
+        .expect("event-driven coordinator wake");
+    assert!(
+        woke.is_some_and(|events| events.contains_cpu_close(disjoint)),
+        "a disjoint resource release must wake the coordinator watch even while it \
+         is focused on another resource; the old watched-set filter discarded it \
+         and forced a COORDINATOR_WAKE_FALLBACK tick",
+    );
+}
+
 #[test]
 fn coordinator_watch_classifies_close_events_by_watched_directory() {
     let _prefixes = LockPrefixesGuard::new();

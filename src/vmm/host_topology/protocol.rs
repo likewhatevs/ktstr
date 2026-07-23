@@ -35,7 +35,7 @@ use std::collections::BTreeSet;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::flock::{FlockMode, TryFlockOutcome, try_flock_with_witness};
@@ -323,6 +323,46 @@ const INOTIFY_TURN_MAX_TIME: Duration = Duration::from_millis(1);
 const TEST_RETRY_WAKE_INTERVAL: Duration = Duration::from_millis(8);
 #[cfg(test)]
 const TEST_RETRY_WAKE_MARKER: &str = ".ktstr-test-retry-wake";
+
+/// CI-only coordinator wake-source accounting (validation instrumentation).
+///
+/// Process-global cumulative counts of why the coordinator's blocking watch
+/// returned. `EVENT` = a real inotify resource/notify wake (the work-conserving
+/// path); `RETRY_TIMEOUT` = the semantic retry deadline expired with nothing
+/// event-driven to do, of which `FALLBACK` is the subset that rode the full
+/// [`COORDINATOR_WAKE_FALLBACK`] tick (no observation pending). Under a healthy
+/// event-driven drain `FALLBACK` should stay ~0 while cells are still queued;
+/// its only legitimate use is the rare missed-event backstop. Dumped to
+/// `${KTSTR_BUILD_DIAGNOSTICS_DIR}/coordinator-wakes-<pid>.txt` (truncating, so
+/// the file always holds the latest cumulative totals for that pid) exactly like
+/// the admission-timing / queue-wait diagnostics; untouched when the env var is
+/// unset, so local and production runs pay only two relaxed atomic increments.
+static COORDINATOR_EVENT_WAKES: AtomicU64 = AtomicU64::new(0);
+static COORDINATOR_RETRY_TIMEOUT_WAKES: AtomicU64 = AtomicU64::new(0);
+static COORDINATOR_FALLBACK_WAKES: AtomicU64 = AtomicU64::new(0);
+
+fn persist_coordinator_wake_stats_if_enabled() {
+    let Some(root) = std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    let event = COORDINATOR_EVENT_WAKES.load(Ordering::Relaxed);
+    let retry = COORDINATOR_RETRY_TIMEOUT_WAKES.load(Ordering::Relaxed);
+    let fallback = COORDINATOR_FALLBACK_WAKES.load(Ordering::Relaxed);
+    let pid = std::process::id();
+    let line = format!(
+        "coordinator-wakes: pid={pid} event={event} retry_timeout={retry} fallback={fallback}\n"
+    );
+    if std::fs::create_dir_all(&root).is_err() {
+        return;
+    }
+    let temp = root.join(format!(".coordinator-wakes-{pid}.tmp"));
+    if std::fs::write(&temp, &line).is_ok() {
+        let _ = std::fs::rename(&temp, root.join(format!("coordinator-wakes-{pid}.txt")));
+    }
+}
 
 /// Directory the protocol files live in — derived from the LLC
 /// lockfile path so the test-only lock-prefix override isolates the
@@ -689,6 +729,19 @@ enum LockDirWatchBackend {
 /// traffic; filtering their close events is essential because a generation
 /// read immediately before `poll` would otherwise wake the coordinator itself
 /// forever.
+///
+/// Every writable (`IN_CLOSE_WRITE`) resource-lock close is reported — the
+/// classifier does NOT filter by the caller's current watch set. A close on a
+/// resource the coordinator is not presently focused on can still unblock a
+/// *disjoint* waiter, and the release edge is single-shot: a scan that armed a
+/// narrow watch after that edge already fired would never see it and would ride
+/// the [`COORDINATOR_WAKE_FALLBACK`] tick instead of granting immediately.
+/// Reporting every real release keeps the wake work-conserving. This is safe
+/// against self-wake precisely because holders open `O_CREAT | O_RDWR`
+/// (so their release is the only `IN_CLOSE_WRITE`) while every probe/observer
+/// uses an `O_RDONLY` fd (`try_flock_with_witness` contention witness and
+/// `probe_flock_existing_read_only`), whose close is `IN_CLOSE_NOWRITE` and
+/// therefore never enters this queue: the visible set is exactly the holder set.
 struct RealInotifyWake {
     ino: nix::sys::inotify::Inotify,
     event_wd: nix::sys::inotify::WatchDescriptor,
@@ -888,7 +941,11 @@ impl RealInotifyWake {
     fn classify(
         &self,
         events: Vec<nix::sys::inotify::InotifyEvent>,
-        watched: &ClaimSet,
+        // Deliberately unused: resource-lock closes are reported regardless of
+        // the current focus set so a disjoint waiter's release edge is never
+        // discarded (see the type doc). Kept in the signature so drain/wait keep
+        // their watch-set-carrying shape for the TestRetry backend and callers.
+        _watched: &ClaimSet,
         batch: &mut LockDirEvents,
     ) {
         use nix::sys::inotify::AddWatchFlags;
@@ -920,7 +977,6 @@ impl RealInotifyWake {
                 .llc_prefix
                 .as_deref()
                 .and_then(|prefix| resource_index(name, prefix))
-                .filter(|index| watched.llcs.contains(index))
             {
                 batch.llc_closes.insert(index);
             }
@@ -928,7 +984,6 @@ impl RealInotifyWake {
                 .cpu_prefix
                 .as_deref()
                 .and_then(|prefix| resource_index(name, prefix))
-                .filter(|index| watched.cpus.contains(index))
             {
                 batch.cpu_closes.insert(index);
             }
@@ -936,7 +991,6 @@ impl RealInotifyWake {
                 .permit_prefix
                 .as_deref()
                 .and_then(|prefix| resource_index(name, prefix))
-                .filter(|index| watched.permits.contains(index))
             {
                 batch.permit_closes.insert(index);
             }
@@ -3786,6 +3840,7 @@ fn acquire_as_coordinator_impl<T>(
         let diagnostic_now = std::time::Instant::now();
         if diagnostic_now >= wait_diagnostic_deadline {
             registry::persist_wait_diagnostic_if_enabled();
+            persist_coordinator_wake_stats_if_enabled();
             wait_diagnostic_deadline = diagnostic_now + WAIT_DIAGNOSTIC_INTERVAL;
         }
         check_interrupted(cancelled)?;
@@ -4085,6 +4140,7 @@ fn acquire_as_coordinator_impl<T>(
                 .map_or(semantic_wait, |poll| semantic_wait.min(poll));
             match check_result(watch.wait(syscall_wait, &watched_resources), cancelled)? {
                 Some(events) => {
+                    COORDINATOR_EVENT_WAKES.fetch_add(1, Ordering::Relaxed);
                     pending_events.merge(events);
                     break;
                 }
@@ -4133,6 +4189,16 @@ fn acquire_as_coordinator_impl<T>(
                     // due sweep without also manufacturing a whole-watch retry.
                     retry_due = liveness_deadline >= retry_deadline;
                     if retry_due {
+                        // The semantic retry deadline (not a live inotify edge)
+                        // woke the coordinator: it is the missed-event backstop.
+                        // `!observation_pending` means the full
+                        // `COORDINATOR_WAKE_FALLBACK` interval elapsed rather
+                        // than the shorter observation retry — the tick Gate 3
+                        // asserts stays ~0 while cells are still queued.
+                        COORDINATOR_RETRY_TIMEOUT_WAKES.fetch_add(1, Ordering::Relaxed);
+                        if !observation_pending {
+                            COORDINATOR_FALLBACK_WAKES.fetch_add(1, Ordering::Relaxed);
+                        }
                         retry_deadline = std::time::Instant::now() + retry_interval;
                     }
                     break;
@@ -4140,6 +4206,7 @@ fn acquire_as_coordinator_impl<T>(
             }
         }
     };
+    persist_coordinator_wake_stats_if_enabled();
     Ok(outcome)
 }
 

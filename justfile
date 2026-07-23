@@ -61,13 +61,14 @@ kernel-build version="":
 # the #[ktstr_test(wprof)] tests require — when itself built with the
 # feature. E.g. `just test 6.14 wprof` → cargo-ktstr built `--features
 # wprof`; tests run `--features integration,wprof`.
-test kernel extra-features="":
+# Host-saturation sampler wrapper: the drain's CPU-bound-vs-idle question
+# can only be settled with a host-wide busy series plus permit-pool
+# occupancy, and no per-cell telemetry captures either. Diagnostic only;
+# written to the build-diagnostics dir CI uploads. Wraps both the test
+# and coverage recipes so every heavy lane produces the series.
+_with-host-sampler +cmd:
     #!/usr/bin/env bash
     set -euo pipefail
-    # Host-saturation sampler: the drain's CPU-bound-vs-idle question can
-    # only be settled with a host-wide busy series plus permit-pool
-    # occupancy, and no per-cell telemetry captures either. Diagnostic
-    # only; written to the build-diagnostics dir CI uploads.
     if [ -n "${KTSTR_BUILD_DIAGNOSTICS_DIR:-}" ]; then
         mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
         (
@@ -91,7 +92,10 @@ test kernel extra-features="":
         sampler_pid=$!
         trap 'kill "${sampler_pid}" 2>/dev/null || true' EXIT
     fi
-    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --no-fail-fast
+    {{cmd}}
+
+test kernel extra-features="":
+    @just _with-host-sampler cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --no-fail-fast
 
 # Run trybuild compile_fail fixtures.
 #
@@ -235,7 +239,7 @@ devdep-isolation:
 # is passed to the cargo-ktstr build (so a blob-embedding feature like `wprof` is
 # provisioned — see `test`) AND appended to the inner coverage feature list.
 coverage kernel extra-features="":
-    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr coverage --kernel {{kernel}} -- --profile ci --lcov --output-path lcov.info --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --exclude-from-report scx-ktstr
+    @just _with-host-sampler cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr coverage --kernel {{kernel}} -- --profile ci --lcov --output-path lcov.info --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --exclude-from-report scx-ktstr
 
 # Show sccache statistics
 sccache-stats:
