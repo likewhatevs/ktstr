@@ -3995,6 +3995,12 @@ impl RunVmThreadGuard {
 
     fn release_run_locks(&mut self) {
         drop(self.run_locks.take());
+        // Arm the exit-phase teardown clock at the exact run-claim release
+        // instant (matching the admission-timing `released` stamp below), then
+        // mark this first post-release point. Everything after this is the
+        // lingering seam CI attributes ~1130s of idle wall to.
+        super::exit_timing::mark_released();
+        super::exit_timing::stamp("run_locks_dropped");
         // Emit the admission-timing line now the physical reservation is
         // released, so its release instant reflects the run-claim release.
         drop(self.admission_timing.take());

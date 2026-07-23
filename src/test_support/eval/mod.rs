@@ -1878,6 +1878,11 @@ fn run_ktstr_test_inner_impl(
         "evaluate_vm_result (includes auto-repro): {:?}",
         post_vm_t.elapsed()
     );
+    // Post-release host-side evaluation (post_vm, sidecar finalize, auto-repro)
+    // is done; the process now unwinds to the libtest harness and exits. A large
+    // step between here and the exit-timing aggregate implicates the harness/exit
+    // path rather than admission teardown.
+    crate::vmm::exit_timing::stamp("eval_done");
     eval_result
 }
 

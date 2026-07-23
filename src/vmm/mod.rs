@@ -70,6 +70,7 @@ pub(crate) mod capture_tasks;
 pub(crate) mod cast_analysis_load;
 pub(crate) mod contention;
 pub(crate) mod exit_dispatch;
+pub(crate) mod exit_timing;
 pub(crate) mod freeze_coord;
 pub(crate) mod initramfs_cache;
 pub(crate) mod net_config;
@@ -2115,6 +2116,10 @@ impl KtstrVm {
             .attach_admission_timing(admission_timing.take());
 
         let mut result = self.collect_results(start, run)?;
+        // Teardown (`release_run_locks` and every worker join) completed inside
+        // `collect_results`; stamp the post-release message/result assembly
+        // boundary so the exit-timing log brackets it.
+        exit_timing::stamp("collect_results_done");
         if let Some(budget) = overcommit_budget {
             result.cpu_budget = budget;
         }
@@ -2136,6 +2141,7 @@ impl KtstrVm {
             crate::test_support::persist_guest_profraw(msgs);
         }
 
+        exit_timing::stamp("vm_run_returning");
         Ok(result)
     }
 

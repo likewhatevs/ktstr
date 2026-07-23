@@ -172,7 +172,11 @@ impl Drop for AdmissionFlockInner {
             }
         }
         run_admission_flock_unlock_hook_for_tests();
-        // `fd` closes only after this Drop implementation returns.
+        // Post-release only (inert before this cell's run-claim release), so
+        // this stamps the final drop of any admission resource retained past
+        // release — the retained preparation permits behind the persisting
+        // permit-lock files. `fd` closes only after this Drop returns.
+        crate::vmm::exit_timing::stamp("admission_flock_release");
     }
 }
 
@@ -1449,6 +1453,10 @@ impl Drop for PendingAdmission {
         // paths.
         drop(self.preparation.take());
         drop(self.ticket.take());
+        // Post-release only: a PENDING intent that survives its cell's run to
+        // retire here at exit is the intent-registration retirement the exit
+        // seam is suspected to serialize on.
+        crate::vmm::exit_timing::stamp("pending_admission_retire");
     }
 }
 
@@ -3806,6 +3814,28 @@ pub(in crate::vmm) fn acquire_as_coordinator_interruptible<T>(
     acquire_as_coordinator_impl(*coordinator.into(), Some(cancelled), step)
 }
 
+/// Render a blocked coordinator claim compactly for the exit-timing fallback
+/// accusation: `cpu=<i>,…,llc=<i>,…,permit=<i>,…`, each set capped so a wide
+/// claim cannot produce an unbounded line.
+fn format_watched_resources(claim: &ClaimSet) -> String {
+    const MAX_PER_KIND: usize = 8;
+    let mut parts = Vec::new();
+    for cpu in claim.cpus.iter().take(MAX_PER_KIND) {
+        parts.push(format!("cpu={cpu}"));
+    }
+    for llc in claim.llcs.iter().take(MAX_PER_KIND) {
+        parts.push(format!("llc={llc}"));
+    }
+    for permit in claim.permits.iter().take(MAX_PER_KIND) {
+        parts.push(format!("permit={permit}"));
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(",")
+    }
+}
+
 fn acquire_as_coordinator_impl<T>(
     mut coordinator: CoordinatorTicket,
     cancelled: Option<&AtomicBool>,
@@ -4138,6 +4168,15 @@ fn acquire_as_coordinator_impl<T>(
             let semantic_wait = wake_deadline.saturating_duration_since(wait_now);
             let syscall_wait = super::reservation_wait_progress_poll()
                 .map_or(semantic_wait, |poll| semantic_wait.min(poll));
+            // A process that has already released its run claim yet is blocking
+            // here is the exit-seam suspect: name what its coordinator turn
+            // waits on. Gated so pre-release/unset sleeps allocate nothing.
+            if crate::vmm::exit_timing::post_release_active() {
+                crate::vmm::exit_timing::stamp_waiting(
+                    "coordinator_watch_wait",
+                    &format_watched_resources(&watched_resources),
+                );
+            }
             match check_result(watch.wait(syscall_wait, &watched_resources), cancelled)? {
                 Some(events) => {
                     COORDINATOR_EVENT_WAKES.fetch_add(1, Ordering::Relaxed);
@@ -4198,6 +4237,24 @@ fn acquire_as_coordinator_impl<T>(
                         COORDINATOR_RETRY_TIMEOUT_WAKES.fetch_add(1, Ordering::Relaxed);
                         if !observation_pending {
                             COORDINATOR_FALLBACK_WAKES.fetch_add(1, Ordering::Relaxed);
+                            // Accusation: a full COORDINATOR_WAKE_FALLBACK tick
+                            // rather than a live edge means a blocked claim's
+                            // release wake was missed. Name the blocking
+                            // resources and their holder so every 30s tick in CI
+                            // is attributable. Best-effort, one nonblocking SH
+                            // read; never perturbs the wait.
+                            if !watched_resources.cpus.is_empty()
+                                || !watched_resources.llcs.is_empty()
+                                || !watched_resources.permits.is_empty()
+                            {
+                                let blocked_on = format_watched_resources(&watched_resources);
+                                let holder =
+                                    registry::resource_holders_nonblocking(&watched_resources)
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                crate::vmm::exit_timing::stamp_fallback_block(&blocked_on, &holder);
+                            }
                         }
                         retry_deadline = std::time::Instant::now() + retry_interval;
                     }

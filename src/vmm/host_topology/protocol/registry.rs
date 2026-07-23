@@ -3925,6 +3925,11 @@ impl Drop for Ticket {
         self.liveness.take();
         let _ = std::fs::remove_file(&self.liveness_path);
         notify_coordinator();
+        // Post-release only: names when a ticket record (an intent or a
+        // coordinator seat the process still held) is finally retired on the
+        // way out, and the `try_lock_registry_existing_nonblocking` above shows
+        // whether that retire had to defer to liveness pruning.
+        crate::vmm::exit_timing::stamp("ticket_record_retire");
     }
 }
 
@@ -4577,6 +4582,84 @@ pub(super) fn persist_wait_diagnostic(root: &Path, bucket: u64, unix_secs: u64) 
     std::fs::rename(&temp_path, &output_path)
         .with_context(|| format!("publish queue diagnostic {}", output_path.display()))?;
     Ok(())
+}
+
+/// Best-effort holder accusation for the exit-timing coordinator-fallback
+/// diagnostic: name a holder of each resource in `watched` (the blocked
+/// coordinator claim) as `<kind>=<index>:pid=<pid>:ticket=<ticket>:state=<...>`,
+/// space-joined and bounded. One nonblocking SH read so it never perturbs
+/// coordinator timing — `Ok(None)` when the registry lock is busy/absent/dirty
+/// (the fallback tick is still counted, just unnamed).
+pub(super) fn resource_holders_nonblocking(watched: &ClaimSet) -> Result<Option<String>> {
+    if watched.cpus.is_empty() && watched.llcs.is_empty() && watched.permits.is_empty() {
+        return Ok(None);
+    }
+    let Some(_registry) = try_lock_registry_existing_nonblocking(FlockMode::Shared)? else {
+        return Ok(None);
+    };
+    match File::open(header_path()) {
+        Ok(header) => {
+            if header.metadata().map(|meta| meta.len()).unwrap_or(0) == 0 {
+                return Ok(None);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("open queue registry for holder accusation"),
+    }
+    let mut table = Table::open_existing()?;
+    if atomic_u64(&table.header, H_AGGREGATE_DIRTY).load(Ordering::SeqCst) != 0 {
+        return Ok(None);
+    }
+    let self_pid = std::process::id();
+    let next_slot = table.next_slot()?;
+    let mut slot = read_u64(&table.header, H_ACTIVE_HEAD);
+    let mut visited = 0u64;
+    let mut named: Vec<String> = Vec::new();
+    const MAX_NAMED: usize = 8;
+    while slot != NONE_SLOT && named.len() < MAX_NAMED {
+        if visited >= next_slot {
+            break;
+        }
+        let Some(record) = table.record(slot)? else {
+            break;
+        };
+        let next_active = record.next_active;
+        if record.pid != self_pid {
+            let resource = record
+                .claim
+                .cpus
+                .iter()
+                .find(|cpu| watched.cpus.contains(cpu))
+                .map(|cpu| format!("cpu={cpu}"))
+                .or_else(|| {
+                    record
+                        .claim
+                        .llcs
+                        .iter()
+                        .find(|llc| watched.llcs.contains(llc))
+                        .map(|llc| format!("llc={llc}"))
+                })
+                .or_else(|| {
+                    record
+                        .claim
+                        .permits
+                        .iter()
+                        .find(|permit| watched.permits.contains(permit))
+                        .map(|permit| format!("permit={permit}"))
+                });
+            if let Some(resource) = resource {
+                named.push(format!(
+                    "{resource}:pid={}:ticket={}:state={}",
+                    record.pid,
+                    record.ticket,
+                    record_state_name(record.state),
+                ));
+            }
+        }
+        visited += 1;
+        slot = next_active;
+    }
+    Ok((!named.is_empty()).then(|| named.join(" ")))
 }
 
 struct WaitDiagnosticSnapshot {
