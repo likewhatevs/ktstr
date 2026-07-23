@@ -15324,8 +15324,25 @@ impl KtstrVm {
                         deadman_decision,
                         Some(watchdog_step::DeadmanHostDecision::Fire(_))
                     );
+                    // Liveness-independent Tier-3 wall net (see
+                    // `watchdog_step::wall_net_tripped`): a phase that has sat
+                    // this many multiples of the effective deadline past its
+                    // last milestone is wedged regardless of any deadman
+                    // defer, so a wedge whose fast tiers are suppressed under
+                    // host load can never reach the outer nextest
+                    // terminate-after without a ktstr kill + failure dump.
+                    // `wall_since_milestone_ns` is run-start-relative, so
+                    // admission-queue time cannot trip it. Unconditional — NOT
+                    // gated on `ordinary_overlay_active`, since the overlays
+                    // fail-closed on their own far-shorter budgets long before
+                    // this and a stuck overlay must not defeat the net.
+                    let wall_net_fire = watchdog_step::wall_net_tripped(
+                        wall_since_milestone_ns,
+                        effective_deadline_budget_ns,
+                    );
                     if kill_set
                         || deadman_fire
+                        || wall_net_fire
                         || tier_fire
                         || attach_fail_closed
                         || attach_monitor_unavailable
@@ -15350,8 +15367,11 @@ impl KtstrVm {
                         // not merely because the wall deadline passed while
                         // the cell stayed alive. So a kill_set arriving
                         // past a deferred deadline is labeled AP-kill, not
-                        // Tier-3, and does not set `timed_out`.
-                        let hard_timeout_fired = deadman_fire;
+                        // Tier-3, and does not set `timed_out`. The
+                        // liveness-independent wall net is a Tier-3-class
+                        // deadline expiry too, so it folds in here (labels
+                        // Tier-3, sets `timed_out`).
+                        let hard_timeout_fired = deadman_fire || wall_net_fire;
                         // Cause precedence: a progress-tier verdict is the
                         // most specific (it names WHICH wedge), so it wins
                         // over the generic hard deadline; the AP-set kill
