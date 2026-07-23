@@ -3792,6 +3792,150 @@ fn suppress_failure_dumps_removes_only_named_tests_dumps() {
 }
 
 #[test]
+fn cleanup_snapshots_removes_only_named_variants_snapshots() {
+    // Pass/skip finalize (and the attempt-prepare reap) drop every on-disk
+    // snapshot for one test variant — primary + repro base, periodic and
+    // one-shot tags alike — while leaving a sibling gauntlet preset's
+    // snapshots, a different test's snapshots, and the failure DUMP
+    // (primary evidence) untouched.
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let dir = crate::test_support::sidecar::sidecar_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = vec![b'x'; 4096];
+    // Variant A of `snaptest` (to clean): primary periodic, repro periodic,
+    // and a one-shot mid_run tag.
+    let a_primary = [
+        "snaptest-000000000000000a.snapshot.periodic_000.json",
+        "snaptest-000000000000000a.snapshot.periodic_001.json",
+        "snaptest-000000000000000a.snapshot.mid_run.json",
+    ];
+    let a_repro = ["snaptest-000000000000000a.repro.snapshot.periodic_000.json"];
+    // Must survive: sibling variant B, a different test, and A's dump.
+    let survivors = [
+        "snaptest-000000000000000b.snapshot.periodic_000.json",
+        "other-000000000000000a.snapshot.periodic_000.json",
+        "snaptest-000000000000000a.failure-dump.json",
+    ];
+    for name in a_primary
+        .iter()
+        .chain(a_repro.iter())
+        .chain(survivors.iter())
+    {
+        std::fs::write(dir.join(name), &big).unwrap();
+    }
+
+    crate::test_support::sidecar::cleanup_snapshots("snaptest", 0xa);
+
+    for name in a_primary.iter().chain(a_repro.iter()) {
+        assert!(
+            !dir.join(name).exists(),
+            "variant A snapshot must be removed: {name}",
+        );
+    }
+    for name in survivors {
+        assert!(
+            dir.join(name).exists(),
+            "non-variant-A / dump artifact must survive: {name}",
+        );
+    }
+}
+
+#[test]
+fn bound_periodic_snapshots_keeps_most_recent_n_per_base() {
+    // A FAILING attempt keeps only the most-recent N periodic snapshots per
+    // base. Primary and repro bases are bounded independently; one-shot tags
+    // and the failure dump are never touched.
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let dir = crate::test_support::sidecar::sidecar_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = vec![b'x'; 4096];
+    let keep = 8usize;
+    let total = 12u32; // 4 over the bound per base
+    for idx in 0..total {
+        std::fs::write(
+            dir.join(format!(
+                "failt-000000000000000a.snapshot.periodic_{idx:03}.json"
+            )),
+            &big,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!(
+                "failt-000000000000000a.repro.snapshot.periodic_{idx:03}.json"
+            )),
+            &big,
+        )
+        .unwrap();
+    }
+    // Untouchables: a one-shot tag and the failure dump.
+    std::fs::write(
+        dir.join("failt-000000000000000a.snapshot.mid_run.json"),
+        &big,
+    )
+    .unwrap();
+    std::fs::write(dir.join("failt-000000000000000a.failure-dump.json"), &big).unwrap();
+
+    crate::test_support::sidecar::bound_periodic_snapshots("failt", 0xa, keep);
+
+    let drop_below = total - keep as u32; // indices 0..4 evicted
+    for idx in 0..total {
+        for base in ["snapshot", "repro.snapshot"] {
+            let name = format!("failt-000000000000000a.{base}.periodic_{idx:03}.json");
+            let kept = dir.join(&name).exists();
+            if idx < drop_below {
+                assert!(!kept, "oldest periodic must be evicted: {name}");
+            } else {
+                assert!(kept, "most-recent {keep} periodic must be kept: {name}");
+            }
+        }
+    }
+    assert!(
+        dir.join("failt-000000000000000a.snapshot.mid_run.json")
+            .exists(),
+        "one-shot snapshot tags are not part of the periodic bound",
+    );
+    assert!(
+        dir.join("failt-000000000000000a.failure-dump.json")
+            .exists(),
+        "the failure dump is primary evidence and must not be bounded",
+    );
+}
+
+#[test]
+fn cleanup_snapshots_does_not_match_name_prefixed_sibling() {
+    // The `-{hash:016x}` boundary makes the prefix exact: cleaning `foo`
+    // must not touch `foobar`'s snapshots even at the same hash.
+    let _lock = lock_env();
+    let _sd = isolated_sidecar_dir();
+    let dir = crate::test_support::sidecar::sidecar_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("foo-000000000000000a.snapshot.periodic_000.json"),
+        b"x",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("foobar-000000000000000a.snapshot.periodic_000.json"),
+        b"x",
+    )
+    .unwrap();
+
+    crate::test_support::sidecar::cleanup_snapshots("foo", 0xa);
+
+    assert!(
+        !dir.join("foo-000000000000000a.snapshot.periodic_000.json")
+            .exists()
+    );
+    assert!(
+        dir.join("foobar-000000000000000a.snapshot.periodic_000.json")
+            .exists(),
+        "a name-prefixed sibling test must not be swept by the shorter name",
+    );
+}
+
+#[test]
 fn summarize_failing_variant_not_masked_by_passing_sibling() {
     // A gauntlet test writes one sidecar per topology variant under
     // the SAME bare name (distinct variant hashes). A passing variant

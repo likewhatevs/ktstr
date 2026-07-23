@@ -300,6 +300,24 @@ pub(crate) fn run_ktstr_test_inner(
         }
         None => {}
     }
+    // Bounded periodic-snapshot retention (best-effort; never gates the
+    // verdict). A pass/skip run needs no periodic forensics, so the whole
+    // pile is dropped — the dominant reclaim, since most e2e tests pass and
+    // each was leaving dozens of multi-MB snapshots that nothing on disk
+    // reads. A failing run keeps only the most-recent
+    // `RETAINED_PERIODIC_SNAPSHOTS` per base (bracketing the failure); the
+    // failure DUMP — the primary evidence — is retained untouched. Prior
+    // attempts' piles were already reaped at prepare; a SIGKILL'd non-final
+    // attempt is reaped by the next attempt's prepare.
+    if passed || skipped {
+        crate::test_support::sidecar::cleanup_snapshots(entry.name, variant_hash);
+    } else {
+        crate::test_support::sidecar::bound_periodic_snapshots(
+            entry.name,
+            variant_hash,
+            crate::test_support::sidecar::RETAINED_PERIODIC_SNAPSHOTS,
+        );
+    }
     // Run-footer advisory: an `expect_err` inversion that PASSED only
     // because the scheduler failed to LOAD/attach (never ran the runtime
     // path the test intends). `take_primary_load_failure` drains the flag
@@ -870,6 +888,17 @@ fn run_ktstr_test_inner_impl(
     for stale in [&primary_dump_path, &repro_dump_path] {
         prepare_failure_dump_path(stale, attempt);
     }
+    // Reap any prior-attempt / SIGKILL-orphaned periodic snapshots for this
+    // variant before boot so the new attempt starts from a clean snapshot
+    // slate. The freeze coordinator overwrites `{base}.snapshot.periodic_NNN`
+    // by tag, but a preceding attempt that fired MORE boundaries (or was
+    // killed by the watchdog mid-run) leaves stale higher-index snapshots the
+    // tag-keyed overwrite cannot reclaim. This is the crash-safety reap: a
+    // killed process cannot clean up after itself, so the next attempt's
+    // prepare does it — the same handoff `prepare_failure_dump_path` performs
+    // for the dump. Unlike the dump, snapshots are supplementary trajectory,
+    // not per-attempt evidence, so they are reaped rather than archived.
+    super::sidecar::cleanup_snapshots(entry.name, variant_hash);
 
     // Attach the primary failure-dump JSON sink at this dispatch
     // site, NOT inside `build_vm_builder_base` — auto-repro calls

@@ -3539,6 +3539,153 @@ pub(crate) fn suppress_failure_dumps(test_name: &str, variant_hash: u64) {
     }
 }
 
+/// How many periodic-snapshot files a FAILING attempt keeps per dump
+/// base (primary and `.repro.` are bounded independently).
+///
+/// The freeze coordinator writes one `{base}.snapshot.periodic_NNN.json`
+/// per fired boundary (up to [`crate::scenario::snapshot::MAX_STORED_SNAPSHOTS`] = 64),
+/// each multi-megabyte. NOTHING on disk reads them back: `eval` and the
+/// cast-analysis pipeline both consume the in-process
+/// [`crate::scenario::snapshot::SnapshotBridge`] (which FIFO-caps at 64
+/// on its own), never these files — they exist solely as CI forensic
+/// artifacts for human inspection. The documented floor for *meaningful*
+/// periodic coverage is `num_snapshots >= 2` (see
+/// `crate::assert::temporal` / `crate::stats::metric_id`); keeping the
+/// most-recent 8 leaves a 4x margin of trajectory approaching the
+/// failure while bounding a 64-deep pile to 8 files. The most recent
+/// samples (highest `periodic_NNN` index) are retained because they
+/// bracket the failure; the periodic tag is zero-padded 3-digit, so
+/// lexical index order is chronological.
+pub(crate) const RETAINED_PERIODIC_SNAPSHOTS: usize = 8;
+
+/// Filename prefix shared by every on-disk snapshot for one test
+/// variant: `{test_name}-{variant_hash:016x}`. The freeze coordinator
+/// derives snapshot names from the failure-dump base by stripping
+/// `.failure-dump` (see `vmm::freeze_coord::snapshot::snapshot_tagged_path`),
+/// so the primary base yields `{prefix}.snapshot.{tag}.json` and the
+/// repro base yields `{prefix}.repro.snapshot.{tag}.json`. The trailing
+/// `-{hash:016x}` makes the prefix an exact variant boundary — `foo`'s
+/// prefix cannot match `foobar`'s files, and a sibling gauntlet preset
+/// (different hash) is untouched.
+fn snapshot_base_prefix(test_name: &str, variant_hash: u64) -> String {
+    format!("{test_name}-{variant_hash:016x}")
+}
+
+/// `true` when `name` is any snapshot file (`.snapshot.{tag}.json`,
+/// primary or `.repro.` base) for the variant identified by `prefix`.
+fn is_snapshot_file_for(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let rest = rest.strip_prefix(".repro").unwrap_or(rest);
+    rest.starts_with(".snapshot.") && rest.ends_with(".json")
+}
+
+/// `Some(index)` when `name` is a PERIODIC snapshot file for `prefix`,
+/// returning the zero-padded 3-digit `periodic_NNN` index for recency
+/// ordering. `None` for a non-matching file or a non-periodic snapshot
+/// tag (e.g. `.snapshot.mid_run.json`, `.snapshot.early-degraded.json`),
+/// which are single-shot and never bounded. The 3-digit / all-ASCII-digit
+/// gate matches the coordinator's `format!("periodic_{:03}", idx)`
+/// emission exactly, so a user-chosen `Op::CaptureSnapshot { name:
+/// "periodic_kaslr" }` tag cannot be mistaken for a periodic sample.
+fn periodic_snapshot_index_for(name: &str, prefix: &str) -> Option<u32> {
+    let rest = name.strip_prefix(prefix)?;
+    let rest = rest.strip_prefix(".repro").unwrap_or(rest);
+    let tag = rest.strip_prefix(".snapshot.")?.strip_suffix(".json")?;
+    let digits = tag.strip_prefix("periodic_")?;
+    if digits.len() == 3 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        digits.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Remove EVERY on-disk snapshot file for this exact test variant
+/// (primary + `.repro.` bases, periodic and one-shot tags alike).
+///
+/// Two callers, both best-effort (a missing dir or file is fine, and
+/// nothing here ever fails a test):
+/// - **Pass/skip finalize** ([`crate::test_support::eval`]): a run whose
+///   FINAL verdict is pass/skip needs no periodic forensics, so the whole
+///   pile is dropped before the process exits (and thus before CI uploads
+///   artifacts). This is the dominant reclaim — most e2e tests pass, and
+///   each was writing dozens of multi-MB snapshots that nothing consumed.
+/// - **Attempt-prepare reap**: called before boot so a new attempt starts
+///   from a clean snapshot slate. A prior attempt that fired MORE
+///   boundaries — or was SIGKILL'd by the watchdog mid-run — leaves stale
+///   higher-index snapshots the coordinator's tag-keyed overwrite would
+///   not reclaim; this reaps them. It is the crash-safety mechanism: a
+///   killed process cannot clean up after itself, so the NEXT attempt's
+///   prepare does it (mirrors [`super::eval`]'s `prepare_failure_dump_path`).
+pub(crate) fn cleanup_snapshots(test_name: &str, variant_hash: u64) {
+    let dir = sidecar_dir();
+    let prefix = snapshot_base_prefix(test_name, variant_hash);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if is_snapshot_file_for(name, &prefix) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Bound the periodic snapshots for a FAILING attempt to the most recent
+/// `keep` per dump base, deleting the older ones. Primary and `.repro.`
+/// bases are bounded independently (each keeps its own `keep`). One-shot
+/// snapshot tags (`mid_run`, degraded) are never touched — they are
+/// single files, not an unbounded periodic series. Best-effort; never
+/// fails a test.
+///
+/// The retained failure DUMP is the primary evidence and is untouched
+/// here; these periodic samples are supplementary trajectory, so the
+/// most-recent `keep` (bracketing the failure) suffice. See
+/// [`RETAINED_PERIODIC_SNAPSHOTS`] for the floor rationale.
+pub(crate) fn bound_periodic_snapshots(test_name: &str, variant_hash: u64, keep: usize) {
+    let dir = sidecar_dir();
+    let prefix = snapshot_base_prefix(test_name, variant_hash);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    // Bucket by base so the repro series does not evict the primary's.
+    let mut primary: Vec<(u32, PathBuf)> = Vec::new();
+    let mut repro: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(idx) = periodic_snapshot_index_for(name, &prefix) else {
+            continue;
+        };
+        let is_repro = name
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|rest| rest.starts_with(".repro."));
+        if is_repro {
+            repro.push((idx, path));
+        } else {
+            primary.push((idx, path));
+        }
+    }
+    for mut set in [primary, repro] {
+        if set.len() <= keep {
+            continue;
+        }
+        // Ascending by index == chronological; drop the oldest overflow,
+        // keep the newest `keep`.
+        set.sort_by_key(|(idx, _)| *idx);
+        let drop_count = set.len() - keep;
+        for (_, path) in set.into_iter().take(drop_count) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// `Some(path)` when `KTSTR_SIDECAR_DIR` is set non-empty,
 /// returning the override path verbatim; `None` when the env
 /// var is unset or empty (default-path branch). Single source
