@@ -176,6 +176,7 @@ fn stx_flow_with_ambiguous_shape_is_order_stable() {
             &[],
             &[],
             &[SubprogReturn {
+                return_struct_id: None,
                 alloc_size: None,
                 insn_offset: 0,
             }],
@@ -191,6 +192,7 @@ fn stx_flow_with_ambiguous_shape_is_order_stable() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],

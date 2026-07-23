@@ -246,9 +246,157 @@ pub(crate) fn build_subprog_returns(
         out.push(SubprogReturn {
             insn_offset: insn_idx,
             alloc_size,
+            // Size-only allocators (`scx_static_alloc_internal`,
+            // `scx_alloc_internal`): the analyzer tags R0 as
+            // `ArenaU64FromAlloc` and the payload struct is resolved at
+            // chase time (bridge or size-match). The typed-return
+            // upgrade is emitted separately by
+            // [`typed_alloc_returns`], which owns the BTF-side
+            // resolution.
+            return_struct_id: None,
         });
     }
     out
+}
+
+/// Name of the single per-task sdt_alloc allocator that
+/// `scx_task_alloc` / `scx_task_init` operate on (a global
+/// `struct scx_allocator scx_task_allocator` in `lib/sdt_task.bpf.c`).
+/// Passed to [`crate::monitor::sdt_alloc::discover_payload_btf_id`] as
+/// the `allocator_name` disambiguator so the analyzer resolves the
+/// payload struct EXACTLY as the renderer does at chase time (the
+/// renderer keys the same allocator var name — see
+/// `dump/mod.rs::append_arena_slot_index_for_allocator`).
+const SCX_TASK_ALLOCATOR_NAME: &str = "scx_task_allocator";
+
+/// Subprog that returns a per-task sdt_alloc payload as a bare
+/// `void __arena *` (`lib/sdt_task.bpf.c::scx_task_alloc`). The
+/// analyzer cannot type this return from the callee FuncProto (the
+/// declared return is `void *`), so a chase THROUGH the returned
+/// pointer would key its STX against an untyped base and drop the
+/// finding. [`typed_alloc_returns`] recovers the payload struct id and
+/// upgrades the return to `Pointer{struct}` when unambiguous.
+const SCX_TASK_ALLOC_NAME: &str = "scx_task_alloc";
+
+/// Subprog that DECLARES the per-task allocator's element size
+/// (`lib/sdt_task.bpf.c::scx_task_init(__u64 data_size)`, called once
+/// with `sizeof(payload)`). `scx_task_alloc` carries no size argument
+/// at its own call site, so the size is recovered from this call's R1
+/// immediate. Both operate on the singleton `scx_task_allocator`, so
+/// one `scx_task_init(size)` fixes the size for every `scx_task_alloc`
+/// return in the object.
+const SCX_TASK_INIT_NAME: &str = "scx_task_init";
+
+/// Recover typed allocator returns for `scx_task_alloc`-class calls,
+/// where the payload struct id is resolvable but the callee FuncProto
+/// return type (`void __arena *`) is not.
+///
+/// Two-step, evidence-based:
+///
+/// 1. Recover the per-task allocator element size from the
+///    `scx_task_init(<size>)` call's R1 immediate (the ONLY static
+///    signal for a size that `scx_task_alloc` sets up at init, not at
+///    each alloc). Multiple `scx_task_init` calls with disagreeing
+///    sizes, or a size the lookback cannot recover, yield `None` and
+///    the whole pass emits nothing — no size, no typed return.
+/// 2. Map that size to a payload struct via
+///    [`crate::monitor::sdt_alloc::discover_payload_btf_id`] — the SAME
+///    size+name match the renderer runs at chase time, so analyzer and
+///    renderer never disagree on the id. It returns `0` on ANY
+///    ambiguity (zero or multiple size candidates that the name
+///    heuristic cannot break); the `!= 0` gate is the correctness
+///    boundary. A `0` result emits nothing (the return stays untyped —
+///    false negative over false positive).
+///
+/// Emits one [`SubprogReturn`] per `scx_task_alloc` call site with
+/// `return_struct_id: Some(sid)`; the analyzer types R0 = `Pointer{sid}`.
+///
+/// Determinism: the reloc walk is section/offset ordered and
+/// `discover_payload_btf_id` scans BTF ids in order with ordered
+/// pattern arms — no HashMap iteration influences the result.
+pub(crate) fn typed_alloc_returns(
+    text_concat: &[BpfInsn],
+    elf: &goblin::elf::Elf<'_>,
+    section_bases: &HashMap<u32, usize>,
+    btf: &btf_rs::Btf,
+) -> Vec<SubprogReturn> {
+    // Step 1: recover the per-task allocator element size, requiring a
+    // unique agreed value across every `scx_task_init` call site.
+    let mut per_task_size: Option<u64> = None;
+    for (insn_idx, name) in iter_named_pseudo_calls(text_concat, elf, section_bases) {
+        if name != SCX_TASK_INIT_NAME {
+            continue;
+        }
+        let Some(size) = recover_alloc_size_from_r1(text_concat, insn_idx) else {
+            // A call whose size we cannot recover makes the per-task
+            // size unknown — bail closed rather than guess.
+            return Vec::new();
+        };
+        match per_task_size {
+            None => per_task_size = Some(size),
+            Some(prev) if prev == size => {}
+            // Disagreeing sizes across init calls: ambiguous, bail.
+            Some(_) => return Vec::new(),
+        }
+    }
+    let Some(size) = per_task_size else {
+        return Vec::new();
+    };
+
+    // Step 2: resolve the payload struct. `!= 0` is the len==1
+    // correctness boundary enforced inside `discover_payload_btf_id`.
+    let choice = crate::monitor::sdt_alloc::discover_payload_btf_id(
+        btf,
+        size as usize,
+        SCX_TASK_ALLOCATOR_NAME,
+    );
+    if choice.target_type_id == 0 {
+        return Vec::new();
+    }
+
+    // Emit a typed return for every scx_task_alloc call site.
+    let mut out = Vec::new();
+    for (insn_idx, name) in iter_named_pseudo_calls(text_concat, elf, section_bases) {
+        if name != SCX_TASK_ALLOC_NAME {
+            continue;
+        }
+        out.push(SubprogReturn {
+            insn_offset: insn_idx,
+            alloc_size: Some(size),
+            return_struct_id: Some(choice.target_type_id),
+        });
+    }
+    out
+}
+
+/// Yield `(insn_index, subprog_name)` for every `BPF_PSEUDO_CALL` to a
+/// defined in-tree `STT_FUNC` subprog — the same call-shape
+/// [`build_subprog_returns`] gates on, factored out so
+/// [`typed_alloc_returns`] can match callee names without the
+/// allocator allowlist. Extern (kfunc) callsites (`SHN_UNDEF`) and
+/// non-call relocations are skipped.
+fn iter_named_pseudo_calls<'a>(
+    text_concat: &'a [BpfInsn],
+    elf: &'a goblin::elf::Elf<'a>,
+    section_bases: &'a HashMap<u32, usize>,
+) -> impl Iterator<Item = (usize, &'a str)> + 'a {
+    iter_text_relocs(elf, section_bases).filter_map(move |(insn_idx, reloc)| {
+        let insn = text_concat.get(insn_idx)?;
+        if insn.code != cast_analysis_load_consts::BPF_JMP_CALL_CODE {
+            return None;
+        }
+        if insn.src_reg() != BPF_PSEUDO_CALL {
+            return None;
+        }
+        let sym = elf.syms.get(reloc.r_sym)?;
+        const STT_FUNC: u8 = goblin::elf::sym::STT_FUNC;
+        const SHN_UNDEF: usize = 0;
+        if sym.st_shndx == SHN_UNDEF || sym.st_type() != STT_FUNC {
+            return None;
+        }
+        let name = elf.strtab.get_at(sym.st_name).filter(|s| !s.is_empty())?;
+        Some((insn_idx, name))
+    })
 }
 
 /// Maximum instructions [`recover_alloc_size_from_r1`] scans backward
@@ -790,9 +938,28 @@ pub(crate) fn patch_subprog_calls(
     // target-section / `r_offset` validation preamble. Each item
     // is a relocation that targets a known program text section
     // at an 8-byte-aligned, in-bounds offset; the subprog-specific
-    // gates (call opcode, imm == -1, BPF_PSEUDO_CALL src_reg,
-    // STT_FUNC defined symbol, callee section in `section_bases`,
-    // st_value alignment) are applied here.
+    // gates (call opcode, BPF_PSEUDO_CALL src_reg, STT_FUNC defined
+    // symbol, callee section in `section_bases`, st_value alignment)
+    // are applied here.
+    //
+    // Every reloc'd `BPF_PSEUDO_CALL` to a defined subprog is rebased
+    // — NOT only the `imm == -1` libbpf placeholder. A single embedded
+    // object produced by `bpftool gen object` (the shape inside an
+    // scx scheduler's `.bpf.objs`) is already partially linked: a
+    // cross-section call (e.g. from a `struct_ops.s/…` program section
+    // into a `.text` library subprog) carries a linker-resolved `imm`
+    // that is PC-relative to the callee's own section, not to our
+    // section-header-order concatenation. Skipping those (the old
+    // `imm != -1` gate did) left the analyzer's `pc + 1 + imm` landing
+    // far past the callee's real entry, so cross-subprog
+    // `caller_arg_types` propagation never reached the callee body.
+    // Recomputing `imm` from `section_base + st_value/8` is safe for
+    // every reloc'd call: it targets the callee's function ENTRY (no
+    // addend — you cannot call into the middle of a BPF subprog), and
+    // for a same-section call the base cancels so the result matches
+    // the already-correct offset. It also puts the callee PC in the
+    // SAME basis `parse_btf_ext_func_entries` uses for `FuncEntry`
+    // offsets, which is exactly what `caller_arg_types` keys on.
     //
     // Capture `text_concat.len()` once up front so the callee-PC
     // bound check inside the loop body does not collide with the
@@ -806,63 +973,95 @@ pub(crate) fn patch_subprog_calls(
         if insn.code != cast_analysis_load_consts::BPF_JMP_CALL_CODE {
             continue;
         }
-        // Gate 2: `imm` must be the libbpf placeholder for global
-        // subprog calls. Static (file-local) subprog calls already
-        // carry the correct PC-relative offset in `imm` and must
-        // not be touched.
-        if insn.imm != -1 {
-            continue;
-        }
-        // Gate 3: src_reg must be the clang-emitted
+        // Gate 2: src_reg must be the clang-emitted
         // `BPF_PSEUDO_CALL` (1). After [`patch_kfunc_calls`] runs
         // first, kfunc call sites have `src_reg ==
         // BPF_PSEUDO_KFUNC_CALL` (2) and naturally skip this gate.
         if insn.src_reg() != BPF_PSEUDO_CALL {
             continue;
         }
-        // Resolve the symbol. The reloc's symbol must be a defined
-        // STT_FUNC (the global subprog shape). Extern kfunc calls
-        // were already handled upstream; data symbols, section
-        // symbols, and STT_NOTYPE entries are not subprog targets.
+        // Resolve the symbol. Two defined-subprog reloc shapes reach
+        // here, distinguished by symbol type:
+        //
+        // - `STT_FUNC`: the reloc names the callee function directly;
+        //   `st_value` is the callee's byte offset within its section.
+        //   This is the classic single-.text / libbpf-placeholder
+        //   (`imm == -1`) shape.
+        // - `STT_SECTION`: the reloc names the callee's *section*
+        //   (name empty, `st_value == 0`) and the callee's in-section
+        //   instruction index is carried in the call's own `imm` as
+        //   `imm + 1`. `bpftool gen object` emits this for a partially
+        //   linked cross-section call — e.g. a `struct_ops.s/…` program
+        //   calling a `.text` library subprog — because it cannot fold
+        //   the two sections into one final PC space. The pre-existing
+        //   `imm` is PC-relative to the CALLEE section start, not to our
+        //   concatenation, so it must be rebased.
+        //
+        // Extern kfunc calls (`SHN_UNDEF`) were handled upstream; data
+        // / NOTYPE symbols are not subprog targets.
         let Some(sym) = elf.syms.get(reloc.r_sym) else {
             continue;
         };
         const STT_FUNC: u8 = goblin::elf::sym::STT_FUNC;
+        const STT_SECTION: u8 = goblin::elf::sym::STT_SECTION;
         const SHN_UNDEF: usize = 0;
         if sym.st_shndx == SHN_UNDEF {
             continue;
         }
-        if sym.st_type() != STT_FUNC {
+        let sym_type = sym.st_type();
+        if sym_type != STT_FUNC && sym_type != STT_SECTION {
             continue;
         }
-        // The symbol's section must appear in `section_bases` —
-        // only sections we concatenated are valid callee
-        // containers. A subprog defined in a section we did not
-        // collect (e.g. SHF_EXECINSTR-less PROGBITS, or one whose
-        // size is not a multiple of [`BPF_INSN_SIZE`]) cannot be
-        // resolved to a callee PC and is skipped silently.
+        // The callee's section must appear in `section_bases` — only
+        // sections we concatenated are valid callee containers. A
+        // subprog defined in a section we did not collect (e.g.
+        // SHF_EXECINSTR-less PROGBITS, or one whose size is not a
+        // multiple of [`BPF_INSN_SIZE`]) cannot be resolved to a callee
+        // PC and is skipped silently.
         let callee_sec_idx = sym.st_shndx as u32;
         let Some(&callee_section_base) = section_bases.get(&callee_sec_idx) else {
             continue;
         };
-        // `sym.st_value` is the byte offset of the callee's first
-        // instruction within its section (relative to the section's
-        // sh_addr). For BPF .o files, sections are non-allocated
-        // and sh_addr is 0, so st_value is a plain byte offset.
-        // We still subtract sh_addr defensively to handle any
-        // future shape where the inner ELF might surface an
-        // allocated text section.
-        let Some(callee_section) = elf.section_headers.get(callee_sec_idx as usize) else {
-            continue;
+        // In-section instruction index of the callee's entry.
+        let callee_insn_in_section = if sym_type == STT_FUNC {
+            // Only the libbpf `imm == -1` global-subprog placeholder is
+            // rebased on the FUNC-symbol path. A static (file-local)
+            // subprog call already carries the correct PC-relative
+            // offset in `imm`; recomputing from `st_value` would be a
+            // no-op at best and must not clobber a non-placeholder
+            // value, so leave it alone.
+            if insn.imm != -1 {
+                continue;
+            }
+            // `sym.st_value` is the callee's byte offset within its
+            // section (relative to sh_addr, which is 0 for the
+            // non-allocated BPF text sections; subtract it defensively
+            // for any future allocated-section shape).
+            let Some(callee_section) = elf.section_headers.get(callee_sec_idx as usize) else {
+                continue;
+            };
+            let Some(sym_offset_bytes) = sym.st_value.checked_sub(callee_section.sh_addr) else {
+                continue;
+            };
+            let sym_offset_bytes = sym_offset_bytes as usize;
+            if !sym_offset_bytes.is_multiple_of(BPF_INSN_SIZE) {
+                continue;
+            }
+            sym_offset_bytes / BPF_INSN_SIZE
+        } else {
+            // STT_SECTION: the callee's in-section instruction index is
+            // `imm + 1` (the linker encodes the target as if the call
+            // sat at instruction -1 of the callee section). Skip any
+            // `imm < 0` — that includes the `-1` placeholder, which on
+            // the SECTION path is ambiguous with a genuine call to the
+            // section's first instruction; a false negative (leaving
+            // the call unresolved) is the safe direction.
+            if insn.imm < 0 {
+                continue;
+            }
+            (insn.imm as usize) + 1
         };
-        let Some(sym_offset_bytes) = sym.st_value.checked_sub(callee_section.sh_addr) else {
-            continue;
-        };
-        let sym_offset_bytes = sym_offset_bytes as usize;
-        if !sym_offset_bytes.is_multiple_of(BPF_INSN_SIZE) {
-            continue;
-        }
-        let callee_pc = match callee_section_base.checked_add(sym_offset_bytes / BPF_INSN_SIZE) {
+        let callee_pc = match callee_section_base.checked_add(callee_insn_in_section) {
             Some(p) => p,
             None => continue,
         };

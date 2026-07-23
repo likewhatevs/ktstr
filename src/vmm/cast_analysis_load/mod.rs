@@ -1257,7 +1257,21 @@ fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>, 
     // Arena cast finding via the new STX-flow path. See
     // [`build_subprog_returns`] for the relocation walk.
     let alloc_seed_t0 = std::time::Instant::now();
-    let subprog_returns = build_subprog_returns(&text_concat, &elf, &section_bases);
+    let mut subprog_returns = build_subprog_returns(&text_concat, &elf, &section_bases);
+    // Typed-return upgrade for `scx_task_alloc`-class allocators whose
+    // `void __arena *` return the analyzer cannot type from the callee
+    // FuncProto. Resolves the payload struct id from the per-task
+    // allocator size (via `discover_payload_btf_id`, uniqueness-guarded)
+    // so a chase THROUGH the returned pointer keys `(payload, off)`
+    // findings. Requires the parsed program BTF, so it runs here rather
+    // than inside `build_subprog_returns` (which is BTF-free). See
+    // [`reloc::typed_alloc_returns`].
+    subprog_returns.extend(reloc::typed_alloc_returns(
+        &text_concat,
+        &elf,
+        &section_bases,
+        btf.as_ref(),
+    ));
     tracing::debug!(
         elapsed_us = alloc_seed_t0.elapsed().as_micros() as u64,
         subprog_returns = subprog_returns.len(),
