@@ -1750,6 +1750,127 @@ pub(crate) fn process_start_elapsed() -> Option<std::time::Duration> {
     PROCESS_START.get().map(std::time::Instant::elapsed)
 }
 
+/// CI-only sink for per-cell admission-timing lines. Set by cargo-ktstr on the
+/// spawned nextest; unset on local runs, which is why [`AdmissionTiming::new`]
+/// returns `None` and every subsequent operation is a no-op with zero overhead.
+const ADMISSION_TIMING_DIR_ENV: &str = "KTSTR_BUILD_DIAGNOSTICS_DIR";
+const ADMISSION_TIMING_FILE: &str = "admission-timing.log";
+
+/// Per-cell admission-timing telemetry: three process-relative instants
+/// (registration, grant, release) decomposing a cell's charged wall into
+/// admission queue-wait vs granted service. All instants use
+/// [`process_start_elapsed`] so the series aligns with the wall-net telemetry
+/// and nextest's process-relative rail.
+///
+/// Constructed at registration and moved into the run's teardown guard, it
+/// emits exactly one line on `drop` — at run-locks release on the normal path,
+/// or wherever the cell unwinds (a never-granted, pending-killed cell) on the
+/// failure path. Emission is best-effort: a missing/unwritable diagnostics dir
+/// never turns a valid run into a failure, and the whole path is inert unless
+/// `KTSTR_BUILD_DIAGNOSTICS_DIR` is set.
+struct AdmissionTiming {
+    dir: PathBuf,
+    identity: String,
+    vcpus: u32,
+    permits: u32,
+    registered: Duration,
+    granted: Option<Duration>,
+}
+
+impl AdmissionTiming {
+    /// Record the registration instant, or `None` when the diagnostics sink is
+    /// unset (the local-run default: no allocation, no clock read, no write).
+    fn new(identity: String, vcpus: u32, permits: u32) -> Option<Self> {
+        let dir = std::env::var_os(ADMISSION_TIMING_DIR_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)?;
+        Some(Self {
+            dir,
+            identity,
+            vcpus,
+            permits,
+            registered: process_start_elapsed().unwrap_or_default(),
+            granted: None,
+        })
+    }
+
+    /// Stamp the grant instant at the PENDING→HELD conversion (i.e. right after
+    /// `acquire_run_locks` resolves the physical run claim).
+    fn mark_granted(&mut self) {
+        self.granted = Some(process_start_elapsed().unwrap_or_default());
+    }
+
+    /// Best-effort single O_APPEND write of one greppable line. `released` is
+    /// the drop instant. IO errors are ignored; the line stays under `PIPE_BUF`
+    /// so concurrent cells sharing this lane's file append atomically.
+    fn emit(&self, released: Duration) {
+        let line = format_admission_timing_line(
+            &self.identity,
+            self.vcpus,
+            self.permits,
+            self.registered,
+            self.granted,
+            released,
+        );
+        let _ = append_admission_timing_line(&self.dir, &line);
+    }
+}
+
+impl Drop for AdmissionTiming {
+    fn drop(&mut self) {
+        self.emit(process_start_elapsed().unwrap_or_default());
+    }
+}
+
+/// Format one admission-timing line. Granted and never-granted (pending-killed)
+/// cells share the field set: a killed cell leaves `granted` empty, reports the
+/// whole lifetime as `wait_ns`, `held_ns=0`, and carries `outcome=pending-killed`.
+fn format_admission_timing_line(
+    identity: &str,
+    vcpus: u32,
+    permits: u32,
+    registered: Duration,
+    granted: Option<Duration>,
+    released: Duration,
+) -> String {
+    let registered_ns = registered.as_nanos();
+    let released_ns = released.as_nanos();
+    match granted {
+        Some(granted) => {
+            let granted_ns = granted.as_nanos();
+            let wait_ns = granted.saturating_sub(registered).as_nanos();
+            let held_ns = released.saturating_sub(granted).as_nanos();
+            format!(
+                "admission-timing: test={identity} vcpus={vcpus} permits={permits} \
+                 registered={registered_ns} granted={granted_ns} released={released_ns} \
+                 wait_ns={wait_ns} held_ns={held_ns} outcome=granted"
+            )
+        }
+        None => {
+            let wait_ns = released.saturating_sub(registered).as_nanos();
+            format!(
+                "admission-timing: test={identity} vcpus={vcpus} permits={permits} \
+                 registered={registered_ns} granted= released={released_ns} \
+                 wait_ns={wait_ns} held_ns=0 outcome=pending-killed"
+            )
+        }
+    }
+}
+
+/// Append one newline-terminated line to `{dir}/admission-timing.log`, creating
+/// the directory and file as needed. A single `write` under `O_APPEND` is
+/// atomic for lines below `PIPE_BUF`, so concurrent cells in one lane interleave
+/// cleanly without a lock.
+fn append_admission_timing_line(dir: &std::path::Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    std::fs::create_dir_all(dir)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(ADMISSION_TIMING_FILE))?;
+    file.write_all(format!("{line}\n").as_bytes())
+}
+
 /// Human-readable summary of device-IRQ routing-install failures, for
 /// `run_interactive`'s teardown. `None` when there were none. `n` is a count of
 /// `KVM_SET_GSI_ROUTING` installs that errored, each leaving a device IRQ
@@ -1861,7 +1982,24 @@ impl KtstrVm {
             validate_prepared_exec_handoff(self, descriptor, memory_mib)?;
         }
         pending_admission.finish_preparation()?;
+        // Registration instant: the pending admission is created (direct path)
+        // or imported from the pre-exec parent (handoff path); either way the
+        // cell is now queued for the physical run claim. A never-granted cell
+        // emits `outcome=pending-killed` when `admission_timing` drops on unwind.
+        let mut admission_timing = AdmissionTiming::new(
+            imported_descriptor
+                .as_ref()
+                .map(|descriptor| descriptor.exact_name.clone())
+                .or_else(|| std::env::var("NEXTEST_TEST_NAME").ok())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            self.topology.total_cpus(),
+            pending_admission.preparation_cpu_permits().len() as u32,
+        );
         let run_locks = self.acquire_run_locks(true, Some(pending_admission), memory_mib)?;
+        // Grant instant: the physical run claim is held (PENDING→HELD).
+        if let Some(timing) = admission_timing.as_mut() {
+            timing.mark_granted();
+        }
         let runtime_mbind_node_map = if self.performance_mode {
             run_locks
                 .pinning_plan
@@ -1971,6 +2109,10 @@ impl KtstrVm {
         // fds immediately after every AP/device/helper has quiesced; its Drop
         // path joins those workers first and only then drops the fds.
         run.run_threads.attach_run_locks(run_locks);
+        // Release instant is stamped when this drops: at run-locks release on the
+        // normal teardown path, or at guard Drop on the unwind path.
+        run.run_threads
+            .attach_admission_timing(admission_timing.take());
 
         let mut result = self.collect_results(start, run)?;
         if let Some(budget) = overcommit_budget {

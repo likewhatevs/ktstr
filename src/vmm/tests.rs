@@ -2635,3 +2635,90 @@ fn builder_performance_mode_mbind_nodes_populated() {
         );
     }
 }
+
+/// Exact per-cell admission-timing line shapes for the granted and
+/// never-granted (pending-killed) outcomes. Pure formatting, so the field
+/// set, ordering, and derived `wait_ns`/`held_ns` are asserted deterministically.
+#[test]
+fn admission_timing_line_shapes() {
+    let granted = format_admission_timing_line(
+        "ktstr::foo",
+        8,
+        4,
+        Duration::from_nanos(1000),
+        Some(Duration::from_nanos(5000)),
+        Duration::from_nanos(9000),
+    );
+    assert_eq!(
+        granted,
+        "admission-timing: test=ktstr::foo vcpus=8 permits=4 \
+         registered=1000 granted=5000 released=9000 \
+         wait_ns=4000 held_ns=4000 outcome=granted"
+    );
+
+    let killed = format_admission_timing_line(
+        "ktstr::bar",
+        2,
+        0,
+        Duration::from_nanos(1000),
+        None,
+        Duration::from_nanos(7000),
+    );
+    assert_eq!(
+        killed,
+        "admission-timing: test=ktstr::bar vcpus=2 permits=0 \
+         registered=1000 granted= released=7000 \
+         wait_ns=6000 held_ns=0 outcome=pending-killed"
+    );
+}
+
+/// When `KTSTR_BUILD_DIAGNOSTICS_DIR` is set, a granted cell and a
+/// never-granted cell each emit exactly one line on drop, both appended to the
+/// single shared `admission-timing.log`.
+#[test]
+fn admission_timing_emits_on_drop_when_dir_set() {
+    let _lock = crate::test_support::test_helpers::lock_env();
+    let dir = tempfile::TempDir::new().expect("admission-timing tempdir");
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(ADMISSION_TIMING_DIR_ENV, dir.path());
+
+    {
+        let mut granted =
+            AdmissionTiming::new("ktstr::granted".into(), 4, 2).expect("dir set -> Some");
+        granted.mark_granted();
+    }
+    AdmissionTiming::new("ktstr::killed".into(), 1, 0).expect("dir set -> Some");
+
+    let log = std::fs::read_to_string(dir.path().join(ADMISSION_TIMING_FILE))
+        .expect("admission-timing.log written");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "one line per cell: {log:?}");
+    let granted_line = lines
+        .iter()
+        .find(|line| line.contains("test=ktstr::granted"))
+        .expect("granted line present");
+    assert!(granted_line.contains("outcome=granted"), "{granted_line}");
+    assert!(!granted_line.contains("granted= "), "{granted_line}");
+    let killed_line = lines
+        .iter()
+        .find(|line| line.contains("test=ktstr::killed"))
+        .expect("killed line present");
+    assert!(
+        killed_line.contains("outcome=pending-killed"),
+        "{killed_line}"
+    );
+    assert!(killed_line.contains("granted= "), "{killed_line}");
+    assert!(killed_line.contains("held_ns=0"), "{killed_line}");
+}
+
+/// The whole path is inert with the env var absent: `new` yields `None`, so no
+/// clock is read, nothing is stored, and dropping writes nothing.
+#[test]
+fn admission_timing_silent_without_dir() {
+    let _lock = crate::test_support::test_helpers::lock_env();
+    let _guard = crate::test_support::test_helpers::EnvVarGuard::remove(ADMISSION_TIMING_DIR_ENV);
+    assert!(
+        AdmissionTiming::new("ktstr::none".into(), 4, 2).is_none(),
+        "no diagnostics dir -> no telemetry"
+    );
+}

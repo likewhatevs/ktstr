@@ -62,6 +62,35 @@ kernel-build version="":
 # feature. E.g. `just test 6.14 wprof` → cargo-ktstr built `--features
 # wprof`; tests run `--features integration,wprof`.
 test kernel extra-features="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Host-saturation sampler: the drain's CPU-bound-vs-idle question can
+    # only be settled with a host-wide busy series plus permit-pool
+    # occupancy, and no per-cell telemetry captures either. Diagnostic
+    # only; written to the build-diagnostics dir CI uploads.
+    if [ -n "${KTSTR_BUILD_DIAGNOSTICS_DIR:-}" ]; then
+        mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+        (
+            lock_dir="${KTSTR_LOCK_DIR:-}"
+            while true; do
+                busy_idle=$(awk '/^cpu /{print $5+$6, $2+$3+$4+$5+$6+$7+$8+$9}' /proc/stat)
+                permits=0
+                if [ -n "$lock_dir" ]; then
+                    # Permit files persist after release; a permit is HELD only
+                    # while some process flocks it. Join /proc/locks' FLOCK
+                    # inodes against the permit files' inodes.
+                    permits=$(comm -12 \
+                        <(stat -c '%i' "$lock_dir"/ktstr-permit-* 2>/dev/null | sort -u) \
+                        <(awk '$2=="FLOCK" || $3=="FLOCK" {n=split($6,p,":"); if (n==3) print p[3]}' /proc/locks 2>/dev/null | sort -u) \
+                        | wc -l)
+                fi
+                echo "host-sample: t=$(date +%s) idle_total=${busy_idle} permit_locks=${permits}"
+                sleep 5
+            done > "${KTSTR_BUILD_DIAGNOSTICS_DIR}/host-saturation.log" 2>/dev/null
+        ) &
+        sampler_pid=$!
+        trap 'kill "${sampler_pid}" 2>/dev/null || true' EXIT
+    fi
     cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --no-fail-fast
 
 # Run trybuild compile_fail fixtures.

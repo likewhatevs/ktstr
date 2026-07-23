@@ -3964,6 +3964,11 @@ pub(crate) struct RunVmThreadGuard {
     /// it immediately after every AP/device/helper is quiescent; the Drop path
     /// runs the same joins before this field is dropped automatically.
     run_locks: Option<super::RunLocks>,
+    /// Per-cell admission-timing telemetry attached by `KtstrVm::run` alongside
+    /// `run_locks`. Dropped together with the reservation at `release_run_locks`,
+    /// so its release instant coincides with the physical run-claim release; on
+    /// the Drop path it emits when this field is destructed.
+    admission_timing: Option<super::AdmissionTiming>,
     kill: Arc<AtomicBool>,
     kill_evt: Arc<EventFd>,
     freeze: Arc<AtomicBool>,
@@ -3984,8 +3989,15 @@ impl RunVmThreadGuard {
         self.run_locks = Some(run_locks);
     }
 
+    pub(super) fn attach_admission_timing(&mut self, timing: Option<super::AdmissionTiming>) {
+        self.admission_timing = timing;
+    }
+
     fn release_run_locks(&mut self) {
         drop(self.run_locks.take());
+        // Emit the admission-timing line now the physical reservation is
+        // released, so its release instant reflects the run-claim release.
+        drop(self.admission_timing.take());
     }
 }
 
@@ -5640,6 +5652,7 @@ impl KtstrVm {
             freeze_coord: None,
             watchdog: None,
             run_locks: None,
+            admission_timing: None,
             kill: kill.clone(),
             kill_evt: kill_evt.clone(),
             freeze: freeze.clone(),
@@ -20406,6 +20419,7 @@ mod run_vm_thread_guard_tests {
             freeze_coord: Some(kill_watching_worker(kill.clone(), joined.clone())),
             watchdog: Some(kill_watching_worker(kill.clone(), joined.clone())),
             run_locks: None,
+            admission_timing: None,
             kill: kill.clone(),
             kill_evt: evt(),
             freeze: Arc::new(AtomicBool::new(true)),
@@ -20465,6 +20479,7 @@ mod run_vm_thread_guard_tests {
                 default_shared_cpu_claim: false,
                 default_shared_fallback: false,
             }),
+            admission_timing: None,
             kill: Arc::clone(&kill),
             kill_evt: evt(),
             freeze: Arc::new(AtomicBool::new(false)),
@@ -20533,6 +20548,7 @@ mod run_vm_thread_guard_tests {
                         freeze_coord: None,
                         watchdog: None,
                         run_locks: None,
+                        admission_timing: None,
                         kill,
                         kill_evt: evt(),
                         freeze: Arc::new(AtomicBool::new(false)),
