@@ -15335,10 +15335,19 @@ impl KtstrVm {
                     // admission-queue time cannot trip it. Unconditional — NOT
                     // gated on `ordinary_overlay_active`, since the overlays
                     // fail-closed on their own far-shorter budgets long before
-                    // this and a stuck overlay must not defeat the net.
+                    // this and a stuck overlay must not defeat the net. The
+                    // absolute-ceiling term (dilation-independent) needs the
+                    // wall since VM start and the current phase's own wall
+                    // backstop as the wedge-signature gate (`u64::MAX` for
+                    // Body, exempting a long idle Body).
                     let wall_net_fire = watchdog_step::wall_net_tripped(
                         wall_since_milestone_ns,
                         effective_deadline_budget_ns,
+                        now_wall_ns,
+                        crate::test_support::runtime::phase_wall_backstop_ns(
+                            snapshot.phase,
+                            vcpus_for_wd,
+                        ),
                     );
                     if kill_set
                         || deadman_fire

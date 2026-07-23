@@ -337,16 +337,59 @@ pub(crate) const fn deadman_cpu_budget_exhausted(
 /// starved cell becomes a witnessed Tier-3 SKIP, the designed degradation).
 pub(crate) const WALL_NET_DEADLINE_MULT: u64 = 4;
 
-/// Whether the liveness-independent Tier-3 wall net has tripped for a phase
-/// that has sat `wall_in_phase_ns` (run-start-relative, so admission-queue
-/// time is excluded) without a milestone. A zero budget (deadline unset)
-/// never trips. Strict `>`.
+/// Absolute, dilation-INDEPENDENT total-VM-wall ceiling for the wall net
+/// (run-start-relative nanoseconds).
+///
+/// The [`WALL_NET_DEADLINE_MULT`] term above is measured against
+/// `effective_deadline_budget_ns`, which is itself dilation-scaled: the
+/// scenario-start watchdog reset arms the deadline to
+/// `ScenarioEnd_wall + workload_duration`, and under an extremely
+/// oversubscribed host (observed: a coverage lane running guests at ~0.7% of
+/// real speed, an 8 s body taking 1190 s of wall) the guest reaches its
+/// milestones so late that the effective deadline balloons to ~1000 s, so
+/// `4x` lands well past the outer nextest terminate-after — the multiple term
+/// alone cannot fire in time and the wedge escapes to a dumpless SIGKILL.
+/// This ceiling is a FIXED wall bound, independent of any guest-derived or
+/// dilation-scaled quantity, chosen to land inside the ~1260 s outer rail with
+/// margin for the kill + teardown to complete. An outer rail that INCLUDES
+/// unbounded admission-queue time cannot be strictly beaten in theory
+/// (`now_wall` is post-admission and excludes queue); on the post-same-wake
+/// x64 admission path the per-cell queue wait is ~0, so this ceiling wins in
+/// practice. Only consulted together with the wedge-signature gate in
+/// [`wall_net_tripped`] (a phase stalled past its own wall backstop), so a
+/// legitimately-dilated cell still making milestone progress — including a
+/// long idle Body, exempt via its `u64::MAX` backstop — is untouched.
+pub(crate) const WALL_NET_ABSOLUTE_CEILING_NS: u64 = 1_000_000_000_000; // 1000 s
+
+/// Whether the liveness-independent Tier-3 wall net has tripped. Two terms,
+/// either sufficient:
+///   - the deadline-relative term: the phase has sat `wall_in_phase_ns`
+///     (measured from the last milestone; run-start-relative, so
+///     admission-queue time is excluded) past [`WALL_NET_DEADLINE_MULT`]x the
+///     effective-deadline budget. A zero budget (deadline unset) disables this
+///     term.
+///   - the absolute-ceiling term: the WHOLE VM has run past
+///     [`WALL_NET_ABSOLUTE_CEILING_NS`] of run-start-relative wall AND the
+///     current phase has stalled past its own `phase_wall_backstop_ns` (the
+///     wedge signature). This dilation-independent backstop catches a wedge
+///     whose effective deadline was inflated past the outer rail by a
+///     dilation-scaled reset. The backstop gate keeps it off a Body phase
+///     (`u64::MAX` backstop) and off a phase that only just re-anchored a
+///     milestone (a legitimately-slow cell making forward progress), so it
+///     fires only on a genuinely stalled INFRA phase.
+///
+/// Strict `>` throughout.
 pub(crate) const fn wall_net_tripped(
     wall_in_phase_ns: u64,
     effective_deadline_budget_ns: u64,
+    now_wall_ns: u64,
+    phase_wall_backstop_ns: u64,
 ) -> bool {
-    effective_deadline_budget_ns != 0
-        && wall_in_phase_ns > effective_deadline_budget_ns.saturating_mul(WALL_NET_DEADLINE_MULT)
+    let deadline_term = effective_deadline_budget_ns != 0
+        && wall_in_phase_ns > effective_deadline_budget_ns.saturating_mul(WALL_NET_DEADLINE_MULT);
+    let absolute_term =
+        now_wall_ns > WALL_NET_ABSOLUTE_CEILING_NS && wall_in_phase_ns > phase_wall_backstop_ns;
+    deadline_term || absolute_term
 }
 
 /// Fold one live [`LedgerSnapshot`] into a [`KillDecision`]: the glue
@@ -410,25 +453,30 @@ pub(crate) fn evaluate_progress(
 /// not lengthen healthy runs.
 pub(crate) const DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS: u64 = 2_000_000_000;
 
-/// Minimum summed guest-CPU advance BETWEEN two Tier-3 observations that
+/// Minimum PER-vCPU guest-CPU advance BETWEEN two Tier-3 observations that
 /// counts as forward progress and re-anchors the blocked-observer interval;
 /// a smaller advance is trickle, not progress, and lets the finite
 /// blocked-observer budget keep accruing.
 ///
-/// Only consulted once every sampled vCPU is non-runnable/unknown (a
-/// runnable vCPU already defers unconditionally). An idle guest that has
-/// merely HLT-ed still takes its periodic timer / RCU interrupts, nudging a
-/// vCPU's cumulative CPU up a few tens to a few hundred microseconds per
-/// ~100 ms watchdog observation (measured populations: 1-10 ms per 10 s
-/// window at 1 vCPU, 20-45 ms per 10 s on the busiest vCPU at 64 vCPUs —
-/// the housekeeping CPU's timekeeping/RCU duty; see [`CpuTrickleTracker`]).
-/// Treating that sub-millisecond trickle as "service advanced" re-anchored
-/// the deadman every observation, so a fully idle wedge never spent the
-/// blocked-observer budget. A vCPU doing genuine work accrues on the order
-/// of the whole inter-observation interval (tens of ms per 100 ms sample),
-/// an order of magnitude above this floor, so a materially-progressing cell
-/// still re-anchors and defers. Deliberately generous (1 ms) so a
-/// legitimately-slow-but-alive teardown is never charged.
+/// Consulted (as the per-vCPU MAX advance, see
+/// [`DeadmanHostService::max_per_task_advance_ns`]) once every sampled vCPU is
+/// non-runnable/unknown; a runnable vCPU already defers unconditionally. An
+/// idle guest that has merely HLT-ed still takes its periodic timer / RCU
+/// interrupts, nudging a vCPU's cumulative CPU up a few tens to a few hundred
+/// microseconds per ~100 ms watchdog observation (measured populations:
+/// 1-10 ms per 10 s window at 1 vCPU, 20-45 ms per 10 s on the busiest vCPU at
+/// 64 vCPUs — the housekeeping CPU's timekeeping/RCU duty; see
+/// [`CpuTrickleTracker`]). MAX, not SUM, is the load-bearing choice: a wide
+/// idle guest's diffuse trickle SUMS above any fixed floor at width (the
+/// 256-vCPU idle-wedge escape) yet its per-vCPU MAX stays sub-floor exactly
+/// like the narrow case, while a genuinely progressing guest always has SOME
+/// vCPU crossing the floor. Treating trickle as "service advanced"
+/// re-anchored the deadman every observation, so a fully idle wedge never
+/// spent the blocked-observer budget. A vCPU doing genuine work accrues on
+/// the order of the whole inter-observation interval (tens of ms per 100 ms
+/// sample), an order of magnitude above this floor, so a
+/// materially-progressing cell still re-anchors and defers. Deliberately
+/// generous (1 ms) so a legitimately-slow-but-alive teardown is never charged.
 pub(crate) const DEADMAN_BLOCKED_OBSERVER_PROGRESS_FLOOR_NS: u64 = 1_000_000;
 
 /// Host scheduler state of one vCPU task at a Tier-3 observation.
@@ -658,7 +706,15 @@ impl DeadmanHostService {
             self.reanchor(input.vcpu_tasks, observer_cpu_ns);
             return DeadmanHostDecision::Defer(DeadmanHostDefer::Seeded);
         };
-        let baseline_summed_cpu_ns = baseline.summed_cpu_ns;
+        // The MAX per-vCPU CPU advance since the baseline (not the SUM). A
+        // wide idle guest's timer/RCU trickle is diffuse — tens to a few
+        // hundred µs on EACH of many vCPUs — so its SUM trivially clears a
+        // fixed floor at width and would re-anchor forever (the 256-vCPU idle
+        // wedge escape). Its per-vCPU MAX, though, stays sub-floor, exactly
+        // like the narrow case; a genuinely progressing guest always has SOME
+        // vCPU doing floor-crossing work. Computed here while `baseline` is
+        // still borrowed, before the arms may replace `self.baseline`.
+        let baseline_max_advance_ns = Self::max_per_task_advance_ns(baseline, input.vcpu_tasks);
 
         // Charge the finite blocked-observer budget against the existing
         // observer anchor. Shared by the Unchanged and sub-floor-trickle
@@ -696,10 +752,10 @@ impl DeadmanHostService {
                 // the guest CPU baseline so the trickle cannot accumulate
                 // across observations, but KEEP the observer anchor so the
                 // finite blocked-observer budget keeps accruing (as for
-                // Unchanged). See DEADMAN_BLOCKED_OBSERVER_PROGRESS_FLOOR_NS.
-                let advance =
-                    Self::summed_cpu_ns(input.vcpu_tasks).saturating_sub(baseline_summed_cpu_ns);
-                if advance >= u128::from(DEADMAN_BLOCKED_OBSERVER_PROGRESS_FLOOR_NS) {
+                // Unchanged). Width-independent: the PER-vCPU MAX advance, not
+                // the summed one — see DEADMAN_BLOCKED_OBSERVER_PROGRESS_FLOOR_NS.
+                if baseline_max_advance_ns >= u128::from(DEADMAN_BLOCKED_OBSERVER_PROGRESS_FLOOR_NS)
+                {
                     self.reanchor(input.vcpu_tasks, observer_cpu_ns);
                     DeadmanHostDecision::Defer(DeadmanHostDefer::VcpuServiceAdvanced)
                 } else {
@@ -736,6 +792,29 @@ impl DeadmanHostService {
             .filter_map(|sample| sample.cpu_ns)
             .map(u128::from)
             .sum()
+    }
+
+    /// The MAX over vCPUs of `tasks[i].cpu_ns - baseline.tasks[i].cpu_ns`
+    /// (saturating; a missing reading on either side contributes 0). Only
+    /// meaningful when `relation` has already established a structural match
+    /// (equal length, same per-index `task_id` / `cpu_ns` presence), which the
+    /// `ServiceAdvanced` caller guarantees. Width-independent, unlike
+    /// [`Self::summed_cpu_ns`]: diffuse per-vCPU idle trickle does not sum into
+    /// a false "progress" verdict.
+    fn max_per_task_advance_ns(
+        baseline: &DeadmanHostBaseline,
+        tasks: &[HostVcpuTaskSample],
+    ) -> u128 {
+        baseline
+            .tasks
+            .iter()
+            .zip(tasks)
+            .map(|(before, now)| match (before.cpu_ns, now.cpu_ns) {
+                (Some(a), Some(b)) => u128::from(b.saturating_sub(a)),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     fn relation(
@@ -1655,29 +1734,151 @@ mod tests {
     }
 
     #[test]
+    fn host_deadman_wide_idle_trickle_stays_sub_floor_by_max() {
+        // THE WIDE-IDLE ESCAPE FIX: a 64-vCPU idle guest whose per-vCPU timer
+        // trickle is sub-floor but whose SUM across 64 vCPUs clears the floor
+        // many times over. The per-vCPU MAX predicate must keep it classified
+        // as blocked (charging the finite budget), not re-anchor forever.
+        let n = 64usize;
+        let per_vcpu = DEADMAN_BLOCKED_OBSERVER_PROGRESS_FLOOR_NS / 4; // sub-floor
+        // Summed advance = 64 * (floor/4) = 16 * floor — far above the floor.
+        assert!((n as u64) * per_vcpu > DEADMAN_BLOCKED_OBSERVER_PROGRESS_FLOOR_NS);
+        let mut deadman = DeadmanHostService::new();
+        let start: Vec<_> = (0..n)
+            .map(|i| host_task(Some(i as u32 + 1), Some(0), HostVcpuRunState::NonRunnable))
+            .collect();
+        assert_eq!(
+            deadman.observe(host_input(0, &start)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Seeded)
+        );
+        // Every vCPU trickled sub-floor; the summed advance is 16x the floor
+        // but the per-vCPU MAX is floor/4, so this is blocked, not progress.
+        let trickled: Vec<_> = (0..n)
+            .map(|i| {
+                host_task(
+                    Some(i as u32 + 1),
+                    Some(per_vcpu),
+                    HostVcpuRunState::NonRunnable,
+                )
+            })
+            .collect();
+        assert_eq!(
+            deadman.observe(host_input(
+                DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+                &trickled
+            )),
+            DeadmanHostDecision::Fire(DeadmanHostFire::BlockedObserverService {
+                observer_service_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+                budget_ns: DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS,
+            }),
+            "wide idle trickle must charge the blocked budget (per-vCPU MAX \
+             sub-floor), not re-anchor on the summed advance"
+        );
+    }
+
+    #[test]
+    fn host_deadman_wide_one_hot_vcpu_reanchors() {
+        // The control for the width-independent floor: 64 vCPUs, 63 idle but
+        // ONE doing floor-crossing work → genuine progress → re-anchor/defer,
+        // exactly as a narrow progressing guest would.
+        let n = 64usize;
+        let mut deadman = DeadmanHostService::new();
+        let start: Vec<_> = (0..n)
+            .map(|i| host_task(Some(i as u32 + 1), Some(0), HostVcpuRunState::NonRunnable))
+            .collect();
+        assert_eq!(
+            deadman.observe(host_input(0, &start)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::Seeded)
+        );
+        let mut hot = start.clone();
+        hot[7] = host_task(
+            Some(8),
+            Some(DEADMAN_BLOCKED_OBSERVER_PROGRESS_FLOOR_NS),
+            HostVcpuRunState::NonRunnable,
+        );
+        assert_eq!(
+            deadman.observe(host_input(DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS - 1, &hot)),
+            DeadmanHostDecision::Defer(DeadmanHostDefer::VcpuServiceAdvanced)
+        );
+    }
+
+    #[test]
     fn wall_net_trips_only_past_the_deadline_multiple() {
         let budget = 150 * S; // a representative effective-deadline budget
+        // Isolate the deadline term: now_wall 0 (below ceiling) and an
+        // infinite backstop so the absolute term never contributes.
+        let deadline_only = |wall_in_phase| wall_net_tripped(wall_in_phase, budget, 0, u64::MAX);
         // Below and at the multiple: not tripped (strict `>`).
-        assert!(!wall_net_tripped(budget * WALL_NET_DEADLINE_MULT, budget));
-        assert!(!wall_net_tripped(budget, budget));
+        assert!(!deadline_only(budget * WALL_NET_DEADLINE_MULT));
+        assert!(!deadline_only(budget));
         // Just past the multiple: tripped.
-        assert!(wall_net_tripped(
-            budget * WALL_NET_DEADLINE_MULT + 1,
-            budget
-        ));
+        assert!(deadline_only(budget * WALL_NET_DEADLINE_MULT + 1));
     }
 
     #[test]
     fn wall_net_never_trips_on_an_unset_deadline() {
-        // A zero budget means no effective deadline is armed yet; the net
-        // must never fire on it however large the in-phase wall grows.
-        assert!(!wall_net_tripped(u64::MAX, 0));
+        // A zero budget disables the deadline term; with now_wall below the
+        // ceiling the net must never fire however large the in-phase wall.
+        assert!(!wall_net_tripped(u64::MAX, 0, 0, u64::MAX));
     }
 
     #[test]
     fn wall_net_saturates_instead_of_overflowing() {
         // A pathologically large budget must not overflow the multiply.
-        assert!(!wall_net_tripped(0, u64::MAX));
+        assert!(!wall_net_tripped(0, u64::MAX, 0, u64::MAX));
+    }
+
+    #[test]
+    fn wall_net_absolute_ceiling_fires_past_ceiling_and_backstop() {
+        // THE DILATION ESCAPE FIX: under extreme host oversubscription the
+        // scenario-start reset inflates the effective deadline to ~the dilated
+        // boot wall, so the deadline term (`4x`) lands far past the outer rail
+        // and never fires. The absolute ceiling is dilation-independent: once
+        // the whole VM has run past the ceiling AND the phase has stalled past
+        // its own wall backstop, the net fires regardless of the (huge)
+        // deadline budget.
+        let teardown_backstop = 15 * S;
+        let huge_budget = 100_000 * S; // 4x is astronomically beyond the rail
+        // Just past the ceiling AND past the phase backstop: fires.
+        assert!(wall_net_tripped(
+            teardown_backstop + 1,
+            huge_budget,
+            WALL_NET_ABSOLUTE_CEILING_NS + 1,
+            teardown_backstop,
+        ));
+    }
+
+    #[test]
+    fn wall_net_absolute_ceiling_needs_both_the_ceiling_and_the_backstop() {
+        let teardown_backstop = 15 * S;
+        let huge_budget = 100_000 * S;
+        // Past the ceiling but the phase only just re-anchored a milestone
+        // (in-phase wall below its backstop — a legitimately-slow cell making
+        // forward progress): NOT tripped.
+        assert!(!wall_net_tripped(
+            teardown_backstop,
+            huge_budget,
+            WALL_NET_ABSOLUTE_CEILING_NS + 1,
+            teardown_backstop,
+        ));
+        // Past the backstop but below the ceiling: NOT tripped.
+        assert!(!wall_net_tripped(
+            teardown_backstop + 1,
+            huge_budget,
+            WALL_NET_ABSOLUTE_CEILING_NS,
+            teardown_backstop,
+        ));
+        // A Body phase (u64::MAX backstop) is exempt from the absolute term
+        // however long it runs past the ceiling — the idle-Body exemption.
+        // budget 0 isolates the absolute term (the deadline term is off), so
+        // this pins the backstop gate alone: nothing exceeds a u64::MAX
+        // backstop, so the absolute term cannot fire in Body.
+        assert!(!wall_net_tripped(
+            u64::MAX,
+            0,
+            WALL_NET_ABSOLUTE_CEILING_NS * 2,
+            u64::MAX,
+        ));
     }
 
     #[test]
