@@ -11,8 +11,9 @@
 //!   field written in `ktstr_cross_btf_chase` THROUGH a `taskc`
 //!   returned by the untyped `void __arena *scx_task_alloc(...)`. This
 //!   is the finding the typed-allocator-return inference recovers — the
-//!   analyzer types `scx_task_alloc`'s return as `Pointer{ktstr_arena_ctx}`
-//!   (size 32 → unique payload via `discover_payload_btf_id`) so the STX
+//!   analyzer types `scx_task_alloc`'s return as a typed
+//!   `ArenaU64FromAlloc{struct_type_id: ktstr_arena_ctx}` (size 32 →
+//!   unique payload via `discover_payload_btf_id`), which as an STX base
 //!   keys against parent 772. WITHOUT the inference this key is absent
 //!   and the field renders as a plain `Uint` (the FIXPOINT REGRESSION).
 //! - `(ktstr_arena_ctx=772, 16) -> Kernel`: `task_kptr`, recovered via
@@ -100,50 +101,81 @@ fn cast_map_recovers_cross_subprog_arena_findings_from_real_scx_ktstr() {
         .first()
         .expect("scx-ktstr produced no cast map");
 
+    use crate::monitor::cast_analysis::AddrSpace;
     let arena_ctx = struct_id_by_name(btf, "ktstr_arena_ctx")
         .expect("ktstr_arena_ctx not found in scx-ktstr program BTF");
     let cross_btf_value = struct_id_by_name(btf, "ktstr_cross_btf_value")
         .expect("ktstr_cross_btf_value not found in scx-ktstr program BTF");
+    let bss_holder = struct_id_by_name(btf, "ktstr_bss_arena_holder")
+        .expect("ktstr_bss_arena_holder not found in scx-ktstr program BTF");
 
-    // Control findings: prove the pipeline typed the structs and the
-    // arena STX-flow path is intact. A regression here means something
-    // OTHER than the typed-allocator-return inference broke.
-    assert!(
-        cast_map.contains_key(&(arena_ctx, 16)),
-        "(ktstr_arena_ctx={arena_ctx}, 16) [task_kptr, directly-typed param] \
-         missing — the analyzer failed to type the struct at all. \
-         cast_map keys: {:?}",
-        cast_map.keys().collect::<Vec<_>>()
-    );
-    assert!(
-        cast_map.contains_key(&(cross_btf_value, 0)),
-        "(ktstr_cross_btf_value={cross_btf_value}, 0) [publish-side cached_ptr] \
-         missing — the arena STX-flow path regressed. cast_map keys: {:?}",
-        cast_map.keys().collect::<Vec<_>>()
-    );
+    // The FULL expected scheduler-specific finding set — every one of
+    // these backs a `cast_analysis_*` e2e assertion, so asserting the
+    // whole set here catches a PARTIAL regression (one finding lost
+    // while another is recovered) before it ships. `(53,*)` sdt_desc
+    // library internals are intentionally NOT asserted: they belong to
+    // the sdt_alloc lib, not this fixture, and may shift across lib
+    // revisions.
+    //
+    //   (ktstr_arena_ctx, 16)  Kernel — `task_kptr`, via the directly
+    //       typed `ktstr_stash_task_kptr` param.
+    //   (ktstr_arena_ctx, 24)  Arena  — `stashed_arena_ptr`, the
+    //       typed-allocator-return path (scx_task_alloc → chase).
+    //   (ktstr_cross_btf_value, 0) Arena — publish-side `cached_ptr`.
+    //   (ktstr_bss_arena_holder, 0) Arena — the bss→arena trainer's
+    //       LDX-side detection. This one is the canary for the
+    //       allocator-return-typing interaction: if the allocator
+    //       return were typed as a plain `Pointer{arena_ctx}` (rather
+    //       than a typed `ArenaU64FromAlloc`), the init_task store
+    //       `holder->arena_target = taskc` would record a spurious
+    //       KPTR finding here and finalize would drop the slot.
+    let expected: &[((u32, u32), AddrSpace, &str)] = &[
+        (
+            (arena_ctx, 16),
+            AddrSpace::Kernel,
+            "ktstr_arena_ctx.task_kptr",
+        ),
+        (
+            (arena_ctx, 24),
+            AddrSpace::Arena,
+            "ktstr_arena_ctx.stashed_arena_ptr (typed-allocator-return path)",
+        ),
+        (
+            (cross_btf_value, 0),
+            AddrSpace::Arena,
+            "ktstr_cross_btf_value.cached_ptr (publish side)",
+        ),
+        (
+            (bss_holder, 0),
+            AddrSpace::Arena,
+            "ktstr_bss_arena_holder.arena_target (bss→arena trainer)",
+        ),
+    ];
 
-    // The finding under test: recovered ONLY when the typed-allocator-
-    // return inference types scx_task_alloc's `void __arena *` return
-    // as Pointer{ktstr_arena_ctx}, so the chase-side STX keys parent 772.
-    let hit = cast_map.get(&(arena_ctx, 24));
+    let keys: Vec<_> = cast_map.keys().collect();
+    let mut missing = Vec::new();
+    let mut wrong_space = Vec::new();
+    for &(key, space, label) in expected {
+        match cast_map.get(&key) {
+            None => missing.push(format!("{label} {key:?}")),
+            Some(hit) if hit.addr_space != space => wrong_space.push(format!(
+                "{label} {key:?}: expected {space:?}, got {:?}",
+                hit.addr_space
+            )),
+            Some(_) => {}
+        }
+    }
     assert!(
-        hit.is_some(),
-        "FIXPOINT REGRESSION: (ktstr_arena_ctx={arena_ctx}, 24) [stashed_arena_ptr] \
-         missing — the typed-allocator-return inference did not carry \
-         Pointer{{ktstr_arena_ctx}} across the scx_task_alloc -> \
-         ktstr_cross_btf_chase boundary. Without it stashed_arena_ptr \
-         renders as a plain Uint. cast_map keys: {:?}",
-        cast_map.keys().collect::<Vec<_>>()
-    );
-    assert_eq!(
-        hit.unwrap().addr_space,
-        crate::monitor::cast_analysis::AddrSpace::Arena,
-        "(ktstr_arena_ctx={arena_ctx}, 24) recovered but not tagged Arena",
+        missing.is_empty() && wrong_space.is_empty(),
+        "cast_map regression against {}:\n  missing: {missing:?}\n  wrong addr_space: {wrong_space:?}\n  actual keys: {keys:?}",
+        path.display()
     );
 
     eprintln!(
-        "real_scheduler_seam: OK against {} — (772={arena_ctx},24) Arena, \
-         (772,16) control, (690={cross_btf_value},0) control all present",
+        "real_scheduler_seam: OK against {} — full expected set present: \
+         (arena_ctx={arena_ctx}:16 Kernel, :24 Arena), \
+         (cross_btf_value={cross_btf_value}:0 Arena), \
+         (bss_holder={bss_holder}:0 Arena)",
         path.display()
     );
 }
