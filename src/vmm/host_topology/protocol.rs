@@ -2290,6 +2290,78 @@ pub(crate) fn exercise_same_wake_redesignation_older_fence_for_tests() -> Result
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_same_wake_own_designation_grant_for_tests(
+    fenced: bool,
+) -> Result<registry::SameWakeOwnDesignationOutcome> {
+    registry::exercise_same_wake_own_designation_grant_for_tests(fenced)
+}
+
+#[cfg(test)]
+pub(crate) struct LevelProbeRecoveryOutcome {
+    /// The release fired before the watch existed, so its inotify edge is lost:
+    /// the drain after arming is empty.
+    pub prewatch_release_left_no_event: bool,
+    /// A bounded blocking wait times out — without the level probe only the 30s
+    /// fallback would recover.
+    pub blocking_wait_times_out: bool,
+    /// The level probe recovers the free-state the lost edge would have carried.
+    pub probe_recovers_free: bool,
+    /// `probe_newly_watched_free` synthesizes the missing close so the loop
+    /// re-scans instead of sleeping.
+    pub synthesized_close_present: bool,
+}
+
+/// Arm-after-release: a resource freed BEFORE the coordinator created its watch.
+/// The inotify edge is lost (edge-triggered; add_watch reports no existing
+/// state), so drain/wait see nothing — the exact 30s-fallback trap. The level
+/// probe recovers the free-state and synthesizes the close.
+#[cfg(test)]
+pub(crate) fn exercise_level_probe_recovers_prewatch_free() -> Result<LevelProbeRecoveryOutcome> {
+    let cpu = 7usize;
+    let path = super::cpu_lock_path(cpu);
+    {
+        let holder = crate::flock::try_flock(&path, FlockMode::Exclusive)?
+            .ok_or_else(|| anyhow::anyhow!("fresh resource must acquire"))?;
+        drop(holder); // release BEFORE any watch exists: the lost edge.
+    }
+    let watch = LockDirWatch::new_real_for_tests()?;
+    let watched = ClaimSet::new(std::iter::empty(), [cpu], FlockMode::Exclusive);
+    let prewatch_release_left_no_event = !watch.drain(&watched)?.contains_cpu_close(cpu);
+    let blocking_wait_times_out = watch
+        .wait(std::time::Duration::from_millis(150), &watched)?
+        .is_none();
+    let probe_recovers_free = resource_flock_is_free(&path);
+    let new_cpus: BTreeSet<usize> = std::iter::once(cpu).collect();
+    let synthesized = probe_newly_watched_free(&new_cpus, &BTreeSet::new(), &BTreeSet::new());
+    Ok(LevelProbeRecoveryOutcome {
+        prewatch_release_left_no_event,
+        blocking_wait_times_out,
+        probe_recovers_free,
+        synthesized_close_present: synthesized.contains_cpu_close(cpu),
+    })
+}
+
+/// Head-of-line promotion: two resources newly enter the watch set — one whose
+/// release predated the watch (free), one still held. The probe synthesizes a
+/// close for ONLY the free one, so the coordinator re-scans for the promotable
+/// waiter without a spurious wake for the still-blocked resource.
+#[cfg(test)]
+pub(crate) fn exercise_level_probe_head_of_line_promotion() -> Result<(bool, bool)> {
+    let free_cpu = 8usize;
+    let held_cpu = 9usize;
+    let held = crate::flock::try_flock(super::cpu_lock_path(held_cpu), FlockMode::Exclusive)?
+        .ok_or_else(|| anyhow::anyhow!("held cpu must acquire"))?;
+    // Materialize `free_cpu`'s lockfile and leave it free (edge predated watch).
+    let _ = crate::flock::try_flock(super::cpu_lock_path(free_cpu), FlockMode::Exclusive)?;
+    let new_cpus: BTreeSet<usize> = [free_cpu, held_cpu].into_iter().collect();
+    let synthesized = probe_newly_watched_free(&new_cpus, &BTreeSet::new(), &BTreeSet::new());
+    let only_free_synthesized =
+        synthesized.contains_cpu_close(free_cpu) && !synthesized.contains_cpu_close(held_cpu);
+    drop(held);
+    Ok((only_free_synthesized, synthesized.is_actionable()))
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_same_wake_redesignation_expired_release_for_tests()
 -> Result<(bool, bool, bool)> {
     registry::exercise_same_wake_redesignation_expired_release_for_tests()
@@ -3836,6 +3908,54 @@ fn format_watched_resources(claim: &ClaimSet) -> String {
     }
 }
 
+/// Nonblocking physical probe of one resource lockfile: `true` iff it is
+/// exclusively acquirable right now (no holder at all). Opens `O_RDONLY` so the
+/// immediate release on drop emits `IN_CLOSE_NOWRITE` — invisible to the
+/// coordinator's own inotify watch, so a probe never self-wakes. The fd is held
+/// only for this call (dropped before return), so a peer's observation sees at
+/// most a microsecond of transient EX contention, self-corrected on its next
+/// nonblocking turn. A missing/unopenable lockfile returns `false`: not provably
+/// free, so leave it to the record-based notify path rather than synthesize.
+fn resource_flock_is_free(path: &str) -> bool {
+    use rustix::fs::{FlockOperation, flock};
+    let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    matches!(
+        flock(&file, FlockOperation::NonBlockingLockExclusive),
+        Ok(())
+    )
+}
+
+/// Synthesize the missing close events for resources that NEWLY entered the
+/// coordinator's watch set this turn and are already physically free. Probes
+/// only the passed (new-entrant) indices — bounded per turn, never a full-
+/// registry scan — and returns their closes as a [`LockDirEvents`] to merge
+/// into the pending batch.
+fn probe_newly_watched_free(
+    new_cpus: &BTreeSet<usize>,
+    new_llcs: &BTreeSet<usize>,
+    new_permits: &BTreeSet<usize>,
+) -> LockDirEvents {
+    let mut synthesized = LockDirEvents::default();
+    for &cpu in new_cpus {
+        if resource_flock_is_free(&super::cpu_lock_path(cpu)) {
+            synthesized.cpu_closes.insert(cpu);
+        }
+    }
+    for &llc in new_llcs {
+        if resource_flock_is_free(&super::llc_lock_path(llc)) {
+            synthesized.llc_closes.insert(llc);
+        }
+    }
+    for &permit in new_permits {
+        if resource_flock_is_free(&super::permit_lock_path(permit)) {
+            synthesized.permit_closes.insert(permit);
+        }
+    }
+    synthesized
+}
+
 fn acquire_as_coordinator_impl<T>(
     mut coordinator: CoordinatorTicket,
     cancelled: Option<&AtomicBool>,
@@ -3858,6 +3978,11 @@ fn acquire_as_coordinator_impl<T>(
             })
     };
     let mut watched_resources = ClaimSet::default();
+    // Resources already level-probed for pre-watch free-state (see the probe
+    // before the blocking wait). Accumulates so each resource is physically
+    // probed at most once per coordinator session — the guarantee that bounds
+    // the level-trigger recovery and makes it terminating.
+    let mut level_checked = ClaimSet::default();
     let mut observer = HolderObserver::new();
     let mut first = true;
     let mut force_step = false;
@@ -4153,6 +4278,59 @@ fn acquire_as_coordinator_impl<T>(
             // This path never sleeps while the kernel queue may still contain
             // a bounded-drain remainder.
             continue;
+        }
+        // Level-trigger recovery for the edge-triggered inotify watch. `watch`
+        // was created (LockDirWatch::new) at coordinator entry; inotify reports
+        // only closes that fire while a directory is watched and never the
+        // existing free-state at add_watch time. A release that landed BEFORE a
+        // resource entered this coordinator's concern — a fresh head-of-line
+        // promotion, or a coordinator handoff whose predecessor freed during the
+        // election gap — left no queued event, so the classify broadening
+        // (which reports every close after the watch exists) still cannot see
+        // it, and only the 30s fallback would recover it. Before sleeping,
+        // physically probe every resource that NEWLY entered `watched_resources`
+        // this turn (relative to `level_checked`); any already-free entrant
+        // synthesizes its own close so the coordinator re-scans instead of
+        // sleeping on an edge that already fired. This is done once here rather
+        // than at each `event_watch` arming because `watched_resources` holds
+        // the final armed set for the turn regardless of which arm produced it,
+        // and this is the only point that actually blocks.
+        //
+        // Bounded + terminating: only the new entrants are probed (never an
+        // O(all-resources) scan), and `level_checked` accumulates so each
+        // resource is probed at most once per session. A synthesized close
+        // forces one more schedule turn; if that scan grants nothing,
+        // `watched_resources` is unchanged, so the next turn has no new entrants
+        // (they are all in `level_checked`) and the loop sleeps normally — no
+        // busy loop. A resource genuinely held at probe time is left to the
+        // ordinary post-watch inotify close / record-removal notify, both
+        // reliable once the watch exists.
+        {
+            let new_cpus: BTreeSet<usize> = watched_resources
+                .cpus
+                .difference(&level_checked.cpus)
+                .copied()
+                .collect();
+            let new_llcs: BTreeSet<usize> = watched_resources
+                .llcs
+                .difference(&level_checked.llcs)
+                .copied()
+                .collect();
+            let new_permits: BTreeSet<usize> = watched_resources
+                .permits
+                .difference(&level_checked.permits)
+                .copied()
+                .collect();
+            if !new_cpus.is_empty() || !new_llcs.is_empty() || !new_permits.is_empty() {
+                level_checked.cpus.extend(new_cpus.iter().copied());
+                level_checked.llcs.extend(new_llcs.iter().copied());
+                level_checked.permits.extend(new_permits.iter().copied());
+                let synthesized = probe_newly_watched_free(&new_cpus, &new_llcs, &new_permits);
+                if synthesized.is_actionable() {
+                    pending_events.merge(synthesized);
+                    continue;
+                }
+            }
         }
         let retry_interval = watch.semantic_retry_interval(observation_pending);
         let now = std::time::Instant::now();

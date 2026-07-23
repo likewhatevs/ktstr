@@ -54,21 +54,37 @@ fn resolve_dir(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
     value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
+#[cfg(test)]
 fn dir() -> Option<PathBuf> {
-    #[cfg(test)]
-    {
-        return TEST_DIR_OVERRIDE
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or(None);
-    }
-    #[cfg(not(test))]
+    // Tests inject a per-test sink without racing the write-once `DIR` OnceLock.
+    TEST_DIR_OVERRIDE
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or(None)
+}
+
+#[cfg(not(test))]
+fn dir() -> Option<PathBuf> {
     DIR.get_or_init(|| resolve_dir(std::env::var_os(EXIT_TIMING_DIR_ENV)))
         .clone()
 }
 
 fn now_ns() -> u64 {
     super::process_start_elapsed()
+        .unwrap_or_default()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+/// Wall-clock nanoseconds since the UNIX epoch, for cross-process ordering.
+/// The fallback accusation uses this instead of [`now_ns`]: an acquisition-phase
+/// coordinator has no `record_process_start` anchor (that is stamped later, in
+/// the post-exec test harness), so its process-relative clock reads 0 and its
+/// accusations would be untotally-ordered against one another.
+fn wall_now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
         .try_into()
@@ -96,10 +112,12 @@ fn format_step_line(
     }
 }
 
-/// Coordinator fallback-tick accusation line. Factored for shape tests.
-fn format_fallback_block_line(pid: u32, instant_ns: u64, blocked_on: &str, holder: &str) -> String {
+/// Coordinator fallback-tick accusation line. `wall_ns` is UNIX-epoch
+/// wall-clock (see [`wall_now_ns`]) so accusations from different acquisition-
+/// phase processes are totally orderable. Factored for shape tests.
+fn format_fallback_block_line(pid: u32, wall_ns: u64, blocked_on: &str, holder: &str) -> String {
     format!(
-        "exit-fallback-block: pid={pid} instant_ns={instant_ns} \
+        "exit-fallback-block: pid={pid} wall_ns={wall_ns} \
          blocked_on={blocked_on} holder={holder}\n"
     )
 }
@@ -216,7 +234,7 @@ pub(crate) fn stamp_fallback_block(blocked_on: &str, holder: &str) {
     append(
         &dir,
         &log_name(),
-        &format_fallback_block_line(std::process::id(), now_ns(), blocked_on, holder),
+        &format_fallback_block_line(std::process::id(), wall_now_ns(), blocked_on, holder),
     );
 }
 
@@ -400,7 +418,7 @@ mod tests {
     fn fallback_block_line_shape() {
         assert_eq!(
             format_fallback_block_line(9, 2_000, "permit=41,permit=42", "pid=1234 ticket=56"),
-            "exit-fallback-block: pid=9 instant_ns=2000 \
+            "exit-fallback-block: pid=9 wall_ns=2000 \
              blocked_on=permit=41,permit=42 holder=pid=1234 ticket=56\n",
         );
     }
