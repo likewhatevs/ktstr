@@ -9141,6 +9141,88 @@ fn same_wake_redesignation_does_not_overtake_an_older_ticket() {
     );
 }
 
+// Regression: a no-license REPLAN wake whose OWN designation frees first
+// acquires it via the candidate loop (next_claim == designated). This must NOT
+// trip the "replan-only wake returned an acquired payload without
+// re-designation" assertion — that model was too narrow and killed
+// distro-boot-arm64 (ticket 28333). It commits HELD on the designation.
+#[test]
+fn same_wake_own_designation_acquire_grants_without_assertion() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_same_wake_own_designation_grant_for_tests(false)
+        .expect("own-designation REPLAN acquire must not assert");
+    assert!(
+        outcome.granted && outcome.held_on_designation,
+        "acquiring one's own freed designation on a replan wake must commit HELD on it",
+    );
+    assert!(
+        outcome.replan_drained,
+        "the granted ticket must drain its ring slot",
+    );
+}
+
+// Level-trigger recovery: a resource freed BEFORE the coordinator armed its
+// watch (fresh election / handoff gap) leaves no inotify edge — drain and a
+// bounded wait see nothing, the 30s COORDINATOR_WAKE_FALLBACK trap. The
+// physical level probe recovers the free-state and synthesizes the missing
+// close so the coordinator grants promptly instead of sleeping.
+#[test]
+fn level_probe_recovers_a_release_that_predated_the_watch() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let outcome = protocol::exercise_level_probe_recovers_prewatch_free()
+        .expect("drive pre-watch release level-probe recovery");
+    assert!(
+        outcome.prewatch_release_left_no_event,
+        "a release before the watch existed leaves no inotify edge to drain",
+    );
+    assert!(
+        outcome.blocking_wait_times_out,
+        "the lost edge means a bounded wait times out — only the fallback would recover it",
+    );
+    assert!(
+        outcome.probe_recovers_free && outcome.synthesized_close_present,
+        "the level probe must recover the free-state and synthesize the missing close",
+    );
+}
+
+// Head-of-line promotion variant: only the newly-free entrant synthesizes a
+// close; a still-held newly-watched resource does not, so the probe cannot
+// manufacture a spurious wake.
+#[test]
+fn level_probe_synthesizes_only_the_free_newly_watched_resource() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let (only_free_synthesized, actionable) =
+        protocol::exercise_level_probe_head_of_line_promotion()
+            .expect("drive head-of-line level-probe promotion");
+    assert!(
+        only_free_synthesized,
+        "the probe must synthesize a close for the free entrant and not the held one",
+    );
+    assert!(
+        actionable,
+        "a synthesized free-resource close makes the batch actionable so the loop re-scans",
+    );
+}
+
+// The suffix-watermark fence must cover an own-designation unlicensed acquire
+// too: an older ticket's change below this ticket releases + requeues it rather
+// than letting it overtake, exactly as for a re-designation onto a different
+// claim.
+#[test]
+fn same_wake_own_designation_acquire_is_fenced_by_an_older_ticket() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_same_wake_own_designation_grant_for_tests(true)
+        .expect("own-designation REPLAN acquire must honor the older-ticket fence");
+    assert!(
+        outcome.released_by_fence && outcome.not_committed,
+        "an own-designation acquire behind a dirtied older ticket must release + requeue, not commit",
+    );
+    assert!(
+        outcome.replan_drained,
+        "the fenced ticket must drain its ring slot",
+    );
+}
+
 #[test]
 fn same_wake_redesignation_releases_a_physically_acquired_alternative_on_wave_expiry() {
     let _prefixes = LockPrefixesGuard::new();

@@ -2698,10 +2698,18 @@ impl Ticket {
         // any earlier ticket's change advances `min_changed_ticket` below this
         // one, so release the just-acquired alternative and requeue rather than
         // committing ahead of an older waiter that may need this rotation.
+        // Any unlicensed REPLAN acquire rides the suffix-watermark fence,
+        // whether it re-designated onto a different claim OR re-acquired its
+        // own freed designation: the candidate loop legitimately selects the
+        // cell's own placement when it frees, and that acquire commits ahead of
+        // an older waiter just as a re-designation would. Fence on
+        // `acquired.is_some()` uniformly rather than on a claim change, so an
+        // own-designation acquire behind a dirtied older ticket still releases
+        // and requeues. `result.next_claim` equals `designated` in that shape,
+        // so the mark_unknown release below targets the correct footprint.
         let dirty_redesignation = !acquisition_allowed
             && record.state == STATE_REPLAN
             && result.acquired.is_some()
-            && result.next_claim != designated
             && table.min_changed_ticket() < record.ticket;
         if dirty_redesignation {
             table.begin_transaction()?;
@@ -2895,16 +2903,17 @@ impl Ticket {
         check_cancelled(cancelled)?;
 
         if let Some(acquired) = result.acquired.take() {
-            // A no-license REPLAN wake may only return a payload when it
-            // physically completed a re-designation (a different claim than the
-            // one the scan published); the licensed GRANTED wake keeps
-            // acquiring exactly its designation.
-            anyhow::ensure!(
-                acquisition_allowed || result.next_claim != designated,
-                "replan-only queue wake returned an acquired payload without \
-                 re-designation for ticket {}",
-                self.ticket
-            );
+            // A no-license REPLAN wake may return a payload for EITHER a
+            // re-designation (a different claim than the scan published) OR its
+            // own designation freeing up first: the acquirer's candidate loop
+            // includes the cell's own placement, and `try_acquire_redesignation`
+            // committing it via `candidate_ready` is exactly what the
+            // authoritative grant would have done. There is nothing to fence on
+            // `next_claim` here — the suffix-watermark `dirty_redesignation`
+            // check above already released+requeued any unlicensed acquire that
+            // raced an older ticket's change. The preparation-claim invariant
+            // still holds: a same-wake acquire never carries a preparation
+            // footprint (that is only produced by the licensed prepare path).
             anyhow::ensure!(
                 acquisition_allowed || result.preparation_claim.is_none(),
                 "same-wake re-designation cannot carry a preparation claim for ticket {}",
@@ -9495,6 +9504,111 @@ pub(super) fn exercise_same_wake_redesignation_older_fence_for_tests() -> Result
     coordinator.finish(None)?;
     waiter.finish(None)?;
     Ok((released, not_committed, replan_drained))
+}
+
+/// Outcome of the own-designation REPLAN acquire exercise (items 2/3).
+#[cfg(test)]
+pub(crate) struct SameWakeOwnDesignationOutcome {
+    /// Unfenced: committed HELD on the cell's OWN designation.
+    pub granted: bool,
+    pub held_on_designation: bool,
+    /// Fenced: the suffix watermark released + requeued instead of committing.
+    pub released_by_fence: bool,
+    pub not_committed: bool,
+    pub replan_drained: bool,
+}
+
+/// A no-license REPLAN wake whose OWN designation frees first: the acquirer's
+/// candidate loop legitimately selects its own placement, so the callback
+/// returns an acquired payload with `next_claim == designated`. This must NOT
+/// trip the "replan-only wake returned an acquired payload without
+/// re-designation" assertion (it was too narrow); the record commits HELD on the
+/// designation. The `fenced` variant stages an older ticket's suffix change so
+/// the same unlicensed acquire — own-designation and all — is released and
+/// requeued by the suffix watermark rather than overtaking the older waiter.
+#[cfg(test)]
+pub(super) fn exercise_same_wake_own_designation_grant_for_tests(
+    fenced: bool,
+) -> Result<SameWakeOwnDesignationOutcome> {
+    // `replacement_free = false`: the only capacity this waiter can take is its
+    // own designation, which frees below after the REPLAN publication.
+    let (mut coordinator, mut waiter, designated, _replacement, _scans_before) =
+        stage_same_wake_replan_waiter(900, 1_000, 1_001, false)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, 1_000, true)?;
+        if fenced {
+            // An older ticket changed its exact claim after this callback's
+            // predecessor snapshot: advance the suffix watermark below this
+            // ticket without touching the claim epoch.
+            table.mark_suffix_dirty(coordinator.ticket);
+            anyhow::ensure!(
+                table.min_changed_ticket() < waiter.ticket,
+                "own-designation fence exercise did not stage a preceding change",
+            );
+        }
+    }
+    let designated_for_wake = designated.clone();
+    let result = waiter.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            anyhow::ensure!(
+                !acquisition_allowed && current == &designated_for_wake,
+                "own-designation callback received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: Some(()),
+                preparation_claim: None,
+                preparation_contention: None,
+                // The candidate loop selected the cell's OWN designation.
+                next_claim: designated_for_wake.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let outcome = if fenced {
+        let released_by_fence = matches!(result, GrantResult::LostGrant);
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let record = table
+            .record(waiter.slot)?
+            .ok_or_else(|| anyhow::anyhow!("own-designation fenced record disappeared"))?;
+        SameWakeOwnDesignationOutcome {
+            granted: false,
+            held_on_designation: false,
+            released_by_fence,
+            not_committed: record.state != STATE_HELD,
+            replan_drained: table.replan_outstanding() == 0,
+        }
+    } else {
+        let held = match result {
+            GrantResult::Acquired((), held) => held,
+            _ => anyhow::bail!("own-designation acquire did not commit HELD"),
+        };
+        let (held_on_designation, replan_drained) = {
+            let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+            let mut table = Table::open_existing()?;
+            let record = table
+                .record(waiter.slot)?
+                .ok_or_else(|| anyhow::anyhow!("own-designation held record disappeared"))?;
+            (
+                record.state == STATE_HELD && record.claim == designated,
+                table.replan_outstanding() == 0,
+            )
+        };
+        drop(held);
+        SameWakeOwnDesignationOutcome {
+            granted: true,
+            held_on_designation,
+            released_by_fence: false,
+            not_committed: false,
+            replan_drained,
+        }
+    };
+    coordinator.finish(None)?;
+    waiter.finish(None)?;
+    Ok(outcome)
 }
 
 /// A REPLAN wave that expires while a same-wake re-designation callback holds a
