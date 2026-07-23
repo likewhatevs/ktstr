@@ -197,6 +197,15 @@ fn main() {
     // or anything that spawns a thread — for the same `set_var` safety
     // reason as `blobs::install_env` above; child processes inherit it.
     run_cargo::install_runs_root_env();
+    // Best-effort reclaim of PRIOR CI runs' sidecar output directories that
+    // accumulate on a persistent runner (one tree per run/attempt/lane under
+    // `KTSTR_SIDECAR_DIR`'s parent). Each run uploaded its own forensics as
+    // artifacts, so a finished run's directory is pure disk noise; nothing
+    // else deletes them, and unbounded growth here is what fills a shared
+    // runner. Concurrent same-run lanes and newer/overlapping runs are never
+    // touched (see `prune_prior_ci_sidecar_dirs`). CI-scoped and side-effect
+    // free off GitHub Actions, so it is safe on this startup path.
+    run_cargo::prune_prior_ci_sidecar_dirs();
     // Mirror `ktstr`'s tracing init (src/bin/ktstr.rs main()) so
     // `tracing::warn!` calls inside `cli::` / `test_support::` surface
     // on stderr instead of being silently dropped. Default to `warn`

@@ -1491,12 +1491,21 @@ fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
     // plumbing, CI per-run endpoints, credentials, and compiler paths whose
     // resolved tool contents are hashed separately. Every other inherited
     // variable is conservatively treated as a build-script input.
+    //
+    // GitHub Actions reserves the entire `GITHUB_*`, `ACTIONS_*`, and
+    // `RUNNER_*` namespaces for orchestration context — commit SHA
+    // (`GITHUB_SHA`), ref (`GITHUB_REF`/`GITHUB_REF_NAME`/`GITHUB_BASE_REF`/
+    // `GITHUB_HEAD_REF`), run coordinates, repository identity, actor,
+    // workflow, and per-runner names/paths. None of it describes a producer's
+    // output bytes, and `GITHUB_SHA` in particular changes on every push:
+    // hashing it would mint a fresh source-independent build-scratch bucket
+    // per push (defeating Cargo dependency reuse and accumulating a full
+    // dep-graph build dir per push until the 14-day idle GC reclaims it) and
+    // split otherwise-identical closures across runs. These are matched by
+    // prefix below so the exclusion holds for future additions to those
+    // reserved namespaces without re-enumerating each variable.
     let exact = [
         "_",
-        "ACTIONS_CACHE_URL",
-        "ACTIONS_RESULTS_URL",
-        "ACTIONS_RUNTIME_TOKEN",
-        "ACTIONS_RUNTIME_URL",
         "CARGO_BUILD_BUILD_DIR",
         "CARGO_BUILD_DEP_INFO_BASEDIR",
         "CARGO_BUILD_JOBS",
@@ -1512,24 +1521,6 @@ fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
         "DBUS_SESSION_BUS_ADDRESS",
         "FORCE_COLOR",
         "GH_TOKEN",
-        "GITHUB_ACTION",
-        "GITHUB_ACTION_PATH",
-        "GITHUB_ACTION_REPOSITORY",
-        "GITHUB_ACTOR",
-        "GITHUB_ACTOR_ID",
-        "GITHUB_ENV",
-        "GITHUB_EVENT_PATH",
-        "GITHUB_JOB",
-        "GITHUB_OUTPUT",
-        "GITHUB_PATH",
-        "GITHUB_RETENTION_DAYS",
-        "GITHUB_RUN_ATTEMPT",
-        "GITHUB_RUN_ID",
-        "GITHUB_RUN_NUMBER",
-        "GITHUB_STEP_SUMMARY",
-        "GITHUB_TOKEN",
-        "GITHUB_TRIGGERING_ACTOR",
-        "GITHUB_WORKSPACE",
         "GIT_ASKPASS",
         "GIT_OPTIONAL_LOCKS",
         "HOSTNAME",
@@ -1575,13 +1566,7 @@ fn scheduler_build_environment_is_nonsemantic(name: &std::ffi::OsStr) -> bool {
         "XDG_CACHE_HOME",
         "XDG_RUNTIME_DIR",
     ];
-    let prefixes = [
-        "ACTIONS_ID_TOKEN_",
-        "ACTIONS_RUNTIME_",
-        "CCACHE_",
-        "RUNNER_",
-        "SCCACHE_",
-    ];
+    let prefixes = ["ACTIONS_", "CCACHE_", "GITHUB_", "RUNNER_", "SCCACHE_"];
     exact.contains(&name)
         || prefixes.iter().any(|prefix| name.starts_with(prefix))
         || (name.starts_with("CARGO_TARGET_") && name.ends_with("_RUNNER"))
@@ -3365,6 +3350,94 @@ mod tests {
             identity("7", "91", "ktstr::nested_retry/retry", "semantic-b"),
             first,
             "an arbitrary inherited build-script input must still split the Cargo cache",
+        );
+    }
+
+    /// The scheduler/artifact cache key must be invariant under the full
+    /// GitHub Actions per-run/per-lane context, and must NOT depend on anyone
+    /// remembering to enumerate each new orchestration variable — the
+    /// namespace-prefix denylist is what guarantees that. Conversely, a
+    /// genuine build input (RUSTFLAGS) must still split the key.
+    #[test]
+    fn scheduler_identity_is_invariant_under_ci_run_context_but_tracks_build_inputs() {
+        let workspace = Path::new("/runner/work/ktstr");
+        let semantic = |environment: Vec<(std::ffi::OsString, std::ffi::OsString)>| {
+            scheduler_build_environment_from(workspace, environment, &|| false)
+                .expect("scheduler environment identity")
+        };
+
+        // The stable build surface every lane and run shares.
+        let base: Vec<(std::ffi::OsString, std::ffi::OsString)> = vec![
+            ("SCHEDULER_FIXTURE_MODE".into(), "semantic-value".into()),
+            ("RUSTFLAGS".into(), "-Cforce-frame-pointers=yes".into()),
+        ];
+
+        // Per-run / per-lane orchestration context. Every one of these varies
+        // between the runs and lanes that compile the exact same closure —
+        // including the commit SHA and ref (which change on every push) and
+        // reserved-namespace variables not individually enumerated anywhere.
+        let run_context =
+            |run: &str, lane: &str| -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+                vec![
+                    ("GITHUB_SHA".into(), format!("{run}deadbeef").into()),
+                    ("GITHUB_REF".into(), format!("refs/pull/{run}/merge").into()),
+                    ("GITHUB_REF_NAME".into(), format!("{run}/merge").into()),
+                    ("GITHUB_BASE_REF".into(), "main".into()),
+                    ("GITHUB_HEAD_REF".into(), format!("feature-{run}").into()),
+                    ("GITHUB_RUN_ID".into(), run.into()),
+                    ("GITHUB_RUN_ATTEMPT".into(), "1".into()),
+                    ("GITHUB_RUN_NUMBER".into(), run.into()),
+                    (
+                        "GITHUB_RUN_STARTED_AT".into(),
+                        format!("2026-07-2{run}").into(),
+                    ),
+                    ("GITHUB_REPOSITORY".into(), "acme/ktstr".into()),
+                    ("GITHUB_EVENT_NAME".into(), "pull_request".into()),
+                    ("GITHUB_WORKFLOW_SHA".into(), format!("{run}c0ffee").into()),
+                    (
+                        "GITHUB_TRIGGERING_ACTOR".into(),
+                        format!("dev-{lane}").into(),
+                    ),
+                    ("RUNNER_NAME".into(), format!("ghars-lane-{lane}").into()),
+                    (
+                        "RUNNER_TRACKING_ID".into(),
+                        format!("tracker-{run}-{lane}").into(),
+                    ),
+                    (
+                        "KTSTR_SIDECAR_DIR".into(),
+                        format!("/w/ci-artifacts/{run}-1-{lane}").into(),
+                    ),
+                    (
+                        "KTSTR_BUILD_DIAGNOSTICS_DIR".into(),
+                        format!("/w/diag/{run}/{lane}").into(),
+                    ),
+                    ("HOSTNAME".into(), format!("runner-{lane}").into()),
+                ]
+            };
+
+        let mut run_a = base.clone();
+        run_a.extend(run_context("100", "x64-base"));
+        let mut run_b = base.clone();
+        run_b.extend(run_context("999", "arm64-cov"));
+        assert_eq!(
+            semantic(run_a),
+            semantic(run_b),
+            "GitHub/runner per-run and per-lane context must never enter the cache key",
+        );
+
+        // A real build input still splits the key.
+        let mut base_flags = base.clone();
+        base_flags.extend(run_context("100", "x64-base"));
+        let mut changed_flags = base_flags.clone();
+        for entry in &mut changed_flags {
+            if entry.0 == "RUSTFLAGS" {
+                entry.1 = "-Cforce-frame-pointers=no".into();
+            }
+        }
+        assert_ne!(
+            semantic(base_flags),
+            semantic(changed_flags),
+            "a content-relevant build variable (RUSTFLAGS) must still split the cache key",
         );
     }
 

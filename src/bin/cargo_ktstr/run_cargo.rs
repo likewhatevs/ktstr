@@ -6473,6 +6473,138 @@ pub(crate) fn install_runs_root_env() {
     }
 }
 
+/// A prior CI run's sidecar directory is kept for at least this long past its
+/// last write before a later run may reclaim it. The `run_id`/`run_attempt`
+/// ordering already excludes every newer or concurrent run; this idle window
+/// is the secondary guard for an *older*-numbered run that overlapped and is
+/// still executing on this persistent runner (jobs queue and run
+/// concurrently). It comfortably exceeds a single ktstr CI job's wall time
+/// (kernel build + scheduler + gauntlet) while bounding accumulation to a few
+/// hours of small forensic directories.
+const PRIOR_RUN_SIDECAR_GRACE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Parse the `<run_id>-<run_attempt>` prefix a CI sidecar directory leaf embeds
+/// (`.github/workflows/ci.yml` sets `KTSTR_SIDECAR_DIR` to
+/// `<run_id>-<run_attempt>-<lane>`). Returns `None` for any leaf that does not
+/// begin with two integer, dash-separated fields, so a non-CI operator override
+/// never parses into an orderable run coordinate.
+fn parse_sidecar_run_coordinate(leaf: &str) -> Option<(u64, u64)> {
+    let mut fields = leaf.splitn(3, '-');
+    let run_id = fields.next()?.parse::<u64>().ok()?;
+    let attempt = fields.next()?.parse::<u64>().ok()?;
+    // A bare `<run_id>-<attempt>` with no lane suffix is not the CI shape.
+    fields.next()?;
+    Some((run_id, attempt))
+}
+
+/// Best-effort removal of *prior* CI runs' sidecar directories that share this
+/// run's `KTSTR_SIDECAR_DIR` parent on a persistent runner.
+///
+/// CI stamps `KTSTR_SIDECAR_DIR` = `<workspace>/target/ktstr-ci-artifacts/`
+/// `<run_id>-<run_attempt>-<lane>`; each run's forensics are uploaded as
+/// artifacts by that run's own `upload-artifact` step, so once a run is over
+/// its directory is pure accumulated noise. Nothing else deletes these, so a
+/// busy runner grows one tree per (run, attempt, lane) without bound.
+///
+/// This is deliberately CI-scoped: it runs only under GitHub Actions
+/// (`GITHUB_ACTIONS`) against directory leaves that parse as the
+/// `<run_id>-<attempt>-<lane>` layout. Local/default runs never produce per-run
+/// sidecar directories — they write to the `{kernel}-{project_commit}`
+/// last-writer-wins run directory under `runs_root()`, which is bounded by
+/// construction — and an operator who points `KTSTR_SIDECAR_DIR` at a
+/// hand-chosen path owns its contents (mirroring the write path, which skips
+/// pre-clear on an override for the same reason). Neither case is touched here.
+///
+/// Safety against concurrent lanes and overlapping runs:
+/// - A sibling sharing this run's exact `(run_id, run_attempt)` is a
+///   concurrent lane of the SAME run and is never removed.
+/// - Only strictly older `(run_id, run_attempt)` siblings are candidates, so a
+///   newer or concurrent *different* run (higher `run_id`) is never touched.
+/// - A candidate is removed only after it has been idle past
+///   [`PRIOR_RUN_SIDECAR_GRACE`], guarding an older-numbered run that queued
+///   behind this one and is still executing.
+///
+/// Best-effort throughout: a missing parent, unparsable leaf, or per-entry
+/// error is skipped so startup never fails on cleanup.
+pub(crate) fn prune_prior_ci_sidecar_dirs() {
+    if std::env::var_os("GITHUB_ACTIONS").is_none() {
+        return;
+    }
+    let Some(sidecar_dir) =
+        std::env::var_os(ktstr::KTSTR_SIDECAR_DIR_ENV).filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let sidecar_dir = PathBuf::from(sidecar_dir);
+    let (Some(parent), Some(current_leaf)) = (
+        sidecar_dir.parent(),
+        sidecar_dir.file_name().and_then(|leaf| leaf.to_str()),
+    ) else {
+        return;
+    };
+    prune_prior_ci_sidecar_dirs_in(parent, current_leaf, std::time::SystemTime::now());
+}
+
+fn prune_prior_ci_sidecar_dirs_in(parent: &Path, current_leaf: &str, now: std::time::SystemTime) {
+    let Some(current) = parse_sidecar_run_coordinate(current_leaf) else {
+        return;
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(leaf) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(coordinate) = parse_sidecar_run_coordinate(&leaf) else {
+            continue;
+        };
+        // Never a same-run concurrent lane, and never a newer/concurrent run.
+        if coordinate >= current {
+            continue;
+        }
+        let path = entry.path();
+        if !sidecar_dir_is_idle(&path, now) {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                dir = %path.display(),
+                error = %error,
+                "could not reclaim prior CI run sidecar directory",
+            );
+        }
+    }
+}
+
+/// Whether a sidecar directory's newest recorded write (its own mtime and its
+/// immediate children's) is older than [`PRIOR_RUN_SIDECAR_GRACE`].
+fn sidecar_dir_is_idle(dir: &Path, now: std::time::SystemTime) -> bool {
+    let mut newest = std::fs::symlink_metadata(dir)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    if let Ok(children) = std::fs::read_dir(dir) {
+        for child in children.flatten() {
+            if let Ok(modified) = child.metadata().and_then(|metadata| metadata.modified()) {
+                newest = Some(newest.map_or(modified, |current| current.max(modified)));
+            }
+        }
+    }
+    match newest {
+        Some(newest) => now
+            .duration_since(newest)
+            .map(|idle| idle >= PRIOR_RUN_SIDECAR_GRACE)
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
 struct ShmCleanupGuard;
 
 impl Drop for ShmCleanupGuard {
@@ -9677,6 +9809,88 @@ path = "junit.xml"
             std::env::var_os(ktstr::KTSTR_RUNS_ROOT_ENV).map(std::path::PathBuf::from),
             Some(preset),
             "a pre-set KTSTR_RUNS_ROOT must survive install (no clobber)",
+        );
+    }
+
+    #[test]
+    fn sidecar_run_coordinate_parses_only_the_ci_layout() {
+        assert_eq!(
+            parse_sidecar_run_coordinate("100-1-x64-base"),
+            Some((100, 1))
+        );
+        assert_eq!(
+            parse_sidecar_run_coordinate("999-2-coverage-arm64"),
+            Some((999, 2)),
+        );
+        // A bare `<run_id>-<attempt>` with no lane suffix is not the CI shape.
+        assert_eq!(parse_sidecar_run_coordinate("100-1"), None);
+        // Operator-chosen / non-numeric leaves never parse into a run order.
+        assert_eq!(parse_sidecar_run_coordinate("my-scratch-dir"), None);
+        assert_eq!(parse_sidecar_run_coordinate("v6.12-abcdef0"), None);
+    }
+
+    /// A persistent runner's sidecar parent accumulates one directory per
+    /// (run, attempt, lane). Startup pruning must reclaim only STRICTLY OLDER,
+    /// idle runs while leaving this run's concurrent lanes, newer/overlapping
+    /// runs, non-CI directories, and not-yet-idle prior runs untouched.
+    #[test]
+    fn prune_removes_only_strictly_older_idle_ci_sidecar_dirs() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let make = |leaf: &str| {
+            let dir = parent.path().join(leaf);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let current = "100-1-x64-base";
+        make(current);
+        let older = make("50-1-x64-base"); // strictly older run
+        let older_attempt = make("100-0-x64-base"); // older attempt of this run
+        let sibling_lane = make("100-1-arm64-cov"); // same (run, attempt): concurrent lane
+        let newer_attempt = make("100-2-x64-base"); // retry of this run (newer)
+        let newer_run = make("200-1-x64-base"); // a later/overlapping run
+        let foreign = make("checkout-scratch"); // non-CI directory
+
+        // Not yet idle: every directory was just created, so nothing is
+        // reclaimed even though older runs exist.
+        prune_prior_ci_sidecar_dirs_in(parent.path(), current, std::time::SystemTime::now());
+        for dir in [
+            &older,
+            &older_attempt,
+            &sibling_lane,
+            &newer_attempt,
+            &newer_run,
+            &foreign,
+        ] {
+            assert!(dir.is_dir(), "nothing is removed before the idle grace");
+        }
+
+        // Well past the idle grace: only the strictly-older, idle runs go.
+        let future = std::time::SystemTime::now() + PRIOR_RUN_SIDECAR_GRACE * 2;
+        prune_prior_ci_sidecar_dirs_in(parent.path(), current, future);
+        assert!(!older.is_dir(), "a strictly older idle run is reclaimed");
+        assert!(
+            !older_attempt.is_dir(),
+            "an older attempt of this run is reclaimed",
+        );
+        assert!(
+            sibling_lane.is_dir(),
+            "a concurrent same-run lane must never be removed",
+        );
+        assert!(
+            newer_attempt.is_dir(),
+            "a newer attempt of this run must never be removed",
+        );
+        assert!(
+            newer_run.is_dir(),
+            "a newer / overlapping run must never be removed",
+        );
+        assert!(
+            foreign.is_dir(),
+            "a non-CI-layout directory must never be removed",
+        );
+        assert!(
+            parent.path().join(current).is_dir(),
+            "this run's own directory must survive",
         );
     }
 
