@@ -18,9 +18,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg_attr(test, allow(dead_code))]
 const EXIT_TIMING_DIR_ENV: &str = "KTSTR_BUILD_DIAGNOSTICS_DIR";
 
 /// Cached diagnostics sink; resolved once. `None` keeps the whole path inert.
+/// Unreachable in test builds, where the test override is authoritative.
+#[cfg_attr(test, allow(dead_code))]
 static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Process-relative instant (ns since process start) of run-locks release, or 0
 /// before release. Ordinary [`stamp`] calls emit only once this is set: the seam
@@ -37,6 +40,10 @@ static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Test-only sink override so the emission path is exercisable without racing
 /// the process-global `DIR` OnceLock (which cannot be reset between tests).
+/// In test builds this override is authoritative: `None` means DISABLED, never
+/// "fall through to the environment" — CI sets the diagnostics env var
+/// ambiently for every test process, and consulting it here would make the
+/// unit tests' inert-when-unset assertions environment-dependent.
 #[cfg(test)]
 static TEST_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
@@ -49,11 +56,13 @@ fn resolve_dir(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
 
 fn dir() -> Option<PathBuf> {
     #[cfg(test)]
-    if let Ok(guard) = TEST_DIR_OVERRIDE.lock()
-        && let Some(path) = guard.as_ref()
     {
-        return Some(path.clone());
+        return TEST_DIR_OVERRIDE
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or(None);
     }
+    #[cfg(not(test))]
     DIR.get_or_init(|| resolve_dir(std::env::var_os(EXIT_TIMING_DIR_ENV)))
         .clone()
 }
