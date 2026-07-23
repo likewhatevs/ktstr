@@ -3696,6 +3696,75 @@ mod tests {
     }
 
     #[test]
+    fn coverage_and_plain_take_distinct_shared_build_buckets_under_one_root() {
+        use crate::run_cargo::CachedNextestMode;
+
+        // One non-source identity surface shared by both producer modes; the
+        // build-scratch bucket deliberately excludes the source component, so
+        // the only thing that must separate an instrumented producer from a
+        // plain one here is the mode label.
+        let args = vec![b"nextest:--features=integration".to_vec()];
+        let packages = BTreeSet::from(["libc@0.2.0:registry+fixture".to_string()]);
+        let environment = vec![(std::ffi::OsString::from("CARGO_INCREMENTAL"), b"0".to_vec())];
+        let tools = vec![
+            ("cargo".to_string(), b"cargo-a".to_vec()),
+            ("rustc".to_string(), b"rustc-a".to_vec()),
+        ];
+
+        let plain_label = CachedNextestMode::Plain.identity_label();
+        let coverage_label = CachedNextestMode::Coverage.identity_label();
+        assert_ne!(
+            plain_label, coverage_label,
+            "the plain and coverage producers must carry distinct identity labels",
+        );
+
+        let plain = build_scratch_bucket(plain_label, &args, &packages, &environment, &tools);
+        let coverage = build_scratch_bucket(coverage_label, &args, &packages, &environment, &tools);
+        assert_ne!(
+            plain, coverage,
+            "instrumented and plain builds must never share a build-scratch bucket",
+        );
+
+        // The bucket is deterministic for a fixed surface, and every non-source
+        // coordinate — including the producer environment cargo-llvm-cov mutates
+        // (e.g. RUSTC_WRAPPER) — moves it, so an instrumented environment can
+        // never collide with a plain one even under an identical label.
+        assert_eq!(
+            coverage,
+            build_scratch_bucket(coverage_label, &args, &packages, &environment, &tools),
+            "the bucket must be stable for a fixed non-source surface",
+        );
+        let mut instrumented_environment = environment.clone();
+        instrumented_environment.push((
+            std::ffi::OsString::from("RUSTC_WRAPPER"),
+            b"cargo-llvm-cov".to_vec(),
+        ));
+        assert_ne!(
+            coverage,
+            build_scratch_bucket(
+                coverage_label,
+                &args,
+                &packages,
+                &instrumented_environment,
+                &tools,
+            ),
+            "a changed producer environment must move the build-scratch bucket",
+        );
+
+        // Distinct buckets still resolve under one parent, so the single lease
+        // and idle-GC discipline governs the coverage bucket exactly as it does
+        // the plain one.
+        let plain_dir = shared_build_scratch_dir(plain).unwrap();
+        let coverage_dir = shared_build_scratch_dir(coverage).unwrap();
+        assert_ne!(plain_dir, coverage_dir);
+        assert_eq!(plain_dir.parent(), coverage_dir.parent());
+        assert_eq!(
+            plain_dir.parent().and_then(Path::file_name),
+            Some(OsStr::new("shared-build-scratch-v1")),
+        );
+    }
+
+    #[test]
     fn explicit_config_and_custom_target_are_detected_captured_and_remapped() {
         let temp = tempfile::tempdir().unwrap();
         let invocation = temp.path().join("invocation");

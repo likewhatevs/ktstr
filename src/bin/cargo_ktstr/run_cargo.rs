@@ -1384,7 +1384,7 @@ pub(crate) enum CachedNextestMode {
 }
 
 impl CachedNextestMode {
-    fn identity_label(self) -> &'static str {
+    pub(crate) fn identity_label(self) -> &'static str {
         match self {
             Self::Plain => "nextest",
             Self::Coverage => "llvm-cov-nextest",
@@ -7258,6 +7258,121 @@ mod tests {
             leased.exists(),
             "a bucket under an active build-output lease must never be deleted",
         );
+    }
+
+    /// Metadata with one workspace member (`scx-ktstr`, `source == null`) and
+    /// one registry dependency (`serde`, `source != null`), so a member purge
+    /// has both something to remove and something it must keep.
+    fn member_and_registry_metadata() -> cargo_metadata::Metadata {
+        let package = |name: &str, id: &str, source: &str| -> String {
+            format!(
+                r#"{{
+                    "name":"{name}",
+                    "version":"1.0.0",
+                    "id":"{id}",
+                    "source":{source},
+                    "description":null,
+                    "dependencies":[],
+                    "license":null,
+                    "license_file":null,
+                    "targets":[],
+                    "features":{{}},
+                    "manifest_path":"/w/{name}/Cargo.toml",
+                    "readme":null,
+                    "repository":null,
+                    "homepage":null,
+                    "documentation":null,
+                    "links":null,
+                    "publish":null,
+                    "default_run":null
+                }}"#
+            )
+        };
+        let member = "scx-ktstr 1.0.0 (path+file:///w/scx-ktstr)";
+        serde_json::from_str(&format!(
+            r#"{{
+                "packages":[{member_package},{dep_package}],
+                "workspace_members":["{member}"],
+                "workspace_default_members":["{member}"],
+                "resolve":null,
+                "workspace_root":"/w",
+                "target_directory":"/w/target",
+                "version":1
+            }}"#,
+            member_package = package("scx-ktstr", member, "null"),
+            dep_package = package(
+                "serde",
+                "serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+                r#""registry+https://github.com/rust-lang/crates.io-index""#,
+            ),
+        ))
+        .expect("member/registry metadata fixture deserializes")
+    }
+
+    /// `load_or_build_nextest_artifacts` runs one acquire-lease -> purge-members
+    /// sequence before Cargo for BOTH producer modes: that lease/purge sits
+    /// outside the `if mode == CachedNextestMode::Coverage` branch, so a coverage
+    /// producer purges stale workspace members from its own (mode-separated)
+    /// shared bucket exactly as a plain producer does. Prove that composition on
+    /// a coverage-style bucket: under the exclusive build-output lease, a
+    /// workspace member is purged while a registry dependency survives.
+    #[test]
+    fn coverage_bucket_purges_members_under_the_build_output_lease() {
+        // Anchors the mode label the coverage producer keys its bucket on; if it
+        // ever drifts, the plain/coverage bucket separation silently collapses.
+        assert_eq!(
+            CachedNextestMode::Coverage.identity_label(),
+            "llvm-cov-nextest",
+        );
+
+        let metadata = member_and_registry_metadata();
+        let temp = tempfile::tempdir().expect("coverage bucket scratch");
+        let bucket = temp
+            .path()
+            .join("shared-build-scratch-v1")
+            .join("0f0f0f0f0f0f0f0f");
+        let lock_root = temp.path().join("output-locks");
+        let deps = bucket.join("ci/deps");
+        let fingerprint = bucket.join("ci/.fingerprint");
+        std::fs::create_dir_all(&deps).unwrap();
+        std::fs::create_dir_all(&fingerprint).unwrap();
+        // Member `scx-ktstr`: underscored in deps/, dashed in .fingerprint/.
+        std::fs::write(deps.join("libscx_ktstr-0123456789abcdef.rlib"), b"member").unwrap();
+        std::fs::create_dir_all(fingerprint.join("scx-ktstr-0123456789abcdef")).unwrap();
+        // Registry dependency that must survive the purge.
+        std::fs::write(deps.join("libserde-fedcba9876543210.rlib"), b"dep").unwrap();
+        std::fs::create_dir_all(fingerprint.join("serde-fedcba9876543210")).unwrap();
+
+        let interrupted = std::sync::atomic::AtomicBool::new(false);
+        let lease = acquire_cargo_build_output_lease_at_root(
+            &bucket,
+            &lock_root,
+            "coverage producer",
+            &interrupted,
+        )
+        .expect("coverage producer owns its shared build bucket");
+
+        purge_shared_build_dir_workspace_members(&bucket, &metadata)
+            .expect("purge coverage bucket members under the build-output lease");
+
+        assert!(
+            !deps.join("libscx_ktstr-0123456789abcdef.rlib").exists(),
+            "coverage bucket must purge the stale member product",
+        );
+        assert!(
+            !fingerprint.join("scx-ktstr-0123456789abcdef").exists(),
+            "coverage bucket must purge the stale member fingerprint",
+        );
+        assert!(
+            deps.join("libserde-fedcba9876543210.rlib").exists(),
+            "coverage bucket must retain the registry dependency it exists to reuse",
+        );
+        assert!(
+            fingerprint.join("serde-fedcba9876543210").exists(),
+            "coverage bucket must retain the registry dependency fingerprint",
+        );
+
+        drop(lease);
     }
 
     fn llvm_cov_feature_metadata() -> cargo_metadata::Metadata {
