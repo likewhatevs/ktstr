@@ -395,11 +395,52 @@ pub(super) const COORDINATOR_HEARTBEAT_INTERVAL: Duration =
 /// returns the authoritative state on the next turnstile gap.
 const TURNSTILE_READ_BACKOFF: Duration = Duration::from_millis(2);
 const DEFERRED_RESCAN_INTERVAL_NS: u64 = 1_000_000_000;
-/// A published GRANTED batch probes outside registry EX. Its negative
-/// completions tend to return together, so give the batch one short,
-/// non-renewing drain interval instead of letting the coordinator reacquire
-/// EX and run an O(N) scan between individual callback publications.
-const GRANT_COMPLETION_RESCAN_INTERVAL_NS: u64 = 10_000_000;
+/// Short, non-renewing coalescing quantum for authoritative grant-scan edges
+/// that arrive in bursts: a GRANTED batch's negative completions (which probe
+/// outside registry EX and tend to return together) and HELD releases (a
+/// draining herd completes en masse). Absorbing every such edge inside one
+/// window lets the coordinator run a single O(N) grant scan per quantum instead
+/// of reacquiring EX and rescanning between individual publications.
+///
+/// 10 ms is chosen from the drain profile: a grant scan and a physical
+/// acquire/commit are sub-millisecond, so 10 ms comfortably batches a wave of
+/// same-quantum completions while adding latency that is invisible next to the
+/// 9–20 s a cell spends resident. It is a re-probe/coalesce cap, not a semantic
+/// poll interval — the next scan still grants everything grantable, and any
+/// edge that misses the window schedules the following scan.
+const GRANT_SCAN_COALESCE_INTERVAL_NS: u64 = 10_000_000;
+
+/// CI-only scan-cost accounting (validation instrumentation), companion to the
+/// coordinator-wake counters. `GRANT_SCANS` counts authoritative grant scans
+/// this process drove and `RECORDS_SCANNED` accumulates their record counts, so
+/// their ratio is the mean scan width; `SCANS_COALESCED` counts release edges
+/// that joined an already-pending scan instead of opening a fresh window. Three
+/// relaxed atomics, read only when the diagnostics dir is set — a healthy drain
+/// shows `records_scanned/grant_scans` far below the peak herd size and a large
+/// `scans_coalesced`.
+static COORDINATOR_GRANT_SCANS: AtomicU64 = AtomicU64::new(0);
+static COORDINATOR_RECORDS_SCANNED: AtomicU64 = AtomicU64::new(0);
+static COORDINATOR_SCANS_COALESCED: AtomicU64 = AtomicU64::new(0);
+
+fn note_grant_scan(records: usize) {
+    COORDINATOR_GRANT_SCANS.fetch_add(1, Ordering::Relaxed);
+    COORDINATOR_RECORDS_SCANNED.fetch_add(records as u64, Ordering::Relaxed);
+}
+
+fn note_grant_scan_coalesced() {
+    COORDINATOR_SCANS_COALESCED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(grant_scans, records_scanned, scans_coalesced)` for the coordinator-wake
+/// diagnostic line. Cumulative and process-global, like the wake counters.
+pub(super) fn coordinator_scan_stats() -> (u64, u64, u64) {
+    (
+        COORDINATOR_GRANT_SCANS.load(Ordering::Relaxed),
+        COORDINATOR_RECORDS_SCANNED.load(Ordering::Relaxed),
+        COORDINATOR_SCANS_COALESCED.load(Ordering::Relaxed),
+    )
+}
+
 /// Eight missed one-second heartbeats are enough to transfer progress to the
 /// oldest waiter. The displaced live coordinator is parked, so a false
 /// positive under extreme descheduling is safe and does not weaken physical
@@ -8439,6 +8480,22 @@ pub(crate) struct GrantCompletionBatchOutcome {
 }
 
 #[cfg(test)]
+pub(crate) struct ReleaseCoalesceOutcome {
+    /// The `holders` releases armed exactly one deferred edge (not one urgent
+    /// scan each), and all but the first were counted as coalesced.
+    pub(crate) releases_coalesced_into_one_edge: bool,
+    /// No authoritative scan ran before the coalescing deadline, so the herd of
+    /// releases did not each drive an O(N) scan.
+    pub(crate) no_scan_before_deadline: bool,
+    /// One scan at the deadline granted every waiter the releases freed —
+    /// work-conserving, nothing left grantable.
+    pub(crate) one_scan_at_deadline_grants_all: bool,
+    /// A release arriving after that scan cleared the edge re-armed the next
+    /// scan (the no-lost-edge handshake).
+    pub(crate) post_scan_release_reschedules: bool,
+}
+
+#[cfg(test)]
 pub(crate) struct BoundedReplanWindowOutcome {
     pub(crate) capacity: usize,
     pub(crate) peak_outstanding: usize,
@@ -10347,6 +10404,127 @@ pub(super) fn exercise_grant_completion_batch_for_tests() -> Result<GrantComplet
         deadline_was_not_renewed,
         no_scan_before_deadline,
         one_scan_at_deadline,
+    })
+}
+
+/// Change A: prove a herd of HELD releases coalesces into one authoritative
+/// grant scan per quantum instead of one O(N) scan per release, that the single
+/// scan still grants everything the releases freed, and that a release after the
+/// scan re-arms the next one (no lost edge). No sleeping: the armed absolute
+/// deadline is read back and probed on either side.
+#[cfg(test)]
+pub(super) fn exercise_release_coalesce_for_tests() -> Result<ReleaseCoalesceOutcome> {
+    const K: usize = 4;
+    let coordinator_claim = ClaimSet::new(std::iter::empty(), [1_770usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let cpus: [usize; K] = std::array::from_fn(|index| 1_771 + index);
+
+    // A HELD holder occupies each contended CPU; a waiter behind it registers
+    // WAITING because the aggregate is already busy there.
+    let mut holders = Vec::new();
+    let mut waiters = Vec::new();
+    for &cpu in &cpus {
+        let claim = ClaimSet::new(std::iter::empty(), [cpu], FlockMode::Exclusive);
+        holders.push(publish_acquired(&claim)?);
+        waiters.push(Ticket::register(claim.clone(), claim, None)?);
+    }
+
+    // Consume the registration/init edge so the coalescing test starts from a
+    // clean scan state (fresh tables publish PENDING_RESCAN). The holders are
+    // still HELD, so no waiter is granted here.
+    let (scans_before, coalesced_before) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.grant_compatible()?;
+        for (holder, waiter) in holders.iter().zip(&waiters) {
+            anyhow::ensure!(
+                table
+                    .record(holder.slot)?
+                    .is_some_and(|record| record.state == STATE_HELD)
+                    && table
+                        .record(waiter.slot)?
+                        .is_some_and(|record| record.state == STATE_WAITING),
+                "release-coalesce fixture did not publish HELD holder + WAITING waiter",
+            );
+        }
+        anyhow::ensure!(
+            table.pending_flags() & (PENDING_RESCAN | PENDING_REPLAN_RESCAN) == 0,
+            "release-coalesce fixture did not reach a clean post-scan edge state",
+        );
+        (
+            read_u64(&table.header, H_GRANT_SCANS),
+            coordinator_scan_stats().2,
+        )
+    };
+
+    // Release every holder within one quantum. The HeldClaim drop path takes the
+    // registry lock itself, so drop without holding it.
+    for holder in holders.drain(..) {
+        drop(holder);
+    }
+
+    let (deadline, releases_coalesced_into_one_edge, no_scan_before_deadline) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let deadline = table.deferred_rescan_deadline_ns();
+        let one_deferred_edge = table.pending_flags() & PENDING_RESCAN == 0
+            && table.pending_flags() & PENDING_REPLAN_RESCAN != 0
+            && deadline != 0
+            && read_u64(&table.header, H_GRANT_SCANS) == scans_before
+            && coordinator_scan_stats().2.wrapping_sub(coalesced_before) == K as u64 - 1;
+        // The deferred edge is not due one nanosecond early: no scan yet.
+        let quiet_before_deadline = !table.prepare_grant_scan_at(deadline.saturating_sub(1))?
+            && read_u64(&table.header, H_GRANT_SCANS) == scans_before;
+        (deadline, one_deferred_edge, quiet_before_deadline)
+    };
+
+    let one_scan_at_deadline_grants_all = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        // Model the coordinator's release observation making the freed CPUs
+        // available before its due scan grants the waiters.
+        for &cpu in &cpus {
+            set_cpu_free_for_tests(&mut table, cpu, true)?;
+        }
+        let promoted = table.prepare_grant_scan_at(deadline)?;
+        table.grant_compatible_at(deadline, None)?;
+        let one_scan = read_u64(&table.header, H_GRANT_SCANS) == scans_before + 1;
+        let all_granted = waiters.iter().try_fold(true, |acc, waiter| {
+            Ok::<_, anyhow::Error>(
+                acc && table
+                    .record(waiter.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            )
+        })?;
+        let edge_cleared = table.pending_flags() & (PENDING_RESCAN | PENDING_REPLAN_RESCAN) == 0
+            && table.deferred_rescan_deadline_ns() == 0;
+        promoted && one_scan && all_granted && edge_cleared
+    };
+
+    // Handshake: an edge arriving after the scan cleared the deferred edge must
+    // schedule the next scan rather than be lost. The scan above left both flags
+    // clear; one more coalesced release edge re-arms the deferred deadline.
+    let post_scan_release_reschedules = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        let started_clear = table.pending_flags() & (PENDING_RESCAN | PENDING_REPLAN_RESCAN) == 0;
+        table.begin_transaction()?;
+        table.schedule_coalesced_grant_rescan_in_transaction()?;
+        table.finish_transaction()?;
+        started_clear
+            && table.pending_flags() & PENDING_REPLAN_RESCAN != 0
+            && table.deferred_rescan_deadline_ns() != 0
+    };
+
+    for waiter in waiters.iter_mut().rev() {
+        waiter.finish(None)?;
+    }
+    coordinator.finish(None)?;
+    Ok(ReleaseCoalesceOutcome {
+        releases_coalesced_into_one_edge,
+        no_scan_before_deadline,
+        one_scan_at_deadline_grants_all,
+        post_scan_release_reschedules,
     })
 }
 
@@ -13119,12 +13297,33 @@ pub(super) fn exercise_waiting_publication_release_progress_for_tests()
     };
 
     drop(held);
-    let release_published_without_observation = {
+    // Change A: a HELD removal coalesces its authoritative rescan behind the
+    // short quantum rather than publishing an urgent scan. Availability was
+    // already free, so no further lock-close will arrive — progress must come
+    // from this durable deferred edge plus the coordinator's own deferred timer
+    // alone, never a second external observation.
+    let (release_published_without_observation, deadline) = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let table = Table::open_existing()?;
-        table.pending_flags() & PENDING_RESCAN != 0
-            && table.pending_flags() & PENDING_OBSERVATION == 0
+        let deadline = table.deferred_rescan_deadline_ns();
+        (
+            table.pending_flags() & PENDING_REPLAN_RESCAN != 0
+                && table.pending_flags() & PENDING_RESCAN == 0
+                && table.pending_flags() & PENDING_OBSERVATION == 0
+                && deadline != 0,
+            deadline,
+        )
     };
+    // Model the coordinator's blocking wait timing out at its own deferred
+    // deadline — an internal timer, not another lock-close event.
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        anyhow::ensure!(
+            table.prepare_grant_scan_at(deadline)?,
+            "the coalesced release edge must promote at its own deferred deadline",
+        );
+    }
 
     let empty = BTreeSet::new();
     let snapshot = coordinator.schedule(
@@ -15120,7 +15319,7 @@ impl Table {
             return Ok(false);
         }
         let now = monotonic_now_ns()?.max(1);
-        let deadline = now.saturating_add(GRANT_COMPLETION_RESCAN_INTERVAL_NS);
+        let deadline = now.saturating_add(GRANT_SCAN_COALESCE_INTERVAL_NS);
         if self.pending_flags() & PENDING_REPLAN_RESCAN != 0 {
             let current = self.deferred_rescan_deadline_ns();
             if current == 0 || deadline < current {
@@ -15134,6 +15333,47 @@ impl Table {
         self.set_pending_flag(PENDING_REPLAN_RESCAN);
         write_u64(&mut self.header, H_DEFERRED_RESCAN_DEADLINE_NS, deadline);
         Ok(true)
+    }
+
+    /// Coalesce a HELD-release grant rescan behind the same short
+    /// [`GRANT_SCAN_COALESCE_INTERVAL_NS`] window the GRANTED batch drain uses,
+    /// so a herd of completing cells drives one O(N) coordinator scan per
+    /// quantum instead of one scan per release. A release only relaxes the
+    /// prefix and its suffix fence is published unconditionally by the caller
+    /// (`mark_claim_changed_metadata`), so deferring just the *scan* costs at
+    /// most one quantum of grant latency — invisible next to a cell's whole run.
+    ///
+    /// This generalizes the record's own pre-existing "coalesce the O(N) scan
+    /// while a speculative wave is live" intent to hold unconditionally: an
+    /// already-armed shorter urgent/deferred edge is never lengthened (shortest
+    /// deadline wins, matching the grant-completion batch). With no coordinator
+    /// it keeps the historical urgent publication without an active-list
+    /// election search — future registration or crash repair owns election,
+    /// exactly as the pre-coalesce release did. `coalesced` reports whether this
+    /// edge joined an already-pending scan rather than opening a fresh window,
+    /// for the scan-cost diagnostic.
+    fn schedule_coalesced_grant_rescan_in_transaction(&mut self) -> Result<()> {
+        if self.coordinator_ticket() == 0 {
+            self.set_urgent_rescan();
+            return Ok(());
+        }
+        if self.pending_flags() & PENDING_RESCAN != 0 {
+            note_grant_scan_coalesced();
+            return Ok(());
+        }
+        let now = monotonic_now_ns()?.max(1);
+        let deadline = now.saturating_add(GRANT_SCAN_COALESCE_INTERVAL_NS);
+        if self.pending_flags() & PENDING_REPLAN_RESCAN != 0 {
+            let current = self.deferred_rescan_deadline_ns();
+            if current == 0 || deadline < current {
+                write_u64(&mut self.header, H_DEFERRED_RESCAN_DEADLINE_NS, deadline);
+            }
+            note_grant_scan_coalesced();
+            return Ok(());
+        }
+        self.set_pending_flag(PENDING_REPLAN_RESCAN);
+        write_u64(&mut self.header, H_DEFERRED_RESCAN_DEADLINE_NS, deadline);
+        Ok(())
     }
 
     fn observation_request_serial(&self) -> u64 {
@@ -16376,9 +16616,9 @@ impl Table {
         self.remove_record_in_transaction(record, acquired)?;
         if !acquired {
             // Removal is a monotonic prefix relaxation. Preserve its claim
-            // epoch/suffix fence immediately, but coalesce the O(N) scan while
-            // an existing speculative wave is still live. Physical release
-            // proof is independently observed and promotes urgent work.
+            // epoch/suffix fence immediately, but coalesce the O(N) scan behind
+            // one short quantum. Physical release proof is independently
+            // observed and promotes urgent work.
             self.mark_claim_changed_metadata(record.ticket)?;
         }
         crash_at_for_tests("remove_record_before_election");
@@ -16391,7 +16631,22 @@ impl Table {
                 // the urgent scan edge without repeating the full active-list
                 // walk when that search found no successor.
                 self.set_urgent_rescan();
+            } else if matches!(record.state, STATE_GRANTED | STATE_REVOKED | STATE_HELD) {
+                // A real resource release. A draining herd completes en masse,
+                // and one urgent scan per completion makes the coordinator run
+                // an O(N) grant scan per release (O(N^2) drain). Coalesce these
+                // behind the shared short quantum so a burst drives one scan,
+                // whether or not a speculative wave is live (shortest deadline
+                // wins — a freed resource should rescan promptly, matching the
+                // grant-completion batch). Work-conserving: the pending scan
+                // still grants everything grantable, and the per-release
+                // coordinator notify guarantees a release arriving after a scan
+                // cleared the edge schedules the next one.
+                self.schedule_coalesced_grant_rescan_in_transaction()?;
             } else if self.replan_outstanding() != 0 && self.coordinator_ticket() != 0 {
+                // A non-resource teardown (a WAITING/REPLAN ticket cancelling)
+                // frees only a watch, so it rides the live speculative wave
+                // without accelerating it.
                 self.schedule_deferred_replan_rescan_in_transaction()?;
             } else {
                 // Preserve the old callback-only drain invariant: publishing
@@ -16859,6 +17114,7 @@ impl Table {
         // their resource-serial lookup a once-per-scan cost.
         let mut encoded_watch_serial_memo = BTreeMap::<EncodedWatchSerialMemoKey, u64>::new();
         self.bump_grant_scans();
+        note_grant_scan(records.len());
 
         for record in records {
             // An expired planner callback is quarantined until its own owner

@@ -5216,6 +5216,29 @@ fn negative_grant_callbacks_batch_one_authoritative_rescan() {
 }
 
 #[test]
+fn held_releases_batch_one_authoritative_rescan_and_grant_all_waiters() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_release_coalesce_for_tests()
+        .expect("exercise HELD-release grant-scan coalescing");
+    assert!(
+        outcome.releases_coalesced_into_one_edge,
+        "a herd of HELD releases must arm one deferred grant edge, not one urgent scan each",
+    );
+    assert!(
+        outcome.no_scan_before_deadline,
+        "coalesced releases must not drive an authoritative scan before the quantum elapses",
+    );
+    assert!(
+        outcome.one_scan_at_deadline_grants_all,
+        "one scan at the deadline must grant every waiter the releases freed (work-conserving)",
+    );
+    assert!(
+        outcome.post_scan_release_reschedules,
+        "a release after the scan cleared the edge must schedule the next scan (no lost edge)",
+    );
+}
+
+#[test]
 fn deferred_replan_rescans_survive_event_storms_and_flush_at_hard_boundaries() {
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_deferred_rescan_policy_for_tests()
@@ -5868,11 +5891,11 @@ fn waiting_publication_preserves_consumed_predecessor_release_progress() {
             .expect("exercise release during coordinator WAITING publication");
     assert!(
         stale_prefix && release_published,
-        "HELD removal must durably publish a prefix rescan even when availability was already free",
+        "HELD removal must durably publish a (coalesced deferred) prefix rescan even when availability was already free",
     );
     assert!(
         prefix_refreshed && immediate_step,
-        "the WAITING publication must return refreshed predecessors as immediate planner progress without relying on another close event",
+        "promoting that edge at the coordinator's own deferred deadline must return refreshed predecessors as planner progress without relying on another close event",
     );
     assert!(
         protocol::waiting_publication_requires_immediate_turn_for_tests(true, false),

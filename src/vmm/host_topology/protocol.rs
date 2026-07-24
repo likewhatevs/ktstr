@@ -364,9 +364,11 @@ fn persist_coordinator_wake_stats_if_enabled() {
     let event = COORDINATOR_EVENT_WAKES.load(Ordering::Relaxed);
     let retry = COORDINATOR_RETRY_TIMEOUT_WAKES.load(Ordering::Relaxed);
     let fallback = COORDINATOR_FALLBACK_WAKES.load(Ordering::Relaxed);
+    let (grant_scans, records_scanned, scans_coalesced) = registry::coordinator_scan_stats();
     let pid = std::process::id();
     let line = format!(
-        "coordinator-wakes: pid={pid} event={event} retry_timeout={retry} fallback={fallback}\n"
+        "coordinator-wakes: pid={pid} event={event} retry_timeout={retry} fallback={fallback} \
+         grant_scans={grant_scans} records_scanned={records_scanned} scans_coalesced={scans_coalesced}\n"
     );
     if std::fs::create_dir_all(&root).is_err() {
         return;
@@ -2423,6 +2425,11 @@ pub(crate) fn exercise_deferred_rescan_policy_for_tests()
 pub(crate) fn exercise_grant_completion_batch_for_tests()
 -> Result<registry::GrantCompletionBatchOutcome> {
     registry::exercise_grant_completion_batch_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_release_coalesce_for_tests() -> Result<registry::ReleaseCoalesceOutcome> {
+    registry::exercise_release_coalesce_for_tests()
 }
 
 #[cfg(test)]
