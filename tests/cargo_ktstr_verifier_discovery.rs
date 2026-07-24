@@ -15,12 +15,23 @@
 //! in that conflict is the end-to-end proof of recursive discovery.
 //!
 //! A second fixture links one compatible declaration into two separate test
-//! binaries plus a private copy of ktstr's real `scx-ktstr` scheduler package.
-//! Its bare verifier invocation must continue through recursive discovery, the
-//! parent-owned scheduler prebuild and immutable artifact/ownership manifests,
-//! and exactly one generated KVM cell. This closes both the success-path gap
-//! left intentionally by the conflict fixture and the cross-binary duplicate
-//! cell/record-writer regression.
+//! binaries plus a minimum-weight stand-in scheduler package (`scx-standin`,
+//! under `tests/fixtures/`). Its bare verifier invocation must continue through
+//! recursive discovery, the parent-owned scheduler prebuild and immutable
+//! artifact/ownership manifests, and exactly one generated KVM cell. This
+//! closes both the success-path gap left intentionally by the conflict fixture
+//! and the cross-binary duplicate cell/record-writer regression.
+//!
+//! Coverage trade: the stand-in is a genuine sched_ext scheduler (global FIFO
+//! through one shared DSQ) that really attaches in the guest — it is what makes
+//! `/sys/kernel/sched_ext/root/ops` non-empty and `state` read `enabled`, the
+//! cell's passing-attach signal — but it is deliberately NOT ktstr's real
+//! `scx-ktstr`. Building the real scheduler through the discovery/prebuild path
+//! (its scx_cargo/gix header-fetch stack) is what made this the whole CI
+//! matrix's wall; that build is already exercised by the main-suite
+//! real-scheduler cells and by actual scx usage. This fixture proves the
+//! discovery / prebuild / one-cell-election / attach-and-exit machinery at
+//! minimum weight.
 
 use std::path::{Path, PathBuf};
 
@@ -459,7 +470,7 @@ use ktstr::test_support::TopologyConstraints;
 
 declare_scheduler!(RECURSIVE_DISCOVERY_SUCCESS_SCHEDULER, {
     name = "recursive-discovery-success",
-    binary = "scx-ktstr",
+    binary = "scx-standin",
     topology = (1, 1, 4, 1),
     constraints = TopologyConstraints {
         min_numa_nodes: 1,
@@ -621,18 +632,8 @@ fn bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end() {
         workspace.join("Cargo.toml"),
         format!(
             r#"[workspace]
-members = ["verifier-e2e", "scx-ktstr"]
+members = ["verifier-e2e", "scx-standin"]
 resolver = "{FIXTURE_RESOLVER}"
-
-[workspace.package]
-edition = "2024"
-rust-version = "1.94.1"
-license = "GPL-2.0-only"
-repository = "https://github.com/likewhatevs/ktstr"
-
-[profile.release]
-lto = "thin"
-panic = "abort"
 
 [profile.test]
 debug = "{FIXTURE_TEST_DEBUG}"
@@ -642,11 +643,14 @@ debug = "{FIXTURE_TEST_DEBUG}"
     .expect("write success workspace manifest");
     std::fs::copy(ktstr_root.join("Cargo.lock"), workspace.join("Cargo.lock"))
         .expect("seed success fixture with ktstr's dependency lock");
+    // The stand-in scheduler package is a real, minimum-weight sched_ext
+    // scheduler kept out of the main workspace (see `workspace.exclude`); copy
+    // it in as the discovered/prebuilt member. No `build_support`/`scx-ktstr`
+    // is needed because the stand-in vendors nothing from scx.
     copy_tree(
-        &ktstr_root.join("build_support"),
-        &workspace.join("build_support"),
+        &ktstr_root.join("tests/fixtures/scx_standin"),
+        &workspace.join("scx-standin"),
     );
-    copy_tree(&ktstr_root.join("scx-ktstr"), &workspace.join("scx-ktstr"));
     write_success_member(&workspace, &ktstr_root);
     let diagnostics = fixture_diagnostics_dir(&temp);
 

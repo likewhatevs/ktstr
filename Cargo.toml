@@ -1,6 +1,11 @@
 [workspace]
 members = [".", "ktstr-macros", "scx-ktstr"]
 resolver = "3"
+# The verifier recursive-discovery e2e fixture's stand-in scheduler package.
+# Excluded so `cargo check/clippy --workspace` never builds it (it needs clang
+# + sched_ext BTF, present only where the KVM e2e itself runs); the fixture
+# copies it into a generated workspace where it builds as a normal member.
+exclude = ["tests/fixtures/scx_standin"]
 
 [workspace.package]
 edition = "2024"
