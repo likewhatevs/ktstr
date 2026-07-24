@@ -85,7 +85,12 @@ _with-host-sampler +cmd:
                         <(awk '$2=="FLOCK" || $3=="FLOCK" {n=split($6,p,":"); if (n==3) print p[3]}' /proc/locks 2>/dev/null | sort -u) \
                         | wc -l)
                 fi
-                echo "host-sample: t=$(date +%s) idle_total=${busy_idle} permit_locks=${permits}"
+                # Aggregate IO across real block devices (skip loop/ram):
+                # sectors read+written and ms spent in IO, cumulative like
+                # /proc/stat, so deltas give the IO rate and utilization the
+                # CPU columns cannot see.
+                io=$(awk '$3 !~ /^(loop|ram)/ {r+=$6; w+=$10; t+=$13} END {print r+w, t}' /proc/diskstats 2>/dev/null)
+                echo "host-sample: t=$(date +%s) idle_total=${busy_idle} permit_locks=${permits} io_sectors_ms=${io}"
                 sleep 5
             done > "${KTSTR_BUILD_DIAGNOSTICS_DIR}/host-saturation.log" 2>/dev/null
         ) &
