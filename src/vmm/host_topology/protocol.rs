@@ -345,6 +345,15 @@ static COORDINATOR_EVENT_WAKES: AtomicU64 = AtomicU64::new(0);
 static COORDINATOR_RETRY_TIMEOUT_WAKES: AtomicU64 = AtomicU64::new(0);
 static COORDINATOR_FALLBACK_WAKES: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative coordinator inotify event-wakes for this process. The herd
+/// benchmark samples it around a run to report event-wakes per grant, so a
+/// watch-traffic regression (for example from widening what a coordinator
+/// watches) is visible rather than assumed harmless.
+#[cfg(test)]
+pub(crate) fn coordinator_event_wakes_for_tests() -> u64 {
+    COORDINATOR_EVENT_WAKES.load(Ordering::Relaxed)
+}
+
 fn persist_coordinator_wake_stats_if_enabled() {
     let Some(root) = std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
         .filter(|root| !root.is_empty())
@@ -1640,6 +1649,11 @@ pub(crate) fn register_intent_for_preparation(
         !host_allowed.is_empty(),
         "could not determine allowed CPU set for selected-intent preparation admission",
     );
+    // Union the token pool into the registered watch. This is what marks the
+    // record a preparation intent for the grant scan's pool budget, and it is
+    // what makes the intent wake on any token release so the per-token blocked
+    // pin is no longer needed to recover a freed slot.
+    let watch = watch.union_envelope(&super::preparation_token_pool_watch()?);
     registry::validate_claim_within_watch(&initial_claim, &watch)?;
     let mut ticket = registry::Ticket::register_after_contention_with_capacity(
         initial_claim.clone(),
@@ -2086,6 +2100,24 @@ pub(crate) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32
 pub(crate) fn exercise_work_conserving_backfill_for_tests()
 -> Result<registry::WorkConservingBackfillOutcome> {
     registry::exercise_work_conserving_backfill_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_preparation_pool_budget_for_tests()
+-> Result<registry::PreparationPoolBudgetOutcome> {
+    registry::exercise_preparation_pool_budget_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_preparation_pool_starvation_for_tests()
+-> Result<registry::PreparationPoolStarvationOutcome> {
+    registry::exercise_preparation_pool_starvation_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_preparation_pool_crash_recovery_for_tests()
+-> Result<registry::PreparationPoolCrashRecoveryOutcome> {
+    registry::exercise_preparation_pool_crash_recovery_for_tests()
 }
 
 #[cfg(test)]
@@ -3976,6 +4008,14 @@ fn acquire_as_coordinator_impl<T>(
     mut step: impl FnMut(&mut HeldLocks) -> Result<CoordinatorStep<T>>,
 ) -> Result<CoordinatorOutcome<T>> {
     let _namespace = coordinator.ticket.enter_namespace();
+    // The coordinator loop owns the topology, so hand the registry the
+    // preparation-slot token range as opaque budget data. Every grant scan this
+    // coordinator drives then bounds preparation grants to the free-slot count
+    // in ticket order. `None` on a host without preparation capacity leaves the
+    // budget disabled — no preparation intents can exist there to gate.
+    coordinator
+        .ticket
+        .set_preparation_tokens(super::preparation_token_range().ok());
     check_interrupted(cancelled)?;
     let watch = check_result(LockDirWatch::new(), cancelled)?;
     check_interrupted(cancelled)?;

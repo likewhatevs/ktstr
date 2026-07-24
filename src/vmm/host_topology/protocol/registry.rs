@@ -266,7 +266,17 @@ const R_BITS: usize = RECORD_FIXED;
 
 const SCAN_FLAG_FLEXIBLE: u32 = 1 << 0;
 const SCAN_FLAG_WATCH_EMPTY: u32 = 1 << 1;
-const SCAN_FLAGS_VALID: u32 = SCAN_FLAG_FLEXIBLE | SCAN_FLAG_WATCH_EMPTY;
+// A preparation intent will consume one scarce preparation-slot token from the
+// pool when granted, before it can physically prepare. Run reservations that
+// share this registry do not. The bit is a pure function of the watch: a
+// preparation intent registers with the token pool unioned into its watch (so
+// it also wakes on any token release), while a run reservation never watches
+// the token sub-range. `for_claims` derives it and `validate_full` re-derives
+// and agrees, so it survives claim rewrites (REPLAN) because the watch is
+// immutable across them.
+const SCAN_FLAG_PREPARATION_INTENT: u32 = 1 << 2;
+const SCAN_FLAGS_VALID: u32 =
+    SCAN_FLAG_FLEXIBLE | SCAN_FLAG_WATCH_EMPTY | SCAN_FLAG_PREPARATION_INTENT;
 const _: () = assert!(R_WATCH_IDENTITY.is_multiple_of(std::mem::align_of::<u64>()));
 const _: () = assert!(R_CLAIM_IDENTITY.is_multiple_of(std::mem::align_of::<u64>()));
 const _: () = assert!(R_CLAIM_IDENTITY + std::mem::size_of::<u64>() == R_BITS);
@@ -538,8 +548,14 @@ pub(super) struct GrantAttempt<T> {
     /// exact activation atomically replaces both.
     pub preparation_claim: Option<ClaimSet>,
     /// Physical preparation resource that prevented this selected intent from
-    /// entering PENDING. It may lie outside the final-run watch; the registry
-    /// stores it only as a wake blocker and never folds it into run fairness.
+    /// entering PENDING. Retained for the mixing-invariant assertions below,
+    /// but no longer a wake blocker on the GRANTED path: the grant scan's
+    /// preparation-slot pool budget bounds the granted cohort to the free-slot
+    /// count, so a granted intent always has a slot to race for and a lost
+    /// token race requeues WAITING for the next budget-ordered grant instead of
+    /// pinning to one token. (The coordinator's own legitimate pool-full wait
+    /// is a separate path; its watch spans the whole pool, so any release wakes
+    /// it.) It may lie outside the final-run watch and is never run fairness.
     pub preparation_contention: Option<ContentionEvidence>,
     pub next_claim: ClaimSet,
     pub contention: Option<ContentionEvidence>,
@@ -1130,6 +1146,7 @@ struct ScanRecord {
     watch_modes: EncodedWatchModes,
     watch_identity: u64,
     flexible: bool,
+    preparation_intent: bool,
     blocked_on: Option<BlockedOn>,
     external_blocker: Option<ContentionMarker>,
     issue_serial: u64,
@@ -1151,6 +1168,11 @@ pub(super) struct Ticket {
     shared: Option<TicketSharedMaps>,
     _interrupt_waiter: Option<InterruptibleFlockWaiter>,
     finished: bool,
+    // Preparation-slot token sub-range, supplied by the coordinator loop that
+    // owns the topology so every scan this ticket drives applies the pool
+    // budget uniformly. `None` disables the budget (no preparation capacity, or
+    // a ticket that never coordinates a scan — e.g. tests).
+    preparation_tokens: Option<std::ops::Range<usize>>,
 }
 
 pub(super) enum PendingRegistration {
@@ -1298,6 +1320,7 @@ pub(super) fn import_pending_exec_handoff(
             shared: Some(shared),
             _interrupt_waiter: None,
             finished: false,
+            preparation_tokens: None,
         },
         record.claim,
     ))
@@ -1656,6 +1679,14 @@ impl Ticket {
         self.namespace.enter()
     }
 
+    /// Supply the preparation-slot token sub-range so every grant scan this
+    /// ticket drives (while it holds the coordinator license) applies the pool
+    /// budget. The coordinator loop, which owns the topology, sets this once;
+    /// the registry itself keeps treating the indices opaquely.
+    pub(super) fn set_preparation_tokens(&mut self, tokens: Option<std::ops::Range<usize>>) {
+        self.preparation_tokens = tokens;
+    }
+
     /// Publish a same-PID pre-exec arrival together with its complete bounded
     /// preparation footprint.  The caller already owns the matching physical
     /// permit flocks.  Returning `None` means an older registry claim won the
@@ -1763,6 +1794,7 @@ impl Ticket {
             shared: Some(shared),
             _interrupt_waiter: None,
             finished: false,
+            preparation_tokens: None,
         }))))
     }
 
@@ -2241,6 +2273,7 @@ impl Ticket {
             shared: Some(shared),
             _interrupt_waiter: interrupt_waiter,
             finished: false,
+            preparation_tokens: None,
         })
     }
 
@@ -2628,10 +2661,13 @@ impl Ticket {
                 if let Some(evidence) = result.contention.as_ref() {
                     validate_contention_within_watch(&[evidence.marker()], &watch)?;
                 }
-                let evidence = result
-                    .contention
-                    .as_ref()
-                    .or(result.preparation_contention.as_ref());
+                // Only CPU/LLC run-claim contention pins a record here. A lost
+                // preparation-token race no longer blocks: the grant scan's
+                // pool budget keeps the granted cohort within the free-slot
+                // count, so a granted intent has a slot to race for, and any
+                // transient miss simply requeues WAITING for the next
+                // budget-ordered grant. (See `preparation_contention`.)
+                let evidence = result.contention.as_ref();
                 if let Some(evidence) = evidence {
                     let marker = evidence.marker();
                     let serial = table.blocker_serial(marker.blocker, marker.mode)?;
@@ -2698,10 +2734,13 @@ impl Ticket {
                 if let Some(evidence) = result.contention.as_ref() {
                     validate_contention_within_watch(&[evidence.marker()], &watch)?;
                 }
-                let evidence = result
-                    .contention
-                    .as_ref()
-                    .or(result.preparation_contention.as_ref());
+                // Only CPU/LLC run-claim contention pins a record here. A lost
+                // preparation-token race no longer blocks: the grant scan's
+                // pool budget keeps the granted cohort within the free-slot
+                // count, so a granted intent has a slot to race for, and any
+                // transient miss simply requeues WAITING for the next
+                // budget-ordered grant. (See `preparation_contention`.)
+                let evidence = result.contention.as_ref();
                 if let Some(evidence) = evidence {
                     let marker = evidence.marker();
                     let serial = table.blocker_serial(marker.blocker, marker.mode)?;
@@ -2792,10 +2831,13 @@ impl Ticket {
                 if let Some(evidence) = result.contention.as_ref() {
                     validate_contention_within_watch(&[evidence.marker()], &watch)?;
                 }
-                let evidence = result
-                    .contention
-                    .as_ref()
-                    .or(result.preparation_contention.as_ref());
+                // Only CPU/LLC run-claim contention pins a record here. A lost
+                // preparation-token race no longer blocks: the grant scan's
+                // pool budget keeps the granted cohort within the free-slot
+                // count, so a granted intent has a slot to race for, and any
+                // transient miss simply requeues WAITING for the next
+                // budget-ordered grant. (See `preparation_contention`.)
+                let evidence = result.contention.as_ref();
                 if let Some(evidence) = evidence {
                     let marker = evidence.marker();
                     let serial = table.blocker_serial(marker.blocker, marker.mode)?;
@@ -3043,10 +3085,10 @@ impl Ticket {
             result.preparation_contention.is_none() || !changed,
             "preparation contention cannot replace the final-run designation",
         );
-        let blocked_evidence = result
-            .contention
-            .as_ref()
-            .or(result.preparation_contention.as_ref());
+        // Only CPU/LLC run-claim contention pins here; a lost preparation-token
+        // race no longer blocks (the pool budget guarantees the granted cohort
+        // a slot, so a miss simply requeues WAITING). See `preparation_contention`.
+        let blocked_evidence = result.contention.as_ref();
         let blocked = if let Some(evidence) = blocked_evidence {
             let marker = evidence.marker();
             Some((marker, table.blocker_serial(marker.blocker, marker.mode)?))
@@ -3294,7 +3336,7 @@ impl Ticket {
         }
         let should_scan = table.prepare_grant_scan()?;
         let (watch, coordinator_prefix_changed) = if should_scan {
-            table.grant_compatible()?
+            table.grant_compatible_with_tokens(self.preparation_tokens.as_ref())?
         } else {
             (table.aggregate_watch()?, false)
         };
@@ -3601,7 +3643,7 @@ impl Ticket {
             release();
         }
         let (watch, coordinator_prefix_changed) = if table.prepare_grant_scan()? {
-            table.grant_compatible()?
+            table.grant_compatible_with_tokens(self.preparation_tokens.as_ref())?
         } else {
             (table.aggregate_watch()?, false)
         };
@@ -3760,7 +3802,7 @@ impl Ticket {
             // reconcile the dirty predecessor suffix here. Exact cached-prefix
             // comparison preserves a disjoint expensive success while still
             // rejecting a genuinely stale payload below.
-            table.grant_compatible()?;
+            table.grant_compatible_with_tokens(self.preparation_tokens.as_ref())?;
             record = table
                 .record(self.slot)?
                 .filter(|record| record.ticket == self.ticket)
@@ -3857,7 +3899,7 @@ impl Ticket {
         let reconciled_dirty_suffix = table.min_changed_ticket() < record.ticket
             || table.pending_flags() & (PENDING_RESCAN | PENDING_REPLAN_RESCAN) != 0;
         if reconciled_dirty_suffix {
-            table.grant_compatible()?;
+            table.grant_compatible_with_tokens(self.preparation_tokens.as_ref())?;
             record = table
                 .record(self.slot)?
                 .filter(|record| record.ticket == self.ticket)
@@ -6483,6 +6525,301 @@ pub(super) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32
 }
 
 #[cfg(test)]
+pub(crate) struct PreparationPoolBudgetOutcome {
+    pub(crate) pool: usize,
+    pub(crate) waiters: usize,
+    pub(crate) granted_in_one_scan: usize,
+    pub(crate) oldest_prefix_granted: bool,
+    pub(crate) surplus_none_granted: bool,
+    pub(crate) surplus_none_pinned: bool,
+}
+
+/// Work-conservation and FIFO for the preparation-slot pool: a single scan
+/// over `WAITERS` compatible preparation intents with a `POOL`-slot budget must
+/// grant exactly `min(WAITERS, POOL)` of them, the oldest by ticket, and leave
+/// the surplus WAITING without pinning any to a token.
+#[cfg(test)]
+pub(super) fn exercise_preparation_pool_budget_for_tests() -> Result<PreparationPoolBudgetOutcome> {
+    const POOL: usize = 2;
+    const WAITERS: usize = 5;
+    let tokens = super::super::preparation_token_range()?;
+    anyhow::ensure!(
+        tokens.len() >= POOL,
+        "host preparation pool {} too small for budget test",
+        tokens.len(),
+    );
+    let pool = tokens.start..tokens.start + POOL;
+    let run_cpu = 7usize;
+    let coord_claim = ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coord_claim.clone(), coord_claim, None)?;
+    // The run claim carries no token; unioning one pool token into the watch is
+    // what marks the record a token-consuming preparation intent for the scan.
+    let waiter_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [run_cpu],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let waiter_watch = ClaimSet::with_permits(
+        std::iter::empty(),
+        [run_cpu],
+        [tokens.start],
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    );
+    let mut waiters = (0..WAITERS)
+        .map(|_| Ticket::register(waiter_claim.clone(), waiter_watch.clone(), None))
+        .collect::<Result<Vec<_>>>()?;
+
+    let (granted, oldest_prefix, surplus_none, surplus_unpinned) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.restage_coordinator_for_tests(&coordinator, waiters.iter())?;
+        set_cpu_free_for_tests(&mut table, run_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, 3, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), Some(&pool))?;
+
+        let mut granted = 0usize;
+        for waiter in &waiters {
+            if table
+                .record(waiter.slot)?
+                .is_some_and(|record| record.state == STATE_GRANTED)
+            {
+                granted += 1;
+            }
+        }
+        let mut oldest_prefix = true;
+        for waiter in &waiters[..POOL] {
+            oldest_prefix &= table
+                .record(waiter.slot)?
+                .is_some_and(|record| record.state == STATE_GRANTED);
+        }
+        let mut surplus_none = true;
+        let mut surplus_unpinned = true;
+        for waiter in &waiters[POOL..] {
+            let record = table
+                .record(waiter.slot)?
+                .ok_or_else(|| anyhow::anyhow!("budget-blocked waiter disappeared"))?;
+            surplus_none &= record.state != STATE_GRANTED;
+            surplus_unpinned &= record.blocked_on.is_none();
+        }
+        (granted, oldest_prefix, surplus_none, surplus_unpinned)
+    };
+    for waiter in &mut waiters {
+        waiter.finish(None)?;
+    }
+    coordinator.finish(None)?;
+    Ok(PreparationPoolBudgetOutcome {
+        pool: POOL,
+        waiters: WAITERS,
+        granted_in_one_scan: granted,
+        oldest_prefix_granted: oldest_prefix,
+        surplus_none_granted: surplus_none,
+        surplus_none_pinned: surplus_unpinned,
+    })
+}
+
+#[cfg(test)]
+pub(crate) struct PreparationPoolStarvationOutcome {
+    pub(crate) blocked_while_full: usize,
+    pub(crate) oldest_wins_freed_slot: bool,
+    pub(crate) newcomer_still_blocked: bool,
+}
+
+/// FIFO starvation-freedom under churn: with a full one-slot pool, the oldest
+/// waiter and a newcomer both wait; when the held slot frees, the very next
+/// scan grants the oldest — never the newcomer — in bounded time (one scan).
+#[cfg(test)]
+pub(super) fn exercise_preparation_pool_starvation_for_tests()
+-> Result<PreparationPoolStarvationOutcome> {
+    let tokens = super::super::preparation_token_range()?;
+    anyhow::ensure!(
+        tokens.len() >= 2,
+        "host preparation pool {} too small for starvation test",
+        tokens.len(),
+    );
+    let pool = tokens.start..tokens.start + 1;
+    let held_token = tokens.start;
+    let run_cpu = 9usize;
+    let coord_claim = ClaimSet::new(std::iter::empty(), [4usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coord_claim.clone(), coord_claim, None)?;
+    // A PENDING holder occupies the single pool slot: its acquired token is in
+    // its claim, so the scan counts it against the budget.
+    let holder_claim = ClaimSet::with_permits(
+        std::iter::empty(),
+        std::iter::empty(),
+        [held_token],
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    );
+    let mut holder = Ticket::register(holder_claim.clone(), holder_claim.clone(), None)?;
+    let waiter_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [run_cpu],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let waiter_watch = ClaimSet::with_permits(
+        std::iter::empty(),
+        [run_cpu],
+        [tokens.start],
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    );
+    // `oldest` registers before `newcomer`, so it holds the lower ticket.
+    let mut oldest = Ticket::register(waiter_claim.clone(), waiter_watch.clone(), None)?;
+    let mut newcomer = Ticket::register(waiter_claim.clone(), waiter_watch.clone(), None)?;
+
+    let blocked_while_full = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.restage_coordinator_for_tests(
+            &coordinator,
+            [&holder, &oldest, &newcomer].into_iter(),
+        )?;
+        table.set_record_state(holder.slot, STATE_PENDING)?;
+        set_cpu_free_for_tests(&mut table, run_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, 4, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), Some(&pool))?;
+        let mut blocked = 0usize;
+        for waiter in [&oldest, &newcomer] {
+            if table
+                .record(waiter.slot)?
+                .is_some_and(|record| record.state != STATE_GRANTED)
+            {
+                blocked += 1;
+            }
+        }
+        blocked
+    };
+
+    // Free the single slot by retiring the holder, then rescan.
+    holder.finish(None)?;
+    let (oldest_wins, newcomer_blocked) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, run_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), Some(&pool))?;
+        let oldest_wins = table
+            .record(oldest.slot)?
+            .is_some_and(|record| record.state == STATE_GRANTED);
+        let newcomer_blocked = table
+            .record(newcomer.slot)?
+            .is_some_and(|record| record.state != STATE_GRANTED);
+        (oldest_wins, newcomer_blocked)
+    };
+    oldest.finish(None)?;
+    newcomer.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(PreparationPoolStarvationOutcome {
+        blocked_while_full,
+        oldest_wins_freed_slot: oldest_wins,
+        newcomer_still_blocked: newcomer_blocked,
+    })
+}
+
+#[cfg(test)]
+pub(crate) struct PreparationPoolCrashRecoveryOutcome {
+    pub(crate) victim_granted: bool,
+    pub(crate) successor_blocked_before_prune: bool,
+    pub(crate) successor_granted_after_prune: bool,
+}
+
+/// Crash-safety of a budgeted slot: a preparation intent granted but not yet
+/// confirmed (GRANTED, still racing) holds a slot in the budget. If its process
+/// dies, the slot must not leak — its dead record keeps charging the budget only
+/// until liveness pruning removes it, after which the next scan hands the slot
+/// to a waiting successor.
+#[cfg(test)]
+pub(super) fn exercise_preparation_pool_crash_recovery_for_tests()
+-> Result<PreparationPoolCrashRecoveryOutcome> {
+    let tokens = super::super::preparation_token_range()?;
+    anyhow::ensure!(
+        tokens.len() >= 2,
+        "host preparation pool {} too small for crash-recovery test",
+        tokens.len(),
+    );
+    let pool = tokens.start..tokens.start + 1;
+    let run_cpu = 11usize;
+    let coord_claim = ClaimSet::new(std::iter::empty(), [5usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coord_claim.clone(), coord_claim, None)?;
+    let waiter_claim = ClaimSet::with_modes(
+        std::iter::empty(),
+        [run_cpu],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let waiter_watch = ClaimSet::with_permits(
+        std::iter::empty(),
+        [run_cpu],
+        [tokens.start],
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    );
+    let victim = Ticket::register(waiter_claim.clone(), waiter_watch.clone(), None)?;
+    let mut successor = Ticket::register(waiter_claim.clone(), waiter_watch.clone(), None)?;
+
+    let (victim_granted, successor_blocked) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.restage_coordinator_for_tests(&coordinator, [&victim, &successor].into_iter())?;
+        set_cpu_free_for_tests(&mut table, run_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, 5, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), Some(&pool))?;
+        let victim_granted = table
+            .record(victim.slot)?
+            .is_some_and(|record| record.state == STATE_GRANTED);
+        let successor_blocked = table
+            .record(successor.slot)?
+            .is_some_and(|record| record.state != STATE_GRANTED);
+        (victim_granted, successor_blocked)
+    };
+
+    // Model abrupt death of the granted-but-unconfirmed intent.
+    victim.abandon_for_tests();
+
+    // Its dead GRANTED record still charges the slot until it is pruned.
+    let successor_blocked_before_prune = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, run_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), Some(&pool))?;
+        table
+            .record(successor.slot)?
+            .is_some_and(|record| record.state != STATE_GRANTED)
+    };
+
+    // Liveness pruning reclaims the dead slot; the next scan grants the successor.
+    let successor_granted_after_prune = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.prune_dead()?;
+        set_cpu_free_for_tests(&mut table, run_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), Some(&pool))?;
+        table
+            .record(successor.slot)?
+            .is_some_and(|record| record.state == STATE_GRANTED)
+    };
+    successor.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(PreparationPoolCrashRecoveryOutcome {
+        victim_granted,
+        successor_blocked_before_prune: successor_blocked && successor_blocked_before_prune,
+        successor_granted_after_prune,
+    })
+}
+
+#[cfg(test)]
 pub(crate) struct WorkConservingBackfillOutcome {
     pub(crate) conflicting_grants: usize,
     pub(crate) conflicting_waiters: usize,
@@ -6568,7 +6905,7 @@ pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConser
             set_cpu_free_for_tests(&mut table, permit_resource_index(permit)?, true)?;
         }
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible_at(scan_now_ns)?;
+        table.grant_compatible_at(scan_now_ns, None)?;
 
         let head = table
             .record(wide_ticket.slot)?
@@ -6602,7 +6939,7 @@ pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConser
         set_cpu_availability_for_tests(&mut table, 0, CpuAvailability::SharedHeld)?;
         set_cpu_free_for_tests(&mut table, 1, false)?;
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible_at(backfill_started_ns.saturating_add(1))?;
+        table.grant_compatible_at(backfill_started_ns.saturating_add(1), None)?;
         count_state(&mut table, &conflicting, STATE_GRANTED)? == TEST_CAPACITY as usize
             && table
                 .record(conflicting[TEST_CAPACITY as usize].slot)?
@@ -6625,7 +6962,7 @@ pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConser
         set_cpu_availability_for_tests(&mut table, 0, CpuAvailability::SharedHeld)?;
         set_cpu_free_for_tests(&mut table, 1, false)?;
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible_at(expired_now_ns)?;
+        table.grant_compatible_at(expired_now_ns, None)?;
         count_state(&mut table, &conflicting, STATE_GRANTED)? == TEST_CAPACITY as usize - 1
             && table
                 .record(conflicting[CONFLICTING - 1].slot)?
@@ -6648,7 +6985,7 @@ pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConser
         set_cpu_free_for_tests(&mut table, 0, true)?;
         set_cpu_free_for_tests(&mut table, 1, true)?;
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible_at(expired_now_ns)?;
+        table.grant_compatible_at(expired_now_ns, None)?;
         (
             table
                 .record(wide_ticket.slot)?
@@ -7928,7 +8265,7 @@ fn exercise_encoded_watch_serial_memo_case_for_tests(
             write_u64(&mut table.header, H_REPLAN_WAVE_DEADLINE_NS, closed_now);
             table.set_pending_flag(PENDING_RESCAN);
             let walks_before = ENCODED_WATCH_SERIAL_WALKS.with(std::cell::Cell::get);
-            table.grant_compatible_at(closed_now)?;
+            table.grant_compatible_at(closed_now, None)?;
             closed_serial_walks = ENCODED_WATCH_SERIAL_WALKS
                 .with(std::cell::Cell::get)
                 .saturating_sub(walks_before);
@@ -7938,7 +8275,7 @@ fn exercise_encoded_watch_serial_memo_case_for_tests(
             table.arm_replan_wave_at(opened_now);
             table.set_pending_flag(PENDING_RESCAN);
             let walks_before = ENCODED_WATCH_SERIAL_WALKS.with(std::cell::Cell::get);
-            table.grant_compatible_at(opened_now)?;
+            table.grant_compatible_at(opened_now, None)?;
             opened_serial_walks = ENCODED_WATCH_SERIAL_WALKS
                 .with(std::cell::Cell::get)
                 .saturating_sub(walks_before);
@@ -9909,7 +10246,7 @@ pub(super) fn exercise_grant_completion_batch_for_tests() -> Result<GrantComplet
             && read_u64(&table.header, H_GRANT_SCANS) == scans_before;
         let due = table.prepare_grant_scan_at(deadline)?;
         if due {
-            table.grant_compatible_at(deadline)?;
+            table.grant_compatible_at(deadline, None)?;
         }
         let scan_delta = read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
         (
@@ -10076,7 +10413,7 @@ pub(super) fn exercise_deferred_rescan_policy_for_tests() -> Result<DeferredResc
             && table.pending_flags() & PENDING_REPLAN_RESCAN == 0
             && table.deferred_rescan_deadline_ns() == 0
             && read_u64(&table.header, H_GRANT_SCANS) == scans_before;
-        table.grant_compatible_at(first_deadline.saturating_sub(1))?;
+        table.grant_compatible_at(first_deadline.saturating_sub(1), None)?;
         (
             promoted,
             table.pending_flags() & PENDING_OBSERVATION != 0
@@ -10095,7 +10432,7 @@ pub(super) fn exercise_deferred_rescan_policy_for_tests() -> Result<DeferredResc
         let due = table.prepare_grant_scan_at(deadline)?;
         let promoted = table.pending_flags() & PENDING_RESCAN != 0
             && table.pending_flags() & PENDING_REPLAN_RESCAN == 0;
-        table.grant_compatible_at(deadline)?;
+        table.grant_compatible_at(deadline, None)?;
         before && due && promoted
     };
 
@@ -10205,7 +10542,7 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
         }
         set_cpu_free_for_tests(&mut table, later_grant_cpu, true)?;
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible_at(monotonic_now_ns()?.max(1))?;
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
         anyhow::ensure!(
             table.replan_outstanding() == 2
                 && table
@@ -10328,7 +10665,7 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
             table.prepare_grant_scan_at(shortened_deadline_ns)?,
             "shortened dirty-grant deadline did not promote its deferred scan",
         );
-        table.grant_compatible_at(shortened_deadline_ns)?;
+        table.grant_compatible_at(shortened_deadline_ns, None)?;
         let authoritative_scan_delta =
             read_u64(&table.header, H_GRANT_SCANS).wrapping_sub(scans_before);
         let completed_replacement_granted = table.record(first.slot)?.is_some_and(|record| {
@@ -10690,7 +11027,7 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
             set_cpu_free_for_tests(&mut table, cpu, false)?;
         }
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible_at(wave_started_ns)?;
+        table.grant_compatible_at(wave_started_ns, None)?;
         anyhow::ensure!(
             table.replan_outstanding() == callbacks.len() as u64
                 && table.replan_wave_started_ns() == wave_started_ns
@@ -10753,7 +11090,7 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
         let horizon_before = read_u64(&table.header, H_REPLAN_HORIZON);
         table.stamp_resource_improvement(S_CPU_EX, incremental_alternative_cpu)?;
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible_at(wave_started_ns.saturating_add(1))?;
+        table.grant_compatible_at(wave_started_ns.saturating_add(1), None)?;
         (
             table.replan_outstanding() == 3
                 && table
@@ -10829,7 +11166,7 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
                 == 0;
 
             set_cpu_free_for_tests(&mut table, replacement_cpus[0], true)?;
-            table.grant_compatible_at(wave_deadline_ns)?;
+            table.grant_compatible_at(wave_deadline_ns, None)?;
             completed_replacement_granted = table.record(completed_slot)?.is_some_and(|record| {
                 record.state == STATE_GRANTED && record.claim == completed_replacement_for_check
             });
@@ -10946,7 +11283,7 @@ pub(super) fn exercise_replan_expiry_publication_crash_for_tests() -> Result<boo
         set_cpu_free_for_tests(&mut table, callback_cpu, false)?;
         set_cpu_free_for_tests(&mut table, alternative_cpu, false)?;
         table.set_pending_flag(PENDING_RESCAN);
-        table.grant_compatible_at(monotonic_now_ns()?.max(1))?;
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
         anyhow::ensure!(
             table
                 .record(callback.slot)?
@@ -16309,11 +16646,27 @@ impl Table {
         TicketSharedMaps::open(self, slot, ticket)
     }
 
+    #[cfg(test)]
     fn grant_compatible(&mut self) -> Result<(ClaimSet, bool)> {
-        self.grant_compatible_at(monotonic_now_ns()?.max(1))
+        self.grant_compatible_at(monotonic_now_ns()?.max(1), None)
     }
 
-    fn grant_compatible_at(&mut self, backfill_now_ns: u64) -> Result<(ClaimSet, bool)> {
+    fn grant_compatible_with_tokens(
+        &mut self,
+        preparation_tokens: Option<&std::ops::Range<usize>>,
+    ) -> Result<(ClaimSet, bool)> {
+        self.grant_compatible_at(monotonic_now_ns()?.max(1), preparation_tokens)
+    }
+
+    // `preparation_tokens` is the preparation-slot permit sub-range, passed in
+    // by the caller that owns the topology so the registry stays index-opaque
+    // and does its pool arithmetic on given budget data. `None` disables the
+    // pool budget (non-preparation callers and tests).
+    fn grant_compatible_at(
+        &mut self,
+        backfill_now_ns: u64,
+        preparation_tokens: Option<&std::ops::Range<usize>>,
+    ) -> Result<(ClaimSet, bool)> {
         struct BackfillHead {
             claim: ScanClaim,
             available: u32,
@@ -16352,6 +16705,37 @@ impl Table {
         let claim_epoch = self.claim_epoch();
         let mut scan_publication_epoch = claim_epoch;
         let coordinator_ticket = self.coordinator_ticket();
+        // Preparation-slot pool budget. The scan grants at most the currently
+        // free token count, in ticket order, so the oldest eligible waiter is
+        // guaranteed the next freed slot and the granted cohort never exceeds
+        // the pool it will physically race (so no granted waiter loses the race
+        // and needs a per-token blocked pin). `preparation_tokens_consumed`
+        // accrues tokens already held by fenced PENDING records — their
+        // acquired token is in the claim, so `add_claim_bits` and this counter
+        // see it — plus one per preparation grant this scan, because a WAITING
+        // intent's run claim carries no token yet and the scan must count its
+        // own not-yet-physical grants. The coordinator is the privileged FIFO
+        // head: if it is itself a token-needing preparation intent still racing
+        // (not yet PENDING/HELD), one slot is reserved out of the budget so a
+        // junior budgeted waiter can never win the slot ahead of it.
+        let preparation_pool = preparation_tokens.map_or(0, |range| range.len());
+        let mut preparation_tokens_consumed = 0usize;
+        let coordinator_reserve = usize::from(
+            preparation_tokens.is_some()
+                && records.iter().any(|record| {
+                    record.ticket == coordinator_ticket
+                        && record.preparation_intent
+                        && !matches!(record.state, STATE_PENDING | STATE_HELD)
+                }),
+        );
+        let preparation_tokens_in_claim = |claim: &ScanClaim| -> usize {
+            preparation_tokens.map_or(0, |range| {
+                claim
+                    .permits()
+                    .filter(|permit| range.contains(permit))
+                    .count()
+            })
+        };
         let global_serial = self.global_serial();
         // REPLAN is a speculative planner callback, not a resource claim. A
         // host-width window bounds concurrent placement computation while
@@ -16425,6 +16809,19 @@ impl Table {
                     &mut llc_exclusive,
                     self.layout.bits,
                 )?;
+                // A PENDING record physically holds its preparation token, and
+                // that token is in its claim, so count it directly. A REVOKED
+                // preparation grant's callback may still own a token it raced
+                // before acknowledging the revoke (its run claim no longer
+                // names one), so charge its slot conservatively to keep the
+                // budget from over-granting against an in-flight release.
+                preparation_tokens_consumed += if record.state == STATE_PENDING {
+                    preparation_tokens_in_claim(&record.claim)
+                } else if record.preparation_intent {
+                    1
+                } else {
+                    0
+                };
                 if record.backfill_started_ns != 0 {
                     self.set_record_backfill_started_ns(record.slot, 0)?;
                     changed = true;
@@ -16514,6 +16911,18 @@ impl Table {
             };
             let acquisition_viable =
                 !conflict && availability_compatible && blocker_ready && !fairness_blocked;
+            // Preparation-slot pool gate. A WAITING preparation intent may be
+            // granted only while a free token remains after tokens held by
+            // fenced PENDING records, this scan's earlier preparation grants,
+            // and the coordinator's reserved head slot. Ticket order makes the
+            // budget FIFO: when a token frees, the next scan grants the oldest
+            // still-blocked preparation intent first. A pool-blocked intent
+            // stays plain WAITING — never blocked-pinned — and its now-in-watch
+            // token pool wakes it on any release, so the next scan re-evaluates
+            // it. Run reservations (not preparation intents) never gate here.
+            let preparation_pool_blocked = record.preparation_intent
+                && preparation_tokens.is_some()
+                && preparation_tokens_consumed + coordinator_reserve >= preparation_pool;
             let mut scan_state = record.state;
             if record.state == STATE_COORDINATOR {
                 // A coordinator can now sit behind live GRANTED/REPLAN
@@ -16580,6 +16989,7 @@ impl Table {
             } else if record.state == STATE_WAITING
                 && record.ticket != coordinator_ticket
                 && acquisition_viable
+                && !preparation_pool_blocked
             {
                 // Charge only an actual new conflicting grant. Disjoint work
                 // is unbounded; existing PENDING/GRANTED/HELD callbacks were
@@ -16608,9 +17018,15 @@ impl Table {
                 && record.ticket != coordinator_ticket
                 && flexible
                 && consider_waiting_replan
+                && !preparation_pool_blocked
                 && replan_publication_open
                 && replan_slots != 0
             {
+                // A pool-blocked preparation intent is not replanned: the pool,
+                // not its CPU/LLC placement, is the binding constraint, so
+                // replanning would only churn. Left plain WAITING, it is granted
+                // directly by the next scan once a slot frees, in ticket order.
+                //
                 // The global serial is an O(1) rejection filter. Walk this
                 // ticket's encoded alternative watch only when a newer global
                 // observation could actually be relevant. Every eligible
@@ -16714,6 +17130,16 @@ impl Table {
                     &mut llc_exclusive,
                     self.layout.bits,
                 )?;
+                // A GRANTED preparation intent — whether granted in an earlier
+                // scan and still racing, or promoted from WAITING just above —
+                // reserves one pool token it has not yet turned into a PENDING
+                // claim. Charge it here (its run claim names no token) so a
+                // junior waiter later in ticket order cannot be granted against
+                // a slot this cohort is already racing for. HELD has released
+                // its token; the coordinator is charged via the head reserve.
+                if scan_state == STATE_GRANTED && record.preparation_intent {
+                    preparation_tokens_consumed += 1;
+                }
             } else if backfill_head.is_none()
                 && !conflict
                 && !fairness_blocked
@@ -19084,6 +19510,20 @@ impl ScanMetadata {
         if watch_empty {
             flags |= SCAN_FLAG_WATCH_EMPTY;
         }
+        // A preparation intent unions the token pool into its watch; a run
+        // reservation never watches the token sub-range. The pool is the
+        // topmost permit sub-range, so any watched permit at or above its base
+        // marks this record as a token-consuming preparation intent. This is
+        // the same kind of topology-boundary lookup `watch_cooperative_permits`
+        // below already performs, and it is a pure function of `watch`.
+        if watch
+            .permits
+            .range(super::super::preparation_token_pool_start()?..)
+            .next()
+            .is_some()
+        {
+            flags |= SCAN_FLAG_PREPARATION_INTENT;
+        }
         Ok(Self {
             flags,
             watch_cpus: u32::try_from(watch.cpus.len())
@@ -19357,6 +19797,7 @@ fn decode_scan_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<S
         },
     };
     let flexible = metadata.flags & SCAN_FLAG_FLEXIBLE != 0;
+    let preparation_intent = metadata.flags & SCAN_FLAG_PREPARATION_INTENT != 0;
     let watch_empty = metadata.flags & SCAN_FLAG_WATCH_EMPTY != 0;
     if read_u32(bytes, R_STATE) == STATE_PENDING && watch_empty {
         anyhow::bail!("queue registry v{VERSION} slot {slot} is PENDING with an empty watch");
@@ -19390,6 +19831,7 @@ fn decode_scan_record(bytes: &[u8], layout: HeaderLayout, slot: u64) -> Result<S
         watch_modes,
         watch_identity: metadata.watch_identity,
         flexible,
+        preparation_intent,
         blocked_on,
         external_blocker,
         issue_serial: read_u64(bytes, R_ISSUE_SERIAL),

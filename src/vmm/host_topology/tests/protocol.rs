@@ -4571,6 +4571,68 @@ fn backfill_is_weighted_by_cooperative_capacity_instead_of_callback_count() {
 }
 
 #[test]
+fn preparation_pool_budget_grants_min_waiters_pool_in_ticket_order() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_preparation_pool_budget_for_tests()
+        .expect("exercise preparation-pool budget");
+    assert_eq!(
+        outcome.granted_in_one_scan, outcome.pool,
+        "one scan must grant exactly min(waiters, pool) preparation intents: {} granted of {} waiters for a {}-slot pool",
+        outcome.granted_in_one_scan, outcome.waiters, outcome.pool,
+    );
+    assert!(
+        outcome.oldest_prefix_granted,
+        "the granted cohort must be the oldest waiters by ticket order (FIFO)",
+    );
+    assert!(
+        outcome.surplus_none_granted,
+        "the pool budget must leave every surplus waiter ungranted rather than over-committing the pool",
+    );
+    assert!(
+        outcome.surplus_none_pinned,
+        "a pool-blocked waiter must stay plain WAITING, never pinned to a single token",
+    );
+}
+
+#[test]
+fn preparation_pool_oldest_waiter_wins_the_freed_slot_before_a_newcomer() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_preparation_pool_starvation_for_tests()
+        .expect("exercise preparation-pool starvation freedom");
+    assert_eq!(
+        outcome.blocked_while_full, 2,
+        "both the oldest waiter and the newcomer must wait while the single pool slot is held",
+    );
+    assert!(
+        outcome.oldest_wins_freed_slot,
+        "the scan after a slot frees must grant the oldest waiter; the freed-slot event reaches the coordinator because the pool is now in its watch",
+    );
+    assert!(
+        outcome.newcomer_still_blocked,
+        "a newcomer must not win the single freed slot ahead of the older waiter",
+    );
+}
+
+#[test]
+fn preparation_pool_slot_of_a_crashed_granted_intent_is_reclaimed_by_pruning() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_preparation_pool_crash_recovery_for_tests()
+        .expect("exercise preparation-pool crash recovery");
+    assert!(
+        outcome.victim_granted,
+        "the oldest waiter must first be granted the single pool slot",
+    );
+    assert!(
+        outcome.successor_blocked_before_prune,
+        "a dead granted intent must keep charging its slot until pruning, so the successor stays blocked",
+    );
+    assert!(
+        outcome.successor_granted_after_prune,
+        "liveness pruning must reclaim the crashed intent's slot so the next scan grants the successor",
+    );
+}
+
+#[test]
 fn unavailable_wide_head_refills_live_backfill_capacity_until_bounded_age_then_drains() {
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_work_conserving_backfill_for_tests()
@@ -8675,6 +8737,7 @@ struct HerdMetrics {
     ideal_lower_bound: std::time::Duration,
     total_exclusive_cpu_units: usize,
     grant_scans: u64,
+    event_wakes: u64,
     generation: u64,
     peak_active_records: u64,
     peak_replan_outstanding: u64,
@@ -8861,6 +8924,7 @@ fn run_herd_benchmark(cells: usize, hold: std::time::Duration, contended: bool) 
     }
 
     start_gate.wait();
+    let event_wakes_before = protocol::coordinator_event_wakes_for_tests();
     let start = std::time::Instant::now();
     // Watchdog: after the deadline, drain any still-blocked waiters via the
     // interruptible-flock broker so the join below is always bounded.
@@ -8881,6 +8945,8 @@ fn run_herd_benchmark(cells: usize, hold: std::time::Duration, contended: bool) 
         handle.join().expect("herd cell join");
     }
     let makespan = start.elapsed();
+    let event_wakes =
+        protocol::coordinator_event_wakes_for_tests().saturating_sub(event_wakes_before);
     done.store(true, Ordering::Relaxed);
     monitor.join().expect("monitor join");
     watchdog.join().expect("watchdog join");
@@ -8902,6 +8968,7 @@ fn run_herd_benchmark(cells: usize, hold: std::time::Duration, contended: bool) 
         ideal_lower_bound,
         total_exclusive_cpu_units,
         grant_scans,
+        event_wakes,
         generation,
         peak_active_records: peak_active_records.load(Ordering::Relaxed),
         peak_replan_outstanding: peak_replan.load(Ordering::Relaxed),
@@ -8944,6 +9011,11 @@ fn report_herd_metrics(m: &HerdMetrics) {
     eprintln!("  grants/sec          {:>10.0}", grants_per_sec);
     eprintln!("  grant_scans         {:>10}", m.grant_scans);
     eprintln!("  scans / grant       {:>10.2}", scans_per_grant);
+    eprintln!("  coord event_wakes   {:>10}", m.event_wakes);
+    eprintln!(
+        "  event_wakes / grant {:>10.2}",
+        m.event_wakes as f64 / m.cells as f64
+    );
     eprintln!("  generation          {:>10}", m.generation);
     eprintln!("  peak active_records {:>10}", m.peak_active_records);
     eprintln!("  peak replan_outstd  {:>10}", m.peak_replan_outstanding);

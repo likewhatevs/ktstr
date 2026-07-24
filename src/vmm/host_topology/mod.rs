@@ -4045,6 +4045,22 @@ fn preparation_slot_capacity(
 }
 
 fn preparation_token_range() -> Result<std::ops::Range<usize>> {
+    // Host topology is fixed for the process lifetime, and this range is
+    // consulted on hot paths — every physical preparation sweep, every grant
+    // scan a coordinator drives, and every claim-metadata write. Compute it
+    // once so those callers pay a cached load, not repeated /proc and /sys
+    // reads (which also keeps the coordinator's latency footprint small on the
+    // timing-sensitive cross-process wake paths).
+    static RANGE: std::sync::OnceLock<std::ops::Range<usize>> = std::sync::OnceLock::new();
+    if let Some(range) = RANGE.get() {
+        return Ok(range.clone());
+    }
+    let range = preparation_token_range_uncached()?;
+    let _ = RANGE.set(range.clone());
+    Ok(range)
+}
+
+fn preparation_token_range_uncached() -> Result<std::ops::Range<usize>> {
     let possible_width = possible_cpu_width();
     let cpu = AdmissionPermitPool::for_host(possible_width);
     let memory = MemoryPermitPool::for_host()?;
@@ -4069,6 +4085,13 @@ fn preparation_token_range() -> Result<std::ops::Range<usize>> {
         .checked_add(slots)
         .ok_or_else(|| anyhow::anyhow!("preparation token namespace overflow"))?;
     Ok(base..end)
+}
+
+/// The first permit index of the preparation-token sub-range. Used by the hot
+/// metadata path (`ScanMetadata::for_claims`, which asks whether a watch covers
+/// the token pool once per claim write); the underlying range is memoized.
+pub(super) fn preparation_token_pool_start() -> Result<usize> {
+    Ok(preparation_token_range()?.start)
 }
 
 fn build_permit_range(cpu_count: usize) -> Result<std::ops::Range<usize>> {
@@ -4503,6 +4526,28 @@ pub(super) fn wait_for_preparation_contention(
 /// selected intent is waiting for a physical preparation tuple. It is not a
 /// registry claim and therefore neither reserves capacity nor inflates the
 /// intent's fairness weight.
+/// The token pool alone, as a watch envelope to union into a preparation
+/// intent's registered watch. Two purposes: (1) it makes the intent wake on
+/// any token release (the pool release event reaches every waiter, not only a
+/// pinned one — the property that lets the per-token blocked pin be retired),
+/// and (2) it is the exact, derivable discriminator the scan uses to identify
+/// a token-consuming preparation intent (`SCAN_FLAG_PREPARATION_INTENT`). Only
+/// the token pool is unioned — not the full `preparation_resource_watch`, whose
+/// `host_allowed_cpus` would broaden CPU event-watch well past the bounded
+/// pool-sized traffic. Tokens are acquired Exclusive, so the pool is watched
+/// Exclusive to observe their release serials; the run watch already carries
+/// `permit_mode` Exclusive, so the union changes no mode.
+pub(super) fn preparation_token_pool_watch() -> Result<protocol::ClaimSet> {
+    Ok(protocol::ClaimSet::with_permits(
+        std::iter::empty(),
+        std::iter::empty(),
+        preparation_token_range()?,
+        FlockMode::Shared,
+        FlockMode::Shared,
+        FlockMode::Exclusive,
+    ))
+}
+
 pub(super) fn preparation_resource_watch() -> Result<protocol::ClaimSet> {
     let cpu = AdmissionPermitPool::for_host(possible_cpu_width());
     let memory = MemoryPermitPool::for_host()?;
