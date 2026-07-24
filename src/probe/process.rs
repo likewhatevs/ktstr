@@ -1039,6 +1039,183 @@ fn set_rodata_slot(
     }
 }
 
+/// Bounded retry count for the kernel-function fexit batch load.
+///
+/// On a heavily contended host the fexit `BPF_PROG_LOAD` can be
+/// rejected with a transient error even for a privileged loader whose
+/// same targets load cleanly on a quiet host — observed as an
+/// intermittent `EPERM (os error 13)` on the busiest arm64 CI lanes,
+/// which dropped the exit-side counters and left the failure dump a
+/// placeholder. Retrying the open+load a few times with a short
+/// backoff — a cost bounded well inside the probe's boot budget —
+/// recovers the real counters. `set_attach_target` is deterministic,
+/// so a chunk with no valid target is never retried.
+const KERNEL_FEXIT_LOAD_ATTEMPTS: u32 = 3;
+
+// More than one attempt is the whole point: it turns a transient load
+// EPERM into a recovered load rather than an immediate placeholder dump.
+const _: () = assert!(
+    KERNEL_FEXIT_LOAD_ATTEMPTS >= 2,
+    "the kernel-fexit batch load must retry at least once"
+);
+
+/// Base backoff between kernel-fexit load attempts, scaled by the
+/// zero-based attempt number (see [`kernel_fexit_load_backoff`]).
+const KERNEL_FEXIT_LOAD_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Backoff before load `attempt` (zero-based): no wait before the
+/// first try, then a linear ramp (0, base, 2·base, …). Factored out so
+/// the schedule is unit-testable without loading BPF.
+fn kernel_fexit_load_backoff(attempt: u32) -> std::time::Duration {
+    KERNEL_FEXIT_LOAD_BACKOFF * attempt
+}
+
+/// Open, configure, load, and attach one batch (`chunk`) of
+/// kernel-function fexit targets against vmlinux BTF (fd 0), retrying
+/// the load [`KERNEL_FEXIT_LOAD_ATTEMPTS`] times on a transient
+/// failure.
+///
+/// `chunk` is `(func_idx, func_name)` pairs, at most `batch` long;
+/// `batch` is the skeleton's fexit slot count. `probe_data_fd` and
+/// `func_meta_fd` are the main skeleton's maps, reused so the fexit
+/// programs write into the shared maps. Attached links are pushed onto
+/// `fexit_links`; `label` tags the log lines with the caller's phase.
+///
+/// Returns `Ok(())` once a load succeeds (individual attach failures
+/// are logged, not fatal) or when the chunk had no valid attach target
+/// (a deterministic outcome that is not retried). Returns
+/// `Err((error, targeted_names))` when every attempt failed so the
+/// caller can surface the error and record the affected functions.
+fn load_kernel_fexit_batch(
+    chunk: &[(u32, &str)],
+    batch: usize,
+    probe_data_fd: std::os::unix::io::BorrowedFd<'_>,
+    func_meta_fd: std::os::unix::io::BorrowedFd<'_>,
+    fexit_links: &mut Vec<libbpf_rs::Link>,
+    label: &str,
+) -> Result<(), (libbpf_rs::Error, Vec<String>)> {
+    use crate::bpf_skel::fentry::*;
+    use libbpf_rs::skel::{OpenSkel, SkelBuilder};
+
+    let mut load_err: Option<libbpf_rs::Error> = None;
+
+    for attempt in 0..KERNEL_FEXIT_LOAD_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(kernel_fexit_load_backoff(attempt));
+        }
+
+        // `.load()` consumes the open skeleton, so the whole open must
+        // be rebuilt each attempt; the obj storage lives for this
+        // iteration only.
+        let mut fentry_open_obj = std::mem::MaybeUninit::uninit();
+        let mut fentry_open = match FentryProbeSkelBuilder::default().open(&mut fentry_open_obj) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(%e, label, "kernel fexit skeleton open failed");
+                load_err = Some(e);
+                continue;
+            }
+        };
+
+        if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
+            rodata.ktstr_enabled = true;
+            for (slot, &(idx, _)) in chunk.iter().enumerate() {
+                set_rodata_slot(rodata, slot, idx, true);
+            }
+        }
+
+        // Only fexit programs are needed here (entry capture is the
+        // kprobe skeleton's job): disable the fentry half and point
+        // each fexit program at its kernel function.
+        let mut ok = vec![false; chunk.len()];
+        for (slot, &(_, name)) in chunk.iter().enumerate() {
+            let Some(fentry_prog) = fentry_prog_mut_by_slot(&mut fentry_open, slot) else {
+                continue;
+            };
+            fentry_prog.set_autoload(false);
+
+            let Some(fexit_prog) = fexit_prog_mut_by_slot(&mut fentry_open, slot) else {
+                continue;
+            };
+            match fexit_prog.set_attach_target(0, Some(name.to_string())) {
+                Ok(()) => {
+                    ok[slot] = true;
+                    tracing::debug!(
+                        slot,
+                        func = name,
+                        label,
+                        "kernel fexit: set_attach_target ok"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(slot, func = name, %e, label, "kernel fexit: set_attach_target failed");
+                    fexit_prog.set_autoload(false);
+                }
+            }
+        }
+
+        if !ok.iter().any(|&v| v) {
+            // No valid attach target in this chunk; retrying cannot
+            // change a deterministic set_attach_target outcome.
+            return Ok(());
+        }
+
+        // Disable both halves of every unused slot. A generic
+        // `SEC("fentry")` program without an attach target is not a
+        // valid load target on all kernels; leaving an unused entry
+        // half enabled can reject the whole short final batch with
+        // EINVAL even though every used fexit target is valid.
+        for slot in 0..batch {
+            if !ok.get(slot).copied().unwrap_or(false) {
+                disable_slot_programs(&mut fentry_open, slot);
+            }
+        }
+
+        if let Err(e) = fentry_open.maps.probe_data.reuse_fd(probe_data_fd) {
+            tracing::warn!(%e, label, "kernel fexit: probe_data reuse_fd failed");
+        }
+        if let Err(e) = fentry_open.maps.func_meta_map.reuse_fd(func_meta_fd) {
+            tracing::warn!(%e, label, "kernel fexit: func_meta_map reuse_fd failed");
+        }
+
+        let fentry_skel = match fentry_open.load() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(%e, attempt, label, "kernel fexit: batch load attempt failed");
+                load_err = Some(e);
+                continue;
+            }
+        };
+
+        for (slot, &(_, name)) in chunk.iter().enumerate() {
+            if !ok[slot] {
+                continue;
+            }
+            let Some(result) = attach_fexit_by_slot(&fentry_skel, slot) else {
+                continue;
+            };
+            match result {
+                Ok(link) => {
+                    tracing::debug!(func = name, label, "kernel fexit attached");
+                    fexit_links.push(link);
+                }
+                Err(e) => {
+                    tracing::debug!(%e, func = name, label, "kernel fexit attach failed");
+                }
+            }
+        }
+
+        drop(fentry_skel);
+        return Ok(());
+    }
+
+    let targeted: Vec<String> = chunk.iter().map(|&(_, name)| name.to_string()).collect();
+    Err((
+        load_err.expect("load_err is Some whenever every load attempt failed"),
+        targeted,
+    ))
+}
+
 /// Causal-task filter for the trigger event's `task_ptr` (sourced
 /// from `args[0]`).
 ///
@@ -1718,127 +1895,29 @@ pub fn run_probe_skeleton(
     } // end if phase_b_rx.is_none() — BPF callback batches
 
     // --- Kernel function fexit batches (fd=0 = vmlinux BTF) ---
+    use std::os::unix::io::AsFd;
     for chunk in kernel_fexit_targets.chunks(FENTRY_BATCH) {
-        let mut targets: Vec<FentryTarget<'_>> = Vec::new();
-        for (slot, kt) in chunk.iter().enumerate() {
-            targets.push(FentryTarget {
-                slot,
-                fd: 0, // vmlinux BTF
-                idx: kt.idx,
-                name: &kt.name,
-                ok: false,
-                is_kernel: true,
-            });
-        }
-
-        use crate::bpf_skel::fentry::*;
-        let mut fentry_open_obj = std::mem::MaybeUninit::uninit();
-        let fentry_builder = FentryProbeSkelBuilder::default();
-        let mut fentry_open = match fentry_builder.open(&mut fentry_open_obj) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(%e, "kernel fexit skeleton open failed");
-                continue;
-            }
-        };
-
-        if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
-            rodata.ktstr_enabled = true;
-            for t in &targets {
-                set_rodata_slot(rodata, t.slot, t.idx, t.is_kernel);
+        let names: Vec<(u32, &str)> = chunk.iter().map(|kt| (kt.idx, kt.name.as_str())).collect();
+        if let Err((e, targeted)) = load_kernel_fexit_batch(
+            &names,
+            FENTRY_BATCH,
+            skel.maps.probe_data.as_fd(),
+            skel.maps.func_meta_map.as_fd(),
+            &mut fexit_links,
+            "kernel fexit",
+        ) {
+            tracing::warn!(
+                %e,
+                kind = ?e.kind(),
+                attempts = KERNEL_FEXIT_LOAD_ATTEMPTS,
+                targets = ?targeted,
+                "kernel fexit: batch load failed",
+            );
+            for name in targeted {
+                diag.fentry_attach_failed
+                    .push((name, format!("batch load: {e}")));
             }
         }
-
-        // For kernel fexit, we only need fexit programs — disable fentry
-        // (entry capture is handled by the kprobe skeleton).
-        for t in targets.iter_mut() {
-            // Disable fentry for kernel functions (kprobe handles entry).
-            let Some(fentry_prog) = fentry_prog_mut_by_slot(&mut fentry_open, t.slot) else {
-                continue;
-            };
-            fentry_prog.set_autoload(false);
-
-            // Set fexit attach target with fd=0 (vmlinux BTF).
-            let Some(fexit_prog) = fexit_prog_mut_by_slot(&mut fentry_open, t.slot) else {
-                continue;
-            };
-            match fexit_prog.set_attach_target(0, Some(t.name.to_string())) {
-                Ok(()) => {
-                    t.ok = true;
-                    tracing::debug!(
-                        slot = t.slot,
-                        func = t.name,
-                        "kernel fexit: set_attach_target ok"
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!(slot = t.slot, func = t.name, %e, "kernel fexit: set_attach_target failed");
-                    fexit_prog.set_autoload(false);
-                }
-            }
-        }
-
-        if !targets.iter().any(|t| t.ok) {
-            continue;
-        }
-
-        // Disable both programs for unused slots. A generic `SEC("fentry")`
-        // program without an attach target is not a valid load target on all
-        // kernels; leaving the unused entry half enabled can reject the whole
-        // short final batch with EINVAL even though every used fexit target is
-        // valid.
-        let used_slots: std::collections::HashSet<usize> =
-            targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
-        for slot in 0..FENTRY_BATCH {
-            if !used_slots.contains(&slot) {
-                disable_slot_programs(&mut fentry_open, slot);
-            }
-        }
-
-        // Reuse probe_data and func_meta_map from the main skeleton.
-        use std::os::unix::io::AsFd;
-        if let Err(e) = fentry_open
-            .maps
-            .probe_data
-            .reuse_fd(skel.maps.probe_data.as_fd())
-        {
-            tracing::warn!(%e, "kernel fexit: probe_data reuse_fd failed");
-        }
-        if let Err(e) = fentry_open
-            .maps
-            .func_meta_map
-            .reuse_fd(skel.maps.func_meta_map.as_fd())
-        {
-            tracing::warn!(%e, "kernel fexit: func_meta_map reuse_fd failed");
-        }
-
-        let fentry_skel = match fentry_open.load() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(%e, "kernel fexit: batch load failed");
-                continue;
-            }
-        };
-
-        for t in &targets {
-            if !t.ok {
-                continue;
-            }
-            let Some(result) = attach_fexit_by_slot(&fentry_skel, t.slot) else {
-                continue;
-            };
-            match result {
-                Ok(link) => {
-                    tracing::debug!(func = t.name, "kernel fexit attached");
-                    fexit_links.push(link);
-                }
-                Err(e) => {
-                    tracing::debug!(%e, func = t.name, "kernel fexit attach failed");
-                }
-            }
-        }
-
-        drop(fentry_skel);
     }
     if !kernel_fexit_targets.is_empty() {
         tracing::debug!(
@@ -2703,114 +2782,29 @@ fn attach_phase_b_fentry(
     }
 
     // --- Phase B kernel function fexit batches (fd=0 = vmlinux BTF) ---
+    use std::os::unix::io::AsFd;
     for chunk in kernel_fexit_targets.chunks(FENTRY_BATCH) {
-        let mut targets: Vec<FentryTarget<'_>> = Vec::new();
-        for (slot, kt) in chunk.iter().enumerate() {
-            targets.push(FentryTarget {
-                slot,
-                fd: 0,
-                idx: kt.idx,
-                name: &kt.name,
-                ok: false,
-                is_kernel: true,
-            });
-        }
-
-        use crate::bpf_skel::fentry::*;
-        let mut fentry_open_obj = std::mem::MaybeUninit::uninit();
-        let fentry_builder = FentryProbeSkelBuilder::default();
-        let mut fentry_open = match fentry_builder.open(&mut fentry_open_obj) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(%e, "phase_b kernel fexit skeleton open failed");
-                continue;
-            }
-        };
-
-        if let Some(rodata) = fentry_open.maps.rodata_data.as_mut() {
-            rodata.ktstr_enabled = true;
-            for t in &targets {
-                set_rodata_slot(rodata, t.slot, t.idx, t.is_kernel);
+        let names: Vec<(u32, &str)> = chunk.iter().map(|kt| (kt.idx, kt.name.as_str())).collect();
+        if let Err((e, targeted)) = load_kernel_fexit_batch(
+            &names,
+            FENTRY_BATCH,
+            skel.maps.probe_data.as_fd(),
+            skel.maps.func_meta_map.as_fd(),
+            fexit_links,
+            "phase_b kernel fexit",
+        ) {
+            tracing::warn!(
+                %e,
+                kind = ?e.kind(),
+                attempts = KERNEL_FEXIT_LOAD_ATTEMPTS,
+                targets = ?targeted,
+                "phase_b kernel fexit: batch load failed",
+            );
+            for name in targeted {
+                diag.fentry_attach_failed
+                    .push((name, format!("batch load: {e}")));
             }
         }
-
-        for t in targets.iter_mut() {
-            let Some(fentry_prog) = fentry_prog_mut_by_slot(&mut fentry_open, t.slot) else {
-                continue;
-            };
-            fentry_prog.set_autoload(false);
-
-            let Some(fexit_prog) = fexit_prog_mut_by_slot(&mut fentry_open, t.slot) else {
-                continue;
-            };
-            match fexit_prog.set_attach_target(0, Some(t.name.to_string())) {
-                Ok(()) => {
-                    t.ok = true;
-                }
-                Err(e) => {
-                    tracing::debug!(func = t.name, %e, "phase_b kernel fexit: set_attach_target failed");
-                    fexit_prog.set_autoload(false);
-                }
-            }
-        }
-
-        if !targets.iter().any(|t| t.ok) {
-            continue;
-        }
-
-        // Disable both halves for unused slots; loading an untargeted generic
-        // fentry program can reject a short batch with EINVAL.
-        let used_slots: std::collections::HashSet<usize> =
-            targets.iter().filter(|t| t.ok).map(|t| t.slot).collect();
-        for slot in 0..FENTRY_BATCH {
-            if !used_slots.contains(&slot) {
-                disable_slot_programs(&mut fentry_open, slot);
-            }
-        }
-
-        use std::os::unix::io::AsFd;
-        if let Err(e) = fentry_open
-            .maps
-            .probe_data
-            .reuse_fd(skel.maps.probe_data.as_fd())
-        {
-            tracing::warn!(%e, "phase_b kernel fexit: probe_data reuse_fd failed");
-        }
-        if let Err(e) = fentry_open
-            .maps
-            .func_meta_map
-            .reuse_fd(skel.maps.func_meta_map.as_fd())
-        {
-            tracing::warn!(%e, "phase_b kernel fexit: func_meta_map reuse_fd failed");
-        }
-
-        let fentry_skel = match fentry_open.load() {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(%e, "phase_b kernel fexit: batch load failed");
-                continue;
-            }
-        };
-
-        for t in &targets {
-            if !t.ok {
-                continue;
-            }
-            let Some(result) = attach_fexit_by_slot(&fentry_skel, t.slot) else {
-                continue;
-            };
-            match result {
-                Ok(link) => {
-                    tracing::debug!(func = t.name, "phase_b kernel fexit attached");
-                    fexit_links.push(link);
-                }
-                Err(e) => {
-                    tracing::debug!(%e, func = t.name, "phase_b kernel fexit attach failed");
-                }
-            }
-        }
-
-        drop(fentry_skel);
     }
 
     // --- Phase B BPF callback fentry/fexit batches ---

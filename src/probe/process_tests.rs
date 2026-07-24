@@ -940,3 +940,35 @@ fn set_rodata_slot_writes_only_target_slot() {
     assert_eq!(r.ktstr_fentry_is_kernel_1, 0, "is_kernel_1 untouched");
     assert_eq!(r.ktstr_fentry_is_kernel_3, 0, "is_kernel_3 untouched");
 }
+
+#[test]
+fn kernel_fexit_load_backoff_ramps_from_zero_within_a_bounded_budget() {
+    // The first attempt must not wait — a quiet host should pay no
+    // retry cost — and subsequent attempts ramp linearly off the base.
+    assert_eq!(
+        kernel_fexit_load_backoff(0),
+        std::time::Duration::ZERO,
+        "the first attempt must fire immediately"
+    );
+    assert_eq!(
+        kernel_fexit_load_backoff(1),
+        KERNEL_FEXIT_LOAD_BACKOFF,
+        "attempt 1 waits one base interval"
+    );
+    assert_eq!(
+        kernel_fexit_load_backoff(2),
+        2 * KERNEL_FEXIT_LOAD_BACKOFF,
+        "attempt 2 waits two base intervals"
+    );
+
+    // The whole retry schedule must stay a small fraction of the
+    // probe's boot budget so it never pushes a slow guest past its
+    // watchdog. Sum the waits skipped before every attempt.
+    let total: std::time::Duration = (0..KERNEL_FEXIT_LOAD_ATTEMPTS)
+        .map(kernel_fexit_load_backoff)
+        .sum();
+    assert!(
+        total <= std::time::Duration::from_secs(1),
+        "cumulative backoff {total:?} must stay well inside the boot budget"
+    );
+}
