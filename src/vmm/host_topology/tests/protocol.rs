@@ -4633,6 +4633,87 @@ fn preparation_pool_slot_of_a_crashed_granted_intent_is_reclaimed_by_pruning() {
 }
 
 #[test]
+fn activated_cell_awaiting_its_run_claim_holds_no_preparation_token() {
+    let _prefixes = LockPrefixesGuard::new();
+    let tokens = preparation_token_range().expect("resolve preparation tokens");
+    assert!(!tokens.is_empty(), "test host must fund a preparation slot");
+    let allowed = host_allowed_cpus();
+    assert!(!allowed.is_empty(), "test host must expose an allowed CPU");
+    let run_cpu = allowed[0];
+
+    // Hold the run CPU exclusively so the activated cell cannot acquire its run
+    // claim and is left waiting (as coordinator) — the exact window in which,
+    // after the token-at-resident release, it must already hold no token.
+    let _run_blocker =
+        crate::flock::try_flock(cpu_lock_path(run_cpu), crate::flock::FlockMode::Exclusive)
+            .expect("open run-cpu blocker")
+            .expect("hold run-cpu blocker");
+
+    let mut pending = protocol::register_pending_admission(
+        admission_resource_capacity_hint().expect("resolve preparation capacity"),
+    )
+    .expect("acquire a preparation token");
+    let token = pending_preparation_token(&pending, &tokens);
+    pending
+        .restore_preparation_affinity()
+        .expect("restore preparation affinity");
+    let token_path = permit_lock_path(token);
+    assert!(
+        crate::flock::try_flock(&token_path, crate::flock::FlockMode::Exclusive)
+            .expect("probe token before activation")
+            .is_none(),
+        "the pending cell must hold its preparation token before activation",
+    );
+
+    let run_claim = resource_claim_with_modes(
+        &[],
+        LlcLockMode::Shared,
+        &[run_cpu],
+        crate::flock::FlockMode::Shared,
+    );
+    let work = protocol::activate_pending_ticket(
+        pending,
+        run_claim.clone(),
+        run_claim.clone(),
+        None,
+        |probe| {
+            let designated = probe.designated().clone();
+            let reusable = probe.clone_reusable_permits()?;
+            probe.try_acquire(&designated, || {
+                acquire_resources_with_permits_granted_reusing(
+                    &[],
+                    LlcLockMode::Shared,
+                    &[run_cpu],
+                    crate::flock::FlockMode::Shared,
+                    &[],
+                    &reusable,
+                )
+            })
+        },
+    )
+    .expect("activate the pending admission");
+
+    // The run CPU is held, so activation yields a coordinator still waiting for
+    // its run resources — never an acquisition.
+    let _coordinator = match work {
+        protocol::TicketWork::Coordinator(coordinator) => coordinator,
+        protocol::TicketWork::Acquired(_) => {
+            panic!("the blocked run claim must not have been acquired")
+        }
+    };
+
+    // The activated-but-not-run cell holds NO preparation token: releasing it at
+    // image-resident frees the pool slot for the next entrant instead of pinning
+    // it to run throughput.
+    assert!(
+        crate::flock::try_flock(&token_path, crate::flock::FlockMode::Exclusive)
+            .expect("probe token after activation")
+            .is_some(),
+        "activation must release the preparation token before acquiring the run claim",
+    );
+}
+
+#[test]
 fn unavailable_wide_head_refills_live_backfill_capacity_until_bounded_age_then_drains() {
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_work_conserving_backfill_for_tests()

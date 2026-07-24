@@ -3277,11 +3277,21 @@ pub(crate) fn activate_pending_ticket<T>(
         ticket.notify_after_coordinator_payload_drop();
         return Err(error);
     }
+    // Release the preparation token here, at image-resident. The token's
+    // designed purpose is bounding concurrent build-phase memory; activation
+    // runs only after the build completed and its image was atomically
+    // published to the CAS (a complete, sealed object made visible by rename,
+    // governed by the CAS's own liveness/GC), so that purpose is over. Post-
+    // build residency is CAS-file durability plus a small process footprint,
+    // and the guest's memory is bounded by the run claim acquired below —
+    // nothing here still needs the token's exclusivity. Holding it through the
+    // run-claim wait only coupled preparation admission to run throughput,
+    // starving the pool; releasing it now frees the slot for the next entrant
+    // while this process waits for its run resources. The one-shot activation
+    // path (`try_activate_pending_once`) already drops the token at this point.
+    drop(preparation);
     ticket.notify_after_coordinator_payload_drop();
-    // Keep only the preparation token until exact physical ownership is
-    // published. It bounds resident prepared processes without causing the
-    // exact claim to self-contend on its own CPU or memory resources.
-    drive_registered_ticket(ticket, cancelled, &mut try_acquire, Some(preparation))
+    drive_registered_ticket(ticket, cancelled, &mut try_acquire, None)
 }
 
 /// Consume a PENDING pre-exec owner with exactly one nonblocking planning

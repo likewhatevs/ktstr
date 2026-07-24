@@ -48,6 +48,8 @@ const LIVENESS_PREFIX: &str = "ktstr-acquire-v24-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 const WAIT_DIAGNOSTIC_BUCKET_SECS: u64 = 30;
+// Minimum gap between preparation-budget diagnostic lines per process.
+const PREP_BUDGET_DIAGNOSTIC_MIN_MS: u64 = 250;
 const WAIT_DIAGNOSTIC_RING_SLOTS: u64 = 8;
 const WAIT_DIAGNOSTIC_MAX_RECORDS: usize = 64;
 const WAIT_DIAGNOSTIC_MAX_BYTES: usize = 128 * 1024;
@@ -4637,6 +4639,49 @@ pub(super) fn with_aggregate_fence<T>(
 /// thirty-second ring keeps even a permanently wedged host bounded. A per-slot
 /// flock serializes writers, and the largest live queue observed in each bucket
 /// wins so an isolated protocol fixture cannot hide the production queue.
+/// Diagnostic-gated, rate-limited per-scan snapshot of the preparation-slot
+/// pool budget: `free = pool - pending_tokens - coordinator_reserve -
+/// granted_this_scan`, alongside the count of preparation intents eligible to
+/// run but for the pool. Appended to `${KTSTR_BUILD_DIAGNOSTICS_DIR}/
+/// prep-budget-<pid>.txt`; untouched when the env var is unset (a relaxed load
+/// only). One CI run then names the term that eats the pool.
+pub(super) fn persist_prep_budget_diagnostic_if_enabled(
+    pool: usize,
+    pending_tokens: usize,
+    coordinator_reserve: usize,
+    granted_this_scan: usize,
+    eligible_waiting: usize,
+) {
+    let Some(root) = std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    static LAST_EMIT_MS: AtomicU64 = AtomicU64::new(0);
+    let now_ms = monotonic_now_ns().unwrap_or(0) / 1_000_000;
+    if now_ms.saturating_sub(LAST_EMIT_MS.load(Ordering::Relaxed)) < PREP_BUDGET_DIAGNOSTIC_MIN_MS {
+        return;
+    }
+    LAST_EMIT_MS.store(now_ms, Ordering::Relaxed);
+    let free = pool.saturating_sub(pending_tokens + granted_this_scan + coordinator_reserve);
+    let pid = std::process::id();
+    let line = format!(
+        "prep-budget: pid={pid} pool={pool} pending_tokens={pending_tokens} \
+         coordinator_reserve={coordinator_reserve} granted_this_scan={granted_this_scan} \
+         free={free} eligible_waiting={eligible_waiting}\n"
+    );
+    if std::fs::create_dir_all(&root).is_err() {
+        return;
+    }
+    let path = root.join(format!("prep-budget-{pid}.txt"));
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+}
+
 pub(super) fn persist_wait_diagnostic_if_enabled() {
     let Some(root) = std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
         .filter(|root| !root.is_empty())
@@ -16719,7 +16764,13 @@ impl Table {
         // (not yet PENDING/HELD), one slot is reserved out of the budget so a
         // junior budgeted waiter can never win the slot ahead of it.
         let preparation_pool = preparation_tokens.map_or(0, |range| range.len());
-        let mut preparation_tokens_consumed = 0usize;
+        // Split for the diagnostic (below): tokens already held by fenced
+        // PENDING/REVOKED records vs. reservations for this scan's own grants.
+        let mut prep_pending_tokens = 0usize;
+        let mut prep_granted_tokens = 0usize;
+        // Preparation intents that could run now but for the pool budget — the
+        // suppressed demand the diagnostic reports against the free count.
+        let mut prep_eligible_waiting = 0usize;
         let coordinator_reserve = usize::from(
             preparation_tokens.is_some()
                 && records.iter().any(|record| {
@@ -16815,7 +16866,7 @@ impl Table {
                 // before acknowledging the revoke (its run claim no longer
                 // names one), so charge its slot conservatively to keep the
                 // budget from over-granting against an in-flight release.
-                preparation_tokens_consumed += if record.state == STATE_PENDING {
+                prep_pending_tokens += if record.state == STATE_PENDING {
                     preparation_tokens_in_claim(&record.claim)
                 } else if record.preparation_intent {
                     1
@@ -16922,7 +16973,17 @@ impl Table {
             // it. Run reservations (not preparation intents) never gate here.
             let preparation_pool_blocked = record.preparation_intent
                 && preparation_tokens.is_some()
-                && preparation_tokens_consumed + coordinator_reserve >= preparation_pool;
+                && prep_pending_tokens + prep_granted_tokens + coordinator_reserve
+                    >= preparation_pool;
+            // Count a WAITING preparation intent that could run now but for the
+            // pool, so the diagnostic can contrast suppressed demand with free.
+            if record.state == STATE_WAITING
+                && record.ticket != coordinator_ticket
+                && record.preparation_intent
+                && acquisition_viable
+            {
+                prep_eligible_waiting += 1;
+            }
             let mut scan_state = record.state;
             if record.state == STATE_COORDINATOR {
                 // A coordinator can now sit behind live GRANTED/REPLAN
@@ -17138,7 +17199,7 @@ impl Table {
                 // a slot this cohort is already racing for. HELD has released
                 // its token; the coordinator is charged via the head reserve.
                 if scan_state == STATE_GRANTED && record.preparation_intent {
-                    preparation_tokens_consumed += 1;
+                    prep_granted_tokens += 1;
                 }
             } else if backfill_head.is_none()
                 && !conflict
@@ -17215,6 +17276,15 @@ impl Table {
         if changed {
             self.advance_generation()?;
             self.note_queue_progress()?;
+        }
+        if preparation_tokens.is_some() {
+            persist_prep_budget_diagnostic_if_enabled(
+                preparation_pool,
+                prep_pending_tokens,
+                coordinator_reserve,
+                prep_granted_tokens,
+                prep_eligible_waiting,
+            );
         }
         self.finish_claim_scan();
         self.clear_pending_flag(PENDING_RESCAN | PENDING_REPLAN_RESCAN);
