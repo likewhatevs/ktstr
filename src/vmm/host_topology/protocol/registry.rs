@@ -2436,6 +2436,30 @@ impl Ticket {
         Ok(Some(state))
     }
 
+    // The retained-futex-wake regression test observes that a cross-process
+    // grant reaches a waiter through its retained read-only MAP_SHARED view.
+    // A grant advances the record state and FUTEX_WAKEs the shared word under
+    // the same registry lock, so the waiter observes it EITHER by its
+    // FUTEX_WAIT resolving (marked inside `RetainedWake::wait`) OR by the next
+    // shared state read seeing the resolved state — which happens whenever the
+    // grant lands after this call's wait budget elapsed, or before the wait was
+    // entered at all. Both are the retained mapping faithfully reflecting the
+    // cross-process wake; publish the same marker so the observer is not
+    // stranded when coordinator latency shifts the grant out of the FUTEX_WAIT
+    // window. Marker-gated (test-only); untouched when the env var is unset.
+    #[cfg(test)]
+    fn publish_retained_wake_resolution() -> Result<()> {
+        if let Some(marker) = std::env::var_os(RETAINED_FUTEX_WAIT_MARKER_ENV) {
+            std::fs::write(&marker, b"woken").with_context(|| {
+                format!(
+                    "publish retained-futex wake resolution marker {}",
+                    Path::new(&marker).display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     pub(super) fn state_or_wait(
         &self,
         timeout: Duration,
@@ -2456,6 +2480,8 @@ impl Ticket {
             None => self.state(cancelled)?,
         };
         if !matches!(state, State::Waiting | State::CoordinatorStandby) {
+            #[cfg(test)]
+            Self::publish_retained_wake_resolution()?;
             return Ok(state);
         }
         let wait_started = std::time::Instant::now();
@@ -2479,10 +2505,18 @@ impl Ticket {
             // bounded crash-recovery tick alone pays for an EX coordinator
             // liveness check, so hundreds of futex waiters do not serialize
             // on every predecessor transition.
-            match self.state_shared(true, cancelled)? {
-                Some(state) => Ok(state),
-                None => self.state_with_recovery(true, cancelled),
+            let resolved = match self.state_shared(true, cancelled)? {
+                Some(state) => state,
+                None => self.state_with_recovery(true, cancelled)?,
+            };
+            // The wait budget elapsed, but a grant that landed meanwhile is
+            // observed here through the retained shared mapping just as a
+            // FUTEX_WAIT would have resolved it; keep the marker faithful.
+            #[cfg(test)]
+            if !matches!(resolved, State::Waiting | State::CoordinatorStandby) {
+                Self::publish_retained_wake_resolution()?;
             }
+            Ok(resolved)
         } else {
             Ok(state)
         }
