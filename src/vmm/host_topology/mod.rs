@@ -3746,6 +3746,25 @@ impl MemoryPermitPool {
         })
     }
 
+    /// Number of `MEMORY_PERMIT_CHUNK_MIB` permits a cell must hold for
+    /// `memory_mib` MiB of admission-charged memory.
+    ///
+    /// The permit reserves what a *trusted deferred* workload makes
+    /// resident — its touch ceiling — NOT the guest's sized RAM. Callers
+    /// pass `max(touch_ceiling, declared_memory)` (see
+    /// `vmm::setup`'s `permit_memory_mib` /
+    /// `vmm::memory_budget::touch_ceiling_mib`), so a wide cell whose sized
+    /// RAM is the `64 MiB/vCPU` floor charges only the fraction it actually
+    /// faults in. This is sound because default/no-perf guest RAM is
+    /// `MAP_NORESERVE` demand-paged (`super::numa_mem`'s
+    /// `anonymous_node_map_flags`): untouched pages cost no host memory, so
+    /// the gap between the resident set and the advertised size is free to
+    /// oversubscribe. A test that touches more than its ceiling must declare
+    /// the memory (`.memory_mib(...)`, which raises the charge); the only
+    /// host-OOM exposure is an undeclared over-allocating test. Performance
+    /// mode is charged its full sized RAM (prefaulted / physically-reserved
+    /// hugetlb pool), so this oversubscription applies only to the
+    /// demand-paged path.
     fn required_chunks(&self, memory_mib: u32) -> Result<usize> {
         let requested = usize::try_from(memory_mib).context("guest memory does not fit usize")?;
         let chunks = requested.div_ceil(MEMORY_PERMIT_CHUNK_MIB);

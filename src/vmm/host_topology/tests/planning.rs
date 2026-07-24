@@ -2109,6 +2109,37 @@ fn preparation_private_working_set_uses_two_chunks_and_preserves_conversion_head
 }
 
 #[test]
+fn required_chunks_charges_touch_ceiling_not_sized_ram_on_wide_cells() {
+    // The run claim charges `required_chunks(permit_memory)` where
+    // `permit_memory` is the touch ceiling (max'd with declared), not the
+    // sized RAM. On the 384 GB host the usable pool is ~1,380 chunks; a
+    // 224-vCPU cell sized at the 64 MiB/vCPU floor (14.3 GiB) would charge
+    // 56 chunks, capping concurrency at 24. Charging its ~2 GiB touch
+    // ceiling instead charges 8 chunks and lifts concurrency to ~170.
+    let (_usable_mib, memory_chunks) = memory_capacity_from_total(384 * 1024);
+    let memory = MemoryPermitPool {
+        permits: (0..memory_chunks).collect(),
+        usable_mib: memory_chunks * MEMORY_PERMIT_CHUNK_MIB,
+    };
+
+    let sized_mib = 224 * 64; // 14336 MiB, the 64 MiB/vCPU floor
+    let touch_mib = 2041; // touch ceiling for the wide cell
+
+    let sized_chunks = memory.required_chunks(sized_mib).expect("sized demand");
+    let touch_chunks = memory.required_chunks(touch_mib).expect("touch demand");
+    assert_eq!(sized_chunks, 56, "sized RAM charges 56 chunks");
+    assert_eq!(touch_chunks, 8, "touch ceiling charges 8 chunks");
+
+    // Projected concurrency from the same usable pool.
+    assert_eq!(memory_chunks / sized_chunks, 24);
+    assert!(
+        (168..=176).contains(&(memory_chunks / touch_chunks)),
+        "touch-ceiling concurrency should be ~170 (got {})",
+        memory_chunks / touch_chunks,
+    );
+}
+
+#[test]
 fn computed_guest_memory_replaces_fixed_preparation_weight() {
     let cpu = AdmissionPermitPool::for_host(1);
     let memory = MemoryPermitPool {

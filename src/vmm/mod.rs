@@ -1982,6 +1982,11 @@ impl KtstrVm {
         if let Some(descriptor) = imported_descriptor.as_ref() {
             validate_prepared_exec_handoff(self, descriptor, memory_mib)?;
         }
+        // The host admission permit charges what the workload makes resident
+        // (the touch ceiling), not the sized RAM the KVM allocation below
+        // uses — a demand-paged `MAP_NORESERVE` guest never faults in its
+        // full advertised size. See `permit_memory_mib`.
+        let permit_memory_mib = self.permit_memory_mib(prepared_initrd.as_ref(), memory_mib)?;
         pending_admission.finish_preparation()?;
         // Registration instant: the pending admission is created (direct path)
         // or imported from the pre-exec parent (handoff path); either way the
@@ -1996,7 +2001,7 @@ impl KtstrVm {
             self.topology.total_cpus(),
             pending_admission.preparation_cpu_permits().len() as u32,
         );
-        let run_locks = self.acquire_run_locks(true, Some(pending_admission), memory_mib)?;
+        let run_locks = self.acquire_run_locks(true, Some(pending_admission), permit_memory_mib)?;
         // Grant instant: the physical run claim is held (PENDING→HELD).
         if let Some(timing) = admission_timing.as_mut() {
             timing.mark_granted();
@@ -3445,12 +3450,16 @@ impl KtstrVm {
         if let Some(descriptor) = imported_descriptor.as_ref() {
             validate_prepared_exec_handoff(self, descriptor, memory_mib)?;
         }
+        // Permit charges the resident touch ceiling, not the sized RAM (see
+        // `permit_memory_mib`); the allocation below still uses `memory_mib`.
+        let permit_memory_mib = self.permit_memory_mib(prepared_initrd.as_ref(), memory_mib)?;
 
         // Resolve admission before allocating guest memory or starting device
         // workers. The returned fds remain live for the whole interactive run,
         // and every placement consumer below uses the matching run-time CPU
         // mask rather than independently consulting the build-time plan.
-        let run_locks = self.acquire_interactive_run_locks(pending, memory_mib, exec_mode)?;
+        let run_locks =
+            self.acquire_interactive_run_locks(pending, permit_memory_mib, exec_mode)?;
         // Capture after admission so this guard is declared after `run_locks`.
         // Rust drops locals in reverse declaration order: every return path
         // therefore restores the caller's original affinity before releasing

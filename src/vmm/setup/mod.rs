@@ -27,7 +27,7 @@ use super::initramfs_cache::{
 };
 use super::memory_budget::{
     MemoryBudget, TmpfsFraction, initramfs_min_memory_mib, read_kernel_init_size,
-    read_kernel_version, read_kernel_version_from_metadata_sidecar,
+    read_kernel_version, read_kernel_version_from_metadata_sidecar, touch_ceiling_mib,
 };
 use super::numa_mem::MemoryBacking;
 use super::pi_mutex::PiMutex;
@@ -1904,6 +1904,60 @@ impl KtstrVm {
         }
     }
 
+    /// Host-memory PERMIT sizing for this cell, distinct from the guest RAM
+    /// SIZE ([`Self::prepared_memory_mib`], which the KVM allocation still
+    /// uses unchanged).
+    ///
+    /// The admission permit reserves what a *trusted deferred* workload
+    /// makes resident, not the guest's advertised RAM. For the default /
+    /// no-perf path the backing is `MAP_NORESERVE` demand-paged (see
+    /// [`super::numa_mem`]'s `anonymous_node_map_flags` and its
+    /// oversubscription note), so the permit charges the touch ceiling
+    /// ([`touch_ceiling_mib`]) — the untouched tail between the resident set
+    /// and the sized RAM is free. A memory-hungry test keeps its escape
+    /// hatch: the ceiling is raised to any explicitly declared
+    /// `.memory_mib(...)`. The result never exceeds `sized_mib` (the guest
+    /// cannot touch more RAM than it is given). The only OOM exposure is a
+    /// test that touches more than the ceiling *without* declaring it.
+    ///
+    /// Performance mode is the exception. Its regions are prefaulted whole
+    /// by `NumaMemoryLayout::mbind_regions` (`MADV_POPULATE_WRITE`), and its
+    /// opportunistic hugetlb backing draws from a physically reserved,
+    /// non-`MAP_NORESERVE` pool (`anonymous_node_map_flags`) — either way
+    /// host residency equals the sized RAM, so the permit charges the full
+    /// size. This is the "hugetlb / prefaulted pool is physically reserved"
+    /// guard: `performance_mode` is the only path that reaches either the
+    /// `MAP_HUGETLB` mapping or the whole-region prefault.
+    pub(super) fn permit_memory_mib(
+        &self,
+        prepared: Option<&PreparedInitrd>,
+        sized_mib: u32,
+    ) -> Result<u32> {
+        let ceiling = if let Some(prepared) = prepared {
+            let kernel_init_size = read_kernel_init_size(&self.kernel)?;
+            let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
+            let budget = MemoryBudget {
+                uncompressed_initramfs_bytes: prepared.uncompressed_len() as u64,
+                compressed_initrd_bytes: prepared.compressed_len() as u64,
+                kernel_init_size,
+                init_coverage_instrumented,
+                instrumented_reserve_bytes,
+                tmpfs_fraction: self.tmpfs_fraction(),
+            };
+            touch_ceiling_mib(&budget, self.topology.total_cpus())
+        } else {
+            // No prepared image (a static-memory VM): nothing better bounds
+            // residency than the sized value itself.
+            sized_mib
+        };
+        Ok(resolve_permit_memory_mib(
+            self.performance_mode,
+            ceiling,
+            self.memory_mib.unwrap_or(0),
+            sized_mib,
+        ))
+    }
+
     /// Validate and load a prepared initramfs into already allocated guest
     /// memory.
     ///
@@ -2686,6 +2740,28 @@ pub(super) fn halt_poll_policy(
         return None;
     }
     None
+}
+
+/// Combine the touch `ceiling`, any explicitly `declared` memory, and the
+/// `sized` guest RAM into the host-memory PERMIT charge (MiB). Pure so the
+/// admission-charge policy is unit-testable without a live [`KtstrVm`]; see
+/// [`KtstrVm::permit_memory_mib`] for the derivation of `ceiling`.
+///
+/// - `performance_mode`: the region is prefaulted whole / hugetlb-reserved,
+///   so residency equals `sized` — charge the full size.
+/// - otherwise: charge the touch `ceiling`, but never below `declared`
+///   (the test's `.memory_mib(...)` escape hatch) and never above `sized`
+///   (the guest cannot fault in more RAM than it is given).
+fn resolve_permit_memory_mib(
+    performance_mode: bool,
+    ceiling: u32,
+    declared: u32,
+    sized: u32,
+) -> u32 {
+    if performance_mode {
+        return sized;
+    }
+    ceiling.max(declared).min(sized)
 }
 
 #[cfg(test)]

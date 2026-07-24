@@ -2467,3 +2467,53 @@ fn halt_poll_policy_truth_table() {
         );
     }
 }
+
+/// [`resolve_permit_memory_mib`] policy: the memory PERMIT charge is the
+/// touch ceiling for a demand-paged (default/no-perf) guest, raised to any
+/// declared memory and clamped to the sized RAM; performance mode charges
+/// the full sized RAM because its region is prefaulted / hugetlb-reserved.
+///
+/// Uses the production wide-cell shape: a 224-vCPU cell is sized at the
+/// `64 MiB/vCPU` floor (14.3 GiB) but touches only ~2 GiB.
+#[test]
+fn resolve_permit_memory_mib_policy() {
+    const WIDE_SIZED_MIB: u32 = 224 * 64; // 14336 MiB, the 64 MiB/vCPU floor
+    const WIDE_TOUCH_MIB: u32 = 2041; // touch_ceiling for the wide cell
+
+    // Default demand-paged path: charge the touch ceiling, far below sized.
+    assert_eq!(
+        resolve_permit_memory_mib(false, WIDE_TOUCH_MIB, 0, WIDE_SIZED_MIB),
+        WIDE_TOUCH_MIB,
+        "demand-paged wide cell charges the touch ceiling, not the sized floor",
+    );
+
+    // Performance mode: prefaulted / hugetlb-reserved -> charge full size,
+    // ignoring the (smaller) touch ceiling entirely.
+    assert_eq!(
+        resolve_permit_memory_mib(true, WIDE_TOUCH_MIB, 0, WIDE_SIZED_MIB),
+        WIDE_SIZED_MIB,
+        "performance mode charges the full sized RAM (physically resident)",
+    );
+
+    // Declared memory (`.memory_mib(...)`) raises the charge above the
+    // ceiling. Here declared == sized (an explicit config sets both).
+    assert_eq!(
+        resolve_permit_memory_mib(false, 700, 4096, 4096),
+        4096,
+        "declared memory overrides the touch ceiling upward",
+    );
+    // Declared below the ceiling does not lower the charge.
+    assert_eq!(
+        resolve_permit_memory_mib(false, 2041, 512, WIDE_SIZED_MIB),
+        2041,
+        "a declared floor below the ceiling leaves the ceiling in force",
+    );
+
+    // A ceiling that exceeds the sized RAM is clamped to sized (the guest
+    // cannot fault in more than it has).
+    assert_eq!(
+        resolve_permit_memory_mib(false, 20_000, 0, WIDE_SIZED_MIB),
+        WIDE_SIZED_MIB,
+        "the charge never exceeds the sized RAM",
+    );
+}
