@@ -3171,24 +3171,57 @@ fn merge_profdata(
     let staged = staged_dir.path().join("merged.profdata");
     let tool = resolve_llvm_profdata(current_dir, environment)?;
     let mut command = Command::new(&tool);
+    // Default to `-failure-mode=all`: llvm-profdata fails only when EVERY
+    // input is unreadable, so one torn shard (a watchdog SIGKILL caught a
+    // test process mid-write) costs just that process's coverage instead of
+    // aborting the whole merge. The pinned llvm-profdata (LLVM 21.1) documents
+    // `any` (its default) as "fail if any profile is invalid" and `all` as
+    // "fail only if all profiles are invalid"; verified empirically that
+    // `all` drops a corrupt shard beside a valid one and still fails loudly
+    // on an all-corrupt set. An explicit caller mode (from the report's
+    // `--failure-mode`) still wins.
+    let failure_mode = failure_mode.unwrap_or("all");
     configure_llvm_profdata_merge(
         &mut command,
         input_list.path(),
         &staged,
-        failure_mode,
+        Some(failure_mode),
         llvm_profdata_flags(environment)?,
     );
     command.current_dir(current_dir);
     apply_command_envs(&mut command, environment);
-    let status = crate::interrupt::run_status(command)
+    let merge_output = crate::interrupt::run_output(command)
         .map_err(|error| format!("spawn {}: {error}", tool.display()))?;
-    if !status.success() {
+    // Forward llvm-profdata's own per-shard warnings so a dropped shard is
+    // never invisible, on both the success and all-corrupt-failure paths.
+    let stderr = String::from_utf8_lossy(&merge_output.stderr);
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+    if !merge_output.status.success() {
         return Err(format!(
             "llvm-profdata merge exited with {}",
-            status
+            merge_output
+                .status
                 .code()
                 .map_or("signal".to_string(), |code| code.to_string()),
         ));
+    }
+    // On a tolerant success, name the shards llvm-profdata dropped so the
+    // coverage loss is a visible, quantified line rather than a warning buried
+    // among thousands.
+    let dropped = dropped_shards_from_stderr(&stderr, inputs);
+    if !dropped.is_empty() {
+        let names = dropped
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "cargo ktstr: dropped {} of {} coverage shard(s) as unreadable; their coverage is lost: {names}",
+            dropped.len(),
+            inputs.len(),
+        );
     }
     std::fs::rename(&staged, output).map_err(|error| {
         format!(
@@ -3198,6 +3231,23 @@ fn merge_profdata(
         )
     })?;
     Ok(())
+}
+
+/// Identify which merge inputs llvm-profdata rejected, from its stderr.
+///
+/// Under `-failure-mode=all` each unreadable input yields a
+/// `warning: <path>: <reason>` line while the merge still succeeds on the
+/// survivors. Match by input path (not by the reason text, which differs per
+/// corruption kind) so unrelated warnings are never miscounted as drops.
+fn dropped_shards_from_stderr<'a>(stderr: &str, inputs: &'a [PathBuf]) -> Vec<&'a Path> {
+    inputs
+        .iter()
+        .filter(|input| {
+            let prefix = format!("warning: {}: ", input.display());
+            stderr.lines().any(|line| line.starts_with(&prefix))
+        })
+        .map(PathBuf::as_path)
+        .collect()
 }
 
 fn compact_coverage_producer_profiles(
@@ -9458,6 +9508,115 @@ path = "junit.xml"
                 OsStr::new("-debug-info-correlate"),
             ],
         );
+    }
+
+    #[test]
+    fn dropped_shards_names_the_warned_inputs_only() {
+        let inputs = vec![
+            PathBuf::from("/p/valid.profdata"),
+            PathBuf::from("/p/torn.profraw"),
+            PathBuf::from("/p/ok.profraw"),
+        ];
+        // The reason text differs per corruption kind (header-corrupt here,
+        // encoding-format elsewhere); matching keys on the input path.
+        let stderr = "warning: /p/torn.profraw: invalid instrumentation \
+             profile data (file header is corrupt)\n";
+        assert_eq!(
+            dropped_shards_from_stderr(stderr, &inputs),
+            vec![Path::new("/p/torn.profraw")],
+        );
+    }
+
+    #[test]
+    fn dropped_shards_empty_without_warnings() {
+        let inputs = vec![PathBuf::from("/p/a.profraw")];
+        assert!(dropped_shards_from_stderr("", &inputs).is_empty());
+    }
+
+    #[test]
+    fn dropped_shards_ignores_warnings_for_foreign_paths() {
+        let inputs = vec![PathBuf::from("/p/a.profraw")];
+        let stderr = "warning: /other/x.profraw: unrecognized instrumentation \
+             profile encoding format\n";
+        assert!(dropped_shards_from_stderr(stderr, &inputs).is_empty());
+    }
+
+    /// Build a valid indexed `.profdata` from a text profile using the pinned
+    /// llvm-profdata (always present via the `llvm-tools-preview` component).
+    fn valid_profdata_fixture(dir: &Path, name: &str) -> PathBuf {
+        let tool = resolve_llvm_profdata(dir, &[]).expect("resolve llvm-profdata");
+        let text = dir.join("fixture.proftext");
+        std::fs::write(&text, "somefunc\n0x0\n1\n1\n\n").unwrap();
+        let out = dir.join(name);
+        let status = Command::new(&tool)
+            .arg("merge")
+            .arg("-o")
+            .arg(&out)
+            .arg(&text)
+            .status()
+            .expect("spawn llvm-profdata to build a valid fixture");
+        assert!(status.success(), "build valid profdata fixture");
+        out
+    }
+
+    /// A torn shard (watchdog SIGKILL mid-write) must cost only that
+    /// process's coverage: the merge succeeds on the surviving valid input.
+    #[test]
+    fn merge_profdata_tolerates_a_corrupt_shard_beside_a_valid_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = valid_profdata_fixture(dir.path(), "valid.profdata");
+        let corrupt = dir.path().join("torn.profraw");
+        std::fs::write(&corrupt, b"not a profile").unwrap();
+        let out = dir.path().join("merged.profdata");
+        merge_profdata(dir.path(), &[], &[valid, corrupt], &out, None)
+            .expect("a valid shard must survive a torn sibling");
+        assert!(out.is_file(), "the merged profile must be published");
+    }
+
+    /// A genuinely all-corrupt set has no coverage to salvage and must still
+    /// fail loudly rather than publish an empty profile.
+    #[test]
+    fn merge_profdata_fails_when_every_shard_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.profraw");
+        let b = dir.path().join("b.profraw");
+        std::fs::write(&a, b"garbage-a").unwrap();
+        std::fs::write(&b, b"garbage-b").unwrap();
+        let out = dir.path().join("merged.profdata");
+        let error = merge_profdata(dir.path(), &[], &[a, b], &out, None)
+            .expect_err("an all-corrupt set must fail");
+        assert!(
+            error.contains("llvm-profdata merge exited"),
+            "expected a merge-exit failure, got: {error}",
+        );
+        assert!(!out.exists(), "no partial profile on total failure");
+    }
+
+    /// An explicit caller failure mode (from the report's `--failure-mode`)
+    /// overrides the tolerant default, so a strict `any` still rejects a torn
+    /// shard beside a valid one.
+    #[test]
+    fn merge_profdata_honors_an_explicit_strict_failure_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = valid_profdata_fixture(dir.path(), "valid.profdata");
+        let corrupt = dir.path().join("torn.profraw");
+        std::fs::write(&corrupt, b"not a profile").unwrap();
+        let out = dir.path().join("merged.profdata");
+        let error = merge_profdata(dir.path(), &[], &[valid, corrupt], &out, Some("any"))
+            .expect_err("explicit -failure-mode=any must reject a torn shard");
+        assert!(
+            error.contains("llvm-profdata merge exited"),
+            "expected a merge-exit failure, got: {error}",
+        );
+    }
+
+    #[test]
+    fn merge_profdata_rejects_an_empty_input_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("merged.profdata");
+        let error = merge_profdata(dir.path(), &[], &[], &out, None)
+            .expect_err("an empty input set must fail");
+        assert!(error.contains("no coverage profile inputs"), "{error}");
     }
 
     #[test]
