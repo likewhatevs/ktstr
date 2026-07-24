@@ -373,6 +373,15 @@ const LIVENESS_SWEEP_INTERVAL_NS: u64 = 30_000_000_000;
 const COORDINATOR_HEARTBEAT_INTERVAL_NS: u64 = 1_000_000_000;
 pub(super) const COORDINATOR_HEARTBEAT_INTERVAL: Duration =
     Duration::from_nanos(COORDINATOR_HEARTBEAT_INTERVAL_NS);
+/// Backoff between nonblocking shared-read attempts when the writer-intent
+/// sidecar is held by a live writer. The read yields to the writer this long,
+/// then re-probes, instead of blocking on the mode-inverted sidecar-EX (the
+/// turnstile convoy that serialized ~990 pre-exec entrants). The ticket futex
+/// cuts the wait short on a grant; the timeout re-probes through a self-election
+/// that bumped no futex. It caps the re-probe rate under sustained writer
+/// priority — it is not a semantic poll interval, and the read still always
+/// returns the authoritative state on the next turnstile gap.
+const TURNSTILE_READ_BACKOFF: Duration = Duration::from_millis(2);
 const DEFERRED_RESCAN_INTERVAL_NS: u64 = 1_000_000_000;
 /// A published GRANTED batch probes outside registry EX. Its negative
 /// completions tend to return together, so give the batch one short,
@@ -2286,6 +2295,47 @@ impl Ticket {
         Ok(state)
     }
 
+    /// Acquire the registry SHARED lock for a state read WITHOUT joining the
+    /// writer-intent turnstile convoy. A blocking SH read takes the sidecar
+    /// EXCLUSIVELY (writer_intent_mode inverts SH->EX), so under a live
+    /// registry-EX writer every pre-exec entrant's per-tick read serializes on
+    /// the turnstile behind the writer's retained sidecar-SH — the observed
+    /// ~990-process, 25-minute flock convoy. Instead, probe nonblocking; on a
+    /// live writer, YIELD (writer-priority preserved) via a bounded futex-backed
+    /// backoff and retry. The turnstile frees whenever the writer finishes its
+    /// bounded transaction, so the probe succeeds on the next gap and the read
+    /// always returns the authoritative state — no missed election or grant. The
+    /// ticket futex wakes the retry immediately on a grant; the short timeout
+    /// re-probes through a self-election that bumped no futex. A missing sidecar
+    /// falls back to the blocking existing-lock so its authoritative error/None
+    /// surfaces exactly as before. Crash-safety is unchanged (same fds, released
+    /// by the kernel on death).
+    fn lock_registry_shared_yielding(
+        &self,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<RegistryLock> {
+        loop {
+            check_cancelled(cancelled)?;
+            match probe_lock_registry_existing_nonblocking(FlockMode::Shared)? {
+                NonblockingRegistryLock::Acquired(lock) => return Ok(lock),
+                NonblockingRegistryLock::Missing => {
+                    return normalize_cancellation(
+                        lock_registry_existing(FlockMode::Shared),
+                        cancelled,
+                    );
+                }
+                NonblockingRegistryLock::Contended => {
+                    if let Some(shared) = self.shared.as_ref() {
+                        let expected = shared.expected();
+                        let _ = shared.wait(expected, TURNSTILE_READ_BACKOFF)?;
+                    } else {
+                        std::thread::sleep(TURNSTILE_READ_BACKOFF);
+                    }
+                }
+            }
+        }
+    }
+
     fn state_shared(
         &self,
         check_coordinator_liveness: bool,
@@ -2293,7 +2343,7 @@ impl Ticket {
     ) -> Result<Option<State>> {
         let _namespace = self.namespace.enter();
         check_cancelled(cancelled)?;
-        let _lock = normalize_cancellation(lock_registry_existing(FlockMode::Shared), cancelled)?;
+        let _lock = self.lock_registry_shared_yielding(cancelled)?;
         #[cfg(test)]
         SHARED_STATE_READS.with(|reads| reads.set(reads.get() + 1));
         let shared = self
@@ -3364,7 +3414,9 @@ impl Ticket {
     ) -> Result<Option<ScheduleSnapshot>> {
         let _namespace = self.namespace.enter();
         check_cancelled(cancelled)?;
-        let _lock = normalize_cancellation(lock_registry_existing(FlockMode::Shared), cancelled)?;
+        // Same turnstile-yielding read as `state_shared`: the coordinator's
+        // known-free fast path must not join the convoy either.
+        let _lock = self.lock_registry_shared_yielding(cancelled)?;
         let shared = self
             .shared
             .as_ref()
@@ -6006,6 +6058,93 @@ pub(super) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
         table.advance_generation()?;
     }
     Ok(())
+}
+
+/// No-convoy proof: `n` concurrent entrants each register a distinct ticket and
+/// perform their post-registration `state_or_wait` reads while a background
+/// writer continuously churns registry-EX (retaining the writer-intent
+/// sidecar-SH). Under the old BLOCKING shared read every entrant serializes on
+/// the mode-inverted sidecar-EX behind the churning writer — the turnstile
+/// convoy. The yielding read makes each entrant catch a gap and complete. All
+/// `n` must finish their reads well inside `deadline`; returns `(all_ok,
+/// elapsed)`.
+#[cfg(test)]
+pub(super) fn exercise_n_entrants_read_under_churn_for_tests(
+    n: usize,
+    reads_each: usize,
+    llc_prefix: Option<String>,
+    cpu_prefix: Option<String>,
+    deadline: Duration,
+) -> Result<(bool, Duration)> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, Barrier};
+
+    fn install(llc: &Option<String>, cpu: &Option<String>) {
+        super::super::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = llc.clone());
+        super::super::CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = cpu.clone());
+    }
+    install(&llc_prefix, &cpu_prefix);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let start_gate = Arc::new(Barrier::new(n + 1));
+
+    // Background writer: churn registry-EX (each hold retains the sidecar-SH the
+    // reader's blocking path would convoy behind).
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let llc = llc_prefix.clone();
+        let cpu = cpu_prefix.clone();
+        std::thread::spawn(move || {
+            install(&llc, &cpu);
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(lock) = hold_registry_exclusive_for_tests() {
+                    std::thread::sleep(Duration::from_millis(1));
+                    drop(lock);
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        })
+    };
+
+    let mut readers = Vec::with_capacity(n);
+    for index in 0..n {
+        let llc = llc_prefix.clone();
+        let cpu = cpu_prefix.clone();
+        let completed = Arc::clone(&completed);
+        let start_gate = Arc::clone(&start_gate);
+        readers.push(std::thread::spawn(move || -> Result<()> {
+            install(&llc, &cpu);
+            let claim = ClaimSet::new(std::iter::empty(), [700 + index], FlockMode::Exclusive);
+            let mut ticket = Ticket::register(claim.clone(), claim, None)?;
+            start_gate.wait();
+            for _ in 0..reads_each {
+                // The pre-exec wait loop's read: must yield to the churning
+                // writer and complete, not convoy.
+                let _ = ticket.state_or_wait(Duration::from_millis(2), None)?;
+            }
+            ticket.finish(None)?;
+            completed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }));
+    }
+    start_gate.wait();
+    let start = std::time::Instant::now();
+    while completed.load(Ordering::Relaxed) < n && start.elapsed() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let elapsed = start.elapsed();
+    let all_completed = completed.load(Ordering::Relaxed) == n;
+    stop.store(true, Ordering::Relaxed);
+    let mut ok = all_completed;
+    for reader in readers {
+        match reader.join() {
+            Ok(Ok(())) => {}
+            _ => ok = false,
+        }
+    }
+    let _ = writer.join();
+    Ok((ok, elapsed))
 }
 
 #[cfg(test)]

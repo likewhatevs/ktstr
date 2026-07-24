@@ -2141,6 +2141,20 @@ pub(crate) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exercise_n_entrants_read_under_churn_for_tests(
+    n: usize,
+    reads_each: usize,
+    llc_prefix: Option<String>,
+    cpu_prefix: Option<String>,
+    deadline: std::time::Duration,
+) -> Result<(bool, std::time::Duration)> {
+    registry::exercise_n_entrants_read_under_churn_for_tests(
+        n, reads_each, llc_prefix, cpu_prefix, deadline,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn active_free_head_is_rejected_for_tests() -> Result<()> {
     registry::active_free_head_is_rejected_for_tests()
 }

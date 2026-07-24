@@ -2480,6 +2480,37 @@ fn announced_writer_intent_blocks_new_readers_while_target_ex_waits() {
     writer.join().expect("writer-intent worker");
 }
 
+// No-convoy shape check: N concurrent entrants each do their post-registration
+// `state_or_wait` reads while a background writer continuously churns
+// registry-EX (retaining the writer-intent sidecar-SH). Every entrant must
+// complete its reads and finish well inside the deadline — no deadlock, no
+// unbounded serialization — exercising the yielding read under real
+// writer/reader contention. The DRAMATIC ~990-process, 25-minute stall is a
+// scale phenomenon (slow registry-EX holds under full CI load) that a fast host
+// cannot reproduce; this bounds the shape and guards against a deadlock/hang
+// regression, while CI carries the scale proof.
+#[test]
+fn n_concurrent_entrants_read_under_a_churning_writer_without_convoying() {
+    let _prefixes = LockPrefixesGuard::new();
+    const N: usize = 24;
+    const READS_EACH: usize = 20;
+    let deadline = std::time::Duration::from_secs(20);
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE.with(|slot| slot.borrow().clone());
+    let (all_ok, elapsed) = protocol::exercise_n_entrants_read_under_churn_for_tests(
+        N, READS_EACH, llc_prefix, cpu_prefix, deadline,
+    )
+    .expect("drive N-entrant read under churn");
+    assert!(
+        all_ok,
+        "all {N} entrants must complete their reads under writer churn; elapsed={elapsed:?}",
+    );
+    assert!(
+        elapsed < deadline,
+        "the {N} entrants convoyed on the turnstile: elapsed={elapsed:?}",
+    );
+}
+
 #[test]
 fn queued_writer_intents_leave_no_reader_admission_gap() {
     use std::sync::mpsc;
