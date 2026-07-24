@@ -5390,6 +5390,38 @@ fn acquire_elastic_build_llc_plan_with_coordinator_step_hook(
     )
 }
 
+/// Exact (non-elastic, direct kernel build) counterpart of
+/// [`acquire_elastic_build_llc_plan_with_coordinator_step_hook`], mirroring
+/// [`acquire_build_llc_plan`]'s policies with `wait: true`. Lets a test drive
+/// the wait phase deterministically: the hook fires once the contended build
+/// has registered and is executing its first coordinator replan.
+#[cfg(test)]
+fn acquire_build_llc_plan_with_coordinator_step_hook(
+    topo: &HostTopology,
+    test_topo: &crate::topology::TestTopology,
+    cpu_cap: Option<CpuCap>,
+    cancelled: Option<&AtomicBool>,
+    on_coordinator_step: impl FnMut(),
+) -> Result<LlcPlan> {
+    acquire_llc_plan_with_acquire_fn_impl(
+        LlcPlanAcquireRequest {
+            topo,
+            test_topo,
+            cpu_cap,
+            llc_policy: PlacementPolicy::Consolidate,
+            cpu_policy: CpuSelectionPolicy::WithinEachLlc(PlacementPolicy::Consolidate),
+            wait: true,
+            sizing: LlcPlanSizing::Exact,
+            permit_admission: PermitAdmission::Build,
+            cancelled,
+            pending: None,
+            memory_mib: None,
+        },
+        try_acquire_llc_plan_locks_with_evidence,
+        on_coordinator_step,
+    )
+}
+
 fn acquire_llc_plan_with_acquire_fn_impl<F, A, C>(
     request: LlcPlanAcquireRequest<'_>,
     mut acquire_fn: F,

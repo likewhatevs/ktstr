@@ -2770,6 +2770,118 @@ fn elastic_build_wait_replans_to_largest_partial_release() {
     drop(retained);
 }
 
+/// A direct (non-elastic, exact-width) kernel build must WAIT for its fixed
+/// width through the host queue instead of bailing after the four TOCTOU
+/// retries — the give-up-instead-of-wait regression that failed a CI lane
+/// (`acquire_llc_plan: could not reserve N CPU(s) after 4 attempts`). Every
+/// LLC/CPU is held so the fast phase cannot satisfy the request; with the
+/// wait routing the build registers and re-plans, and the release performed
+/// during its first coordinator step — while other holders stay live — is what
+/// satisfies it. Success without a bail proves the queue, not a retry timeout.
+#[test]
+fn direct_build_waits_for_exact_width_on_release_instead_of_bailing() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+
+    let mut holders = Vec::new();
+    for index in 0usize..4 {
+        let llc = try_flock(llc_lock_path(index), FlockMode::Exclusive)
+            .expect("open holder LLC lock")
+            .expect("reserve holder LLC");
+        let cpu = try_flock(cpu_lock_path(index), FlockMode::Exclusive)
+            .expect("open holder CPU lock")
+            .expect("reserve holder CPU");
+        holders.push((llc, cpu));
+    }
+    // An exact designation names a complete CANONICAL set even while busy
+    // (Consolidate -> the lowest two LLCs, 0 and 1), so release exactly those
+    // after the waiter has crossed registration and is executing its first
+    // coordinator replan; LLCs 2 and 3 stay held, so success proves the release
+    // of the designated width satisfied the queued exact build, not a timeout.
+    let retained = holders.split_off(2);
+    let mut released = Some(holders);
+    let plan = acquire_build_llc_plan_with_coordinator_step_hook(
+        &topo,
+        &test_topo,
+        Some(CpuCap::new(2).unwrap()),
+        None,
+        || {
+            drop(released.take());
+        },
+    )
+    .expect("a two-CPU release must satisfy a waiting exact build, never a bail");
+    assert_eq!(
+        plan.cpus,
+        vec![0, 1],
+        "the exact build takes its canonical width"
+    );
+    assert_eq!(make_jobs_for_plan(&plan), 2);
+
+    drop(plan);
+    drop(retained);
+}
+
+/// N direct kernel builds contending for the SAME exact width must all
+/// eventually reserve and complete by serializing through the host queue —
+/// none may give up the lane. Each wants the whole two-CPU LLC, so only one
+/// can hold at a time; with the wait routing the losers queue and each is
+/// granted in turn as the current holder releases. Before the fix they raced
+/// four TOCTOU attempts and failed a lane under exactly this overlap.
+#[test]
+fn many_contenders_for_one_exact_build_width_all_reserve_without_bailing() {
+    use std::sync::{Arc, Barrier};
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .expect("parent LLC prefix");
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .expect("parent CPU prefix");
+
+    const CONTENDERS: usize = 4;
+    let barrier = Arc::new(Barrier::new(CONTENDERS));
+    let handles: Vec<_> = (0..CONTENDERS)
+        .map(|_| {
+            let llc_prefix = llc_prefix.clone();
+            let cpu_prefix = cpu_prefix.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                // Thread-local test overrides do not inherit across spawn.
+                LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(llc_prefix));
+                CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(cpu_prefix));
+                ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![0, 1]));
+                let topo = synth_host_topo(&[(vec![0, 1], 0)]);
+                let test_topo = crate::topology::TestTopology::synthetic(2, 1);
+                // Start together to maximize the overlap the fast phase cannot
+                // satisfy — the exact shape that previously bailed a lane.
+                barrier.wait();
+                let plan = acquire_build_llc_plan(
+                    &topo,
+                    &test_topo,
+                    Some(CpuCap::new(2).unwrap()),
+                    true,
+                    None,
+                )
+                .expect("every contender must wait and reserve, never bail");
+                assert_eq!(plan.cpus, vec![0, 1]);
+                // Hold briefly, then release so the next queued contender is
+                // granted; the drop releases the LLC/CPU flocks and wakes the
+                // coordinator.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                drop(plan);
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle
+            .join()
+            .expect("every contender must reserve and complete without a bail");
+    }
+}
+
 /// `no_perf_cpu_budget` sizes a no-perf VM to its EXACT vCPU count
 /// (clamped to the allowed cpuset, min-1) — the topology's real need,
 /// with the 30% `default_cpu_budget` acting as NEITHER a floor nor a

@@ -140,8 +140,10 @@ pub fn acquire_build_reservation(
 /// non-empty placement that does not overlap an exact VM reservation, and
 /// derives Cargo/make parallelism from that actual placement. It joins the
 /// queue only while every compatible CPU is occupied, then repeats that
-/// largest-fit plan on each wake. Kernel builds retain
-/// [`acquire_build_reservation`]'s exact, interactive nonblocking behavior.
+/// largest-fit plan on each wake. Direct kernel builds
+/// ([`acquire_build_reservation`]) instead hold a fixed exact width, but they
+/// too wait work-conservingly on that width through the same host queue rather
+/// than giving up the lane under transient contention.
 pub fn acquire_build_reservation_waiting(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
@@ -218,16 +220,23 @@ fn acquire_build_reservation_impl(
         // cooperative SH overlap as the fully-occupied fallback.
         //
         // A direct kernel build keeps its fixed Consolidate contract. It is
-        // non-elastic, may hold a source-tree lock, and deliberately packs
-        // one bounded compile rather than participating in the independently
-        // fanned-out harness-build storm.
+        // non-elastic and deliberately packs one bounded compile at its exact
+        // width rather than participating in the independently fanned-out
+        // harness-build storm. It waits work-conservingly for that width: the
+        // reservation is taken here BEFORE the source-tree flock below, so the
+        // wait holds no other lock, and it routes through the same event-driven
+        // registry admission that run claims use (`register_ticket_or_acquire`
+        // via the wait phase). Under contention it joins the host queue and
+        // re-plans on each coordinator wake instead of giving up the lane after
+        // a few TOCTOU retries — dead holders are pruned by the registry's
+        // liveness, and it never abandons a plan while live holders progress.
         let acquired_plan = if elastic {
             crate::vmm::host_topology::acquire_elastic_build_llc_plan(
                 &host_topo, &test_topo, cpu_cap, cancelled,
             )?
         } else {
             crate::vmm::host_topology::acquire_build_llc_plan(
-                &host_topo, &test_topo, cpu_cap, false, cancelled,
+                &host_topo, &test_topo, cpu_cap, true, cancelled,
             )?
         };
         check_reservation_cancelled(cancelled)?;
