@@ -486,11 +486,17 @@ const GRANT_SCAN_COALESCE_INTERVAL_NS: u64 = 10_000_000;
 /// CI-only scan-cost accounting (validation instrumentation), companion to the
 /// coordinator-wake counters. `GRANT_SCANS` counts authoritative grant scans
 /// this process drove and `RECORDS_SCANNED` accumulates their record counts, so
-/// their ratio is the mean scan width; `SCANS_COALESCED` counts release edges
-/// that joined an already-pending scan instead of opening a fresh window. Three
-/// relaxed atomics, read only when the diagnostics dir is set — a healthy drain
-/// shows `records_scanned/grant_scans` far below the peak herd size and a large
-/// `scans_coalesced`.
+/// their ratio is the mean scan width. Both are relaxed atomics read only when
+/// the diagnostics dir is set — a healthy drain shows
+/// `records_scanned/grant_scans` far below the peak herd size.
+///
+/// `SCANS_COALESCED` counts release edges that joined an already-pending scan
+/// instead of opening a fresh window, and is deliberately process-local: the
+/// increment lands in whichever process drove the release, while the diagnostic
+/// line is written by the process sitting in the coordinator wait, so a
+/// persisted value would not describe the run's actual coalescing. It exists for
+/// `exercise_release_coalesce_for_tests`, which drives the releases and the
+/// scans in one process and reads it directly.
 static COORDINATOR_GRANT_SCANS: AtomicU64 = AtomicU64::new(0);
 static COORDINATOR_RECORDS_SCANNED: AtomicU64 = AtomicU64::new(0);
 static COORDINATOR_SCANS_COALESCED: AtomicU64 = AtomicU64::new(0);
@@ -504,13 +510,12 @@ fn note_grant_scan_coalesced() {
     COORDINATOR_SCANS_COALESCED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// `(grant_scans, records_scanned, scans_coalesced)` for the coordinator-wake
-/// diagnostic line. Cumulative and process-global, like the wake counters.
-pub(super) fn coordinator_scan_stats() -> (u64, u64, u64) {
+/// `(grant_scans, records_scanned)` for the coordinator-wake diagnostic line.
+/// Cumulative and process-global, like the wake counters.
+pub(super) fn coordinator_scan_stats() -> (u64, u64) {
     (
         COORDINATOR_GRANT_SCANS.load(Ordering::Relaxed),
         COORDINATOR_RECORDS_SCANNED.load(Ordering::Relaxed),
-        COORDINATOR_SCANS_COALESCED.load(Ordering::Relaxed),
     )
 }
 
@@ -10685,7 +10690,7 @@ pub(super) fn exercise_release_coalesce_for_tests() -> Result<ReleaseCoalesceOut
         );
         (
             read_u64(&table.header, H_GRANT_SCANS),
-            coordinator_scan_stats().2,
+            COORDINATOR_SCANS_COALESCED.load(Ordering::Relaxed),
         )
     };
 
@@ -10703,7 +10708,10 @@ pub(super) fn exercise_release_coalesce_for_tests() -> Result<ReleaseCoalesceOut
             && table.pending_flags() & PENDING_REPLAN_RESCAN != 0
             && deadline != 0
             && read_u64(&table.header, H_GRANT_SCANS) == scans_before
-            && coordinator_scan_stats().2.wrapping_sub(coalesced_before) == K as u64 - 1;
+            && COORDINATOR_SCANS_COALESCED
+                .load(Ordering::Relaxed)
+                .wrapping_sub(coalesced_before)
+                == K as u64 - 1;
         // The deferred edge is not due one nanosecond early: no scan yet.
         let quiet_before_deadline = !table.prepare_grant_scan_at(deadline.saturating_sub(1))?
             && read_u64(&table.header, H_GRANT_SCANS) == scans_before;
