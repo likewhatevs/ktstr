@@ -4052,11 +4052,7 @@ impl Ticket {
         validate_claim_within_watch(exact, &record.watch)?;
         validate_contention_within_watch(contention, &record.watch)?;
         if record.state == STATE_COORDINATOR_STANDBY {
-            table.begin_transaction()?;
-            table.mark_unknown(&exact.cpus, &exact.llcs, &exact.permits)?;
-            table.mark_blockers_unknown(contention)?;
-            table.advance_generation()?;
-            table.finish_transaction()?;
+            table.publish_negative_evidence(exact, contention)?;
             drop(table);
             drop(_lock);
             return Ok(FinishAcquireResult::Stale);
@@ -4065,11 +4061,7 @@ impl Ticket {
             || table.coordinator_ticket() != self.ticket
             || table.coordinator_slot()? != self.slot
         {
-            table.begin_transaction()?;
-            table.mark_unknown(&exact.cpus, &exact.llcs, &exact.permits)?;
-            table.mark_blockers_unknown(contention)?;
-            table.advance_generation()?;
-            table.finish_transaction()?;
+            table.publish_negative_evidence(exact, contention)?;
             drop(table);
             drop(_lock);
             anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
@@ -4106,11 +4098,7 @@ impl Ticket {
             // publish any exact negative evidence gathered in the same planner
             // turn, and let the next scan refresh its predecessor prefix before
             // probing again.
-            table.begin_transaction()?;
-            table.mark_unknown(&exact.cpus, &exact.llcs, &exact.permits)?;
-            table.mark_blockers_unknown(contention)?;
-            table.advance_generation()?;
-            table.finish_transaction()?;
+            table.publish_negative_evidence(exact, contention)?;
             drop(table);
             drop(_lock);
             return Ok(FinishAcquireResult::Stale);
@@ -4153,11 +4141,7 @@ impl Ticket {
         validate_claim_within_watch(selected_final, &record.watch)?;
         validate_contention_within_watch(contention, &record.watch)?;
         if record.state == STATE_COORDINATOR_STANDBY {
-            table.begin_transaction()?;
-            table.mark_unknown(&preparation.cpus, &preparation.llcs, &preparation.permits)?;
-            table.mark_blockers_unknown(contention)?;
-            table.advance_generation()?;
-            table.finish_transaction()?;
+            table.publish_negative_evidence(preparation, contention)?;
             drop(table);
             drop(_lock);
             return Ok(FinishPreparationResult::Stale);
@@ -4166,11 +4150,7 @@ impl Ticket {
             || table.coordinator_ticket() != self.ticket
             || table.coordinator_slot()? != self.slot
         {
-            table.begin_transaction()?;
-            table.mark_unknown(&preparation.cpus, &preparation.llcs, &preparation.permits)?;
-            table.mark_blockers_unknown(contention)?;
-            table.advance_generation()?;
-            table.finish_transaction()?;
+            table.publish_negative_evidence(preparation, contention)?;
             drop(table);
             drop(_lock);
             anyhow::bail!("ticket {} lost the queue coordinator license", self.ticket);
@@ -4198,11 +4178,7 @@ impl Ticket {
             || record.state != STATE_COORDINATOR
             || (record.prefix_epoch != commit_token.prefix_epoch && !refreshed_prefix_compatible);
         if stale {
-            table.begin_transaction()?;
-            table.mark_unknown(&preparation.cpus, &preparation.llcs, &preparation.permits)?;
-            table.mark_blockers_unknown(contention)?;
-            table.advance_generation()?;
-            table.finish_transaction()?;
+            table.publish_negative_evidence(preparation, contention)?;
             drop(table);
             drop(_lock);
             return Ok(FinishPreparationResult::Stale);
@@ -4215,11 +4191,7 @@ impl Ticket {
         )? {
             PendingTransition::Committed(pending_claim) => pending_claim,
             PendingTransition::Contended(_) => {
-                table.begin_transaction()?;
-                table.mark_unknown(&preparation.cpus, &preparation.llcs, &preparation.permits)?;
-                table.mark_blockers_unknown(contention)?;
-                table.advance_generation()?;
-                table.finish_transaction()?;
+                table.publish_negative_evidence(preparation, contention)?;
                 drop(table);
                 drop(_lock);
                 return Ok(FinishPreparationResult::Stale);
@@ -20225,6 +20197,23 @@ impl Table {
             }
         }
         self.mark_unknown(&cpus, &llcs, &permits).map(|_| ())
+    }
+
+    /// Retire a physical probe that produced no publishable ownership: the
+    /// probe footprint and every blocker it observed become UNKNOWN in one
+    /// transaction that also advances the generation. Every stale, contended,
+    /// or license-losing exit from the commit paths publishes exactly this
+    /// before releasing the registry fence.
+    fn publish_negative_evidence(
+        &mut self,
+        footprint: &ClaimSet,
+        contention: &[ContentionMarker],
+    ) -> Result<()> {
+        self.begin_transaction()?;
+        self.mark_unknown(&footprint.cpus, &footprint.llcs, &footprint.permits)?;
+        self.mark_blockers_unknown(contention)?;
+        self.advance_generation()?;
+        self.finish_transaction()
     }
 
     fn publish_claim_busy(&mut self, claim: &ClaimSet) -> Result<()> {
