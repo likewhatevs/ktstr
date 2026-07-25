@@ -678,7 +678,7 @@ fn resolve_shared_libs_dynamic_binary() {
 
 #[test]
 fn resolve_interpreter_deps_walks_nonstandard_interp_deps() {
-    // The cache key (BaseKey::hash_shared_libs) and the base packer
+    // The cache key (prepared_base_semantic_key) and the base packer
     // (build_initramfs_base) both fold a non-standard interpreter's OWN
     // shared-lib deps in via resolve_interpreter_deps. A standard ld.so is
     // statically linked (no deps) and must resolve to an EMPTY set so the
@@ -867,13 +867,6 @@ fn suffix_without_sched_args_omits_entry() {
 }
 
 #[test]
-fn shm_segment_name_format() {
-    let name = shm_segment_name(0xDEADBEEF);
-    assert!(name.starts_with("/ktstr-base-"));
-    assert!(name.contains("deadbeef"));
-}
-
-#[test]
 fn is_deleted_self_returns_false_for_nonexistent() {
     assert!(!is_deleted_self(Path::new("/nonexistent/binary")));
 }
@@ -883,190 +876,6 @@ fn is_deleted_self_returns_false_for_current() {
     let exe = crate::resolve_current_exe().unwrap();
     // Current binary is not deleted.
     assert!(!is_deleted_self(&exe));
-}
-
-#[test]
-fn shm_store_load_unlink_roundtrip() {
-    let hash = unique_test_shm_hash(0);
-    let data = vec![0x42u8; 1024];
-    shm_store_base(hash, &data).unwrap();
-    let loaded = shm_load_base(hash);
-    assert!(loaded.is_some());
-    assert_eq!(loaded.unwrap().as_ref(), &data[..]);
-    shm_unlink_base(hash);
-    // After unlink, load should return None.
-    assert!(shm_load_base(hash).is_none());
-}
-
-#[test]
-fn shm_load_nonexistent_returns_none() {
-    let hash = unique_test_shm_hash(1);
-    shm_unlink_base(hash); // ensure clean
-    assert!(shm_load_base(hash).is_none());
-}
-
-#[test]
-fn shm_store_last_writer_wins_even_with_size_change() {
-    // Documents actual semantics: shm_store reuses the segment name,
-    // so a second write with different size overwrites the first.
-    // Idempotent writes (same content_hash → same contents) rely on
-    // callers to derive the hash from the actual content — this test
-    // deliberately uses differently-sized payloads to prove the
-    // writer does NOT assume the old name's size is still valid.
-    let hash = unique_test_shm_hash(2);
-    let d1 = vec![0x11u8; 64];
-    let d2 = vec![0x22u8; 128];
-    shm_store_base(hash, &d1).unwrap();
-    shm_store_base(hash, &d2).unwrap();
-    let loaded = shm_load_base(hash);
-    assert!(loaded.is_some());
-    assert_eq!(loaded.unwrap().as_ref(), &d2[..]);
-    shm_unlink_base(hash);
-}
-
-#[test]
-fn shm_segment_name_unique_per_hash() {
-    let n1 = shm_segment_name(0);
-    let n2 = shm_segment_name(1);
-    assert_ne!(n1, n2);
-    assert!(n1.starts_with("/ktstr-base-"));
-    assert!(n2.starts_with("/ktstr-base-"));
-}
-
-#[test]
-fn shm_unlink_nonexistent_is_noop() {
-    // Should not panic.
-    shm_unlink_base(unique_test_shm_hash(3));
-}
-
-#[test]
-fn mapped_shm_send_sync() {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<MappedShm>();
-}
-
-#[test]
-fn shm_load_base_holds_lock_until_drop() {
-    // Invariant: as long as a MappedShm is live, the SHM
-    // segment's flock is held in LOCK_SH. A concurrent writer
-    // calling LOCK_EX | LOCK_NB must fail with EWOULDBLOCK. Once
-    // the MappedShm is dropped, the lock releases and a subsequent
-    // LOCK_EX | LOCK_NB must succeed.
-    //
-    // This is the core invariant — if it regresses, shm_store's
-    // ftruncate can race with a live reader and cause SIGBUS on
-    // the mapped pages.
-    let hash = unique_test_shm_hash(4);
-    shm_unlink_base(hash); // clean any stale segment
-    shm_store_base(hash, &vec![0x55u8; 256]).unwrap();
-    let loaded = shm_load_base(hash).expect("load must succeed");
-
-    // Open a second fd and attempt LOCK_EX|LOCK_NB. Should fail
-    // with EWOULDBLOCK because the MappedShm holds LOCK_SH.
-    let name = shm_segment_name(hash);
-    let fd2 = rustix::shm::open(
-        name.as_str(),
-        rustix::shm::OFlags::RDONLY,
-        rustix::fs::Mode::empty(),
-    )
-    .expect("second shm_open must succeed");
-    let err = rustix::fs::flock(&fd2, rustix::fs::FlockOperation::NonBlockingLockExclusive);
-    assert!(
-        matches!(err, Err(e) if e == rustix::io::Errno::WOULDBLOCK),
-        "LOCK_EX|LOCK_NB must be blocked by the live reader's LOCK_SH (got {err:?})",
-    );
-    drop(fd2);
-
-    // Drop the mapping; lock releases.
-    drop(loaded);
-
-    // Now LOCK_EX|LOCK_NB must succeed on a fresh fd.
-    let fd3 = rustix::shm::open(
-        name.as_str(),
-        rustix::shm::OFlags::RDONLY,
-        rustix::fs::Mode::empty(),
-    )
-    .expect("third shm_open must succeed");
-    rustix::fs::flock(&fd3, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .expect("LOCK_EX|LOCK_NB must succeed after the MappedShm is dropped");
-    rustix::fs::flock(&fd3, rustix::fs::FlockOperation::Unlock).ok();
-    drop(fd3);
-    shm_unlink_base(hash);
-}
-
-#[test]
-fn shm_store_skips_write_when_reader_holds_lock_sh() {
-    // Regression (x86 CI wedge): shm_store takes a NON-BLOCKING
-    // LOCK_EX and SKIPS the write when a reader holds LOCK_SH (a live
-    // MappedShm / COW overlay). A blocking LOCK_EX starved indefinitely
-    // under sustained host concurrency: Linux flock grants no writer
-    // preference, so VM-lifetime LOCK_SH readers perpetually jumped the
-    // queue and wedged the suite. The skip also preserves the SIGBUS
-    // invariant: it never ftruncates a segment a reader is mapping.
-    //
-    // Same-process flock conflict: the reader's fd holds LOCK_SH and
-    // shm_store opens a second fd for LOCK_EX; flock(2) treats the two
-    // fds independently, so the writer genuinely contends.
-    let hash = unique_test_shm_hash(5);
-    shm_unlink_base(hash); // clean any stale segment
-
-    let original = [0x55u8; 256];
-    shm_store_base(hash, &original).unwrap();
-    let reader = shm_load_base(hash).expect("load must succeed");
-
-    // Writer with DIFFERENT content while the reader holds LOCK_SH:
-    // must return Ok WITHOUT blocking (a blocking LOCK_EX would
-    // self-deadlock this thread and hang) and WITHOUT rewriting the
-    // live segment.
-    shm_store_base(hash, &[0xAAu8; 512]).expect("shm_store must skip (Ok), not block");
-
-    // The reader's mapped view is untouched: the write was skipped.
-    assert!(
-        reader.as_ref().iter().all(|&b| b == 0x55),
-        "reader bytes must be unchanged: shm_store skipped, did not rewrite/truncate",
-    );
-    drop(reader);
-
-    // Once the reader releases LOCK_SH, the cache is not wedged: a
-    // writer acquires LOCK_EX and the write takes effect.
-    shm_store_base(hash, &[0xCCu8; 128]).expect("shm_store must write after reader drops");
-    let reloaded = shm_load_base(hash).expect("reload after write");
-    assert!(
-        reloaded.as_ref().len() == 128 && reloaded.as_ref().iter().all(|&b| b == 0xCC),
-        "post-drop write must take effect",
-    );
-    drop(reloaded);
-    shm_unlink_base(hash);
-}
-
-#[test]
-fn shm_load_lz4_roundtrips_and_rejects_non_lz4() {
-    // shm_load_lz4 (the #2 shared loader): round-trips an LZ4-magic
-    // segment, and rejects a segment whose first bytes are not the LZ4
-    // legacy magic (a stale zstd/gzip segment or a truncated write).
-    let hash = unique_test_shm_hash(6);
-    let lz4_name = shm_lz4_segment_name(hash);
-    let _ = rustix::shm::unlink(lz4_name.as_str()); // clean any stale segment
-
-    // LZ4-magic-prefixed bytes round-trip store -> load.
-    let mut data = LZ4_LEGACY_MAGIC.to_vec();
-    data.extend_from_slice(&[0x11u8; 64]);
-    shm_store_lz4(hash, &data).unwrap();
-    assert_eq!(
-        shm_load_lz4(hash).as_deref(),
-        Some(data.as_slice()),
-        "LZ4-magic segment must round-trip",
-    );
-
-    // A segment lacking the LZ4 legacy magic is rejected as stale.
-    let _ = rustix::shm::unlink(lz4_name.as_str());
-    shm_store_lz4(hash, &[0xDEu8; 64]).unwrap();
-    assert!(
-        shm_load_lz4(hash).is_none(),
-        "segment lacking the LZ4 legacy magic must be rejected",
-    );
-
-    let _ = rustix::shm::unlink(lz4_name.as_str());
 }
 
 #[test]

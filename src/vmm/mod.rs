@@ -291,8 +291,8 @@ pub struct KtstrVm {
     /// [`StagedScheduler`](crate::vmm::builder::StagedScheduler)
     /// shape is held here so `prepare_initramfs` can hand the
     /// binary paths to
-    /// [`BaseKey::new`](crate::vmm::initramfs_cache::BaseKey) on
-    /// the resolve thread. The companion
+    /// [`prepare_base_inputs`](crate::vmm::initramfs_cache::prepare_base_inputs)
+    /// on the resolve thread. The companion
     /// [`Self::staged_sched_args_packed`] holds the same `(name,
     /// args)` view in a borrow-friendly tuple form so
     /// [`Self::suffix_params`] can borrow a slice typed `&[(String,

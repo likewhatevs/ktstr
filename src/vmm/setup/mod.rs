@@ -17,8 +17,6 @@ use std::time::Instant;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::KtstrVm;
-#[cfg(test)]
-use super::initramfs_cache::BaseKey;
 #[cfg(any(target_arch = "aarch64", test))]
 use super::initramfs_cache::PREPARED_MAPPING_GRANULE;
 use super::initramfs_cache::{
@@ -851,98 +849,6 @@ fn numa_balancing_cmdline_token(topology: &crate::vmm::topology::Topology) -> &'
     }
 }
 
-/// Pure helper: assemble the `extras` slice and the [`BaseKey`] from
-/// the resolved scheduler/probe/worker/staged-binary paths. Extracted
-/// out of [`KtstrVm::prepare_initramfs`] so the staged-extras
-/// path-format contract, the per-staged iteration order, and the
-/// shell-mode-vs-non-shell BaseKey threading can be unit-tested
-/// without spawning the resolve thread or running the full
-/// initramfs build.
-///
-/// Caller responsibilities:
-/// - Pre-compute `staged_extras_names` as
-///   `format!("{}/scheduler", staged_scheduler_archive_dir(&s.name))`
-///   for each staged scheduler (the helper indexes into this vec by
-///   position, so caller MUST keep order identical to
-///   `staged_schedulers`). Materialized externally so the borrow
-///   lifetime ties to the caller's owned Vec.
-/// - Pre-compute `merged_includes` (operator's `include_files` plus
-///   the optional alloc-worker binary).
-/// - Pre-compute `has_jemalloc_extras` = `probe.is_some() ||
-///   worker.is_some()` for shell-mode determination.
-///
-/// Returns `(extras, base_key)`. The extras vec borrows from
-/// `scheduler`, `probe`, `staged_extras_names`, and
-/// `staged_schedulers` — all `'a`-tied to the caller's lifetimes.
-/// The base_key is owned `BaseKey`.
-///
-/// `#[allow(clippy::too_many_arguments)]` — the parameter set is
-/// intrinsically flat (binaries + staging slice + flags); folding
-/// into a builder or struct here would just rename the same
-/// positional ordering. Sibling precedent: `build_vm_builder_base`
-/// in `src/test_support/runtime.rs` uses the same allow for the
-/// same reason.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub(crate) fn assemble_extras_and_key<'a>(
-    payload: &'a std::path::Path,
-    scheduler: Option<&'a std::path::Path>,
-    probe: Option<&'a std::path::Path>,
-    worker: Option<&'a std::path::Path>,
-    staged_schedulers: &'a [crate::vmm::builder::StagedScheduler],
-    staged_extras_names: &'a [String],
-    merged_includes: &'a [(String, PathBuf)],
-    busybox_bytes: Option<&[u8]>,
-    has_jemalloc_extras: bool,
-) -> Result<(Vec<(&'a str, &'a std::path::Path)>, BaseKey)> {
-    debug_assert_eq!(
-        staged_schedulers.len(),
-        staged_extras_names.len(),
-        "staged_schedulers and staged_extras_names must be co-indexed; \
-         caller mis-built the extras-names slice"
-    );
-
-    let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
-    if let Some(s) = scheduler {
-        extras.push(("scheduler", s));
-    }
-    if let Some(p) = probe {
-        extras.push(("bin/ktstr-jemalloc-probe", p));
-    }
-    for (idx, staged) in staged_schedulers.iter().enumerate() {
-        extras.push((staged_extras_names[idx].as_str(), staged.binary.as_path()));
-    }
-
-    // Shell-mode determination: busybox flag, non-empty includes,
-    // or any jemalloc extras (probe / worker present). Mirrors the
-    // pre-extraction logic in prepare_initramfs — kept
-    // explicit here so the helper is a closed unit under test
-    // without a hidden dependency on the caller's shell_mode
-    // computation.
-    let shell_mode = busybox_bytes.is_some() || !merged_includes.is_empty() || has_jemalloc_extras;
-
-    let staged_for_key: Vec<(&str, &std::path::Path)> = staged_schedulers
-        .iter()
-        .map(|s| (s.name.as_str(), s.binary.as_path()))
-        .collect();
-
-    let key = if shell_mode {
-        BaseKey::new_shell(
-            payload,
-            scheduler,
-            probe,
-            worker,
-            &staged_for_key,
-            merged_includes,
-            busybox_bytes,
-        )?
-    } else {
-        BaseKey::new(payload, scheduler, probe, worker, &staged_for_key)?
-    };
-
-    Ok((extras, key))
-}
-
 impl KtstrVm {
     /// Open the per-test backing file for `disk`, sized to `capacity`.
     /// Shared by both transports — `init_virtio_blk` (aarch64 MMIO) and
@@ -1653,10 +1559,10 @@ impl KtstrVm {
             .collect();
 
         // Merge include_files with worker so both the cache key and the actual
-        // archive build see the same worker entry; the probe is added to
-        // extras inside `assemble_extras_and_key`. wprof (when set) also rides
-        // include_files so DT_NEEDED resolution pulls its dynamic dependencies
-        // into the archive alongside the binary.
+        // archive build see the same worker entry; the probe rides `extras`
+        // built just below. wprof (when set) also rides include_files so
+        // DT_NEEDED resolution pulls its dynamic dependencies into the
+        // archive alongside the binary.
         let mut merged_includes: Vec<(String, PathBuf)> = include_files;
         if let Some((archive_path, host_path)) = kernel_config {
             merged_includes.push((archive_path, host_path));
