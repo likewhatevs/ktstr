@@ -1679,7 +1679,6 @@ pub enum LlcLockMode {
     /// Shared access to the LLC (non-perf pinned tests).
     /// Multiple shared holders coexist; returns unavailable when
     /// exclusive holder exists.
-    #[allow(dead_code)]
     Shared,
 }
 
@@ -2768,10 +2767,12 @@ pub(crate) struct LlcSnapshot {
     /// PLAN scoring. Derived from the admission registry aggregate, not from a
     /// `/proc/locks` walk.
     pub(crate) holder_count: usize,
-    /// Whether `/proc/locks` observed an incompatible `LOCK_EX` holder.
-    /// Advisory planning excludes these LLCs when a complete ready
-    /// alternative exists; the authoritative nonblocking flock still
-    /// resolves races and hosts where procfs observation is unavailable.
+    /// Whether the registry aggregate reports a registered `LOCK_EX` holder
+    /// of this LLC. Live planning drops such an LLC outright — no SH request
+    /// can coexist with it — while the queued designation deliberately keeps
+    /// it, being a static full-budget candidate rather than a live selection.
+    /// The authoritative nonblocking flock still resolves races against
+    /// holders the aggregate has not published yet.
     pub(crate) exclusive_held: bool,
     /// Count of in-flight grant charges (GRANTED/REVOKED registry records)
     /// covering this LLC. Subordinate rank key only: it biases both policies
@@ -2932,7 +2933,7 @@ fn discover_registered_placement_states(
 /// allowed-CPU overlap) until the accumulated contribution meets
 /// the budget. The LAST selected LLC may contribute more allowed
 /// CPUs than the remaining budget needs; the materialization layer
-/// at [`materialize_llc_plan`] takes only the needed
+/// at [`materialize_plan_cpus`] takes only the needed
 /// prefix of that LLC's allowed CPUs into `plan.cpus`. The flock
 /// is always held at LLC granularity — coordination with concurrent
 /// ktstr peers happens per-LLC, regardless of how many of the LLC's
@@ -3266,7 +3267,11 @@ fn try_acquire_llc_plan_locks_with_evidence(
     Ok(LlcLockAttempt::Acquired(locks))
 }
 
-/// Entry point for the `--cpu-cap` PLAN pipeline.
+/// Exact LLC-SH/CPU-SH planner used for cooperative VM admission.
+///
+/// It acquires topology locks and weighted admission permits in one registry
+/// claim, and observes cancellation while waiting behind hard-exclusive
+/// pressure.
 ///
 /// Runs DISCOVER → PLAN → ACQUIRE with up to
 /// [`ACQUIRE_MAX_TOCTOU_RETRIES`] retries (each separated by a
@@ -3279,10 +3284,8 @@ fn try_acquire_llc_plan_locks_with_evidence(
 /// cross-invocation registry and, as coordinator, RE-PLANS AGAINST LIVE HOLDER
 /// STATE ON EVERY WAKE — plans are never cached across waits — waiting
 /// for a genuine holder's authoritative flock release rather than
-/// skipping.
-/// On
-/// success returns an [`LlcPlan`] holding the selected LLCs, their
-/// flattened CPUs (intersected with the calling process's allowed
+/// skipping. On success returns an [`LlcPlan`] holding the selected LLCs,
+/// their flattened CPUs (intersected with the calling process's allowed
 /// cpuset), the derived `mems` set, and the RAII flock handles.
 ///
 /// `cpu_cap == None` means "reserve 30% of the allowed-CPU set" (see
@@ -3297,9 +3300,7 @@ fn try_acquire_llc_plan_locks_with_evidence(
 /// exact reservations. Shared VM reservations use process-rotated
 /// [`PlacementPolicy::Spread`] (see the enum docs for the clustering failure
 /// Spread exists to prevent); direct fixed-size kernel builds use
-/// Exact LLC-SH/CPU-SH planner used for cooperative VM admission. It acquires
-/// topology locks and weighted admission permits in one registry claim, and
-/// observes cancellation while waiting behind hard-exclusive pressure.
+/// [`PlacementPolicy::Consolidate`].
 #[allow(clippy::too_many_arguments)] // Each argument is a distinct admission-policy input.
 pub(crate) fn acquire_llc_plan_interruptible(
     topo: &HostTopology,
@@ -6537,19 +6538,8 @@ pub fn plan_llc_selection_only(
     ))
 }
 
-/// Materialize the final [`LlcPlan`] from a selected LLC set and its
-/// held locks: flatten each selected LLC's CPUs, intersecting with
-/// `allowed` so `plan.cpus` never contains a CPU the process cannot
-/// run on, and TRUNCATING at exactly `target_cpus` so the last-LLC
-/// overshoot contributes only the prefix the budget needs. The full
-/// LLC is still flocked (the coordination unit is per-LLC), but the
-/// CPUs beyond `target_cpus` never appear in `plan.cpus` —
-/// sched_setaffinity masks and cgroup cpuset.cpus writes reflect the
-/// exact budget. `mems` collects the NUMA nodes of CPUs that actually
-/// appear in `plan.cpus`; an LLC that contributes a partial slice on
-/// a cross-node split only registers the nodes of its actually-used
-/// CPUs. Shared by the fast-phase and coordinator-phase success paths so the
-/// two cannot drift.
+/// Per-CPU discover state for one allowed host CPU, derived alongside
+/// [`LlcSnapshot`] from the same registry aggregate.
 #[derive(Debug, Clone, Copy, Default)]
 struct CpuPlacementState {
     exclusive_held: bool,
@@ -6639,6 +6629,18 @@ fn cpu_eligible_allowed(
     Ok(eligible)
 }
 
+/// Materialize a plan's CPU list from a selected LLC set: flatten each
+/// selected LLC's CPUs, keeping only the `eligible` ones so the result never
+/// contains a CPU this turn may not use, and TRUNCATING at exactly
+/// `target_cpus` so the last-LLC overshoot contributes only the prefix the
+/// budget needs. The full LLC is still flocked (the coordination unit is
+/// per-LLC), but the CPUs beyond `target_cpus` never appear in `plan.cpus` —
+/// sched_setaffinity masks and cgroup cpuset.cpus writes reflect the exact
+/// budget. The returned `mems` collects the NUMA nodes of CPUs that actually
+/// appear in `plan.cpus`; an LLC that contributes a partial slice on a
+/// cross-node split only registers the nodes of its actually-used CPUs.
+/// `None` means the eligible CPUs inside the selection cannot fund
+/// `target_cpus`.
 fn materialize_plan_cpus(
     selected: &[usize],
     topo: &HostTopology,
@@ -6734,6 +6736,11 @@ fn plan_mems(cpus: &[usize], topo: &HostTopology) -> std::collections::BTreeSet<
         .collect()
 }
 
+/// Assemble the returned [`LlcPlan`] from one acquired selection: its LLCs,
+/// the CPUs and NUMA nodes materialized for them, the CPU permits funding
+/// that width, and the RAII lock owners. Shared by the fast-phase, ticket,
+/// coordinator, and ownership-free selection-only paths so the plan they
+/// return cannot drift apart.
 fn materialize_llc_plan(
     selected: Vec<usize>,
     locks: protocol::Acquired<Vec<protocol::AdmissionFlock>>,
