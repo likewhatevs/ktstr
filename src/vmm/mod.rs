@@ -2924,8 +2924,8 @@ impl KtstrVm {
             let reusable_permits = probe.clone_reusable_permits()?;
             let exact = exact_attempts > 0;
             let designated_permits = designated.permits.iter().copied().collect::<Vec<_>>();
-            if exact {
-                let acquired = probe.try_acquire_default_exact(&designated, || {
+            if exact
+                && let Some(locks) = probe.try_acquire_default_exact(&designated, || {
                     host_topology::acquire_default_exact_footprint_with_permits_granted_reusing(
                         &candidate.shared_llcs,
                         &candidate.shared_cpus,
@@ -2933,13 +2933,9 @@ impl KtstrVm {
                         &designated_permits,
                         &reusable_permits,
                     )
-                })?;
-                if probe.acquisition_licensed() {
-                    crate::vmm::grant_flow::note_default_exact_probe(acquired.is_some());
-                }
-                if let Some(locks) = acquired {
-                    return Ok(Some((index, true, locks)));
-                }
+                })?
+            {
+                return Ok(Some((index, true, locks)));
             }
             // The shared acquire of the SAME designated placement. On an
             // `exact` licensed wake this is the same-wake fallback for a

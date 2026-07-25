@@ -565,6 +565,15 @@ const TEST_TRANSITION_SERVICE_BUDGET_NS: u64 = 1_000_000_000;
 // Charge the observer only after every live helper is blocked, and allow that
 // one real semantic timer to expire before diagnosing an all-actor deadlock.
 const TEST_EXTERNAL_BLOCKED_SERVICE_BUDGET_NS: u64 = 5_000_000_000;
+/// Process-CPU net for cross-process waits: if THIS test process burns this
+/// much CPU in the observer spin without the awaited transition, the wait is
+/// declared lost and fails with full helper/registry diagnostics instead of
+/// spinning silently until the harness rail kills the test undiagnosed (the
+/// 7x270s shape the retained-futex wake loss produced). Process CPU time —
+/// not wall — so host starvation cannot false-fire it: a descheduled
+/// observer accrues nothing. Sized far above the healthy saturated p100
+/// (seconds) for these fixtures.
+const TEST_EXTERNAL_PROCESS_CPU_NET_NS: u64 = 90_000_000_000;
 
 fn protocol_test_thread_cpu_time_ns() -> anyhow::Result<u64> {
     let mut timestamp = libc::timespec {
@@ -853,7 +862,13 @@ fn wait_with_task_service<T>(
     sources: &[TestTaskService],
     observe: impl FnMut() -> anyhow::Result<Option<T>>,
 ) -> anyhow::Result<T> {
-    wait_with_task_service_config(context, sources, TEST_TRANSITION_SERVICE_BUDGET_NS, observe)
+    wait_with_task_service_config(
+        context,
+        sources,
+        TEST_TRANSITION_SERVICE_BUDGET_NS,
+        None,
+        observe,
+    )
 }
 
 fn wait_with_external_task_service<T>(
@@ -865,17 +880,36 @@ fn wait_with_external_task_service<T>(
         context,
         sources,
         TEST_EXTERNAL_BLOCKED_SERVICE_BUDGET_NS,
+        Some(TEST_EXTERNAL_PROCESS_CPU_NET_NS),
         observe,
     )
+}
+
+/// This process's consumed CPU time. Zero on clock failure, degrading the
+/// process-CPU net to inert rather than false-firing.
+fn process_cpu_now_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes the timespec on success; failure leaves
+    // the zero initialization in place.
+    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    u64::try_from(ts.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(ts.tv_nsec).unwrap_or(0))
 }
 
 fn wait_with_task_service_config<T>(
     context: &str,
     sources: &[TestTaskService],
     blocked_observer_budget_ns: u64,
+    process_cpu_net_ns: Option<u64>,
     mut observe: impl FnMut() -> anyhow::Result<Option<T>>,
 ) -> anyhow::Result<T> {
     let mut watchdog = TestTaskServiceWatchdog::new(sources, blocked_observer_budget_ns)?;
+    let cpu_start = process_cpu_net_ns.map(|_| process_cpu_now_ns());
     let mut polls = 0usize;
     loop {
         if let Some(value) = observe()? {
@@ -885,6 +919,18 @@ fn wait_with_task_service_config<T>(
         polls = polls.wrapping_add(1);
         if polls.is_multiple_of(64) {
             watchdog.poll(context)?;
+            if let (Some(net), Some(start)) = (process_cpu_net_ns, cpu_start) {
+                let burned = process_cpu_now_ns().saturating_sub(start);
+                anyhow::ensure!(
+                    burned <= net,
+                    "{context} did not complete after this test process burned \
+                     {}ms of CPU in the observer spin (net {}ms) — treating the \
+                     awaited cross-process transition as lost rather than \
+                     spinning silently into the harness kill",
+                    burned / 1_000_000,
+                    net / 1_000_000,
+                );
+            }
         }
     }
 }

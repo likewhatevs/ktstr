@@ -2831,7 +2831,12 @@ const RESPONSE_200: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: 
 fn metadata_request_timeout_bounds_headers_then_stalled_body() {
     use std::io::Write;
 
-    const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+    // Generous request budget: reqwest's per-request timeout covers connect +
+    // request + body, so a saturated host can eat a small budget in the
+    // healthy phases and time the request out before the deliberate body
+    // stall is what fires. Two seconds keeps the assertion about the BODY
+    // stall while staying far below the socket fail-safe.
+    const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const SOCKET_FAILSAFE: std::time::Duration = std::time::Duration::from_secs(10);
 
     let root = tempfile::tempdir().expect("metadata Unix-socket tempdir");
@@ -2898,7 +2903,7 @@ fn metadata_request_timeout_bounds_headers_then_stalled_body() {
         "stalled body must surface a timeout error: {err:#}",
     );
     assert!(
-        body_stall_elapsed < std::time::Duration::from_secs(5),
+        body_stall_elapsed < SOCKET_FAILSAFE,
         "{BODY_TIMEOUT:?} body timeout took {body_stall_elapsed:?}; the socket fail-safe \
          must not be what unblocked the read",
     );

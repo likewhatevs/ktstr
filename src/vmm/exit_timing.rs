@@ -1,17 +1,18 @@
 //! Exit-phase admission-teardown telemetry (diagnostic-only, pure observation).
 //!
 //! Pins where a finished VM cell spends wall between `release_run_locks` and
-//! process exit — the post-release lingering seam CI shows at ~1130s median
-//! while the host sits ~93% idle. Each labelled stamp carries a process-relative
-//! instant and the delta since run-locks release, so a stall *between* stamps is
-//! attributable to the surrounding teardown step, and one aggregate line names
-//! the slowest step.
+//! process exit. Labelled stamps feed an in-memory aggregate (delta since
+//! release, slowest single step) and write nothing themselves; one aggregate
+//! line per process is appended at exit, so ~1100 cells/lane cost ~1100 lines
+//! in ONE shared file instead of ~1100 per-pid step logs. The 30s coordinator
+//! fallback accusation keeps its own line, deduplicated to the first block
+//! per process.
 //!
 //! Entirely inert unless `KTSTR_BUILD_DIAGNOSTICS_DIR` is set (CI only), the same
 //! idiom as [`super::AdmissionTiming`] and the coordinator wake counter: an
 //! unset sink costs one cached env lookup plus a relaxed atomic load per stamp
 //! and changes no wait/wake semantics. Lines land in
-//! `${KTSTR_BUILD_DIAGNOSTICS_DIR}/exit-timing-<pid>.log`.
+//! `${KTSTR_BUILD_DIAGNOSTICS_DIR}/exit-timing.log`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,8 @@ static PREV_DELTA_NS: AtomicU64 = AtomicU64::new(0);
 /// Slowest single step observed so far: `(label, step_ns)`.
 static SLOWEST: Mutex<(String, u64)> = Mutex::new((String::new(), 0));
 static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// First-fallback-accusation dedupe: see [`stamp_fallback_block`].
+static FALLBACK_BLOCK_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Test-only sink override so the emission path is exercisable without racing
 /// the process-global `DIR` OnceLock (which cannot be reset between tests).
@@ -91,27 +94,6 @@ fn wall_now_ns() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-/// One post-release teardown stamp line. Factored for shape tests.
-fn format_step_line(
-    pid: u32,
-    label: &str,
-    instant_ns: u64,
-    delta_ns: u64,
-    step_ns: u64,
-    waiting_on: Option<&str>,
-) -> String {
-    match waiting_on {
-        Some(target) => format!(
-            "exit-step: pid={pid} label={label} instant_ns={instant_ns} \
-             delta_ns={delta_ns} step_ns={step_ns} waiting_on={target}\n"
-        ),
-        None => format!(
-            "exit-step: pid={pid} label={label} instant_ns={instant_ns} \
-             delta_ns={delta_ns} step_ns={step_ns}\n"
-        ),
-    }
-}
-
 /// Coordinator fallback-tick accusation line. `wall_ns` is UNIX-epoch
 /// wall-clock (see [`wall_now_ns`]) so accusations from different acquisition-
 /// phase processes are totally orderable. Factored for shape tests.
@@ -156,7 +138,10 @@ fn append(dir: &Path, name: &str, line: &str) {
 }
 
 fn log_name() -> String {
-    format!("exit-timing-{}.log", std::process::id())
+    // One shared O_APPEND file for every process: each line is far below
+    // PIPE_BUF, so concurrent appends stay whole, and the artifact set stays
+    // one file per lane instead of one per cell.
+    "exit-timing.log".to_string()
 }
 
 /// Record the run-locks release instant and arm the exit aggregate. Called once
@@ -194,7 +179,7 @@ pub(crate) fn stamp_waiting(label: &str, waiting_on: &str) {
     stamp_inner(label, Some(waiting_on));
 }
 
-fn stamp_inner(label: &str, waiting_on: Option<&str>) {
+fn stamp_inner(label: &str, _waiting_on: Option<&str>) {
     // Cheapest gate first: `RELEASED_NS` is 0 both before this cell's release
     // AND whenever the sink is unset (`mark_released` never ran), so the common
     // no-op path is one relaxed load with no directory clone.
@@ -202,9 +187,10 @@ fn stamp_inner(label: &str, waiting_on: Option<&str>) {
     if released == 0 {
         return;
     }
-    let Some(dir) = dir() else {
-        return;
-    };
+    // Aggregate-only: stamps feed the slowest-step attribution the atexit
+    // line reports and write no per-step lines of their own — the per-step
+    // channel cost ~1100 tiny per-pid files per lane for a question the
+    // aggregate answers.
     let now = now_ns();
     let delta = now.saturating_sub(released);
     let prev = PREV_DELTA_NS.swap(delta, Ordering::Relaxed);
@@ -215,11 +201,6 @@ fn stamp_inner(label: &str, waiting_on: Option<&str>) {
     {
         *slowest = (label.to_string(), step);
     }
-    append(
-        &dir,
-        &log_name(),
-        &format_step_line(std::process::id(), label, now, delta, step, waiting_on),
-    );
 }
 
 /// Accusation line for a coordinator fallback tick: name the blocking resources
@@ -231,6 +212,12 @@ pub(crate) fn stamp_fallback_block(blocked_on: &str, holder: &str) {
     let Some(dir) = dir() else {
         return;
     };
+    // One accusation per process: the first blocked tick names the wedge; a
+    // long wedge would otherwise append a line every 30s from every blocked
+    // coordinator.
+    if FALLBACK_BLOCK_EMITTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
     append(
         &dir,
         &log_name(),
@@ -265,6 +252,7 @@ fn register_atexit() {
 #[cfg(test)]
 fn reset_for_tests(dir: Option<PathBuf>) {
     RELEASED_NS.store(0, Ordering::Relaxed);
+    FALLBACK_BLOCK_EMITTED.store(false, Ordering::Relaxed);
     LAST_STAMP_NS.store(0, Ordering::Relaxed);
     PREV_DELTA_NS.store(0, Ordering::Relaxed);
     ATEXIT_REGISTERED.store(false, Ordering::Relaxed);
@@ -312,7 +300,7 @@ mod tests {
     static STATE_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn stamp_is_release_gated_then_emits_ordered_lines_and_aggregate() {
+    fn stamps_feed_the_aggregate_without_per_step_lines() {
         let _serial = STATE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::TempDir::new().expect("exit-timing tempdir");
         reset_for_tests(Some(tmp.path().to_path_buf()));
@@ -326,25 +314,23 @@ mod tests {
             "an ordinary stamp before mark_released must not emit",
         );
 
-        // Release arms the seam; subsequent stamps emit in order with the
-        // aggregate closing it out.
+        // Release arms the seam; stamps feed the in-memory aggregate but
+        // write no per-step lines — only the atexit aggregate reaches the
+        // shared file.
         mark_released();
         assert!(post_release_active(), "active once released");
         stamp("run_locks_dropped");
         stamp("eval_done");
+        assert!(!log.exists(), "per-step stamps must not write file lines");
         emit_aggregate();
 
         let body = std::fs::read_to_string(&log).expect("exit-timing log written");
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 3, "two steps plus one aggregate: {body:?}");
+        assert_eq!(lines.len(), 1, "exactly one aggregate line: {body:?}");
         assert!(
-            lines[0].starts_with("exit-step: ") && lines[0].contains("label=run_locks_dropped")
-        );
-        assert!(lines[1].starts_with("exit-step: ") && lines[1].contains("label=eval_done"));
-        assert!(
-            lines[2].starts_with("exit-timing: ") && lines[2].contains("slowest_step="),
-            "aggregate line closes the log: {:?}",
-            lines[2],
+            lines[0].starts_with("exit-timing: ") && lines[0].contains("slowest_step="),
+            "the aggregate closes the log with the slowest-step field: {:?}",
+            lines[0],
         );
 
         // Disabling the sink makes even a post-release stamp inert.
@@ -364,14 +350,19 @@ mod tests {
         let log = tmp.path().join(log_name());
 
         // No mark_released: a fallback accusation still emits (a coordinator
-        // rides fallbacks during acquisition, before its own release).
+        // rides fallbacks during acquisition, before its own release), and a
+        // repeated block from the same process is deduplicated to the first.
         assert!(!post_release_active());
         stamp_fallback_block("cpu=3,permit=7", "pid=42 ticket=9");
+        stamp_fallback_block("cpu=3,permit=7", "pid=42 ticket=9");
         let body = std::fs::read_to_string(&log).expect("fallback line written");
+        assert_eq!(
+            body.matches("exit-fallback-block: ").count(),
+            1,
+            "repeated blocks dedupe to the first accusation: {body:?}",
+        );
         assert!(
-            body.contains("exit-fallback-block: ")
-                && body.contains("blocked_on=cpu=3,permit=7")
-                && body.contains("holder=pid=42 ticket=9"),
+            body.contains("blocked_on=cpu=3,permit=7") && body.contains("holder=pid=42 ticket=9"),
             "fallback accusation emits pre-release: {body:?}",
         );
 
@@ -390,27 +381,6 @@ mod tests {
             resolve_dir(Some(std::ffi::OsString::from("/tmp/diag"))),
             Some(PathBuf::from("/tmp/diag")),
             "a non-empty path enables the sink",
-        );
-    }
-
-    #[test]
-    fn step_line_shape_with_and_without_wait_target() {
-        assert_eq!(
-            format_step_line(42, "run_locks_dropped", 1_000, 0, 0, None),
-            "exit-step: pid=42 label=run_locks_dropped instant_ns=1000 \
-             delta_ns=0 step_ns=0\n",
-        );
-        assert_eq!(
-            format_step_line(
-                42,
-                "ticket_record_retire",
-                5_000,
-                4_000,
-                3_000,
-                Some("ticket=7")
-            ),
-            "exit-step: pid=42 label=ticket_record_retire instant_ns=5000 \
-             delta_ns=4000 step_ns=3000 waiting_on=ticket=7\n",
         );
     }
 
@@ -434,32 +404,6 @@ mod tests {
             format_aggregate_line(3, 100, 100, 100, "", 0),
             "exit-timing: pid=3 released=100 handles_done=100 exit=100 slowest_step=none,0\n",
             "an empty slowest label renders as `none`",
-        );
-    }
-
-    #[test]
-    fn stamp_is_inert_until_marked_and_writes_after() {
-        // This test owns the process-global state, so keep it single-threaded
-        // relative to the other exit_timing state by running it alone; the
-        // OnceLock dir is resolved from a real temp dir via the env.
-        let tmp = tempfile::TempDir::new().expect("exit-timing tempdir");
-        // Directly exercise the append + formatter path a stamp takes, without
-        // depending on the process-global OnceLock (which cannot be reset
-        // between tests): a stamp before release writes nothing, after release
-        // writes one greppable line.
-        let name = "exit-timing-probe.log";
-        // Pre-release: no file.
-        assert!(!tmp.path().join(name).exists(), "no line before any stamp",);
-        // Post-release emission shape.
-        append(
-            tmp.path(),
-            name,
-            &format_step_line(7, "vm_run_returned", 12, 2, 2, None),
-        );
-        let body = std::fs::read_to_string(tmp.path().join(name)).expect("stamp line written");
-        assert_eq!(
-            body,
-            "exit-step: pid=7 label=vm_run_returned instant_ns=12 delta_ns=2 step_ns=2\n",
         );
     }
 }

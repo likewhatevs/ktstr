@@ -71,19 +71,40 @@ _with-host-sampler +cmd:
     set -euo pipefail
     if [ -n "${KTSTR_BUILD_DIAGNOSTICS_DIR:-}" ]; then
         mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+        # Materialized once for the sampler loop: probing each permit file
+        # with LOCK_SH|LOCK_NB from a single interpreter per sample replaces
+        # the /proc/locks seq-file walk (which serializes on the kernel
+        # lock-table lock and poisons peer flock ops — the regression this
+        # branch removed from the planner) without forking per file.
+        probe_script="${KTSTR_BUILD_DIAGNOSTICS_DIR}/.permit-probe.py"
+        printf '%s\n' \
+            'import fcntl, glob, sys' \
+            'held = 0' \
+            'for path in glob.glob(sys.argv[1] + "/ktstr-permit-*"):' \
+            '    try:' \
+            '        handle = open(path)' \
+            '    except OSError:' \
+            '        continue' \
+            '    try:' \
+            '        fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)' \
+            '        fcntl.flock(handle, fcntl.LOCK_UN)' \
+            '    except OSError:' \
+            '        held += 1' \
+            '    finally:' \
+            '        handle.close()' \
+            'print(held)' > "$probe_script"
         (
             lock_dir="${KTSTR_LOCK_DIR:-}"
             while true; do
                 busy_idle=$(awk '/^cpu /{print $5+$6, $2+$3+$4+$5+$6+$7+$8+$9}' /proc/stat)
                 permits=0
-                if [ -n "$lock_dir" ]; then
-                    # Permit files persist after release; a permit is HELD only
-                    # while some process flocks it. Join /proc/locks' FLOCK
-                    # inodes against the permit files' inodes.
-                    permits=$(comm -12 \
-                        <(stat -c '%i' "$lock_dir"/ktstr-permit-* 2>/dev/null | sort -u) \
-                        <(awk '$2=="FLOCK" || $3=="FLOCK" {n=split($6,p,":"); if (n==3) print p[3]}' /proc/locks 2>/dev/null | sort -u) \
-                        | wc -l)
+                if [ -n "$lock_dir" ] && command -v python3 >/dev/null 2>&1; then
+                    # Permit files persist after release; a permit is HELD
+                    # only while some process flocks it (always LOCK_EX). A
+                    # failed SH probe means an EX holder; a successful probe
+                    # is released immediately and can only collide with a
+                    # concurrent EX probe for a microsecond-scale window.
+                    permits=$(python3 "$probe_script" "$lock_dir" 2>/dev/null || echo 0)
                 fi
                 # Aggregate IO across real block devices (skip loop/ram):
                 # sectors read+written and ms spent in IO, cumulative like

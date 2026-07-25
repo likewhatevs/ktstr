@@ -48,8 +48,6 @@ const LIVENESS_PREFIX: &str = "ktstr-acquire-v26-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 const WAIT_DIAGNOSTIC_BUCKET_SECS: u64 = 30;
-// Minimum gap between preparation-budget diagnostic lines per process.
-const PREP_BUDGET_DIAGNOSTIC_MIN_MS: u64 = 250;
 const WAIT_DIAGNOSTIC_RING_SLOTS: u64 = 8;
 const WAIT_DIAGNOSTIC_MAX_RECORDS: usize = 64;
 const WAIT_DIAGNOSTIC_MAX_BYTES: usize = 128 * 1024;
@@ -427,6 +425,9 @@ const Q_LLC_SH: usize = 2;
 const Q_LLC_EX: usize = 3;
 const REQUEST_ARRAYS: usize = 4;
 const LIVENESS_SWEEP_INTERVAL_NS: u64 = 30_000_000_000;
+/// Minimum spacing between liveness sweeps triggered by coordinator-session
+/// reconcile requests. See [`Table::request_liveness_reconciliation`].
+const LIVENESS_RECONCILE_MIN_INTERVAL_NS: u64 = 5_000_000_000;
 /// The elected coordinator alone wakes at this cadence and renews one header
 /// word. No planner, observation, grant scan, or liveness sweep is coupled to
 /// this tick.
@@ -443,6 +444,30 @@ pub(super) const COORDINATOR_HEARTBEAT_INTERVAL: Duration =
 /// returns the authoritative state on the next turnstile gap.
 const TURNSTILE_READ_BACKOFF: Duration = Duration::from_millis(2);
 const DEFERRED_RESCAN_INTERVAL_NS: u64 = 1_000_000_000;
+#[cfg(test)]
+thread_local! {
+    /// Test-injected replacement for [`DEFERRED_RESCAN_INTERVAL_NS`]. The
+    /// deadline exercises arm a fixture deadline exactly one interval ahead
+    /// and assert the first completion shortens it; with the production 1s
+    /// interval, a test process descheduled for ~1s between arming and the
+    /// completion crosses the window and flakes the assertion. Injecting a
+    /// longer interval (consistently into the arm site AND the validity
+    /// clamps, which flush any deadline further than one interval out)
+    /// removes the wall-clock race without weakening what the tests pin.
+    static DEFERRED_RESCAN_INTERVAL_OVERRIDE_NS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn deferred_rescan_interval_ns() -> u64 {
+    #[cfg(test)]
+    {
+        let injected = DEFERRED_RESCAN_INTERVAL_OVERRIDE_NS.with(std::cell::Cell::get);
+        if injected != 0 {
+            return injected;
+        }
+    }
+    DEFERRED_RESCAN_INTERVAL_NS
+}
 /// Short, non-renewing coalescing quantum for authoritative grant-scan edges
 /// that arrive in bursts: a GRANTED batch's negative completions (which probe
 /// outside registry EX and tend to return together) and HELD releases (a
@@ -2717,7 +2742,6 @@ impl Ticket {
                 .filter(|record| record.ticket == self.ticket)
                 .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
             if record.state == STATE_REVOKED {
-                crate::vmm::grant_flow::note_lost_revoked();
                 let acknowledgement = table.acknowledge_revoked(self.slot, self.ticket, None)?;
                 drop(table);
                 drop(_lock);
@@ -2739,41 +2763,37 @@ impl Ticket {
             if !matches!(record.state, STATE_GRANTED | STATE_REPLAN) {
                 return Ok(GrantResult::LostGrant);
             }
-            if record.state == STATE_GRANTED && table.min_changed_ticket() < record.ticket {
-                if table.changed_claims_saturated()
-                    || table.changed_claims_conflict(&record.claim)?
-                {
-                    crate::vmm::grant_flow::note_lost_suffix_watermark();
-                    crate::vmm::grant_flow::note_watermark_park(table.replan_outstanding() > 0);
-                    // Never run the O(N) authoritative scan from a callback
-                    // entrant. An earlier non-fencing REPLAN replacement can
-                    // dirty this suffix without advancing the global claim
-                    // epoch, so the suffix watermark plus the changed-claims
-                    // accumulator is the complete admission fence. Park this
-                    // unentered token and publish one coalesced edge; the
-                    // coordinator consumes it in its normal scan turn.
-                    table.begin_transaction()?;
-                    table.set_record_state(self.slot, STATE_WAITING)?;
-                    table.clear_record_blocked(self.slot)?;
-                    let notify = table.schedule_grant_completion_edge_in_transaction()?;
-                    table.finish_transaction()?;
-                    drop(table);
-                    drop(_lock);
-                    if notify {
-                        notify_coordinator();
-                    }
-                    return Ok(GrantResult::LostGrant);
+            // Park a granted entrant behind a dirty suffix only when its
+            // claim overlaps something that became newly fenceable since the
+            // last authoritative scan: new fences are a subset of the
+            // changed-claims accumulator and retirements only shrink
+            // prefixes, so a disjoint entrant cannot be doomed by the
+            // pending scan and proceeds — its probe runs now and every
+            // completion path publishes its own scan edge, superseding the
+            // wave-edge shortening a park would have provided.
+            if record.state == STATE_GRANTED
+                && table.min_changed_ticket() < record.ticket
+                && (table.changed_claims_saturated()
+                    || table.changed_claims_conflict(&record.claim)?)
+            {
+                // Never run the O(N) authoritative scan from a callback
+                // entrant. An earlier non-fencing REPLAN replacement can
+                // dirty this suffix without advancing the global claim
+                // epoch, so the suffix watermark plus the changed-claims
+                // accumulator is the complete admission fence. Park this
+                // unentered token and publish one coalesced edge; the
+                // coordinator consumes it in its normal scan turn.
+                table.begin_transaction()?;
+                table.set_record_state(self.slot, STATE_WAITING)?;
+                table.clear_record_blocked(self.slot)?;
+                let notify = table.schedule_grant_completion_edge_in_transaction()?;
+                table.finish_transaction()?;
+                drop(table);
+                drop(_lock);
+                if notify {
+                    notify_coordinator();
                 }
-                // The suffix is dirty, but every claim that became newly
-                // fenceable since the last authoritative scan is disjoint
-                // from this grant (new fences are a subset of the
-                // accumulator; retirements only shrink prefixes), so the
-                // pending scan cannot doom it. Proceed instead of parking:
-                // the probe runs now, and every completion path — promote,
-                // requeue, contention — publishes its own scan edge, so the
-                // wave-edge shortening a park would have provided is
-                // superseded by actual progress.
-                crate::vmm::grant_flow::note_watermark_proceed();
+                return Ok(GrantResult::LostGrant);
             }
             let state_epoch = if record.state == STATE_GRANTED {
                 record.grant_epoch
@@ -2782,7 +2802,6 @@ impl Ticket {
             };
             let (prefix_epoch, mut predecessors) = table.cached_prefix(record.slot)?;
             if prefix_epoch == 0 || prefix_epoch != state_epoch {
-                crate::vmm::grant_flow::note_lost_prefix_epoch();
                 table.begin_transaction()?;
                 let replan_completion = record.state == STATE_REPLAN;
                 if replan_completion {
@@ -2953,15 +2972,7 @@ impl Ticket {
         let dirty_grant = dirty_suffix
             && (table.changed_claims_saturated()
                 || table.changed_claims_conflict(&record.claim)?);
-        if dirty_suffix && !dirty_grant {
-            // Same overlap test as the entry park: the accumulated changed
-            // claims are disjoint from this acquired grant, so the pending
-            // scan cannot revoke it — commit rather than releasing the
-            // physical payload.
-            crate::vmm::grant_flow::note_watermark_proceed();
-        }
         if dirty_grant && record.state == STATE_GRANTED && record.claim == designated {
-            crate::vmm::grant_flow::note_lost_suffix_watermark();
             let released_acquired = result.acquired.is_some();
             let blocked = if released_acquired {
                 None
@@ -3036,7 +3047,6 @@ impl Ticket {
             && result.acquired.is_some()
             && table.min_changed_ticket_replan() < record.ticket;
         if dirty_redesignation {
-            crate::vmm::grant_flow::note_replan_requeue();
             table.begin_transaction()?;
             // REPLAN -> WAITING drains this ring slot through set_record_state.
             table.set_record_state(self.slot, STATE_WAITING)?;
@@ -3057,7 +3067,6 @@ impl Ticket {
             return Ok(GrantResult::LostGrant);
         }
         if record.state == STATE_REVOKED {
-            crate::vmm::grant_flow::note_lost_revoked();
             // The revocation scan deliberately kept this exact claim in every
             // later prefix. If the callback won the physical race, publish an
             // UNKNOWN observation before releasing its OFDs. Only after the
@@ -3173,7 +3182,6 @@ impl Ticket {
             || !same_replan_issuance
             || (acquisition_allowed && stale && !accept_stale_contention)
         {
-            crate::vmm::grant_flow::note_lost_stale_regrant();
             // A changed publication token means the coordinator already issued
             // a fresh callback snapshot. Preserve an unrelated new claim, but
             // revoke a same-claim grant below when this callback proved that
@@ -3319,26 +3327,6 @@ impl Ticket {
             validate_contention_within_watch(&[evidence.marker()], &watch)?;
         }
         let changed = result.next_claim != designated;
-        // Classify the eventual licensed probe loss while the contention
-        // evidence is still alive: `changed` completions rotated to a new
-        // designation after their probe miss (default's opportunistic
-        // CPU-EX pin probe deliberately discards its evidence, so most land
-        // in the changed/no-evidence bucket); unchanged completions carry
-        // the exact resource+mode that rejected the flock.
-        let probe_loss_class = if acquisition_allowed {
-            Some(crate::vmm::grant_flow::classify_probe_loss(
-                changed,
-                result.contention.as_ref().map(|evidence| {
-                    (
-                        matches!(evidence.blocker, ResourceKey::Cpu(_)),
-                        matches!(evidence.blocker, ResourceKey::Permit(_)),
-                        evidence.mode == FlockMode::Exclusive,
-                    )
-                }),
-            ))
-        } else {
-            None
-        };
         anyhow::ensure!(
             result.preparation_contention.is_none() || !changed,
             "preparation contention cannot replace the final-run designation",
@@ -3411,10 +3399,8 @@ impl Ticket {
                 // charge proves that new fence can doom no in-flight grant.
                 // The replan word still fences speculative acquire-commits.
                 if table.claim_grant_conflicts_header(&record.claim)? {
-                    crate::vmm::grant_flow::note_completion_guard(false);
                     table.mark_suffix_dirty_fencing(record.ticket, &record.claim)?;
                 } else {
-                    crate::vmm::grant_flow::note_completion_guard(true);
                     table.mark_replan_suffix_dirty(record.ticket);
                 }
             }
@@ -3449,14 +3435,6 @@ impl Ticket {
         drop(result);
         if notify_now {
             notify_coordinator();
-        }
-        // A licensed GRANTED callback reaching here lost its physical flock to a
-        // real competing holder; an unlicensed REPLAN callback simply re-planned
-        // without acquiring (normal elastic churn, not a grant loss).
-        if let Some(class) = probe_loss_class {
-            crate::vmm::grant_flow::note_lost_physical_probe(class);
-        } else {
-            crate::vmm::grant_flow::note_replan_requeue();
         }
         Ok(GrantResult::Requeued)
     }
@@ -3759,7 +3737,6 @@ impl Ticket {
         if read_u32(record_bytes, R_STATE) != STATE_COORDINATOR {
             return Ok(None);
         }
-        let record = decode_record(record_bytes, layout, self.slot)?;
 
         let watch_llcs = decode_header_bitset(header, layout, B_WATCH_LLCS);
         let (watch_cpus, watch_permits) =
@@ -3787,6 +3764,38 @@ impl Ticket {
                 ClaimMode::Exclusive
             },
         );
+        let watched_cpus = closed_cpus.intersection(&watch.cpus).copied();
+        let watched_llcs = closed_llcs.intersection(&watch.llcs).copied();
+        let watched_permits = closed_permits.intersection(&watch.permits).copied();
+        let cpus_free = watched_cpus.into_iter().all(|cpu| {
+            header_bitmap_bit(header, layout, B_CPU_KNOWN, cpu)
+                && header_bitmap_bit(header, layout, B_CPU_SH_AVAILABLE, cpu)
+                && (!watch_cpu_exclusive.contains(&cpu)
+                    || header_bitmap_bit(header, layout, B_CPU_EX_AVAILABLE, cpu))
+        });
+        let llcs_free = watched_llcs.into_iter().all(|llc| {
+            header_bitmap_bit(header, layout, B_LLC_KNOWN, llc)
+                && header_bitmap_bit(header, layout, B_LLC_SH_AVAILABLE, llc)
+                && (!watch_llc_exclusive.contains(&llc)
+                    || header_bitmap_bit(header, layout, B_LLC_EX_AVAILABLE, llc))
+        });
+        let permits_free = watched_permits.into_iter().all(|permit| {
+            let Ok(index) = permit_resource_index(permit) else {
+                return false;
+            };
+            header_bitmap_bit(header, layout, B_CPU_KNOWN, index)
+                && header_bitmap_bit(header, layout, B_CPU_SH_AVAILABLE, index)
+                && (!watch_permit_exclusive.contains(&permit)
+                    || header_bitmap_bit(header, layout, B_CPU_EX_AVAILABLE, index))
+        });
+        if !cpus_free || !llcs_free || !permits_free {
+            return Ok(None);
+        }
+        check_cancelled(cancelled)?;
+        // Only a known-free hit pays the full record decode and the
+        // O(bits) snapshot copies below; the common busy-close sample
+        // returns above after the cheap header-bit checks.
+        let record = decode_record(record_bytes, layout, self.slot)?;
         let record_words = |which| {
             (0..layout.words)
                 .map(|word| {
@@ -3844,34 +3853,6 @@ impl Ticket {
             llc_sh_available: header_words(B_LLC_SH_AVAILABLE),
             llc_ex_available: header_words(B_LLC_EX_AVAILABLE),
         };
-        let watched_cpus = closed_cpus.intersection(&watch.cpus).copied();
-        let watched_llcs = closed_llcs.intersection(&watch.llcs).copied();
-        let watched_permits = closed_permits.intersection(&watch.permits).copied();
-        let cpus_free = watched_cpus.into_iter().all(|cpu| {
-            header_bitmap_bit(header, layout, B_CPU_KNOWN, cpu)
-                && header_bitmap_bit(header, layout, B_CPU_SH_AVAILABLE, cpu)
-                && (!watch_cpu_exclusive.contains(&cpu)
-                    || header_bitmap_bit(header, layout, B_CPU_EX_AVAILABLE, cpu))
-        });
-        let llcs_free = watched_llcs.into_iter().all(|llc| {
-            header_bitmap_bit(header, layout, B_LLC_KNOWN, llc)
-                && header_bitmap_bit(header, layout, B_LLC_SH_AVAILABLE, llc)
-                && (!watch_llc_exclusive.contains(&llc)
-                    || header_bitmap_bit(header, layout, B_LLC_EX_AVAILABLE, llc))
-        });
-        let permits_free = watched_permits.into_iter().all(|permit| {
-            let Ok(index) = permit_resource_index(permit) else {
-                return false;
-            };
-            header_bitmap_bit(header, layout, B_CPU_KNOWN, index)
-                && header_bitmap_bit(header, layout, B_CPU_SH_AVAILABLE, index)
-                && (!watch_permit_exclusive.contains(&permit)
-                    || header_bitmap_bit(header, layout, B_CPU_EX_AVAILABLE, index))
-        });
-        if !cpus_free || !llcs_free || !permits_free {
-            return Ok(None);
-        }
-        check_cancelled(cancelled)?;
         Ok(Some(ScheduleSnapshot {
             watch,
             candidate_claim: record.claim,
@@ -4939,49 +4920,6 @@ pub(super) fn with_aggregate_fence<T>(
 /// thirty-second ring keeps even a permanently wedged host bounded. A per-slot
 /// flock serializes writers, and the largest live queue observed in each bucket
 /// wins so an isolated protocol fixture cannot hide the production queue.
-/// Diagnostic-gated, rate-limited per-scan snapshot of the preparation-slot
-/// pool budget: `free = pool - pending_tokens - coordinator_reserve -
-/// granted_this_scan`, alongside the count of preparation intents eligible to
-/// run but for the pool. Appended to `${KTSTR_BUILD_DIAGNOSTICS_DIR}/
-/// prep-budget-<pid>.txt`; untouched when the env var is unset (a relaxed load
-/// only). One CI run then names the term that eats the pool.
-pub(super) fn persist_prep_budget_diagnostic_if_enabled(
-    pool: usize,
-    pending_tokens: usize,
-    coordinator_reserve: usize,
-    granted_this_scan: usize,
-    eligible_waiting: usize,
-) {
-    let Some(root) = std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
-        .filter(|root| !root.is_empty())
-        .map(PathBuf::from)
-    else {
-        return;
-    };
-    static LAST_EMIT_MS: AtomicU64 = AtomicU64::new(0);
-    let now_ms = monotonic_now_ns().unwrap_or(0) / 1_000_000;
-    if now_ms.saturating_sub(LAST_EMIT_MS.load(Ordering::Relaxed)) < PREP_BUDGET_DIAGNOSTIC_MIN_MS {
-        return;
-    }
-    LAST_EMIT_MS.store(now_ms, Ordering::Relaxed);
-    let free = pool.saturating_sub(pending_tokens + granted_this_scan + coordinator_reserve);
-    let pid = std::process::id();
-    let line = format!(
-        "prep-budget: pid={pid} pool={pool} pending_tokens={pending_tokens} \
-         coordinator_reserve={coordinator_reserve} granted_this_scan={granted_this_scan} \
-         free={free} eligible_waiting={eligible_waiting}\n"
-    );
-    if std::fs::create_dir_all(&root).is_err() {
-        return;
-    }
-    let path = root.join(format!("prep-budget-{pid}.txt"));
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
-}
-
 pub(super) fn persist_wait_diagnostic_if_enabled() {
     let Some(root) = std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
         .filter(|root| !root.is_empty())
@@ -10517,6 +10455,18 @@ pub(super) fn exercise_same_wake_redesignation_expired_release_for_tests()
 /// between individual negative completions.
 #[cfg(test)]
 pub(super) fn exercise_grant_completion_batch_for_tests() -> Result<GrantCompletionBatchOutcome> {
+    // Deflake: the fixture arms its speculative deadline one deferred-rescan
+    // interval ahead and asserts the first completion shortens it. Inject a
+    // five-minute interval so test-process descheduling cannot cross the
+    // window (see `DEFERRED_RESCAN_INTERVAL_OVERRIDE_NS`).
+    struct IntervalGuard;
+    impl Drop for IntervalGuard {
+        fn drop(&mut self) {
+            DEFERRED_RESCAN_INTERVAL_OVERRIDE_NS.with(|cell| cell.set(0));
+        }
+    }
+    DEFERRED_RESCAN_INTERVAL_OVERRIDE_NS.with(|cell| cell.set(300_000_000_000));
+    let _interval_guard = IntervalGuard;
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [1_750usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     {
@@ -10546,7 +10496,7 @@ pub(super) fn exercise_grant_completion_batch_for_tests() -> Result<GrantComplet
         );
         let speculative_deadline = monotonic_now_ns()?
             .max(1)
-            .saturating_add(DEFERRED_RESCAN_INTERVAL_NS);
+            .saturating_add(deferred_rescan_interval_ns());
         table.begin_transaction()?;
         table.set_pending_flag(PENDING_REPLAN_RESCAN);
         write_u64(
@@ -10850,6 +10800,20 @@ pub(super) fn exercise_deferred_rescan_policy_for_tests() -> Result<DeferredResc
             read_u64(&table.header, H_GRANT_SCANS),
         )
     };
+    // Deflake: the known-free SH fast path requires a fresh coordinator
+    // activity lease. Renew the heartbeat word immediately before the
+    // release turn so a descheduled test process cannot stale the lease
+    // between fixture setup and this assertion — the EX fallback it would
+    // otherwise take is correct production behavior, but not what this pin
+    // tests. A raw header touch (not `Ticket::heartbeat`, whose loop also
+    // promotes deferred edges) leaves the deferred state this test asserts
+    // on untouched; it takes the registry EX flock itself, so the
+    // EX-acquisition counter is sampled only afterwards.
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.touch_coordinator_heartbeat()?;
+    }
     let ex_before = REGISTRY_EX_ACQUISITIONS.with(std::cell::Cell::get);
     let released_cpu = BTreeSet::from([1_800usize]);
     let empty = BTreeSet::new();
@@ -16405,7 +16369,7 @@ impl Table {
         // cases flush now instead of stranding authoritative work.
         deadline == 0
             || deadline <= now
-            || deadline > now.saturating_add(DEFERRED_RESCAN_INTERVAL_NS)
+            || deadline > now.saturating_add(deferred_rescan_interval_ns())
     }
 
     fn deferred_rescan_due_in_at(&self, now: u64) -> Option<Duration> {
@@ -16505,7 +16469,7 @@ impl Table {
             write_u64(
                 &mut self.header,
                 H_DEFERRED_RESCAN_DEADLINE_NS,
-                now.saturating_add(DEFERRED_RESCAN_INTERVAL_NS),
+                now.saturating_add(deferred_rescan_interval_ns()),
             );
         }
         Ok(false)
@@ -16836,7 +16800,17 @@ impl Table {
     fn request_liveness_reconciliation(&mut self, delay: Duration) -> Result<()> {
         let now = monotonic_now_ns()?;
         let delay_ns = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX);
-        let requested = now.saturating_add(delay_ns).max(1);
+        // Rate-limit reconcile-triggered sweeps: every coordinator session
+        // requests one, and a session churn storm would otherwise run the
+        // O(records) prune (full liveness probe per record, under the
+        // registry EX flock) every ~500ms. Clamping the deadline to a
+        // minimum spacing after the LAST sweep keeps the pre-watch
+        // death-recovery guarantee (the request is never dropped, only
+        // deferred) while bounding the sweep rate well inside the ordinary
+        // 30s liveness cadence.
+        let floor = read_u64(&self.header, H_LAST_LIVENESS_SWEEP_NS)
+            .saturating_add(LIVENESS_RECONCILE_MIN_INTERVAL_NS);
+        let requested = now.saturating_add(delay_ns).max(floor).max(1);
         let current = read_u64(&self.header, H_LIVENESS_RECONCILE_BY_NS);
         if current == 0 || requested < current {
             write_u64(&mut self.header, H_LIVENESS_RECONCILE_BY_NS, requested);
@@ -17838,12 +17812,6 @@ impl Table {
                 self.mark_claim_changed_fencing(ticket, new)?;
             }
             ReplacementFenceEffect::NonFencing => {
-                if crate::vmm::grant_flow::enabled() {
-                    crate::vmm::grant_flow::note_replan_replace(
-                        new == old,
-                        new.cpus == old.cpus && new.llcs == old.llcs,
-                    );
-                }
                 // REPLAN and WAITING are both non-fencing, so this replacement
                 // must not invalidate every live callback through the global
                 // claim epoch. It can become a new predecessor fence in the
@@ -17865,10 +17833,8 @@ impl Table {
                 // grant charge and stay fenced through the always-dirtied
                 // replan word.
                 if self.claim_grant_conflicts_header(new)? {
-                    crate::vmm::grant_flow::note_replace_guard(false);
                     self.mark_suffix_dirty_fencing(ticket, new)?;
                 } else {
-                    crate::vmm::grant_flow::note_replace_guard(true);
                     self.mark_replan_suffix_dirty(ticket);
                 }
             }
@@ -18610,13 +18576,10 @@ impl Table {
         // (not yet PENDING/HELD), one slot is reserved out of the budget so a
         // junior budgeted waiter can never win the slot ahead of it.
         let preparation_pool = preparation_tokens.map_or(0, |range| range.len());
-        // Split for the diagnostic (below): tokens already held by fenced
-        // PENDING/REVOKED records vs. reservations for this scan's own grants.
+        // Tokens already held by fenced PENDING/REVOKED records vs.
+        // reservations for this scan's own grants.
         let mut prep_pending_tokens = 0usize;
         let mut prep_granted_tokens = 0usize;
-        // Preparation intents that could run now but for the pool budget — the
-        // suppressed demand the diagnostic reports against the free count.
-        let mut prep_eligible_waiting = 0usize;
         let coordinator_reserve = usize::from(
             preparation_tokens.is_some()
                 && records.iter().any(|record| {
@@ -18832,15 +18795,6 @@ impl Table {
                 && preparation_tokens.is_some()
                 && prep_pending_tokens + prep_granted_tokens + coordinator_reserve
                     >= preparation_pool;
-            // Count a WAITING preparation intent that could run now but for the
-            // pool, so the diagnostic can contrast suppressed demand with free.
-            if record.state == STATE_WAITING
-                && record.ticket != coordinator_ticket
-                && record.preparation_intent
-                && acquisition_viable
-            {
-                prep_eligible_waiting += 1;
-            }
             let mut scan_state = record.state;
             if record.state == STATE_COORDINATOR {
                 // A coordinator can now sit behind live GRANTED/REPLAN
@@ -19143,15 +19097,6 @@ impl Table {
             self.advance_generation()?;
             self.note_queue_progress()?;
         }
-        if preparation_tokens.is_some() {
-            persist_prep_budget_diagnostic_if_enabled(
-                preparation_pool,
-                prep_pending_tokens,
-                coordinator_reserve,
-                prep_granted_tokens,
-                prep_eligible_waiting,
-            );
-        }
         if sample_held_in_flight {
             let distinct_cpus = held_cpu_bits
                 .iter()
@@ -19168,11 +19113,15 @@ impl Table {
     }
 
     fn prune_dead(&mut self) -> Result<()> {
-        let records = self.records()?;
+        // Victim detection needs only identities; walk the lazy scan records
+        // so a large live population does not pay a full watch decode per
+        // record on every sweep. Only the dead few are fully re-decoded
+        // inside the removal transaction below.
+        let records = self.scan_records()?;
         let mut dead = Vec::new();
         for record in records {
             if !ticket_is_live(record.slot, record.ticket)? {
-                dead.push(record);
+                dead.push((record.slot, record.ticket));
             }
         }
         if dead.is_empty() {
@@ -19185,20 +19134,20 @@ impl Table {
         // next corpse and degenerating to O(N²).
         let removed_coordinator = dead
             .iter()
-            .any(|record| record.ticket == self.coordinator_ticket());
+            .any(|&(_, ticket)| ticket == self.coordinator_ticket());
         self.begin_transaction()?;
-        for record in &dead {
+        for &(slot, ticket) in &dead {
             // Each unlink mutates its neighbours' prev/next fields. Re-read
             // the next victim so a cloned stale link cannot write through an
             // already-freed predecessor and corrupt the active/free lists.
             if let Some(current) = self
-                .record(record.slot)?
-                .filter(|current| current.ticket == record.ticket)
+                .record(slot)?
+                .filter(|current| current.ticket == ticket)
             {
                 self.remove_record_in_transaction(&current, false)?;
             }
         }
-        if let Some(first) = dead.iter().map(|record| record.ticket).min() {
+        if let Some(first) = dead.iter().map(|&(_, ticket)| ticket).min() {
             self.mark_claim_changed_relaxation_metadata(first)?;
         }
         crash_at_for_tests("remove_record_before_election");
@@ -19212,8 +19161,8 @@ impl Table {
         }
         self.advance_generation_and_wake_pending()?;
         self.finish_transaction()?;
-        for record in dead {
-            let _ = std::fs::remove_file(liveness_path(record.slot, record.ticket));
+        for (slot, ticket) in dead {
+            let _ = std::fs::remove_file(liveness_path(slot, ticket));
         }
         Ok(())
     }
@@ -19448,7 +19397,10 @@ impl Table {
             #[cfg(test)]
             COORDINATOR_ELECTION_RECORD_READS
                 .with(|reads| reads.set(reads.get().saturating_add(1)));
-            let record = self.record(slot)?.ok_or_else(|| {
+            // Election needs only state/ticket/links; the lazy scan decode
+            // avoids materializing every candidate's alternative watch under
+            // the registry EX flock.
+            let record = self.scan_record(slot)?.ok_or_else(|| {
                 anyhow::anyhow!("queue active slot {slot} disappeared during coordinator election")
             })?;
             if matches!(record.state, STATE_WAITING | STATE_COORDINATOR_STANDBY) {
@@ -22287,7 +22239,7 @@ fn deferred_rescan_due_in_from_header(header: &[u8], now: u64) -> Option<Duratio
     let deadline = read_u64(header, H_DEFERRED_RESCAN_DEADLINE_NS);
     if deadline == 0
         || deadline <= now
-        || deadline > now.saturating_add(DEFERRED_RESCAN_INTERVAL_NS)
+        || deadline > now.saturating_add(deferred_rescan_interval_ns())
     {
         Some(Duration::ZERO)
     } else {

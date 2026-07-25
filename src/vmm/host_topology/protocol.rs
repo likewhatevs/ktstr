@@ -1256,13 +1256,6 @@ impl GrantedProbe {
         self.try_acquire_impl(candidate, acquire, true)
     }
 
-    /// Whether this wake carries an acquisition license (a GRANTED wake, as
-    /// opposed to a speculative REPLAN wake whose probes are planning-only).
-    /// Lets callers gate probe diagnostics on the probes that actually ran.
-    pub(crate) fn acquisition_licensed(&self) -> bool {
-        self.acquisition_allowed
-    }
-
     /// Probe default mode's preferred unshared placement without turning a
     /// miss into durable queue contention. The published claim deliberately
     /// remains CPU-SH: a failed CPU-EX probe is only the signal to take the
@@ -4174,6 +4167,11 @@ fn acquire_as_coordinator_impl<T>(
         if diagnostic_now >= wait_diagnostic_deadline {
             registry::persist_wait_diagnostic_if_enabled();
             persist_coordinator_wake_stats_if_enabled();
+            // Periodic grant-flow image from the scan-running process, on
+            // the same cadence and — unlike the old in-scan persist — always
+            // outside the registry EX flock, so diagnostic file IO can never
+            // extend the global admission critical section.
+            crate::vmm::grant_flow::persist_now();
             wait_diagnostic_deadline = diagnostic_now + WAIT_DIAGNOSTIC_INTERVAL;
         }
         check_interrupted(cancelled)?;

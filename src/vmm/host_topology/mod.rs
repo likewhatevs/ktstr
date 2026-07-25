@@ -4980,7 +4980,6 @@ fn select_plan_permits_grant_aware(
     mut ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
     mut grant_conflicts: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
 ) -> Result<Option<PlanPermitSelection>> {
-    let diagnostics = crate::vmm::grant_flow::enabled();
     if let Some(selection) = select_plan_permits(
         kind,
         sizing,
@@ -4992,21 +4991,10 @@ fn select_plan_permits_grant_aware(
         memory_rotation,
         preferred_cpu,
         preferred_memory,
-        |candidate| {
-            if !ready(candidate)? {
-                return Ok(false);
-            }
-            let charged = grant_conflicts(candidate)?;
-            if diagnostics {
-                crate::vmm::grant_flow::note_permit_candidate(charged);
-            }
-            Ok(!charged)
-        },
+        |candidate| Ok(ready(candidate)? && !grant_conflicts(candidate)?),
     )? {
-        crate::vmm::grant_flow::note_permit_selection(false);
         return Ok(Some(selection));
     }
-    crate::vmm::grant_flow::note_permit_selection(true);
     select_plan_permits(
         kind,
         sizing,
