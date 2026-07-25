@@ -20718,37 +20718,6 @@ impl Table {
         ))
     }
 
-    #[allow(dead_code)]
-    fn watched_intersection(&self, claim: &ClaimSet) -> Result<ClaimSet> {
-        let mut cpus = BTreeSet::new();
-        let mut llcs = BTreeSet::new();
-        let mut permits = BTreeSet::new();
-        for &cpu in &claim.cpus {
-            if cpu < self.layout.bits && self.bitmap_bit(B_WATCH_CPUS, cpu)? {
-                cpus.insert(cpu);
-            }
-        }
-        for &llc in &claim.llcs {
-            if llc < self.layout.bits && self.bitmap_bit(B_WATCH_LLCS, llc)? {
-                llcs.insert(llc);
-            }
-        }
-        for &permit in &claim.permits {
-            let index = permit_resource_index(permit)?;
-            if index < self.layout.bits && self.bitmap_bit(B_WATCH_CPUS, index)? {
-                permits.insert(permit);
-            }
-        }
-        Ok(ClaimSet::with_all_claim_modes(
-            llcs,
-            cpus,
-            permits,
-            claim.llc_mode,
-            claim.cpu_mode,
-            claim.permit_mode,
-        ))
-    }
-
     fn watched_subset(
         &self,
         cpus: &BTreeSet<usize>,
