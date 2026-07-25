@@ -18934,10 +18934,7 @@ impl Table {
                 crate::vmm::grant_flow::note_grant_issued();
                 changed = true;
                 scan_state = STATE_GRANTED;
-            } else if record.state == STATE_WAITING
-                && record.ticket != coordinator_ticket
-                && flexible
-                && consider_waiting_replan
+            } else if consider_waiting_replan
                 && !preparation_pool_blocked
                 && replan_publication_open
                 && replan_slots != 0
@@ -19075,7 +19072,6 @@ impl Table {
                 }
             } else if backfill_head.is_none()
                 && !conflict
-                && !fairness_blocked
                 && (!availability_compatible || !blocker_ready)
                 && (scan_state == STATE_COORDINATOR || (scan_state == STATE_WAITING && !flexible))
             {
