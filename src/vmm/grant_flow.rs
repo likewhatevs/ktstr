@@ -42,6 +42,23 @@ static LOST_SUFFIX_WATERMARK: AtomicU64 = AtomicU64::new(0);
 static LOST_PREFIX_EPOCH: AtomicU64 = AtomicU64::new(0);
 static LOST_STALE_REGRANT: AtomicU64 = AtomicU64::new(0);
 static LOST_PHYSICAL_PROBE: AtomicU64 = AtomicU64::new(0);
+// Licensed probe-loss characterization: `rotated` completions replaced their
+// designation after the miss (default's opportunistic CPU-EX pin probe
+// discards its evidence before rotating, so it lands here); the remaining
+// buckets split unchanged completions by the exact rejecting resource and
+// the probe mode that failed. `no_evidence` unchanged losses are pure
+// requeues without a durable blocker (e.g. lost preparation-token races).
+static LOST_PROBE_ROTATED: AtomicU64 = AtomicU64::new(0);
+static LOST_PROBE_CPU_EX: AtomicU64 = AtomicU64::new(0);
+static LOST_PROBE_CPU_SH: AtomicU64 = AtomicU64::new(0);
+static LOST_PROBE_LLC: AtomicU64 = AtomicU64::new(0);
+static LOST_PROBE_PERMIT: AtomicU64 = AtomicU64::new(0);
+static LOST_PROBE_NO_EVIDENCE: AtomicU64 = AtomicU64::new(0);
+// Default-mode opportunistic unshared placement probe outcomes (the
+// transient CPU-EX pin over a published SH claim): a miss is only the
+// signal to fall back, but each miss burns one full flock-probe cycle.
+static DEFAULT_EXACT_HIT: AtomicU64 = AtomicU64::new(0);
+static DEFAULT_EXACT_MISS: AtomicU64 = AtomicU64::new(0);
 // Suffix-watermark parks at the entry self-demote with a REPLAN wave
 // outstanding: the park also shortens the wave's deferred rescan edge
 // (load-bearing coordination, not churn). The former per-park O(N) overlap
@@ -195,9 +212,57 @@ pub(crate) fn note_lost_stale_regrant() {
     LOST_STALE_REGRANT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// One licensed probe loss, pre-classified by [`classify_probe_loss`].
+#[derive(Clone, Copy)]
+pub(crate) enum ProbeLossClass {
+    Rotated,
+    CpuExclusive,
+    CpuShared,
+    Llc,
+    Permit,
+    NoEvidence,
+}
+
+/// Classify a licensed probe loss from its completion shape: whether the
+/// completion rotated to a new designation, and the rejecting resource
+/// evidence as `(is_cpu, is_permit, wanted_exclusive)` when retained.
+pub(crate) fn classify_probe_loss(
+    changed: bool,
+    evidence: Option<(bool, bool, bool)>,
+) -> ProbeLossClass {
+    if changed {
+        return ProbeLossClass::Rotated;
+    }
+    match evidence {
+        Some((true, _, true)) => ProbeLossClass::CpuExclusive,
+        Some((true, _, false)) => ProbeLossClass::CpuShared,
+        Some((_, true, _)) => ProbeLossClass::Permit,
+        Some((false, false, _)) => ProbeLossClass::Llc,
+        None => ProbeLossClass::NoEvidence,
+    }
+}
+
 /// The physical flock probe lost the resource to a real competing holder.
-pub(crate) fn note_lost_physical_probe() {
+pub(crate) fn note_lost_physical_probe(class: ProbeLossClass) {
     LOST_PHYSICAL_PROBE.fetch_add(1, Ordering::Relaxed);
+    let cell = match class {
+        ProbeLossClass::Rotated => &LOST_PROBE_ROTATED,
+        ProbeLossClass::CpuExclusive => &LOST_PROBE_CPU_EX,
+        ProbeLossClass::CpuShared => &LOST_PROBE_CPU_SH,
+        ProbeLossClass::Llc => &LOST_PROBE_LLC,
+        ProbeLossClass::Permit => &LOST_PROBE_PERMIT,
+        ProbeLossClass::NoEvidence => &LOST_PROBE_NO_EVIDENCE,
+    };
+    cell.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One default-mode opportunistic unshared (CPU-EX pin) placement probe.
+pub(crate) fn note_default_exact_probe(hit: bool) {
+    if hit {
+        DEFAULT_EXACT_HIT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        DEFAULT_EXACT_MISS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A speculative REPLAN callback requeued without acquiring (normal elastic
@@ -284,6 +349,9 @@ fn format_line(pid: u32) -> String {
         "grant-flow: pid={pid} grants_issued={} grants_reached_held={} grants_lost={} \
          lost_revoked={} lost_suffix_watermark={} lost_prefix_epoch={} \
          lost_stale_regrant={} lost_physical_probe={} replan_requeue={} \
+         lost_probe_rotated={} lost_probe_cpu_ex={} lost_probe_cpu_sh={} \
+         lost_probe_llc={} lost_probe_permit={} lost_probe_no_evidence={} \
+         default_exact_hit={} default_exact_miss={} \
          wmpark_wave={} wmpark_proceed_disjoint={} \
          replan_replace_total={} replan_replace_noop={} replan_replace_placement_same={} \
          guard_replace_skip={} guard_replace_dirty={} \
@@ -301,6 +369,14 @@ fn format_line(pid: u32) -> String {
         LOST_STALE_REGRANT.load(Ordering::Relaxed),
         LOST_PHYSICAL_PROBE.load(Ordering::Relaxed),
         REPLAN_REQUEUE.load(Ordering::Relaxed),
+        LOST_PROBE_ROTATED.load(Ordering::Relaxed),
+        LOST_PROBE_CPU_EX.load(Ordering::Relaxed),
+        LOST_PROBE_CPU_SH.load(Ordering::Relaxed),
+        LOST_PROBE_LLC.load(Ordering::Relaxed),
+        LOST_PROBE_PERMIT.load(Ordering::Relaxed),
+        LOST_PROBE_NO_EVIDENCE.load(Ordering::Relaxed),
+        DEFAULT_EXACT_HIT.load(Ordering::Relaxed),
+        DEFAULT_EXACT_MISS.load(Ordering::Relaxed),
         WATERMARK_PARK_WAVE.load(Ordering::Relaxed),
         WATERMARK_PROCEED_DISJOINT.load(Ordering::Relaxed),
         REPLAN_REPLACE_TOTAL.load(Ordering::Relaxed),
@@ -366,6 +442,14 @@ mod tests {
             "lost_stale_regrant=",
             "lost_physical_probe=",
             "replan_requeue=",
+            "lost_probe_rotated=",
+            "lost_probe_cpu_ex=",
+            "lost_probe_cpu_sh=",
+            "lost_probe_llc=",
+            "lost_probe_permit=",
+            "lost_probe_no_evidence=",
+            "default_exact_hit=",
+            "default_exact_miss=",
             "wmpark_wave=",
             "wmpark_proceed_disjoint=",
             "replan_replace_total=",

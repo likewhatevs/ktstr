@@ -1256,10 +1256,18 @@ impl GrantedProbe {
         self.try_acquire_impl(candidate, acquire, true)
     }
 
+    /// Whether this wake carries an acquisition license (a GRANTED wake, as
+    /// opposed to a speculative REPLAN wake whose probes are planning-only).
+    /// Lets callers gate probe diagnostics on the probes that actually ran.
+    pub(crate) fn acquisition_licensed(&self) -> bool {
+        self.acquisition_allowed
+    }
+
     /// Probe default mode's preferred unshared placement without turning a
     /// miss into durable queue contention. The published claim deliberately
-    /// remains CPU-SH: a failed CPU-EX probe is only the signal to try the
-    /// shared fallback, not a blocker that the registry must wait to clear.
+    /// remains CPU-SH: a failed CPU-EX probe is only the signal to take the
+    /// same-wake shared fallback on the same designated placement, not a
+    /// blocker that the registry must wait to clear.
     pub(crate) fn try_acquire_default_exact<T, O: IntoProbeOutcome<T>>(
         &mut self,
         candidate: &ClaimSet,

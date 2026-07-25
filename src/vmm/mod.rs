@@ -2924,8 +2924,8 @@ impl KtstrVm {
             let reusable_permits = probe.clone_reusable_permits()?;
             let exact = exact_attempts > 0;
             let designated_permits = designated.permits.iter().copied().collect::<Vec<_>>();
-            let result = if exact {
-                probe.try_acquire_default_exact(&designated, || {
+            if exact {
+                let acquired = probe.try_acquire_default_exact(&designated, || {
                     host_topology::acquire_default_exact_footprint_with_permits_granted_reusing(
                         &candidate.shared_llcs,
                         &candidate.shared_cpus,
@@ -2933,21 +2933,39 @@ impl KtstrVm {
                         &designated_permits,
                         &reusable_permits,
                     )
-                })?
-            } else {
-                probe.try_acquire(&designated, || {
-                    host_topology::acquire_resources_with_permits_granted_reusing(
-                        &candidate.shared_llcs,
-                        host_topology::LlcLockMode::Shared,
-                        &candidate.shared_cpus,
-                        crate::flock::FlockMode::Shared,
-                        &designated_permits,
-                        &reusable_permits,
-                    )
-                })?
-            };
-            if let Some(locks) = result {
-                return Ok(Some((index, exact, locks)));
+                })?;
+                if probe.acquisition_licensed() {
+                    crate::vmm::grant_flow::note_default_exact_probe(acquired.is_some());
+                }
+                if let Some(locks) = acquired {
+                    return Ok(Some((index, true, locks)));
+                }
+            }
+            // The shared acquire of the SAME designated placement. On an
+            // `exact` licensed wake this is the same-wake fallback for a
+            // missed CPU-EX pin probe: the transient pin only tests whether
+            // the placement happens to be unshared right now, while the
+            // published SH claim — the claim this grant actually validated
+            // against every predecessor — is satisfiable exactly as it
+            // stands. Rotating to another candidate here instead (the old
+            // behavior) burned a full reserve -> rescan -> regrant cycle per
+            // pin miss (measured ~98% of all licensed probe losses, with a
+            // ~1.5% pin hit rate under load) without changing the eventual
+            // shared outcome, and abandoned the top-ranked placement for a
+            // lower-ranked one. Default mode still PREFERS unshared: the pin
+            // is probed first on every exact wake and commits the pinned run
+            // path on a hit.
+            if let Some(locks) = probe.try_acquire(&designated, || {
+                host_topology::acquire_resources_with_permits_granted_reusing(
+                    &candidate.shared_llcs,
+                    host_topology::LlcLockMode::Shared,
+                    &candidate.shared_cpus,
+                    crate::flock::FlockMode::Shared,
+                    &designated_permits,
+                    &reusable_permits,
+                )
+            })? {
+                return Ok(Some((index, false, locks)));
             }
             exact_attempts = exact_attempts.saturating_sub(1);
             for offset in 1..=candidates.len() {

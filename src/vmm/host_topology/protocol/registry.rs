@@ -3319,6 +3319,26 @@ impl Ticket {
             validate_contention_within_watch(&[evidence.marker()], &watch)?;
         }
         let changed = result.next_claim != designated;
+        // Classify the eventual licensed probe loss while the contention
+        // evidence is still alive: `changed` completions rotated to a new
+        // designation after their probe miss (default's opportunistic
+        // CPU-EX pin probe deliberately discards its evidence, so most land
+        // in the changed/no-evidence bucket); unchanged completions carry
+        // the exact resource+mode that rejected the flock.
+        let probe_loss_class = if acquisition_allowed {
+            Some(crate::vmm::grant_flow::classify_probe_loss(
+                changed,
+                result.contention.as_ref().map(|evidence| {
+                    (
+                        matches!(evidence.blocker, ResourceKey::Cpu(_)),
+                        matches!(evidence.blocker, ResourceKey::Permit(_)),
+                        evidence.mode == FlockMode::Exclusive,
+                    )
+                }),
+            ))
+        } else {
+            None
+        };
         anyhow::ensure!(
             result.preparation_contention.is_none() || !changed,
             "preparation contention cannot replace the final-run designation",
@@ -3433,8 +3453,8 @@ impl Ticket {
         // A licensed GRANTED callback reaching here lost its physical flock to a
         // real competing holder; an unlicensed REPLAN callback simply re-planned
         // without acquiring (normal elastic churn, not a grant loss).
-        if acquisition_allowed {
-            crate::vmm::grant_flow::note_lost_physical_probe();
+        if let Some(class) = probe_loss_class {
+            crate::vmm::grant_flow::note_lost_physical_probe(class);
         } else {
             crate::vmm::grant_flow::note_replan_requeue();
         }
