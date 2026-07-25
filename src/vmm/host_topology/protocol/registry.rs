@@ -2597,6 +2597,7 @@ impl Ticket {
                 .filter(|record| record.ticket == self.ticket)
                 .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
             if record.state == STATE_REVOKED {
+                crate::vmm::grant_flow::note_lost_revoked();
                 let acknowledgement = table.acknowledge_revoked(self.slot, self.ticket, None)?;
                 drop(table);
                 drop(_lock);
@@ -2619,6 +2620,42 @@ impl Ticket {
                 return Ok(GrantResult::LostGrant);
             }
             if record.state == STATE_GRANTED && table.min_changed_ticket() < record.ticket {
+                crate::vmm::grant_flow::note_lost_suffix_watermark();
+                if crate::vmm::grant_flow::enabled() {
+                    // Diagnostic-only: classify this entry park by whether an
+                    // EARLIER-ticket live claim actually overlaps this record's
+                    // claim — the exact fairness predicate a relevance-gate would
+                    // test. A later grant must yield only to a senior conflicting
+                    // claim, never to disjoint churn or a junior waiter, so the
+                    // aggregate "conflicts with any live claim" test overcounts;
+                    // scope it to tickets strictly ahead in line. Also record
+                    // whether a REPLAN wave was outstanding (the deferred-edge
+                    // coordination the park additionally serves). Pure
+                    // observation — the O(N) walk runs only behind the gate.
+                    let mut earlier_overlap = false;
+                    if let Ok(next_slot) = table.next_slot() {
+                        for other_slot in 0..next_slot {
+                            let Ok(Some(other)) = table.record(other_slot) else {
+                                continue;
+                            };
+                            if other.ticket != 0
+                                && other.ticket < record.ticket
+                                && matches!(
+                                    other.state,
+                                    STATE_WAITING | STATE_GRANTED | STATE_REPLAN | STATE_HELD
+                                )
+                                && other.claim.conflicts_with(&record.claim)
+                            {
+                                earlier_overlap = true;
+                                break;
+                            }
+                        }
+                    }
+                    crate::vmm::grant_flow::note_watermark_park(
+                        earlier_overlap,
+                        table.replan_outstanding() > 0,
+                    );
+                }
                 // Never run the O(N) authoritative scan from a callback
                 // entrant. An earlier non-fencing REPLAN replacement can
                 // dirty this suffix without advancing the global claim epoch,
@@ -2644,6 +2681,7 @@ impl Ticket {
             };
             let (prefix_epoch, predecessors) = table.cached_prefix(record.slot)?;
             if prefix_epoch == 0 || prefix_epoch != state_epoch {
+                crate::vmm::grant_flow::note_lost_prefix_epoch();
                 table.begin_transaction()?;
                 let replan_completion = record.state == STATE_REPLAN;
                 if replan_completion {
@@ -2804,6 +2842,7 @@ impl Ticket {
         }
         let dirty_grant = acquisition_allowed && table.min_changed_ticket() < record.ticket;
         if dirty_grant && record.state == STATE_GRANTED && record.claim == designated {
+            crate::vmm::grant_flow::note_lost_suffix_watermark();
             let released_acquired = result.acquired.is_some();
             let blocked = if released_acquired {
                 None
@@ -2878,6 +2917,7 @@ impl Ticket {
             && result.acquired.is_some()
             && table.min_changed_ticket() < record.ticket;
         if dirty_redesignation {
+            crate::vmm::grant_flow::note_replan_requeue();
             table.begin_transaction()?;
             // REPLAN -> WAITING drains this ring slot through set_record_state.
             table.set_record_state(self.slot, STATE_WAITING)?;
@@ -2898,6 +2938,7 @@ impl Ticket {
             return Ok(GrantResult::LostGrant);
         }
         if record.state == STATE_REVOKED {
+            crate::vmm::grant_flow::note_lost_revoked();
             // The revocation scan deliberately kept this exact claim in every
             // later prefix. If the callback won the physical race, publish an
             // UNKNOWN observation before releasing its OFDs. Only after the
@@ -3013,6 +3054,7 @@ impl Ticket {
             || !same_replan_issuance
             || (acquisition_allowed && stale && !accept_stale_contention)
         {
+            crate::vmm::grant_flow::note_lost_stale_regrant();
             // A changed publication token means the coordinator already issued
             // a fresh callback snapshot. Preserve an unrelated new claim, but
             // revoke a same-claim grant below when this callback proved that
@@ -3256,6 +3298,14 @@ impl Ticket {
         drop(result);
         if notify_now {
             notify_coordinator();
+        }
+        // A licensed GRANTED callback reaching here lost its physical flock to a
+        // real competing holder; an unlicensed REPLAN callback simply re-planned
+        // without acquiring (normal elastic churn, not a grant loss).
+        if acquisition_allowed {
+            crate::vmm::grant_flow::note_lost_physical_probe();
+        } else {
+            crate::vmm::grant_flow::note_replan_requeue();
         }
         Ok(GrantResult::Requeued)
     }
@@ -16368,6 +16418,12 @@ impl Table {
                 self.mark_claim_changed(ticket)?;
             }
             ReplacementFenceEffect::NonFencing => {
+                if crate::vmm::grant_flow::enabled() {
+                    crate::vmm::grant_flow::note_replan_replace(
+                        new == old,
+                        new.cpus == old.cpus && new.llcs == old.llcs,
+                    );
+                }
                 // REPLAN and WAITING are both non-fencing, so this replacement
                 // must not invalidate every live callback through the global
                 // claim epoch. It can become a new predecessor fence in the

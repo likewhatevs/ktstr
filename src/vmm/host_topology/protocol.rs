@@ -580,7 +580,6 @@ impl ClaimSet {
     /// Whether two complete reservation claims are incompatible.
     ///
     /// CPU and LLC compatibility independently follow the flock SH/EX matrix.
-    #[cfg(test)]
     pub(crate) fn conflicts_with(&self, other: &Self) -> bool {
         if self.cpus.iter().any(|cpu| other.cpus.contains(cpu))
             && matches!(
@@ -3359,7 +3358,8 @@ fn drive_registered_ticket<T>(
                     preparation_watch: None,
                 })));
             }
-            registry::State::Granted | registry::State::Replan => {
+            grant_or_replan @ (registry::State::Granted | registry::State::Replan) => {
+                let licensed_grant = matches!(grant_or_replan, registry::State::Granted);
                 let reusable_permits = preparation
                     .as_ref()
                     .map(super::PreparationPermit::clone_permit_fds)
@@ -3413,10 +3413,16 @@ fn drive_registered_ticket<T>(
                         unreachable!("prepared result returned through ordinary ticket drive")
                     }
                     registry::GrantResult::Requeued | registry::GrantResult::LostGrant => {
-                        // A grant the coordinator issued did not convert to a
-                        // live HELD claim (registry revoke, stale prefix, or a
-                        // lost physical probe). Count the churn, then requeue.
-                        crate::vmm::grant_flow::note_grant_lost();
+                        // Count only a licensed GRANTED grant that failed to
+                        // convert to a live HELD claim (registry revoke, stale
+                        // prefix, or a lost physical probe) as headline churn. An
+                        // unlicensed REPLAN completion that re-plans without
+                        // acquiring is not a lost grant — it is already tallied
+                        // in `replan_requeue` — so it must not inflate the
+                        // grants_lost headline. Then requeue either way.
+                        if licensed_grant {
+                            crate::vmm::grant_flow::note_grant_lost();
+                        }
                         continue;
                     }
                 }

@@ -33,6 +33,36 @@ static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 static GRANTS_ISSUED: AtomicU64 = AtomicU64::new(0);
 static GRANTS_REACHED_HELD: AtomicU64 = AtomicU64::new(0);
 static GRANTS_LOST: AtomicU64 = AtomicU64::new(0);
+// LostGrant cause breakdown, to attribute the grant→commit churn.
+static LOST_REVOKED: AtomicU64 = AtomicU64::new(0);
+static LOST_SUFFIX_WATERMARK: AtomicU64 = AtomicU64::new(0);
+static LOST_PREFIX_EPOCH: AtomicU64 = AtomicU64::new(0);
+static LOST_STALE_REGRANT: AtomicU64 = AtomicU64::new(0);
+static LOST_PHYSICAL_PROBE: AtomicU64 = AtomicU64::new(0);
+// Suffix-watermark park breakdown at the entry self-demote (registry.rs:2622),
+// to size the relevance-gate headroom vs the REPLAN-wave-coordination floor:
+// - no_overlap: the record's claim conflicts with no live claim — a candidate
+//   for the relevance-gate to commit instead of park.
+// - with_overlap: a real conflict exists — parking is a fairness fence.
+// - wave: a REPLAN wave was outstanding at park time — the park also shortens
+//   the wave's deferred rescan edge (load-bearing coordination, not churn).
+static WATERMARK_PARK_NO_OVERLAP: AtomicU64 = AtomicU64::new(0);
+static WATERMARK_PARK_WITH_OVERLAP: AtomicU64 = AtomicU64::new(0);
+static WATERMARK_PARK_WAVE: AtomicU64 = AtomicU64::new(0);
+// Non-fencing REPLAN claim replacements (registry.rs:16427), split by whether
+// the replan reproduced the same claim. A `new == old` replacement still dirties
+// the later suffix and parks every junior grant, yet introduces no new fence —
+// the guard-headroom measurement for the no-op replan damping fix.
+static REPLAN_REPLACE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REPLAN_REPLACE_NOOP: AtomicU64 = AtomicU64::new(0);
+// Of the replan replacements that DO change the claim, how many keep the same
+// physical placement (CPUs + LLCs) and differ only in permits/mode/class. A
+// high share means the suffix-dirty churn is permit-rotation, not a genuine
+// placement move — the headroom a placement-scoped damping guard would need.
+static REPLAN_REPLACE_PLACEMENT_SAME: AtomicU64 = AtomicU64::new(0);
+// Speculative REPLAN callbacks that re-planned/requeued without acquiring — the
+// elastic replanner's own churn, distinct from a licensed GRANTED grant loss.
+static REPLAN_REQUEUE: AtomicU64 = AtomicU64::new(0);
 static HELD_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 static DISTINCT_HELD_CPUS_MAX: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -95,6 +125,69 @@ pub(crate) fn note_grant_lost() {
     ensure_atexit();
 }
 
+/// The coordinator scan revoked this grant (an earlier ticket took its
+/// resource): `GRANTED→REVOKED`, acknowledged here.
+pub(crate) fn note_lost_revoked() {
+    LOST_REVOKED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The suffix watermark parked this grant: some earlier ticket changed
+/// (`min_changed_ticket < ticket`), whether or not it was relevant to this
+/// claim — and even when the physical acquire had already succeeded.
+pub(crate) fn note_lost_suffix_watermark() {
+    LOST_SUFFIX_WATERMARK.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Classify one entry-level suffix-watermark park (registry.rs:2622) by whether
+/// the parked claim actually overlaps a live claim and whether a REPLAN wave was
+/// outstanding. Sizes the relevance-gate headroom against the wave-coordination
+/// floor. Only called behind [`enabled`] (the overlap test is O(resources)).
+pub(crate) fn note_watermark_park(overlap: bool, wave_outstanding: bool) {
+    if overlap {
+        WATERMARK_PARK_WITH_OVERLAP.fetch_add(1, Ordering::Relaxed);
+    } else {
+        WATERMARK_PARK_NO_OVERLAP.fetch_add(1, Ordering::Relaxed);
+    }
+    if wave_outstanding {
+        WATERMARK_PARK_WAVE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Count one non-fencing REPLAN claim replacement. `noop` flags an identical
+/// claim (`new == old`); `placement_same` flags a changed claim that keeps the
+/// same CPUs+LLCs (permit/mode/class churn only). Sizes the damping headroom.
+pub(crate) fn note_replan_replace(noop: bool, placement_same: bool) {
+    REPLAN_REPLACE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if noop {
+        REPLAN_REPLACE_NOOP.fetch_add(1, Ordering::Relaxed);
+    }
+    if placement_same {
+        REPLAN_REPLACE_PLACEMENT_SAME.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The cached predecessor prefix epoch went stale.
+pub(crate) fn note_lost_prefix_epoch() {
+    LOST_PREFIX_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A newer grant for the same exact claim was published while this callback
+/// physically held it, so this one is consumed rather than re-committed.
+pub(crate) fn note_lost_stale_regrant() {
+    LOST_STALE_REGRANT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The physical flock probe lost the resource to a real competing holder.
+pub(crate) fn note_lost_physical_probe() {
+    LOST_PHYSICAL_PROBE.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A speculative REPLAN callback requeued without acquiring (normal elastic
+/// replanning), distinct from a licensed grant loss.
+pub(crate) fn note_replan_requeue() {
+    REPLAN_REQUEUE.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Peak in-flight HELD run claims and the distinct host CPUs they cover,
 /// sampled once per authoritative grant scan. Only called behind [`enabled`].
 pub(crate) fn note_held_in_flight(held_records: u64, distinct_cpus: u64) {
@@ -124,11 +217,27 @@ fn format_line(pid: u32) -> String {
         .unwrap_or(0);
     format!(
         "grant-flow: pid={pid} grants_issued={} grants_reached_held={} grants_lost={} \
+         lost_revoked={} lost_suffix_watermark={} lost_prefix_epoch={} \
+         lost_stale_regrant={} lost_physical_probe={} replan_requeue={} \
+         wmpark_no_overlap={} wmpark_with_overlap={} wmpark_wave={} \
+         replan_replace_total={} replan_replace_noop={} replan_replace_placement_same={} \
          held_in_flight_max={} distinct_held_cpus_max={} discover_count={} \
          discover_ns_mean={discover_ns_mean} discover_ns_max={}\n",
         GRANTS_ISSUED.load(Ordering::Relaxed),
         GRANTS_REACHED_HELD.load(Ordering::Relaxed),
         GRANTS_LOST.load(Ordering::Relaxed),
+        LOST_REVOKED.load(Ordering::Relaxed),
+        LOST_SUFFIX_WATERMARK.load(Ordering::Relaxed),
+        LOST_PREFIX_EPOCH.load(Ordering::Relaxed),
+        LOST_STALE_REGRANT.load(Ordering::Relaxed),
+        LOST_PHYSICAL_PROBE.load(Ordering::Relaxed),
+        REPLAN_REQUEUE.load(Ordering::Relaxed),
+        WATERMARK_PARK_NO_OVERLAP.load(Ordering::Relaxed),
+        WATERMARK_PARK_WITH_OVERLAP.load(Ordering::Relaxed),
+        WATERMARK_PARK_WAVE.load(Ordering::Relaxed),
+        REPLAN_REPLACE_TOTAL.load(Ordering::Relaxed),
+        REPLAN_REPLACE_NOOP.load(Ordering::Relaxed),
+        REPLAN_REPLACE_PLACEMENT_SAME.load(Ordering::Relaxed),
         HELD_IN_FLIGHT_MAX.load(Ordering::Relaxed),
         DISTINCT_HELD_CPUS_MAX.load(Ordering::Relaxed),
         discover_count,
@@ -168,6 +277,18 @@ mod tests {
             "grants_issued=",
             "grants_reached_held=",
             "grants_lost=",
+            "lost_revoked=",
+            "lost_suffix_watermark=",
+            "lost_prefix_epoch=",
+            "lost_stale_regrant=",
+            "lost_physical_probe=",
+            "replan_requeue=",
+            "wmpark_no_overlap=",
+            "wmpark_with_overlap=",
+            "wmpark_wave=",
+            "replan_replace_total=",
+            "replan_replace_noop=",
+            "replan_replace_placement_same=",
             "held_in_flight_max=",
             "distinct_held_cpus_max=",
             "discover_count=",
