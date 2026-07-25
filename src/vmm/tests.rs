@@ -1602,8 +1602,11 @@ fn bench_boot_time() {
 /// helper both detects the marker in a genuine `crash_message` and stops
 /// once a clean boot arrives.
 ///
-/// Named `boot_kernel_*` so the nextest slow-timeout override
-/// (`test(boot_kernel) | test(bench_boot)`) covers its two cold boots.
+/// Named `boot_kernel_*` so the lock-taking-VM-cell override's
+/// `vmm::tests::boot_kernel_.*` arm covers its two cold boots — that block
+/// is first in `.config/nextest.toml` and overrides are first-match per
+/// setting, so it, not the later `test(boot_kernel) | test(bench_boot)`
+/// block, is what sets this test's slow-timeout.
 /// Follows the sibling boot tests' `skip_on_contention!` convention for
 /// the /dev/kvm + host-resource gate.
 #[test]
