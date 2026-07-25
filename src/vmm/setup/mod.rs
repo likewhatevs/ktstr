@@ -1869,23 +1869,29 @@ impl KtstrVm {
         TmpfsFraction::for_kernel_version(version)
     }
 
+    /// Assemble the [`MemoryBudget`] for `prepared`. Every budget consumer —
+    /// the pre-admission sizing, the permit ceiling, and the load-time
+    /// re-validation — goes through here so all three see identical inputs;
+    /// a divergence would let a cell be admitted against one figure and
+    /// rejected against another.
+    fn memory_budget(&self, prepared: &PreparedInitrd) -> Result<MemoryBudget> {
+        let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
+        Ok(MemoryBudget {
+            uncompressed_initramfs_bytes: prepared.uncompressed_len() as u64,
+            compressed_initrd_bytes: prepared.compressed_len() as u64,
+            kernel_init_size: read_kernel_init_size(&self.kernel)?,
+            init_coverage_instrumented,
+            instrumented_reserve_bytes,
+            tmpfs_fraction: self.tmpfs_fraction(),
+        })
+    }
+
     /// Resolve the exact guest-memory allocation from immutable prepared
     /// inputs. This runs before host admission so the queue claim and the KVM
     /// allocation use the same value.
     pub(super) fn prepared_memory_mib(&self, prepared: Option<&PreparedInitrd>) -> Result<u32> {
         let computed_min = if let Some(prepared) = prepared {
-            let uncompressed_size = prepared.uncompressed_len();
-            let compressed_size = prepared.compressed_len();
-            let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-            let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
-            let budget = MemoryBudget {
-                uncompressed_initramfs_bytes: uncompressed_size as u64,
-                compressed_initrd_bytes: compressed_size as u64,
-                kernel_init_size,
-                init_coverage_instrumented,
-                instrumented_reserve_bytes,
-                tmpfs_fraction: self.tmpfs_fraction(),
-            };
+            let budget = self.memory_budget(prepared)?;
             initramfs_min_memory_mib(&budget).max(self.memory_min_mib)
         } else {
             256u32.max(self.memory_min_mib)
@@ -1931,16 +1937,7 @@ impl KtstrVm {
         sized_mib: u32,
     ) -> Result<u32> {
         let ceiling = if let Some(prepared) = prepared {
-            let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-            let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
-            let budget = MemoryBudget {
-                uncompressed_initramfs_bytes: prepared.uncompressed_len() as u64,
-                compressed_initrd_bytes: prepared.compressed_len() as u64,
-                kernel_init_size,
-                init_coverage_instrumented,
-                instrumented_reserve_bytes,
-                tmpfs_fraction: self.tmpfs_fraction(),
-            };
+            let budget = self.memory_budget(prepared)?;
             touch_ceiling_mib(&budget, self.topology.total_cpus())
         } else {
             // No prepared image (a static-memory VM): nothing better bounds
@@ -1974,16 +1971,8 @@ impl KtstrVm {
         let compressed_size = prepared.compressed_len();
 
         // Enforce the same minimum used before admission.
-        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-        let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
-        let budget = MemoryBudget {
-            uncompressed_initramfs_bytes: uncompressed_size as u64,
-            compressed_initrd_bytes: compressed_size as u64,
-            kernel_init_size,
-            init_coverage_instrumented,
-            instrumented_reserve_bytes,
-            tmpfs_fraction: self.tmpfs_fraction(),
-        };
+        let budget = self.memory_budget(&prepared)?;
+        let kernel_init_size = budget.kernel_init_size;
         let min_mib = initramfs_min_memory_mib(&budget);
         if memory_mib < min_mib {
             anyhow::bail!(
@@ -2316,16 +2305,8 @@ impl KtstrVm {
         // initramfs budget. Mirrors the x86_64 validate_and_load_initramfs
         // contract: a builder with too-small memory_mib fails fast here
         // instead of OOMing during boot.
-        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-        let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
-        let budget = MemoryBudget {
-            uncompressed_initramfs_bytes: uncompressed_size as u64,
-            compressed_initrd_bytes: compressed_size as u64,
-            kernel_init_size,
-            init_coverage_instrumented,
-            instrumented_reserve_bytes,
-            tmpfs_fraction: self.tmpfs_fraction(),
-        };
+        let budget = self.memory_budget(&prepared)?;
+        let kernel_init_size = budget.kernel_init_size;
         let min_mib = initramfs_min_memory_mib(&budget);
         if memory_mib < min_mib {
             anyhow::bail!(
