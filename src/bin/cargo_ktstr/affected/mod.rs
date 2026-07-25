@@ -202,7 +202,6 @@ fn enumerate_scheduler_inventory_from_bins(bins: &[PathBuf]) -> Result<Scheduler
     }
     let per_binary = crate::misc::probe_scheduler_manifests_from_bins(
         bins,
-        &[],
         None,
         "test binaries for affected scheduler manifests",
     )

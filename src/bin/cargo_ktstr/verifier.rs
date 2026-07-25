@@ -811,12 +811,10 @@ fn build_injected_scoped_nextest_args_with(
 
 fn probe_scheduler_manifests(
     test_bins: &[PathBuf],
-    loader_paths: &[PathBuf],
     probe_provenance: Option<&HashMap<PathBuf, PathBuf>>,
 ) -> Result<Vec<TestBinarySchedulerManifest>, String> {
     crate::misc::probe_scheduler_manifests_from_bins(
         test_bins,
-        loader_paths,
         probe_provenance,
         "warmed test binaries for scheduler manifests",
     )
@@ -825,10 +823,9 @@ fn probe_scheduler_manifests(
 
 fn probe_scheduler_declarations(
     test_bins: &[PathBuf],
-    loader_paths: &[PathBuf],
     probe_provenance: &HashMap<PathBuf, PathBuf>,
 ) -> Result<Vec<TestBinarySchedulerDeclarations>, String> {
-    probe_scheduler_manifests(test_bins, loader_paths, Some(probe_provenance)).map(|manifests| {
+    probe_scheduler_manifests(test_bins, Some(probe_provenance)).map(|manifests| {
         manifests
             .into_iter()
             .map(|binary| TestBinarySchedulerDeclarations {
@@ -854,12 +851,11 @@ fn cached_scheduler_declarations(
 
 fn probe_scheduler_artifact_requirements(
     test_bins: &[PathBuf],
-    loader_paths: &[PathBuf],
 ) -> Result<Vec<ktstr::test_support::SchedulerArtifactRequirement>, String> {
     if test_bins.is_empty() {
         return Ok(Vec::new());
     }
-    let per_binary = probe_scheduler_manifests(test_bins, loader_paths, None)?;
+    let per_binary = probe_scheduler_manifests(test_bins, None)?;
     merge_scheduler_artifact_requirements(per_binary.into_iter().map(|binary| binary.manifest))
 }
 
@@ -1849,12 +1845,11 @@ pub(crate) struct PreparedSchedulerArtifacts {
 /// fallback.
 pub(crate) fn prepare_scheduler_artifacts(
     test_bins: &[PathBuf],
-    loader_paths: &[PathBuf],
     cli_profile: Option<&str>,
     cargo_args: &[String],
     invocation_dir: &Path,
 ) -> Result<PreparedSchedulerArtifacts, String> {
-    let requirements = probe_scheduler_artifact_requirements(test_bins, loader_paths)?;
+    let requirements = probe_scheduler_artifact_requirements(test_bins)?;
     prepare_scheduler_artifacts_from_requirements(
         requirements,
         cli_profile,
@@ -2548,8 +2543,7 @@ pub(crate) fn run_verifier(
             }
             let test_bins = pinned_test_bins.probe_paths();
             let probe_provenance = pinned_test_bins.probe_provenance();
-            let binary_declarations =
-                probe_scheduler_declarations(&test_bins, &[], &probe_provenance)?;
+            let binary_declarations = probe_scheduler_declarations(&test_bins, &probe_provenance)?;
             // Ownership now records Cargo's canonical emitted paths; no later
             // phase reads through the warmed executable descriptors.
             drop(pinned_test_bins);

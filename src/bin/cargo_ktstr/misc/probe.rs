@@ -358,15 +358,13 @@ fn scheduler_stamp_read_parallelism(binary_count: usize) -> usize {
 /// Read the combined scheduler payload from every distinct selected binary.
 ///
 /// The payload is a versioned, link-retained ELF stamp emitted by
-/// `declare_scheduler!` and `#[ktstr_test]`; no candidate binary is executed.
-/// `loader_paths` remains in the private call shape because the other probe
-/// families still need it, but scheduler-manifest discovery is independent of
-/// the dynamic loader. Descriptor-backed verifier binaries can provide a map
-/// back to Cargo's canonical emitted executable so cell ownership retains
-/// stable provenance after the descriptors are dropped.
+/// `declare_scheduler!` and `#[ktstr_test]`; no candidate binary is executed,
+/// so discovery is independent of the dynamic loader. Descriptor-backed
+/// verifier binaries can provide a map back to Cargo's canonical emitted
+/// executable so cell ownership retains stable provenance after the descriptors
+/// are dropped.
 pub(crate) fn probe_scheduler_manifests_from_bins(
     bins: &[PathBuf],
-    _loader_paths: &[PathBuf],
     provenance: Option<&HashMap<PathBuf, PathBuf>>,
     description: &str,
 ) -> Result<Vec<ProbedSchedulerManifest>, String> {

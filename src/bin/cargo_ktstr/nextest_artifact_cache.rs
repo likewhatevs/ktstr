@@ -37,8 +37,6 @@ struct BuildMetadata {
     #[serde(default)]
     build_directory: Option<PathBuf>,
     #[serde(default)]
-    base_output_directories: BTreeSet<PathBuf>,
-    #[serde(default)]
     non_test_binaries: BTreeMap<String, BTreeSet<NonTestBinary>>,
     #[serde(default)]
     build_script_out_dirs: BTreeMap<String, PathBuf>,
@@ -93,7 +91,6 @@ pub(crate) struct MaterializedNextestArtifacts {
     /// into the immutable artifact record or content CAS.
     pub producer_profdata: Option<PathBuf>,
     pub test_binaries: Vec<PathBuf>,
-    pub loader_paths: Vec<PathBuf>,
     pub scheduler_stamps: Vec<CachedBinaryStamp>,
     // Retain the stable source owner until the nextest child (and a possible
     // llvm-cov report child) has exited.
@@ -616,21 +613,6 @@ pub(crate) fn finish_materialization(
         .collect::<Result<Vec<_>, _>>()?;
     test_binaries.sort();
     test_binaries.dedup();
-    let mut loader_paths = Vec::new();
-    for relative in &metadata.rust_build_meta.linked_paths {
-        loader_paths.push(
-            materialized_build_directory.join(checked_relative(relative, "linked loader path")?),
-        );
-    }
-    for relative in &metadata.rust_build_meta.base_output_directories {
-        let base =
-            materialized_build_directory.join(checked_relative(relative, "base output directory")?);
-        loader_paths.push(base.join("deps"));
-        loader_paths.push(base);
-    }
-    loader_paths.retain(|path| path.is_dir());
-    loader_paths.sort();
-    loader_paths.dedup();
     let stamp_path = tree.root().join(KTSTR_STAMPS_PATH);
     let stamps: CachedStampSet =
         serde_json::from_slice(&std::fs::read(&stamp_path).map_err(|error| {
@@ -662,7 +644,6 @@ pub(crate) fn finish_materialization(
         build_directory: materialized_build_directory,
         producer_profdata,
         test_binaries,
-        loader_paths,
         scheduler_stamps: stamps.binaries,
         tree,
         _stable_source: stable_source,

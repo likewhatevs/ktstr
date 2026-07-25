@@ -3966,10 +3966,6 @@ struct NextestArchiveBuildMetadata {
     target_directory: PathBuf,
     #[serde(default)]
     build_directory: Option<PathBuf>,
-    #[serde(default)]
-    base_output_directories: std::collections::BTreeSet<PathBuf>,
-    #[serde(default)]
-    linked_paths: std::collections::BTreeSet<PathBuf>,
 }
 
 #[derive(serde::Deserialize)]
@@ -3981,7 +3977,6 @@ struct NextestArchiveBinary {
 struct ExtractedNextestArchive {
     _owner: tempfile::TempDir,
     test_binaries: Vec<PathBuf>,
-    loader_paths: Vec<PathBuf>,
 }
 
 fn validated_archive_target_path(relative: &std::path::Path) -> Result<PathBuf, String> {
@@ -4034,28 +4029,6 @@ fn nextest_archive_binary_entry_paths(
             })?;
         paths.insert(validated_archive_target_path(relative)?);
     }
-    Ok(paths)
-}
-
-fn nextest_archive_loader_entry_dirs(
-    metadata: &NextestArchiveBinaryMetadata,
-) -> Result<Vec<PathBuf>, String> {
-    let mut paths = Vec::new();
-    let mut push_unique = |path| {
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    };
-    for relative in &metadata.rust_build_meta.linked_paths {
-        push_unique(validated_archive_target_path(relative)?);
-    }
-    for relative in &metadata.rust_build_meta.base_output_directories {
-        let base = validated_archive_target_path(relative)?;
-        push_unique(base.join("deps"));
-        push_unique(base);
-    }
-    push_unique(PathBuf::from("target/nextest/libdirs/host"));
-    push_unique(PathBuf::from("target/nextest/libdirs/target/0"));
     Ok(paths)
 }
 
@@ -4196,7 +4169,6 @@ fn extract_nextest_archive_test_binaries(
 
     let metadata = read_nextest_archive_binary_metadata(archive_path)?;
     let wanted = nextest_archive_binary_entry_paths(&metadata)?;
-    let loader_entry_dirs = nextest_archive_loader_entry_dirs(&metadata)?;
     let owner = tempfile::Builder::new()
         .prefix("ktstr-nextest-archive-probe-")
         .tempdir()
@@ -4338,15 +4310,9 @@ fn extract_nextest_archive_test_binaries(
             )
         })?);
     }
-    let loader_paths = loader_entry_dirs
-        .into_iter()
-        .map(|path| owner.path().join(path))
-        .filter(|path| path.is_dir())
-        .collect();
     Ok(ExtractedNextestArchive {
         _owner: owner,
         test_binaries,
-        loader_paths,
     })
 }
 
@@ -4772,17 +4738,8 @@ fn run_cargo_sub(
             )?,
         )
     } else if needs_prebuild || archive_probe.is_some() {
-        let loader_paths = cached_nextest.as_ref().map_or_else(
-            || {
-                archive_probe
-                    .as_ref()
-                    .map_or(&[][..], |archive| archive.loader_paths.as_slice())
-            },
-            |cached| cached.loader_paths.as_slice(),
-        );
         Some(crate::verifier::prepare_scheduler_artifacts(
             &test_bins,
-            loader_paths,
             profile.as_deref(),
             &args,
             &invocation_dir,
@@ -12322,7 +12279,7 @@ cargo-llvm-cov diagnostic
     }
 
     #[test]
-    fn nextest_archive_probe_extracts_and_orders_loader_directories() {
+    fn nextest_archive_probe_extracts_the_whole_loader_closure() {
         let temp = tempfile::tempdir().expect("archive fixture tempdir");
         let archive_path = temp.path().join("reuse.tar.zst");
         let metadata = br#"{
@@ -12358,28 +12315,16 @@ cargo-llvm-cov diagnostic
 
         let extracted =
             extract_nextest_archive_test_binaries(&archive_path).expect("extract probe closure");
-        let relative = extracted
-            .loader_paths
-            .iter()
-            .map(|path| {
-                path.strip_prefix(extracted._owner.path())
-                    .unwrap()
-                    .to_path_buf()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            relative,
-            [
-                "target/vendor/lib",
-                "target/debug/deps",
-                "target/debug",
-                "target/nextest/libdirs/host",
-            ]
-            .into_iter()
-            .map(PathBuf::from)
-            .collect::<Vec<_>>(),
-            "probe loader order must match nextest: linked, deps/base, Rust libdirs",
-        );
+        for retained in [
+            "target/vendor/lib/liblinked.so",
+            "target/debug/libbase.so",
+            "target/nextest/libdirs/host/libstd.so",
+        ] {
+            assert!(
+                extracted._owner.path().join(retained).exists(),
+                "{retained} belongs to the archived loader closure",
+            );
+        }
         assert!(
             extracted
                 ._owner
