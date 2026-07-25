@@ -18,10 +18,11 @@
 //!    callers may use that witness to order its `IN_CLOSE_WRITE` after
 //!    publishing their blocked state, avoiding an unnecessary UNKNOWN
 //!    observation and re-probe.
-//!  - `probe_flock_existing_read_only` — non-creating, read-only
-//!    observation of an existing lockfile. Its fd closes with
+//!  - `probe_flock_existing_read_only` — test-only. Non-creating,
+//!    read-only observation of an existing lockfile. Its fd closes with
 //!    `IN_CLOSE_NOWRITE`, so a resource-release watcher can ignore
-//!    observation traffic.
+//!    observation traffic; production observers open the file read-only
+//!    themselves for the same reason.
 //!  - [`block_flock`] — blocking acquire. Parks the calling thread
 //!    in the kernel until the lock is available. Used after
 //!    [`try_flock`] returns `None` for callers that want to wait

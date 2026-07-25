@@ -772,12 +772,14 @@ enum LockDirWatchBackend {
 /// *disjoint* waiter, and the release edge is single-shot: a scan that armed a
 /// narrow watch after that edge already fired would never see it and would ride
 /// the [`COORDINATOR_WAKE_FALLBACK`] tick instead of granting immediately.
-/// Reporting every real release keeps the wake work-conserving. This is safe
-/// against self-wake precisely because holders open `O_CREAT | O_RDWR`
-/// (so their release is the only `IN_CLOSE_WRITE`) while every probe/observer
-/// uses an `O_RDONLY` fd (`try_flock_with_witness` contention witness and
-/// `probe_flock_existing_read_only`), whose close is `IN_CLOSE_NOWRITE` and
-/// therefore never enters this queue: the visible set is exactly the holder set.
+/// Reporting every real release keeps the wake work-conserving. The writable
+/// closes this queue sees are holder releases plus the contention witnesses
+/// `try_flock_with_witness` deliberately retains — those fds are `O_RDWR` too,
+/// and their close is exactly the edge a blocked waiter orders after publishing
+/// its state, so reporting them is the point rather than a leak. What stays out
+/// of the queue is pure observation: availability proofs open the lock file
+/// read-only (`HolderObserver::proof_file`, `resource_flock_is_free`), so their
+/// `IN_CLOSE_NOWRITE` cannot wake the coordinator that took them.
 struct RealInotifyWake {
     ino: nix::sys::inotify::Inotify,
     event_wd: nix::sys::inotify::WatchDescriptor,
