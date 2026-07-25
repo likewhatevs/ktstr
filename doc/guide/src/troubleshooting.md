@@ -804,9 +804,13 @@ lockfiles because `flock(2)` semantics there are unreliable — see
 A VM test that stops making progress is eventually flagged `SLOW` by
 nextest and then terminated when it exceeds the profile's
 slow-timeout budget: 60 s × 2 periods on the default profile, 90 s ×
-3 on the `ci` profile, with larger per-test overrides for heavy
-classes (verifier sweeps 180 s, the wide-SMP boots up to 960 s — see
-`.config/nextest.toml`).
+3 on the `ci` profile. Those bases cover ordinary host tests. Every
+lock-taking cell — the generated `ktstr/`, `gauntlet/`, and `verifier/`
+names plus the VM-driving integration binaries — instead falls under a
+single 180 s × 12 rail, because a cell's reported duration includes the
+time it spent waiting for admission, so the bound has to clear a full
+suite drain rather than one cell's runtime. The wide-SMP boots go up to
+960 s. See `.config/nextest.toml`.
 
 ktstr's own per-VM watchdog is sized to fire *before* nextest's kill
 so you get a failure dump instead of a blunt termination. If nextest

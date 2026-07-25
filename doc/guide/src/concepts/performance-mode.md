@@ -113,9 +113,10 @@ excess tests join the lock-dir acquisition queue and proceed as each
 holder releases. The queue does not infer that a live holder is wedged
 from elapsed wall time: the holder's VM watchdog owns guest progress,
 nextest owns the final process-lifecycle rail, and a crash releases the
-flock in the kernel. The
-`vm-perf` test group in `.config/nextest.toml` caps how many run at
-once.
+flock in the kernel. No nextest test group caps the count — the
+[admission registry](resource-budget.md#admission-registry-a-second-order-scheduler-under-nextest)
+is the only limit, and it admits a cell exactly when the cell's own CPU
+and LLC claims are free.
 
 ## Failure modes
 
