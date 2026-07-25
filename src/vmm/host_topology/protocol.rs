@@ -302,10 +302,17 @@ const COORDINATOR_WAKE_FALLBACK: Duration = Duration::from_secs(30);
 /// coordinator immediately when the holder actually changes.
 const OBSERVATION_RETRY_FALLBACK: Duration = Duration::from_secs(5);
 /// Claim-specific waiter watches should receive every relevant release or
-/// predecessor-state transition. This long, per-ticket-staggered fallback is
+/// predecessor-state transition. This long, per-process-staggered fallback is
 /// only a missed-event recovery tick; it avoids turning hundreds of queued
 /// cells into a synchronized `/proc/locks` polling herd.
 const WAITER_CRASH_RECOVERY_BASE: Duration = Duration::from_secs(3);
+
+/// The recovery deadline a waiting ticket sleeps on. The per-process offset is
+/// what breaks the herd, so every waiter loop takes the deadline from here
+/// rather than staggering (or forgetting to stagger) locally.
+fn waiter_crash_recovery_fallback() -> Duration {
+    WAITER_CRASH_RECOVERY_BASE + Duration::from_millis((std::process::id() as u64 * 37) % 1000)
+}
 const WAIT_DIAGNOSTIC_INITIAL_DELAY: Duration = Duration::from_secs(10);
 const WAIT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(30);
 /// Bound the watch-install handoff gap without making every short-lived
@@ -1693,7 +1700,7 @@ pub(crate) fn register_intent_for_preparation(
     let mut rotation_bias = 0usize;
     loop {
         super::tick_reservation_wait_progress();
-        match ticket.state_or_wait(WAITER_CRASH_RECOVERY_BASE, None)? {
+        match ticket.state_or_wait(waiter_crash_recovery_fallback(), None)? {
             registry::State::Granted | registry::State::Replan => {
                 let result = ticket.run_granted(
                     None,
@@ -3421,12 +3428,11 @@ fn drive_registered_ticket<T>(
     try_acquire: &mut impl FnMut(&mut GrantedProbe) -> Result<Option<T>>,
     mut preparation: Option<super::PreparationPermit>,
 ) -> Result<TicketWork<T>> {
-    let stagger = Duration::from_millis((std::process::id() as u64 * 37) % 1000);
     loop {
         super::tick_reservation_wait_progress();
         check_interrupted(cancelled)?;
         match check_result(
-            ticket.state_or_wait(WAITER_CRASH_RECOVERY_BASE + stagger, cancelled),
+            ticket.state_or_wait(waiter_crash_recovery_fallback(), cancelled),
             cancelled,
         )? {
             registry::State::Coordinator => {
