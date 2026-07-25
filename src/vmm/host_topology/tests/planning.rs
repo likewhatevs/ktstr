@@ -1696,6 +1696,48 @@ fn cooperative_permits_admit_four_host_width_claims_and_reject_a_fifth() {
     );
 }
 
+/// A zero-width request names no permits. The selection loop only stops on
+/// `permits.len() == maximum`, so a `maximum` of 0 would otherwise run to the
+/// end of the pool and name every ready permit in it — a whole-host admission
+/// claim funding no CPUs.
+#[test]
+fn zero_width_permit_request_names_no_permits() {
+    let host_width = 8;
+    let pool = AdmissionPermitPool::for_host(host_width);
+    assert_eq!(pool.len(), host_width * COOPERATIVE_OVERSUBSCRIPTION);
+
+    let mut probes = 0usize;
+    let selection =
+        select_admission_permits(PermitAdmission::Cooperative, &pool, 0, 0, 0, &[], |_| {
+            probes += 1;
+            Ok(true)
+        })
+        .expect("select a zero-width shape")
+        .expect("a zero-width request with no floor is met by an empty selection");
+    assert!(
+        selection.permits.is_empty(),
+        "zero-width selection must name no permits, got {:?}",
+        selection.permits,
+    );
+    assert_eq!(
+        selection.admission_class,
+        admission_protocol::AdmissionClass::Ordinary,
+    );
+    assert_eq!(
+        probes, 0,
+        "a zero-width request must not probe pool permits at all",
+    );
+
+    assert!(
+        select_admission_permits(PermitAdmission::Cooperative, &pool, 0, 1, 0, &[], |_| Ok(
+            true
+        ))
+        .expect("select a zero-width shape under a one-permit floor")
+        .is_none(),
+        "an empty selection cannot clear a one-permit floor",
+    );
+}
+
 #[test]
 fn preparation_private_working_set_uses_two_chunks_and_preserves_conversion_headroom() {
     assert_eq!(MEMORY_PERMIT_CHUNK_MIB, 256);

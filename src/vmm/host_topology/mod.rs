@@ -4542,6 +4542,20 @@ fn select_admission_permits(
             admission_class: protocol::AdmissionClass::Ordinary,
         }));
     }
+    if maximum == 0 {
+        // A zero-width request names no permits. The collection loop below
+        // only stops on `permits.len() == maximum`, so without this it walks
+        // the whole pool and hands back every ready permit. An empty selection
+        // still has to clear the caller's floor.
+        return Ok((minimum == 0).then(|| PermitSelection {
+            permits: Vec::new(),
+            admission_class: match kind {
+                PermitAdmission::Cooperative => protocol::AdmissionClass::Ordinary,
+                PermitAdmission::Build => protocol::AdmissionClass::Build,
+                PermitAdmission::None => unreachable!(),
+            },
+        }));
+    }
     let (first, second) = match kind {
         PermitAdmission::Cooperative => (&pool.general, &pool.reserved),
         PermitAdmission::Build => (&pool.reserved, &pool.general),
@@ -5515,7 +5529,13 @@ where
             .into());
         }
         let (mut selected_cpus, mut selected_mems) = selected_materialized.unwrap_or_default();
-        let plan_permit_selection = if permit_admission == PermitAdmission::None {
+        let plan_permit_selection = if selected_cpus.is_empty() {
+            // Claim-blocked: there is no plan to fund. Every acquisition arm
+            // below requires a non-empty selection, so selecting permits for a
+            // zero-width plan only costs a registry snapshot and a full walk of
+            // the permit pool whose result this attempt cannot use.
+            None
+        } else if permit_admission == PermitAdmission::None {
             Some(PlanPermitSelection {
                 permits: VmPermitSelection {
                     cpu_permits: Vec::new(),
