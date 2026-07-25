@@ -93,12 +93,6 @@ fn fetch_scx_lib(dest: &Path) {
     if scx_lib_complete(dest) {
         return;
     }
-    if let Some(legacy) = legacy_scx_cache_entry()
-        && scx_lib_complete(&legacy)
-    {
-        copy_scx_lib(&legacy, dest);
-        return;
-    }
     let key_parts = [
         "scx-selected-source-v1",
         SCX_URL,
@@ -152,21 +146,6 @@ fn fetch_scx_lib(dest: &Path) {
         })
     };
     copy_scx_lib(&shared, dest);
-}
-
-/// Reuse the pre-content-addressed cache layout so existing operator-provided
-/// source files continue to avoid the network after upgrading ktstr.
-fn legacy_scx_cache_entry() -> Option<PathBuf> {
-    let root = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .map(|home| home.join(".cache"))
-        })?;
-    Some(root.join("ktstr/scx-lib").join(SCX_TAG))
 }
 
 fn populate_scx_stage(
