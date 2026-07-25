@@ -2901,23 +2901,11 @@ impl Ticket {
         };
         if record.state == STATE_REPLAN_EXPIRED {
             let blocked = if result.acquired.is_none() {
-                if let Some(evidence) = result.contention.as_ref() {
-                    validate_contention_within_watch(&[evidence.marker()], &watch)?;
-                }
-                // Only CPU/LLC run-claim contention pins a record here. A lost
-                // preparation-token race no longer blocks: the grant scan's
-                // pool budget keeps the granted cohort within the free-slot
-                // count, so a granted intent has a slot to race for, and any
-                // transient miss simply requeues WAITING for the next
-                // budget-ordered grant. (See `preparation_contention`.)
-                let evidence = result.contention.as_ref();
-                if let Some(evidence) = evidence {
-                    let marker = evidence.marker();
-                    let serial = table.blocker_serial(marker.blocker, marker.mode)?;
-                    Some((marker, serial, callback_snapshot_serial.max(serial)))
-                } else {
-                    None
-                }
+                table.blocked_evidence(
+                    result.contention.as_ref(),
+                    &watch,
+                    callback_snapshot_serial,
+                )?
             } else {
                 None
             };
@@ -2977,23 +2965,11 @@ impl Ticket {
             let blocked = if released_acquired {
                 None
             } else {
-                if let Some(evidence) = result.contention.as_ref() {
-                    validate_contention_within_watch(&[evidence.marker()], &watch)?;
-                }
-                // Only CPU/LLC run-claim contention pins a record here. A lost
-                // preparation-token race no longer blocks: the grant scan's
-                // pool budget keeps the granted cohort within the free-slot
-                // count, so a granted intent has a slot to race for, and any
-                // transient miss simply requeues WAITING for the next
-                // budget-ordered grant. (See `preparation_contention`.)
-                let evidence = result.contention.as_ref();
-                if let Some(evidence) = evidence {
-                    let marker = evidence.marker();
-                    let serial = table.blocker_serial(marker.blocker, marker.mode)?;
-                    Some((marker, serial, callback_snapshot_serial.max(serial)))
-                } else {
-                    None
-                }
+                table.blocked_evidence(
+                    result.contention.as_ref(),
+                    &watch,
+                    callback_snapshot_serial,
+                )?
             };
             table.begin_transaction()?;
             table.set_record_state(self.slot, STATE_WAITING)?;
@@ -3074,23 +3050,11 @@ impl Ticket {
             // and request the successor scan.
             let released_acquired = result.acquired.is_some();
             let blocked = if !released_acquired {
-                if let Some(evidence) = result.contention.as_ref() {
-                    validate_contention_within_watch(&[evidence.marker()], &watch)?;
-                }
-                // Only CPU/LLC run-claim contention pins a record here. A lost
-                // preparation-token race no longer blocks: the grant scan's
-                // pool budget keeps the granted cohort within the free-slot
-                // count, so a granted intent has a slot to race for, and any
-                // transient miss simply requeues WAITING for the next
-                // budget-ordered grant. (See `preparation_contention`.)
-                let evidence = result.contention.as_ref();
-                if let Some(evidence) = evidence {
-                    let marker = evidence.marker();
-                    let serial = table.blocker_serial(marker.blocker, marker.mode)?;
-                    Some((marker, serial, callback_snapshot_serial.max(serial)))
-                } else {
-                    None
-                }
+                table.blocked_evidence(
+                    result.contention.as_ref(),
+                    &watch,
+                    callback_snapshot_serial,
+                )?
             } else {
                 None
             };
@@ -3331,9 +3295,9 @@ impl Ticket {
             result.preparation_contention.is_none() || !changed,
             "preparation contention cannot replace the final-run designation",
         );
-        // Only CPU/LLC run-claim contention pins here; a lost preparation-token
-        // race no longer blocks (the pool budget guarantees the granted cohort
-        // a slot, so a miss simply requeues WAITING). See `preparation_contention`.
+        // Run-claim contention only, for the reason `blocked_evidence`
+        // documents. The consumed serial is folded in separately below
+        // because the replacement paths take the pin and the serial apart.
         let blocked_evidence = result.contention.as_ref();
         let blocked = if let Some(evidence) = blocked_evidence {
             let marker = evidence.marker();
@@ -19800,6 +19764,30 @@ impl Table {
                 self.resource_serial(S_CPU_EX, permit_resource_index(index)?)
             }
         }
+    }
+
+    /// Turn a callback's negative physical evidence into the registry pin a
+    /// requeue publishes: the blocker, the serial it was observed at, and the
+    /// consumed serial that folds in the callback's availability snapshot.
+    /// Only CPU/LLC run-claim contention pins a record: a lost
+    /// preparation-token race no longer blocks, because the grant scan's pool
+    /// budget keeps the granted cohort within the free-slot count, so a
+    /// granted intent has a slot to race for and any transient miss simply
+    /// requeues WAITING for the next budget-ordered grant. (See
+    /// `preparation_contention`.)
+    fn blocked_evidence(
+        &self,
+        contention: Option<&ContentionEvidence>,
+        watch: &ClaimSet,
+        callback_snapshot_serial: u64,
+    ) -> Result<Option<(ContentionMarker, u64, u64)>> {
+        let Some(evidence) = contention else {
+            return Ok(None);
+        };
+        let marker = evidence.marker();
+        validate_contention_within_watch(&[marker], watch)?;
+        let serial = self.blocker_serial(marker.blocker, marker.mode)?;
+        Ok(Some((marker, serial, callback_snapshot_serial.max(serial))))
     }
 
     fn max_watch_serial(&self, watch: &impl ClaimView) -> Result<u64> {
