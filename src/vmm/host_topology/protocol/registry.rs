@@ -6165,7 +6165,7 @@ pub(super) fn exercise_stalled_takeover_notification_for_tests(
     // Install the real watch before this helper is called, then discard every
     // registration edge. The only event observed below must come from the
     // stalled-transfer transaction itself.
-    watch.drain(&ClaimSet::default())?;
+    watch.drain()?;
     let wake_before = coordinator
         .shared
         .as_ref()
@@ -6199,9 +6199,7 @@ pub(super) fn exercise_stalled_takeover_notification_for_tests(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("parked coordinator wake mapping disappeared"))?
         .expected();
-    let notified = watch
-        .drain(&ClaimSet::default())?
-        .contains_registry_notify();
+    let notified = watch.drain()?.contains_registry_notify();
 
     successor.finish(None)?;
     coordinator.finish(None)?;
@@ -6220,7 +6218,7 @@ pub(super) fn exercise_dirty_repair_notification_for_tests(
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(claim.clone(), claim, None)?;
 
-    watch.drain(&ClaimSet::default())?;
+    watch.drain()?;
     let wake_before = coordinator
         .shared
         .as_ref()
@@ -6254,9 +6252,7 @@ pub(super) fn exercise_dirty_repair_notification_for_tests(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("repaired coordinator wake mapping disappeared"))?
         .expected();
-    let notified = watch
-        .drain(&ClaimSet::default())?
-        .contains_registry_notify();
+    let notified = watch.drain()?.contains_registry_notify();
 
     coordinator.finish(None)?;
     Ok((

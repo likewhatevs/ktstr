@@ -978,15 +978,10 @@ fn admission_flock_unlocks_before_its_close_wake() {
             .expect("open admission resource")
             .expect("acquire fresh admission resource"),
     );
-    let watched = protocol::ClaimSet::new(
-        std::iter::empty(),
-        [cpu],
-        crate::flock::FlockMode::Exclusive,
-    );
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
     assert!(
         !watch
-            .drain(&watched)
+            .drain()
             .expect("drain coordinator watch")
             .contains_cpu_close(cpu),
         "installing the watch must not synthesize a resource close",
@@ -1015,7 +1010,7 @@ fn admission_flock_unlocks_before_its_close_wake() {
     });
     let physically_free =
         recv_from_service_thread(&unlocked_rx, "admission unlock-before-close hook", &worker);
-    let before_close = watch.drain(&watched);
+    let before_close = watch.drain();
     resume_tx.send(()).expect("release final close hook");
     worker.join().expect("final admission-owner drop");
     assert!(
@@ -1030,7 +1025,7 @@ fn admission_flock_unlocks_before_its_close_wake() {
     );
     assert!(
         watch
-            .wait(std::time::Duration::from_secs(2), &watched)
+            .wait(std::time::Duration::from_secs(2))
             .expect("wait for final writable close")
             .is_some_and(|events| events.contains_cpu_close(cpu)),
         "the final close must wake coordinators after physical unlock",
@@ -1048,13 +1043,8 @@ fn admission_flock_clone_unlocks_and_closes_only_after_last_owner() {
             .expect("acquire fresh admission resource"),
     );
     let clone = owner.try_clone().expect("clone logical admission owner");
-    let watched = protocol::ClaimSet::new(
-        std::iter::empty(),
-        [cpu],
-        crate::flock::FlockMode::Exclusive,
-    );
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
-    watch.drain(&watched).expect("drain coordinator watch");
+    watch.drain().expect("drain coordinator watch");
 
     let unlocks = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let hook_unlocks = std::rc::Rc::clone(&unlocks);
@@ -1069,7 +1059,7 @@ fn admission_flock_clone_unlocks_and_closes_only_after_last_owner() {
     );
     assert!(
         !watch
-            .drain(&watched)
+            .drain()
             .expect("probe watch after non-final drop")
             .contains_cpu_close(cpu),
         "dropping a non-final logical owner must not close the resource fd",
@@ -1094,7 +1084,7 @@ fn admission_flock_clone_unlocks_and_closes_only_after_last_owner() {
     );
     assert!(
         watch
-            .wait(std::time::Duration::from_secs(2), &watched)
+            .wait(std::time::Duration::from_secs(2))
             .expect("wait for final logical-owner close")
             .is_some_and(|events| events.contains_cpu_close(cpu)),
         "the final logical owner must produce the coordinator close wake",
@@ -1132,9 +1122,7 @@ fn coordinator_watch_filters_registry_self_closes_without_spinning() {
     drop(coordinator);
 
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
-    watch
-        .drain(&protocol::ClaimSet::default())
-        .expect("drain coordinator watch");
+    watch.drain().expect("drain coordinator watch");
     assert!(
         !protocol::registered_claim_conflicts(&claim).expect("read registry aggregate"),
         "empty registry must not fence a candidate",
@@ -1142,10 +1130,7 @@ fn coordinator_watch_filters_registry_self_closes_without_spinning() {
     let started = std::time::Instant::now();
     assert!(
         watch
-            .wait(
-                std::time::Duration::from_millis(120),
-                &protocol::ClaimSet::default(),
-            )
+            .wait(std::time::Duration::from_millis(120))
             .expect("bounded coordinator wait")
             .is_none(),
         "registry lock/header close events must not wake the coordinator",
@@ -1158,21 +1143,18 @@ fn coordinator_watch_filters_registry_self_closes_without_spinning() {
 
 // Regression for the disjoint-release wake. A release for a resource the
 // coordinator is not currently focused on must still wake its watch. The
-// classifier previously filtered resource closes by the live watch set and
-// DISCARDED such an edge; because a flock release is single-shot, a later scan
-// that armed a narrow watch after the edge had already fired never saw it and
-// rode the 30s COORDINATOR_WAKE_FALLBACK instead of granting the disjoint
+// classifier once filtered resource closes by a watch set handed to drain/wait
+// and DISCARDED such an edge; because a flock release is single-shot, a later
+// scan that armed a narrow watch after the edge had already fired never saw it
+// and rode the 30s COORDINATOR_WAKE_FALLBACK instead of granting the disjoint
 // waiter at once (CI: coordinator stalled with free capacity, grant_scans=1).
+// The transport now takes no watch set at all — focus belongs to the scan that
+// consumes the events, not to the wake — so this pins the property at its
+// source: every resource close reaches the waiter whatever it waits for.
 #[test]
 fn disjoint_resource_close_wakes_coordinator_watch_regardless_of_focus() {
     let _prefixes = LockPrefixesGuard::new_real_wake();
-    let focused = 6usize; // the resource the coordinator's current claim watches
-    let disjoint = 5usize; // an unrelated held resource that will release
-    let watched = protocol::ClaimSet::new(
-        std::iter::empty(),
-        [focused],
-        crate::flock::FlockMode::Exclusive,
-    );
+    let disjoint = 5usize; // held resource unrelated to any claim under wait
     // A peer holds the disjoint CPU through a writable owner — the real-release
     // fd shape (O_RDWR, so its close is the IN_CLOSE_WRITE a holder emits).
     let holder = protocol::AdmissionFlock::from_acquired(
@@ -1181,40 +1163,33 @@ fn disjoint_resource_close_wakes_coordinator_watch_regardless_of_focus() {
             .expect("acquire fresh disjoint resource"),
     );
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
-    // Baseline drain while focused on `focused`; no close has happened yet.
+    // Baseline drain; no close has happened yet.
     assert!(
         !watch
-            .drain(&watched)
+            .drain()
             .expect("baseline drain")
             .contains_cpu_close(disjoint),
         "installing the watch must not synthesize a resource close",
     );
-    // The disjoint holder releases while the coordinator is still focused on a
-    // different resource.
     drop(holder);
-    // The very next watch turn — still carrying the narrow `focused` set — must
-    // observe the disjoint release event-drivenly, far under the 30s fallback.
+    // The very next watch turn must observe the disjoint release
+    // event-drivenly, far under the 30s fallback.
     let woke = watch
-        .wait(std::time::Duration::from_secs(2), &watched)
+        .wait(std::time::Duration::from_secs(2))
         .expect("event-driven coordinator wake");
     assert!(
         woke.is_some_and(|events| events.contains_cpu_close(disjoint)),
-        "a disjoint resource release must wake the coordinator watch even while it \
-         is focused on another resource; the old watched-set filter discarded it \
-         and forced a COORDINATOR_WAKE_FALLBACK tick",
+        "a disjoint resource release must wake the coordinator watch even though \
+         no claim under wait covers it; the old watched-set filter discarded such \
+         an edge and forced a COORDINATOR_WAKE_FALLBACK tick",
     );
 }
 
 #[test]
 fn coordinator_watch_classifies_close_events_by_watched_directory() {
     let _prefixes = LockPrefixesGuard::new();
-    let watched = protocol::ClaimSet::new(
-        std::iter::empty(),
-        [1usize],
-        crate::flock::FlockMode::Exclusive,
-    );
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
-    watch.drain(&watched).expect("drain coordinator watch");
+    watch.drain().expect("drain coordinator watch");
 
     let resource_dir = std::path::Path::new(&cpu_lock_path(1))
         .parent()
@@ -1246,7 +1221,7 @@ fn coordinator_watch_classifies_close_events_by_watched_directory() {
 
     assert!(
         watch
-            .wait(std::time::Duration::from_millis(120), &watched)
+            .wait(std::time::Duration::from_millis(120))
             .expect("bounded collision wait")
             .is_none(),
         "a basename collision on the wrong watch descriptor must not become a registry or resource event",
@@ -1708,9 +1683,7 @@ fn cpu_only_exact_claim_keeps_independent_canonical_modes() {
 fn coordinator_watch_wakes_for_registry_notification() {
     let _prefixes = LockPrefixesGuard::new();
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
-    watch
-        .drain(&protocol::ClaimSet::default())
-        .expect("drain coordinator watch");
+    watch.drain().expect("drain coordinator watch");
     let claim = protocol::ClaimSet::new(
         std::iter::empty(),
         [1usize],
@@ -1726,10 +1699,7 @@ fn coordinator_watch_wakes_for_registry_notification() {
     };
     assert!(
         watch
-            .wait(
-                std::time::Duration::from_secs(1),
-                &protocol::ClaimSet::default(),
-            )
+            .wait(std::time::Duration::from_secs(1))
             .expect("wait for registry notification")
             .is_some(),
         "ticket publication must wake the coordinator watch",
@@ -1907,9 +1877,7 @@ fn coordinator_watch_observes_owner_liveness_close_but_not_readonly_probes() {
         protocol::TicketWork::Acquired(_) => panic!("fresh registry must elect a coordinator"),
     };
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
-    watch
-        .drain(&protocol::ClaimSet::default())
-        .expect("drain registration events");
+    watch.drain().expect("drain registration events");
 
     let (identity, live) =
         protocol::coordinator_liveness_probe_for_tests().expect("probe coordinator liveness");
@@ -1921,10 +1889,7 @@ fn coordinator_watch_observes_owner_liveness_close_but_not_readonly_probes() {
     );
     assert!(
         watch
-            .wait(
-                std::time::Duration::from_millis(120),
-                &protocol::ClaimSet::default(),
-            )
+            .wait(std::time::Duration::from_millis(120))
             .expect("bounded liveness-probe wait")
             .is_none(),
         "O_RDONLY liveness probes and registry mappings must not enqueue actionable closes",
@@ -1932,10 +1897,7 @@ fn coordinator_watch_observes_owner_liveness_close_but_not_readonly_probes() {
 
     drop(coordinator);
     let events = watch
-        .wait(
-            std::time::Duration::from_secs(1),
-            &protocol::ClaimSet::default(),
-        )
+        .wait(std::time::Duration::from_secs(1))
         .expect("wait for liveness owner close")
         .expect("owner close must be actionable");
     assert!(
@@ -1951,16 +1913,11 @@ fn coordinator_watch_wakes_for_resource_release() {
         .expect("open resource lock")
         .expect("take fresh resource lock");
     let watch = protocol::LockDirWatch::new_real_for_tests().expect("coordinator watch");
-    let watched = protocol::ClaimSet::new(
-        std::iter::empty(),
-        [1usize],
-        crate::flock::FlockMode::Exclusive,
-    );
-    watch.drain(&watched).expect("drain coordinator watch");
+    watch.drain().expect("drain coordinator watch");
     drop(held);
     assert!(
         watch
-            .wait(std::time::Duration::from_secs(1), &watched)
+            .wait(std::time::Duration::from_secs(1))
             .expect("wait for resource release")
             .is_some(),
         "resource-lock close must wake the coordinator watch",
@@ -1994,8 +1951,7 @@ fn coordinator_watch_yields_between_bounded_close_storm_chunks() {
             .expect("create trailing registry notification"),
     );
 
-    let watched = protocol::ClaimSet::default();
-    let first = watch.drain(&watched).expect("drain first bounded turn");
+    let first = watch.drain().expect("drain first bounded turn");
     assert!(
         first.has_backlog(),
         "a close storm larger than one coordinator budget must yield with backlog",
@@ -2010,7 +1966,7 @@ fn coordinator_watch_yields_between_bounded_close_storm_chunks() {
         if saw_notify {
             break;
         }
-        let events = watch.drain(&watched).expect("drain next bounded turn");
+        let events = watch.drain().expect("drain next bounded turn");
         assert!(
             !events.overflowed(),
             "the bounded test storm must remain below the kernel overflow limit",
@@ -3053,12 +3009,8 @@ fn stale_broker_generation_cannot_interrupt_the_next_registration() {
         second_id_tx
             .send(crate::flock::interruptible_flock_waiter_id())
             .expect("report second generation");
-        let result = protocol::LockDirWatch::new_real_for_tests().and_then(|watch| {
-            watch.wait(
-                std::time::Duration::from_millis(150),
-                &protocol::ClaimSet::default(),
-            )
-        });
+        let result = protocol::LockDirWatch::new_real_for_tests()
+            .and_then(|watch| watch.wait(std::time::Duration::from_millis(150)));
         poll_tx.send(result).expect("report bounded poll");
         drop(second);
     });

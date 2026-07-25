@@ -767,11 +767,12 @@ enum LockDirWatchBackend {
 /// forever.
 ///
 /// Every writable (`IN_CLOSE_WRITE`) resource-lock close is reported — the
-/// classifier does NOT filter by the caller's current watch set. A close on a
-/// resource the coordinator is not presently focused on can still unblock a
-/// *disjoint* waiter, and the release edge is single-shot: a scan that armed a
-/// narrow watch after that edge already fired would never see it and would ride
-/// the [`COORDINATOR_WAKE_FALLBACK`] tick instead of granting immediately.
+/// classifier is handed no watch set to filter by, so drain/wait take none
+/// either. A close on a resource the coordinator is not presently focused on
+/// can still unblock a *disjoint* waiter, and the release edge is single-shot:
+/// a scan that armed a narrow watch after that edge already fired would never
+/// see it and would ride the [`COORDINATOR_WAKE_FALLBACK`] tick instead of
+/// granting immediately.
 /// Reporting every real release keeps the wake work-conserving. The writable
 /// closes this queue sees are holder releases plus the contention witnesses
 /// `try_flock_with_witness` deliberately retains — those fds are `O_RDWR` too,
@@ -913,11 +914,11 @@ impl RealInotifyWake {
     /// it straight back up (a self-wake busy loop). An external
     /// release slipping into the drain-to-sleep gap is caught by the
     /// [`COORDINATOR_WAKE_FALLBACK`] tick.
-    pub(crate) fn drain(&self, watched: &ClaimSet) -> Result<LockDirEvents> {
-        self.read_bounded(watched)
+    pub(crate) fn drain(&self) -> Result<LockDirEvents> {
+        self.read_bounded()
     }
 
-    fn read_bounded(&self, watched: &ClaimSet) -> Result<LockDirEvents> {
+    fn read_bounded(&self) -> Result<LockDirEvents> {
         let mut batch = LockDirEvents::default();
         let started = std::time::Instant::now();
         let mut reads = 0usize;
@@ -938,7 +939,7 @@ impl RealInotifyWake {
                 Ok(events) => {
                     reads += 1;
                     decoded = decoded.saturating_add(events.len());
-                    self.classify(events, watched, &mut batch);
+                    self.classify(events, &mut batch);
                 }
                 Err(nix::errno::Errno::EAGAIN) => break,
                 Err(error) => return Err(error.into()),
@@ -950,11 +951,7 @@ impl RealInotifyWake {
     /// Sleep until a resource release/registry notification arrives or
     /// `timeout` passes. Protocol-internal close events are consumed without
     /// returning so coordinator bookkeeping cannot create a self-wake loop.
-    pub(crate) fn wait(
-        &self,
-        timeout: Duration,
-        watched: &ClaimSet,
-    ) -> Result<Option<LockDirEvents>> {
+    pub(crate) fn wait(&self, timeout: Duration) -> Result<Option<LockDirEvents>> {
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
         use std::os::fd::AsFd;
         let deadline = std::time::Instant::now() + timeout;
@@ -969,23 +966,17 @@ impl RealInotifyWake {
             if poll(&mut fds, PollTimeout::from(ms))? == 0 {
                 return Ok(None);
             }
-            let batch = self.read_bounded(watched)?;
+            let batch = self.read_bounded()?;
             if batch.is_actionable() {
                 return Ok(Some(batch));
             }
         }
     }
 
-    fn classify(
-        &self,
-        events: Vec<nix::sys::inotify::InotifyEvent>,
-        // Deliberately unused: resource-lock closes are reported regardless of
-        // the current focus set so a disjoint waiter's release edge is never
-        // discarded (see the type doc). Kept in the signature so drain/wait keep
-        // their watch-set-carrying shape for the TestRetry backend and callers.
-        _watched: &ClaimSet,
-        batch: &mut LockDirEvents,
-    ) {
+    /// Resource-lock closes are reported regardless of the caller's current
+    /// focus set so a disjoint waiter's release edge is never discarded (see
+    /// the type doc), which is why no watch set reaches here.
+    fn classify(&self, events: Vec<nix::sys::inotify::InotifyEvent>, batch: &mut LockDirEvents) {
         use nix::sys::inotify::AddWatchFlags;
 
         for event in events {
@@ -1060,21 +1051,17 @@ impl LockDirWatch {
         Self::new_real_wake()
     }
 
-    pub(crate) fn drain(&self, watched: &ClaimSet) -> Result<LockDirEvents> {
+    pub(crate) fn drain(&self) -> Result<LockDirEvents> {
         match &self.backend {
-            LockDirWatchBackend::RealInotify(wake) => wake.drain(watched),
+            LockDirWatchBackend::RealInotify(wake) => wake.drain(),
             #[cfg(test)]
             LockDirWatchBackend::TestRetry => Ok(LockDirEvents::default()),
         }
     }
 
-    pub(crate) fn wait(
-        &self,
-        timeout: Duration,
-        watched: &ClaimSet,
-    ) -> Result<Option<LockDirEvents>> {
+    pub(crate) fn wait(&self, timeout: Duration) -> Result<Option<LockDirEvents>> {
         match &self.backend {
-            LockDirWatchBackend::RealInotify(wake) => wake.wait(timeout, watched),
+            LockDirWatchBackend::RealInotify(wake) => wake.wait(timeout),
             #[cfg(test)]
             LockDirWatchBackend::TestRetry => {
                 std::thread::sleep(timeout);
@@ -2417,11 +2404,8 @@ pub(crate) fn exercise_level_probe_recovers_prewatch_free() -> Result<LevelProbe
         drop(holder); // release BEFORE any watch exists: the lost edge.
     }
     let watch = LockDirWatch::new_real_for_tests()?;
-    let watched = ClaimSet::new(std::iter::empty(), [cpu], FlockMode::Exclusive);
-    let prewatch_release_left_no_event = !watch.drain(&watched)?.contains_cpu_close(cpu);
-    let blocking_wait_times_out = watch
-        .wait(std::time::Duration::from_millis(150), &watched)?
-        .is_none();
+    let prewatch_release_left_no_event = !watch.drain()?.contains_cpu_close(cpu);
+    let blocking_wait_times_out = watch.wait(std::time::Duration::from_millis(150))?.is_none();
     let probe_recovers_free = resource_flock_is_free(&path);
     let new_cpus: BTreeSet<usize> = std::iter::once(cpu).collect();
     let synthesized = probe_newly_watched_free(&new_cpus, &BTreeSet::new(), &BTreeSet::new());
@@ -4161,7 +4145,10 @@ fn acquire_as_coordinator_impl<T>(
                 watch.union_envelope(preparation)
             })
     };
-    let mut watched_resources = ClaimSet::default();
+    // Re-armed from the schedule snapshot at the top of every turn, before any
+    // read. It drives the level probe and the fallback diagnostic only — the
+    // wake transport itself is unfiltered.
+    let mut watched_resources;
     // Resources already level-probed for pre-watch free-state (see the probe
     // before the blocking wait). Accumulates so each resource is physically
     // probed at most once per coordinator session — the guarantee that bounds
@@ -4188,7 +4175,7 @@ fn acquire_as_coordinator_impl<T>(
             wait_diagnostic_deadline = diagnostic_now + WAIT_DIAGNOSTIC_INTERVAL;
         }
         check_interrupted(cancelled)?;
-        pending_events.merge(check_result(watch.drain(&watched_resources), cancelled)?);
+        pending_events.merge(check_result(watch.drain(), cancelled)?);
         let drain_backlog = pending_events.backlog;
         let closed_tickets: Vec<_> = pending_events.liveness_closes.iter().copied().collect();
         let mut snapshot = check_result(
@@ -4539,7 +4526,7 @@ fn acquire_as_coordinator_impl<T>(
             // here is the exit-seam suspect. The stamp's own relaxed-load gate
             // keeps pre-release and sink-unset sleeps free.
             crate::vmm::exit_timing::stamp("coordinator_watch_wait");
-            match check_result(watch.wait(syscall_wait, &watched_resources), cancelled)? {
+            match check_result(watch.wait(syscall_wait), cancelled)? {
                 Some(events) => {
                     COORDINATOR_EVENT_WAKES.fetch_add(1, Ordering::Relaxed);
                     pending_events.merge(events);
