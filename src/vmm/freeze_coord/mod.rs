@@ -17951,10 +17951,12 @@ impl KtstrVm {
                         // wake, matching the other freeze-coord worker loops).
                         poll_eventfd_until_ready_or_timeout(&kill_evt_clone, 200);
                     };
-                    eprintln!(
-                        "bpf_map_write: field '{}' resolved to map '{}' off={} width={} after {} attempts",
-                        params.field, map_info.name(), offset, width, attempt,
-                    );
+                    if crate::vmm::debug_logging_enabled() {
+                        eprintln!(
+                            "bpf_map_write: field '{}' resolved to map '{}' off={} width={} after {} attempts",
+                            params.field, map_info.name(), offset, width, attempt,
+                        );
+                    }
                     resolved.push((params.clone(), map_info, offset, width));
                 }
 
@@ -17980,17 +17982,21 @@ impl KtstrVm {
                 // `BpfMapInfo` captured in phase 2, so any live accessor works.
                 let accessor = owned.as_accessor();
 
-                // Log all maps for diagnostic visibility.
-                let all_maps = accessor.maps();
-                eprintln!(
-                    "bpf_map_write: maps() found {} map(s): [{}]",
-                    all_maps.len(),
-                    all_maps
-                        .iter()
-                        .map(|m| format!("{}(type={})", m.name(), m.map_type))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
+                // Log all maps for diagnostic visibility. The maps() IDR walk
+                // exists only to feed this line, so it hides behind the gate
+                // too.
+                if crate::vmm::debug_logging_enabled() {
+                    let all_maps = accessor.maps();
+                    eprintln!(
+                        "bpf_map_write: maps() found {} map(s): [{}]",
+                        all_maps.len(),
+                        all_maps
+                            .iter()
+                            .map(|m| format!("{}(type={})", m.name(), m.map_type))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
 
                 // Acquire the console before the first mutation and hold it
                 // through completion publication. A crash/stall store can

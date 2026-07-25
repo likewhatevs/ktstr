@@ -1703,9 +1703,11 @@ static INTERACTIVE_BSP_ENTERED: AtomicBool = AtomicBool::new(false);
 /// Returns `true` when either [`crate::KTSTR_DEBUG_ENV`] or
 /// [`crate::RUNNER_DEBUG_ENV`] is set to exactly `"1"`. The per-vCPU
 /// affinity-mask lines, the BSP run-loop trace, the `CLEANUP:`
-/// teardown timings, the `KtstrVm::run` VM-setup timing lines, and the
-/// watchdog lifecycle lines (started / BSP-done / scheduler-attach
-/// reset — but not the timeout/kick diagnostics on the failure path)
+/// teardown timings, the `KtstrVm::run` VM-setup timing lines, the
+/// `performance_mode:` pin/mbind success lines, the `bpf_map_write:`
+/// resolution/map-listing success lines, and the watchdog
+/// lifecycle lines (started / BSP-done / scheduler-attach reset — but
+/// not the timeout/kick diagnostics on the failure path)
 /// route through this gate so they stay out of normal
 /// CI logs — where they otherwise bury the scheduler test failure a
 /// run is investigating — yet reappear on demand. `RUNNER_DEBUG=1` is

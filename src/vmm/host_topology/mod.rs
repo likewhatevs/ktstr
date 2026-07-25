@@ -6985,11 +6985,15 @@ pub unsafe fn mbind_to_nodes(addr: *mut u8, len: usize, nodes: &[usize]) {
         )
     };
     if rc == 0 {
-        eprintln!(
-            "performance_mode: mbind {} MB to NUMA node(s) {:?}",
-            len >> 20,
-            nodes,
-        );
+        // Success is per-region chatter; debug-gated like the per-vCPU pin
+        // lines. Failure stays unconditional — it explains degraded locality.
+        if crate::vmm::debug_logging_enabled() {
+            eprintln!(
+                "performance_mode: mbind {} MB to NUMA node(s) {:?}",
+                len >> 20,
+                nodes,
+            );
+        }
     } else {
         let err = std::io::Error::last_os_error();
         eprintln!(

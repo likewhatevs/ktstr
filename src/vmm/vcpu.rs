@@ -430,7 +430,7 @@ pub(crate) fn register_vcpu_signal_handler() {
 // ---------------------------------------------------------------------------
 
 /// Pin the calling thread to a single host CPU via sched_setaffinity(0, ...).
-/// Logs success or warning; does not fail the VM.
+/// Logs success (debug-gated) or warning; does not fail the VM.
 pub(crate) fn pin_current_thread(cpu: usize, label: &str) {
     let mut cpuset = nix::sched::CpuSet::new();
     if let Err(e) = cpuset.set(cpu) {
@@ -445,7 +445,14 @@ pub(crate) fn pin_current_thread(cpu: usize, label: &str) {
         return;
     }
     match nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset) {
-        Ok(()) => eprintln!("performance_mode: pinned {label} to host CPU {cpu}"),
+        Ok(()) => {
+            // Success is per-vCPU chatter (N lines per VM); route it through
+            // the debug gate like the other per-vCPU diagnostics. Failure
+            // stays unconditional — it explains degraded timing.
+            if crate::vmm::debug_logging_enabled() {
+                eprintln!("performance_mode: pinned {label} to host CPU {cpu}");
+            }
+        }
         Err(e) => eprintln!("performance_mode: WARNING: pin {label} to CPU {cpu}: {e}"),
     }
 }
