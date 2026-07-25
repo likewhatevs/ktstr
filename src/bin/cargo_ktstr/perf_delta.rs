@@ -189,8 +189,8 @@ fn baseline_child_env(
 /// [`CheckoutGuard`]`::drop`) accumulates in `temp_root` forever. This
 /// runs at perf-delta startup on the run-producing paths and removes
 /// every `ktstr-perf-delta-co-*` directory whose sibling `.lock` is NOT
-/// held by a live run — mirroring `cleanup_stale_shm`'s lock-gated
-/// reclamation, so it never removes a concurrent run's checkout.
+/// held by a live run: the lock gate is what makes the sweep safe, since
+/// it never removes a concurrent run's checkout.
 /// Best-effort: each step swallows failure (a busy or racing entry is
 /// skipped and reclaimed by a later sweep). The checkout is a plain dir
 /// (no linked-worktree registration), so `remove_dir_all` fully reclaims

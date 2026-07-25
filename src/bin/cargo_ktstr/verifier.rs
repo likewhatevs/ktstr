@@ -219,8 +219,8 @@ impl Drop for VerifierResultDir {
 /// abort-style crashes cannot run Rust cleanup and therefore orphan the dir.
 /// This runs at startup and removes every
 /// `ktstr-verifier-results-<pid>` dir whose owning pid is no longer alive
-/// (`kill(pid, 0)` -> ESRCH), mirroring `cleanup_stale_shm`'s next-run
-/// reclamation. A dir owned by a LIVE pid is a concurrent verifier run and
+/// (`kill(pid, 0)` -> ESRCH), so the next run reclaims what a killed one
+/// left behind. A dir owned by a LIVE pid is a concurrent verifier run and
 /// is left untouched.
 fn sweep_stale_result_dirs(temp_root: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(temp_root) else {
