@@ -2,7 +2,7 @@
 //!
 //! The slim core that outlived the admission-wall investigation:
 //! - `grants_issued`: WAITING→GRANTED transitions the coordinator scan makes.
-//! - `grants_reached_held`: grants that converted to a live HELD run claim.
+//! - `grants_reached_held`: records published as a live HELD run claim.
 //! - `grants_lost`: licensed grants a cell was told about but did not convert.
 //! - `held_in_flight` / `distinct_held_cpus`: peak count of in-flight
 //!   GRANTED+HELD claims and the distinct host CPUs they cover — the ramp
@@ -12,6 +12,12 @@
 //!   contended LLC lock files with a non-blocking flock (no host-global
 //!   `/proc/locks` walk), so `discover_ns` staying at syscall scale is the
 //!   regression tripwire for that fix.
+//!
+//! The first three are independent rates, not a conserved flow: read them
+//! against each other over time, never as `issued == reached_held + lost`. A
+//! preparation intent is granted like any other waiter, but its grant converts
+//! to a parked PENDING preparation rather than to HELD, and the later one-shot
+//! activation that does publish HELD needs no fresh grant.
 //!
 //! The per-cause loss/probe/replan/guard/watermark breakdown counters this
 //! module once carried answered their questions (the watermark-park and

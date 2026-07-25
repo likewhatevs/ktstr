@@ -1701,7 +1701,8 @@ pub(crate) fn register_intent_for_preparation(
     loop {
         super::tick_reservation_wait_progress();
         match ticket.state_or_wait(waiter_crash_recovery_fallback(), None)? {
-            registry::State::Granted | registry::State::Replan => {
+            grant_or_replan @ (registry::State::Granted | registry::State::Replan) => {
+                let licensed_grant = matches!(grant_or_replan, registry::State::Granted);
                 let result = ticket.run_granted(
                     None,
                     |designated, watch, acquisition_allowed, predecessors, availability| {
@@ -1791,7 +1792,16 @@ pub(crate) fn register_intent_for_preparation(
                     registry::GrantResult::Acquired(_, _) => {
                         unreachable!("intent callback published its run claim as HELD")
                     }
-                    registry::GrantResult::Requeued | registry::GrantResult::LostGrant => {}
+                    registry::GrantResult::Requeued | registry::GrantResult::LostGrant => {
+                        // Same rule as the ordinary ticket drive: a licensed
+                        // GRANTED grant that failed to reach preparation is
+                        // headline churn, while an unlicensed REPLAN completion
+                        // is already tallied as a replan requeue and must not
+                        // inflate grants_lost.
+                        if licensed_grant {
+                            crate::vmm::grant_flow::note_grant_lost();
+                        }
+                    }
                 }
             }
             registry::State::Coordinator => {
