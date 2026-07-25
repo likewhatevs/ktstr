@@ -758,6 +758,72 @@ fn find_sdt_allocation_by_addr(
     None
 }
 
+/// Assert one `sdt_allocations` slot payload is the typed per-task arena
+/// context carrying the alloc-time sentinel fields. Used by the dedup
+/// branch of the sdt_alloc bridge check: when the renderer skipped the
+/// inline chase because the slot was "already rendered in
+/// sdt_allocations", the slot's rendered payload is the bridge's proof
+/// of work and must hold up to the same content bar as an inline chase.
+fn verify_arena_ctx_sentinel(
+    payload: &serde_json::Value,
+    entry_idx: usize,
+    dump_artifact: &str,
+) -> Result<()> {
+    const KTSTR_ARENA_MAGIC: u64 = 0xDEADBEEFCAFEBABE;
+    const KTSTR_TASK_COUNTER: u64 = 42;
+    let kind = payload
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or("<no-kind>");
+    if kind != "struct" {
+        anyhow::bail!(
+            "dedup-resolved sdt_allocations payload for entry[{entry_idx}] must \
+             be a rendered struct, got kind={kind:?}; {dump_artifact}"
+        );
+    }
+    let type_name = payload
+        .get("type_name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("<no-type-name>");
+    if type_name != "ktstr_arena_ctx" {
+        anyhow::bail!(
+            "dedup-resolved sdt_allocations payload for entry[{entry_idx}] has \
+             type_name={type_name:?}, expected \"ktstr_arena_ctx\" -- the \
+             bridge's typed index resolved the wrong payload type; \
+             {dump_artifact}"
+        );
+    }
+    let magic = struct_member(payload, "magic", dump_artifact)?;
+    let magic_value = magic.get("value").and_then(|v| v.as_u64()).ok_or_else(|| {
+        anyhow::anyhow!("sdt_allocations magic not a u64; entry={entry_idx}; {dump_artifact}")
+    })?;
+    if magic_value != KTSTR_ARENA_MAGIC {
+        anyhow::bail!(
+            "dedup-resolved sdt_allocations payload for entry[{entry_idx}] has \
+             magic 0x{magic_value:016x}, expected 0x{KTSTR_ARENA_MAGIC:016x} -- \
+             the dedup pointed at a slot that does not carry the alloc-time \
+             sentinel; {dump_artifact}"
+        );
+    }
+    let counter = struct_member(payload, "counter", dump_artifact)?;
+    let counter_value = counter
+        .get("value")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "sdt_allocations counter not numeric; entry={entry_idx}; {dump_artifact}"
+            )
+        })?;
+    if counter_value != KTSTR_TASK_COUNTER {
+        anyhow::bail!(
+            "dedup-resolved sdt_allocations payload for entry[{entry_idx}] has \
+             counter {counter_value}, expected {KTSTR_TASK_COUNTER}; \
+             {dump_artifact}"
+        );
+    }
+    Ok(())
+}
+
 /// Locate the scheduler's `.bss` map inside the dump. Same name-suffix
 /// rule the existing `failure_dump_e2e.rs::scenario_failure_dump_renders_bss_fields`
 /// uses: libbpf composes `<obj>.bss` for the global-section map, scx-ktstr
@@ -1238,8 +1304,14 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
 fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Result<()> {
     let dump = read_failure_dump(result)?;
     let dump_artifact = failure_dump_artifact(result);
+    check_sdt_alloc_bridge_dump(&dump, &dump_artifact)
+}
 
-    let task_storage = find_task_storage_map(&dump, &dump_artifact)?;
+/// Dump-level body of the sdt_alloc bridge check, split out so the
+/// dedup/bridge branch matrix is deterministically testable against
+/// synthetic dump JSON (the VM path exercises it end-to-end).
+fn check_sdt_alloc_bridge_dump(dump: &serde_json::Value, dump_artifact: &str) -> Result<()> {
+    let task_storage = find_task_storage_map(dump, dump_artifact)?;
     let entries = task_storage
         .get("entries")
         .and_then(|e| e.as_array())
@@ -1261,6 +1333,7 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
     // per-entry walk cheap.
     let mut data_members_seen: usize = 0;
     let mut any_bridge_fired: bool = false;
+    let mut dedup_verified: usize = 0;
     let mut any_data_with_chase: bool = false;
     for (idx, entry) in entries.iter().enumerate() {
         let Some(value) = entry.get("value") else {
@@ -1326,27 +1399,65 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
 
         any_data_with_chase = true;
 
-        // PRIMARY ASSERTION: no entry's `data` may surface a Fwd
-        // skip reason. The bridge's job is exactly to prevent that.
-        if let Some(reason) = data_value
+        // PRIMARY ASSERTION: branch on the chase outcome. A "forward
+        // declaration" skip is the exact regression the bridge exists
+        // to prevent. The renderer's dedup ("already rendered in
+        // sdt_allocations", chase_arena_pointer in btf_render/mod.rs)
+        // fires only when the typed-slot index resolved the chased
+        // address, so it is bridge-SUCCESS evidence -- verified below
+        // against the actual sdt_allocations payload rather than
+        // taken on faith. Any other skip reason means the chase could
+        // not run at all (e.g. the page fell outside the captured
+        // snapshot) and proves nothing about the bridge either way.
+        match data_value
             .get("deref_skipped_reason")
             .and_then(|r| r.as_str())
-            && reason.contains("forward declaration")
         {
-            anyhow::bail!(
-                "REGRESSION: entry[{idx}].value.data surfaced a 'forward \
-                 declaration' skip reason -- the sdt_alloc bridge did NOT \
-                 fire. The chased pointer 0x{data_value_u64:x} fell outside \
-                 every known allocator slot's payload-start index, the dump \
-                 pre-pass failed to populate the index, or \
-                 [`MemReader::resolve_arena_type`] returned None. Without \
-                 the bridge the per-task struct content is unrenderable on \
-                 the surface-struct path. Skip reason: {reason:?}; \
-                 {dump_artifact}"
-            );
+            Some(reason) if reason.contains("forward declaration") => {
+                anyhow::bail!(
+                    "REGRESSION: entry[{idx}].value.data surfaced a 'forward \
+                     declaration' skip reason -- the sdt_alloc bridge did NOT \
+                     fire. The chased pointer 0x{data_value_u64:x} fell outside \
+                     every known allocator slot's payload-start index, the dump \
+                     pre-pass failed to populate the index, or \
+                     [`MemReader::resolve_arena_type`] returned None. Without \
+                     the bridge the per-task struct content is unrenderable on \
+                     the surface-struct path. Skip reason: {reason:?}; \
+                     {dump_artifact}"
+                );
+            }
+            // Must match the dedup reason string emitted at
+            // btf_render/mod.rs (chase_arena_pointer); a drift falls to
+            // the neutral arm below and, if every entry drifts, the
+            // final no-evidence bail still fires.
+            Some("already rendered in sdt_allocations") => {
+                // Strengthen, don't just accept: the dedup claims the
+                // typed payload already sits in `dump.sdt_allocations`.
+                // Hold it to that -- the slot must exist at the chased
+                // address and carry the alloc-time sentinel, so a
+                // bridge that mis-indexes addresses or drops payloads
+                // still fails here instead of hiding behind the dedup.
+                let payload =
+                    find_sdt_allocation_by_addr(dump, data_value_u64).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "entry[{idx}].value.data chase was dedup-skipped \
+                             (\"already rendered in sdt_allocations\") but no \
+                             sdt_allocations slot's [user_addr, user_addr+elem_size) \
+                             range contains the low 32 bits of 0x{data_value_u64:x}. \
+                             The renderer's dedup index claims the slot is rendered \
+                             there, but the dump's sdt_allocations disagree; \
+                             {dump_artifact}"
+                        )
+                    })?;
+                verify_arena_ctx_sentinel(payload, idx, dump_artifact)?;
+                dedup_verified += 1;
+                continue;
+            }
+            Some(_neutral) => continue,
+            None => {}
         }
 
-        // When the chase succeeded AND the bridge fired, the
+        // When the chase ran inline AND the bridge fired, the
         // `cast_annotation` MUST be exactly "sdt_alloc". (BTF
         // Type::Ptr arm -- not the cast-analyzer arm, so no
         // "cast→arena" prefix.)
@@ -1387,17 +1498,16 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
         );
     }
 
-    if !any_bridge_fired {
+    if !any_bridge_fired && dedup_verified == 0 {
         anyhow::bail!(
             "REGRESSION: scx_task_map entries carried non-null `value.data` \
-             pointers with no `deref_skipped_reason`, but NONE surfaced \
-             cast_annotation='sdt_alloc'. That means the chase succeeded \
-             via the BTF-only path -- which would only happen if the \
-             program BTF carried a complete `struct sdt_data` body, \
-             contradicting scx-ktstr's compiled BTF where `sdt_data` is \
-             emitted as a Fwd. Either the bridge ran but failed to set \
-             the annotation, or the test fixture's BTF shape changed in \
-             a way that bypassed the Fwd path. \
+             pointers, yet no entry surfaced cast_annotation='sdt_alloc' AND \
+             none was dedup-resolved into sdt_allocations. Either the chase \
+             succeeded via the BTF-only path (the program BTF carried a \
+             complete `struct sdt_data` body, contradicting scx-ktstr's \
+             compiled BTF where `sdt_data` is emitted as a Fwd), the bridge \
+             ran but failed to set the annotation, or the test fixture's BTF \
+             shape changed in a way that bypassed the Fwd path. \
              data_members_seen={data_members_seen}"
         );
     }
@@ -1437,7 +1547,7 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
         payloads_inspected += 1;
 
         // magic must read the alloc-time sentinel.
-        let magic = struct_member(payload, "magic", &dump_artifact)?;
+        let magic = struct_member(payload, "magic", dump_artifact)?;
         let magic_value = magic.get("value").and_then(|v| v.as_u64()).ok_or_else(|| {
             anyhow::anyhow!("magic value not a u64; entry={idx}; {dump_artifact}")
         })?;
@@ -1453,7 +1563,7 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
             );
         }
 
-        let counter = struct_member(payload, "counter", &dump_artifact)?;
+        let counter = struct_member(payload, "counter", dump_artifact)?;
         let counter_value = counter
             .get("value")
             .and_then(|v| v.as_u64())
@@ -1482,7 +1592,8 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
     eprintln!(
         "sdt_alloc bridge E2E: dump carries scx_task_map with \
          {} entries; data_members_seen={data_members_seen}, \
-         any_bridge_fired={any_bridge_fired}, payloads_inspected={payloads_inspected}. \
+         any_bridge_fired={any_bridge_fired}, dedup_verified={dedup_verified}, \
+         payloads_inspected={payloads_inspected}. \
          No entry's `data` showed a 'forward declaration' skip reason; \
          every chased ktstr_arena_ctx payload carries the alloc-time \
          sentinel and counter.",
@@ -1490,6 +1601,155 @@ fn check_cast_analysis_sdt_alloc_bridge_resolves_fwd(result: &VmResult) -> Resul
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod sdt_bridge_dump_replay {
+    //! Deterministic replays of `check_sdt_alloc_bridge_dump` against
+    //! synthetic dump JSON: the dedup/bridge branch matrix that CI can
+    //! only reach through lane-specific dump shapes (the x64-7.1-base
+    //! dumps dedup EVERY entry into `sdt_allocations`, which the check
+    //! previously misread as a bridge regression).
+    use super::check_sdt_alloc_bridge_dump;
+
+    const MAGIC: u64 = 0xDEADBEEFCAFEBABE;
+    const COUNTER: u64 = 42;
+
+    fn arena_ctx(magic: u64, counter: u64) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "struct",
+            "type_name": "ktstr_arena_ctx",
+            "members": [
+                {"name": "magic", "value": {"kind": "uint", "bits": 64, "value": magic}},
+                {"name": "counter", "value": {"kind": "uint", "bits": 32, "value": counter}},
+            ],
+        })
+    }
+
+    /// One TASK_STORAGE entry whose surface `data` Ptr carries the given
+    /// chase outcome, plus a healthy `payload` so ASSERTION 2 passes.
+    fn entry(data_value: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "value": {
+                "kind": "struct",
+                "type_name": "scx_task_map_val",
+                "members": [{"name": "data", "value": data_value}],
+            },
+            "payload": arena_ctx(MAGIC, COUNTER),
+        })
+    }
+
+    fn dump(entries: Vec<serde_json::Value>, allocations: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "maps": [{"name": "scx_task_map", "map_type": 29, "entries": entries}],
+            "sdt_allocations": allocations,
+        })
+    }
+
+    /// The x64-7.1-base shape: every entry dedup-skipped, typed payloads
+    /// present in `sdt_allocations` — bridge success, check must PASS.
+    #[test]
+    fn accepts_dedup_skip_with_verified_slot_payload() {
+        let d = dump(
+            vec![entry(serde_json::json!({
+                "kind": "ptr",
+                "value": 0x1000_0000_a9d8u64,
+                "deref_skipped_reason": "already rendered in sdt_allocations",
+            }))],
+            serde_json::json!([{
+                "allocator_name": "scx_task_allocator",
+                "elem_size": 0x80,
+                "entries": [{"idx": 0, "user_addr": 0xa980, "payload": arena_ctx(MAGIC, COUNTER)}],
+            }]),
+        );
+        check_sdt_alloc_bridge_dump(&d, "synthetic dump")
+            .expect("dedup-skipped entries with verified slot payloads are bridge success");
+    }
+
+    /// Dedup reason with NO slot covering the chased address: the dedup
+    /// index and the rendered dump disagree — must FAIL.
+    #[test]
+    fn rejects_dedup_skip_without_covering_slot() {
+        let d = dump(
+            vec![entry(serde_json::json!({
+                "kind": "ptr",
+                "value": 0x1000_0000_a9d8u64,
+                "deref_skipped_reason": "already rendered in sdt_allocations",
+            }))],
+            serde_json::json!([]),
+        );
+        let error = check_sdt_alloc_bridge_dump(&d, "synthetic dump")
+            .expect_err("a dedup skip without a rendered slot must fail");
+        assert!(
+            error.to_string().contains("dedup-skipped"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// Dedup-resolved slot whose payload lacks the alloc-time sentinel:
+    /// the bridge indexed a wrong/stale slot — must FAIL.
+    #[test]
+    fn rejects_dedup_slot_with_wrong_sentinel() {
+        let d = dump(
+            vec![entry(serde_json::json!({
+                "kind": "ptr",
+                "value": 0x1000_0000_a9d8u64,
+                "deref_skipped_reason": "already rendered in sdt_allocations",
+            }))],
+            serde_json::json!([{
+                "allocator_name": "scx_task_allocator",
+                "elem_size": 0x80,
+                "entries": [{"idx": 0, "user_addr": 0xa980, "payload": arena_ctx(0xBAD, COUNTER)}],
+            }]),
+        );
+        let error = check_sdt_alloc_bridge_dump(&d, "synthetic dump")
+            .expect_err("a dedup slot without the sentinel must fail");
+        assert!(
+            error.to_string().contains("magic"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// The original regression the check exists for: a "forward
+    /// declaration" skip means the bridge did not fire — must FAIL.
+    #[test]
+    fn rejects_forward_declaration_skip() {
+        let d = dump(
+            vec![entry(serde_json::json!({
+                "kind": "ptr",
+                "value": 0x1000_0000_a9d8u64,
+                "deref_skipped_reason":
+                    "pointee is a forward declaration; body not in this BTF",
+            }))],
+            serde_json::json!([]),
+        );
+        let error = check_sdt_alloc_bridge_dump(&d, "synthetic dump")
+            .expect_err("a forward-declaration skip is the bridge regression");
+        assert!(
+            error.to_string().contains("forward"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// Inline chase with no annotation and no dedup evidence anywhere:
+    /// the no-evidence gate must still FAIL (BTF-only bypass).
+    #[test]
+    fn rejects_annotation_free_inline_chase() {
+        let d = dump(
+            vec![entry(serde_json::json!({
+                "kind": "ptr",
+                "value": 0x1000_0000_a9d8u64,
+                "deref": {"kind": "struct", "type_name": "sdt_data", "members": []},
+            }))],
+            serde_json::json!([]),
+        );
+        let error = check_sdt_alloc_bridge_dump(&d, "synthetic dump")
+            .expect_err("annotation-free inline chases carry no bridge evidence");
+        assert!(
+            error.to_string().contains("REGRESSION"),
+            "unexpected error: {error:#}"
+        );
+    }
 }
 
 /// Asserts that the cross-subprog arena pointer propagation
