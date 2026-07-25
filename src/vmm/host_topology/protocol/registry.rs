@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ24");
-const VERSION: u32 = 24;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ25");
+const VERSION: u32 = 25;
 #[cfg(test)]
 const RETAINED_FUTEX_WAIT_MARKER_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 #[cfg(test)]
@@ -43,8 +43,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v24-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v24-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v25-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v25-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 const WAIT_DIAGNOSTIC_BUCKET_SECS: u64 = 30;
@@ -322,6 +322,15 @@ const STATE_REVOKED: u32 = 8;
 /// scanned again, and the old callback publication is rejected on return.
 const STATE_REPLAN_EXPIRED: u32 = 9;
 
+/// Whether a record in `state` charges its exact claim into the `C_GRANT_*`
+/// planner-occupancy families. REVOKED stays charged: a revoked callback's
+/// exact claim fences the scan until acknowledgement and its physical OFDs
+/// may still be live, so releasing at the revoke flip would re-blind the
+/// planner to a genuinely occupied footprint for the revoke -> ack window.
+fn charged_state(state: u32) -> bool {
+    matches!(state, STATE_GRANTED | STATE_REVOKED)
+}
+
 const BLOCK_NONE: u32 = 0;
 const BLOCK_CPU: u32 = 1;
 const BLOCK_LLC: u32 = 2;
@@ -366,7 +375,17 @@ const HEADER_BITMAPS: usize = 26;
 /// work off the physical CPUs currently licensed to Cargo/kernel builds while
 /// still allowing cooperative overlap when the complement is exhausted.
 const C_BUILD_CLAIM_CPUS: usize = 12;
-const AGGREGATE_BITMAPS: usize = 13;
+/// Count-only planner-charge families for in-flight grants: the exact claims
+/// of every GRANTED and REVOKED record, folded like `adjust_held_counts`
+/// (permits land at `permit_resource_index` in the CPU families). These are
+/// planner *bias* inputs only — they must never feed `conflicts()`,
+/// availability, `exclusive_held`, or the holder counts, all of which stay
+/// HELD-only so a granted claim can never become an absolute planner fence.
+const C_GRANT_CPU_ANY: usize = 13;
+const C_GRANT_CPU_EX: usize = 14;
+const C_GRANT_LLC_ANY: usize = 15;
+const C_GRANT_LLC_EX: usize = 16;
+const AGGREGATE_BITMAPS: usize = 17;
 
 const S_CPU_SH: usize = 0;
 const S_CPU_EX: usize = 1;
@@ -765,6 +784,15 @@ pub(super) struct AggregateSnapshot {
     llc_shared_holders: Vec<u32>,
     llc_exclusive_holders: Vec<u32>,
     build_cpu_claims: Vec<u32>,
+    /// In-flight grant charge (`C_GRANT_*`): the exact claims of GRANTED and
+    /// REVOKED records, permits folded at their CPU-space resource indices.
+    /// Planner bias only — deliberately absent from `conflicts` /
+    /// `first_conflict` and from every holder/exclusive accessor, so a
+    /// granted claim can bias placement but never fence it.
+    cpu_grant_any: Vec<u32>,
+    cpu_grant_exclusive: Vec<u32>,
+    llc_grant_any: Vec<u32>,
+    llc_grant_exclusive: Vec<u32>,
 }
 
 impl AggregateSnapshot {
@@ -780,6 +808,10 @@ impl AggregateSnapshot {
             llc_shared_holders: vec![0; layout.bits],
             llc_exclusive_holders: vec![0; layout.bits],
             build_cpu_claims: vec![0; layout.bits],
+            cpu_grant_any: vec![0; layout.bits],
+            cpu_grant_exclusive: vec![0; layout.bits],
+            llc_grant_any: vec![0; layout.bits],
+            llc_grant_exclusive: vec![0; layout.bits],
         }
     }
 
@@ -879,6 +911,59 @@ impl AggregateSnapshot {
     pub(super) fn cpu_build_claimed(&self, cpu: usize) -> Result<bool> {
         self.ensure_index(cpu, "CPU")?;
         Ok(self.build_cpu_claims[cpu] != 0)
+    }
+
+    pub(super) fn cpu_grant_count(&self, cpu: usize) -> Result<usize> {
+        self.ensure_index(cpu, "CPU")?;
+        Ok(self.cpu_grant_any[cpu] as usize)
+    }
+
+    pub(super) fn llc_grant_count(&self, llc: usize) -> Result<usize> {
+        self.ensure_index(llc, "LLC")?;
+        Ok(self.llc_grant_any[llc] as usize)
+    }
+
+    /// Whether `candidate` overlaps any in-flight grant charge, using the
+    /// same mode matrix as [`Self::first_conflict`]: an exclusive candidate
+    /// resource conflicts with any charge, a shared one only with an
+    /// exclusive charge. Permits are tested at their folded CPU-space
+    /// indices. This is a soft-avoid input for two-tier candidate selection —
+    /// never a fence: callers must fall back to a grant-blind pass when no
+    /// grant-free candidate satisfies the request.
+    pub(super) fn grant_conflicts(&self, candidate: &ClaimSet) -> Result<bool> {
+        validate_claim(candidate)?;
+        for &cpu in &candidate.cpus {
+            self.ensure_index(cpu, "CPU")?;
+            let charged = match candidate.cpu_mode {
+                ClaimMode::Exclusive => self.cpu_grant_any[cpu],
+                ClaimMode::Shared => self.cpu_grant_exclusive[cpu],
+            };
+            if charged != 0 {
+                return Ok(true);
+            }
+        }
+        for &permit in &candidate.permits {
+            let index = permit_resource_index(permit)?;
+            self.ensure_index(index, "permit resource")?;
+            let charged = match candidate.permit_mode {
+                ClaimMode::Exclusive => self.cpu_grant_any[index],
+                ClaimMode::Shared => self.cpu_grant_exclusive[index],
+            };
+            if charged != 0 {
+                return Ok(true);
+            }
+        }
+        for &llc in &candidate.llcs {
+            self.ensure_index(llc, "LLC")?;
+            let charged = match candidate.llc_mode {
+                ClaimMode::Exclusive => self.llc_grant_any[llc],
+                ClaimMode::Shared => self.llc_grant_exclusive[llc],
+            };
+            if charged != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn ensure_index(&self, index: usize, kind: &str) -> Result<()> {
@@ -2267,6 +2352,12 @@ impl Ticket {
         crash_at_for_tests("register_record_before_counts");
         table.adjust_claim_counts(&claim, true)?;
         table.adjust_watch_counts(&watch, true)?;
+        if initial_state == STATE_GRANTED {
+            // The born-GRANTED fast path publishes a charged record without
+            // passing through `set_record_state`; charge it here, inside the
+            // same dirty transaction as its claim counts.
+            table.adjust_granted_occupancy(&claim, true)?;
+        }
         table.mark_observation_modes(&newly_watched)?;
         table.mark_blockers_unknown(&contention_markers)?;
         if initial_state == STATE_WAITING
@@ -2645,7 +2736,7 @@ impl Ticket {
             } else {
                 record.replan_claim_epoch
             };
-            let (prefix_epoch, predecessors) = table.cached_prefix(record.slot)?;
+            let (prefix_epoch, mut predecessors) = table.cached_prefix(record.slot)?;
             if prefix_epoch == 0 || prefix_epoch != state_epoch {
                 crate::vmm::grant_flow::note_lost_prefix_epoch();
                 table.begin_transaction()?;
@@ -2668,6 +2759,14 @@ impl Ticket {
                 }
                 return Ok(GrantResult::LostGrant);
             }
+            // A licensed GRANTED ticket's own claim is charged while its
+            // callback plans; subtract it so the soft-avoid bias cannot steer
+            // the callback off its own designated footprint. REPLAN is never
+            // charged and needs no exclusion.
+            table.fill_grant_occupancy(
+                &mut predecessors,
+                (record.state == STATE_GRANTED).then_some(&record.claim),
+            )?;
             let availability = table.availability_snapshot();
             let callback_wake = table
                 .record_bytes(record.slot)?
@@ -3433,7 +3532,9 @@ impl Ticket {
         } else {
             (table.aggregate_watch()?, false)
         };
-        let (prefix_epoch, predecessors) = table.cached_prefix(self.slot)?;
+        let (prefix_epoch, mut predecessors) = table.cached_prefix(self.slot)?;
+        // A coordinator record is never grant-charged: no self-exclusion.
+        table.fill_grant_occupancy(&mut predecessors, None)?;
         let availability = table.availability_snapshot();
         let observation = table.observation_request()?;
         table.touch_coordinator_heartbeat()?;
@@ -3610,6 +3711,16 @@ impl Ticket {
                 })
                 .collect()
         };
+        let header_counts = |which| {
+            (0..layout.bits)
+                .map(|index| {
+                    read_u32(
+                        header,
+                        layout.count_offset(which) + index * std::mem::size_of::<u32>(),
+                    )
+                })
+                .collect()
+        };
         let predecessors = AggregateSnapshot {
             bits: layout.bits,
             cpu_any: record_words(RB_PREFIX_CPU_ANY),
@@ -3621,6 +3732,12 @@ impl Ticket {
             llc_shared_holders: vec![0; layout.bits],
             llc_exclusive_holders: vec![0; layout.bits],
             build_cpu_claims: vec![0; layout.bits],
+            // The coordinator itself is never grant-charged, so its planning
+            // view carries the whole live grant charge without exclusion.
+            cpu_grant_any: header_counts(C_GRANT_CPU_ANY),
+            cpu_grant_exclusive: header_counts(C_GRANT_CPU_EX),
+            llc_grant_any: header_counts(C_GRANT_LLC_ANY),
+            llc_grant_exclusive: header_counts(C_GRANT_LLC_EX),
         };
         let header_words = |which| {
             (0..layout.words)
@@ -3740,7 +3857,9 @@ impl Ticket {
         } else {
             (table.aggregate_watch()?, false)
         };
-        let (prefix_epoch, predecessors) = table.cached_prefix(self.slot)?;
+        let (prefix_epoch, mut predecessors) = table.cached_prefix(self.slot)?;
+        // A coordinator record is never grant-charged: no self-exclusion.
+        table.fill_grant_occupancy(&mut predecessors, None)?;
         let availability = table.availability_snapshot();
         let observation = table.observation_request()?;
         let liveness_due_in = table.liveness_due_in()?;
@@ -4226,6 +4345,10 @@ fn aggregate_snapshot_impl(
             llc_shared_holders: read_counts(B_HELD_LLC_SHARED),
             llc_exclusive_holders: read_counts(B_HELD_LLC_EXCLUSIVE),
             build_cpu_claims: read_counts(C_BUILD_CLAIM_CPUS),
+            cpu_grant_any: read_counts(C_GRANT_CPU_ANY),
+            cpu_grant_exclusive: read_counts(C_GRANT_CPU_EX),
+            llc_grant_any: read_counts(C_GRANT_LLC_ANY),
+            llc_grant_exclusive: read_counts(C_GRANT_LLC_EX),
         };
         // The common disjoint snapshot is a pure SH/read-only operation. Only
         // a claim that is actually fenced needs any liveness work.
@@ -11008,6 +11131,444 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
     })
 }
 
+/// Compare every `C_GRANT_*` header count array against a recomputation from
+/// the live records (charged set = {GRANTED, REVOKED}). The strongest leak
+/// tripwire available to tests: any unbalanced charge site shows up as a
+/// per-resource mismatch here even before an adjust helper under/overflows.
+#[cfg(test)]
+fn grant_charge_derived_matches(table: &mut Table) -> Result<()> {
+    let bits = table.layout.bits;
+    let mut cpu_any = vec![0u32; bits];
+    let mut cpu_ex = vec![0u32; bits];
+    let mut llc_any = vec![0u32; bits];
+    let mut llc_ex = vec![0u32; bits];
+    for record in table.records()? {
+        if !charged_state(record.state) {
+            continue;
+        }
+        let claim = &record.claim;
+        for &cpu in &claim.cpus {
+            cpu_any[cpu] += 1;
+            if claim.cpu_mode == ClaimMode::Exclusive {
+                cpu_ex[cpu] += 1;
+            }
+        }
+        for &permit in &claim.permits {
+            let index = permit_resource_index(permit)?;
+            cpu_any[index] += 1;
+            if claim.permit_mode == ClaimMode::Exclusive {
+                cpu_ex[index] += 1;
+            }
+        }
+        for &llc in &claim.llcs {
+            llc_any[llc] += 1;
+            if claim.llc_mode == ClaimMode::Exclusive {
+                llc_ex[llc] += 1;
+            }
+        }
+    }
+    for (name, which, expected) in [
+        ("C_GRANT_CPU_ANY", C_GRANT_CPU_ANY, &cpu_any),
+        ("C_GRANT_CPU_EX", C_GRANT_CPU_EX, &cpu_ex),
+        ("C_GRANT_LLC_ANY", C_GRANT_LLC_ANY, &llc_any),
+        ("C_GRANT_LLC_EX", C_GRANT_LLC_EX, &llc_ex),
+    ] {
+        let actual = table.header_counts(which);
+        for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            anyhow::ensure!(
+                actual == expected,
+                "grant charge {name}[{index}] is {actual}, derived from records: {expected}",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn grant_charge_total(table: &Table) -> u64 {
+    table
+        .header_counts(C_GRANT_CPU_ANY)
+        .iter()
+        .chain(table.header_counts(C_GRANT_LLC_ANY).iter())
+        .map(|&count| u64::from(count))
+        .sum()
+}
+
+/// Assert aggregate == derived for the grant-charge families in the shared
+/// registry image, running dirty repair first exactly like any entrant.
+#[cfg(test)]
+pub(super) fn grant_charge_matches_derived_for_tests() -> Result<()> {
+    let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+    let mut table = Table::open_existing()?;
+    table.repair_consistency_if_needed()?;
+    grant_charge_derived_matches(&mut table)
+}
+
+#[cfg(test)]
+pub(crate) struct GrantedChargeLifecycleOutcome {
+    pub(crate) scan_granted_charged: bool,
+    pub(crate) pending_uncharged: bool,
+    pub(crate) born_granted_charged: bool,
+    pub(crate) held_uncharged: bool,
+    pub(crate) drained_to_zero: bool,
+}
+
+/// Drive one grant through GRANTED -> PENDING (preparation) -> removal and a
+/// second through born-GRANTED -> HELD -> removal, auditing the `C_GRANT_*`
+/// charge against the derived truth at every stage. Pins the
+/// GRANTED->PENDING release (the old claim, not the preparation claim), the
+/// born-GRANTED registration charge, and the unconditional promote release.
+#[cfg(test)]
+pub(super) fn exercise_granted_charge_lifecycle_for_tests() -> Result<GrantedChargeLifecycleOutcome>
+{
+    let coordinator_cpu = 2_300usize;
+    let scan_cpu = 2_301usize;
+    let prep_cpu = 2_302usize;
+    let born_cpu = 2_303usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let scan_claim = ClaimSet::new(std::iter::empty(), [scan_cpu], FlockMode::Exclusive);
+    let mut scan_ticket = Ticket::register(scan_claim.clone(), scan_claim.clone(), None)?;
+    let scan_granted_charged = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, scan_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, prep_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+        anyhow::ensure!(
+            table
+                .record(scan_ticket.slot)?
+                .is_some_and(|record| record.state == STATE_GRANTED),
+            "charge lifecycle fixture did not grant its scan waiter",
+        );
+        grant_charge_derived_matches(&mut table)?;
+        grant_charge_total(&table) == 1
+    };
+    let preparation = ClaimSet::new(std::iter::empty(), [prep_cpu], FlockMode::Exclusive);
+    let scan_claim_for_wake = scan_claim.clone();
+    let preparation_for_wake = preparation.clone();
+    let result = scan_ticket.run_granted(None, |current, _watch, acquisition_allowed, _, _| {
+        anyhow::ensure!(
+            acquisition_allowed && current == &scan_claim_for_wake,
+            "charge lifecycle callback received the wrong publication",
+        );
+        Ok(GrantAttempt::<()> {
+            acquired: Some(()),
+            preparation_claim: Some(preparation_for_wake.clone()),
+            preparation_contention: None,
+            next_claim: scan_claim_for_wake.clone(),
+            contention: None,
+        })
+    })?;
+    anyhow::ensure!(
+        matches!(result, GrantResult::Prepared((), _)),
+        "charge lifecycle preparation grant did not reach PENDING",
+    );
+    let pending_uncharged = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        anyhow::ensure!(
+            table
+                .record(scan_ticket.slot)?
+                .is_some_and(|record| record.state == STATE_PENDING),
+            "charge lifecycle preparation grant is not PENDING",
+        );
+        grant_charge_derived_matches(&mut table)?;
+        grant_charge_total(&table) == 0
+    };
+    scan_ticket.finish(None)?;
+    // The PENDING removal dirtied the suffix watermark; run one scan so the
+    // born-GRANTED entrant below is not parked by unrelated churn.
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, born_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+    }
+    let born_claim = ClaimSet::new(std::iter::empty(), [born_cpu], FlockMode::Exclusive);
+    let mut born = Ticket::register(born_claim.clone(), born_claim.clone(), None)?;
+    let born_granted_charged = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        anyhow::ensure!(
+            table
+                .record(born.slot)?
+                .is_some_and(|record| record.state == STATE_GRANTED),
+            "registration did not take the born-GRANTED fast path",
+        );
+        grant_charge_derived_matches(&mut table)?;
+        grant_charge_total(&table) == 1
+    };
+    let born_claim_for_wake = born_claim.clone();
+    let result = born.run_granted(None, |current, _watch, acquisition_allowed, _, _| {
+        anyhow::ensure!(
+            acquisition_allowed && current == &born_claim_for_wake,
+            "born-GRANTED callback received the wrong publication",
+        );
+        Ok(GrantAttempt::<()> {
+            acquired: Some(()),
+            preparation_claim: None,
+            preparation_contention: None,
+            next_claim: born_claim_for_wake.clone(),
+            contention: None,
+        })
+    })?;
+    let held = match result {
+        GrantResult::Acquired((), held) => held,
+        _ => anyhow::bail!("born-GRANTED acquire did not commit HELD"),
+    };
+    let held_uncharged = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        grant_charge_derived_matches(&mut table)?;
+        grant_charge_total(&table) == 0
+    };
+    drop(held);
+    coordinator.finish(None)?;
+    let drained_to_zero = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        grant_charge_derived_matches(&mut table)?;
+        grant_charge_total(&table) == 0
+    };
+    Ok(GrantedChargeLifecycleOutcome {
+        scan_granted_charged,
+        pending_uncharged,
+        born_granted_charged,
+        held_uncharged,
+        drained_to_zero,
+    })
+}
+
+#[cfg(test)]
+pub(crate) struct GrantChargeRevokeAckOutcome {
+    pub(crate) junior_granted_charged: bool,
+    pub(crate) replacement_dirtied_watermark: bool,
+    pub(crate) senior_granted_and_junior_revoked: bool,
+    pub(crate) revoked_stays_charged: bool,
+    pub(crate) ack_releases_charge: bool,
+}
+
+/// End-to-end ticket-order win on a grant-charged resource: a senior REPLAN
+/// publishes a replacement overlapping a junior's grant (the guard dirties
+/// the suffix), the next authoritative scan grants the senior and revokes the
+/// junior, and the revoked claim stays charged until its acknowledgement.
+#[cfg(test)]
+pub(super) fn exercise_grant_charge_revoke_ack_for_tests() -> Result<GrantChargeRevokeAckOutcome> {
+    let coordinator_cpu = 2_400usize;
+    let senior_designated_cpu = 2_401usize;
+    let contended_cpu = 2_402usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let senior_designated = ClaimSet::new(
+        std::iter::empty(),
+        [senior_designated_cpu],
+        FlockMode::Exclusive,
+    );
+    let senior_watch = ClaimSet::new(
+        std::iter::empty(),
+        [senior_designated_cpu, contended_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut senior = Ticket::register(senior_designated.clone(), senior_watch, None)?;
+    let junior_claim = ClaimSet::new(std::iter::empty(), [contended_cpu], FlockMode::Exclusive);
+    let mut junior = Ticket::register(junior_claim.clone(), junior_claim.clone(), None)?;
+    let junior_granted_charged = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, senior_designated_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, contended_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+        anyhow::ensure!(
+            table
+                .record(senior.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(junior.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            "revoke-ack fixture did not publish its senior callback and junior grant",
+        );
+        grant_charge_derived_matches(&mut table)?;
+        grant_charge_total(&table) == 1
+    };
+    let replacement = junior_claim.clone();
+    let senior_designated_for_wake = senior_designated.clone();
+    let replacement_for_wake = replacement.clone();
+    let result = senior.run_granted(None, |current, _watch, acquisition_allowed, _, _| {
+        anyhow::ensure!(
+            !acquisition_allowed && current == &senior_designated_for_wake,
+            "revoke-ack senior callback received the wrong publication",
+        );
+        Ok(GrantAttempt::<()> {
+            acquired: None,
+            preparation_claim: None,
+            preparation_contention: None,
+            next_claim: replacement_for_wake.clone(),
+            contention: None,
+        })
+    })?;
+    anyhow::ensure!(
+        matches!(result, GrantResult::Requeued),
+        "revoke-ack senior completion did not requeue",
+    );
+    let (replacement_dirtied_watermark, senior_granted_and_junior_revoked, revoked_stays_charged) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        // The replacement overlaps the junior grant's charge, so the guard
+        // must have dirtied the full suffix.
+        let replacement_dirtied_watermark = table.min_changed_ticket() < junior.ticket;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+        let senior_granted_and_junior_revoked = table
+            .record(senior.slot)?
+            .is_some_and(|record| record.state == STATE_GRANTED && record.claim == replacement)
+            && table
+                .record(junior.slot)?
+                .is_some_and(|record| record.state == STATE_REVOKED);
+        grant_charge_derived_matches(&mut table)?;
+        // Senior GRANTED and junior REVOKED both charge the contended CPU.
+        let revoked_stays_charged = grant_charge_total(&table) == 2;
+        (
+            replacement_dirtied_watermark,
+            senior_granted_and_junior_revoked,
+            revoked_stays_charged,
+        )
+    };
+    // The junior's next state read acknowledges the revocation.
+    let junior_state = junior.state(None)?;
+    let ack_releases_charge = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        anyhow::ensure!(
+            junior_state == State::Waiting
+                && table
+                    .record(junior.slot)?
+                    .is_some_and(|record| record.state == STATE_WAITING),
+            "revoked junior did not acknowledge back to WAITING",
+        );
+        grant_charge_derived_matches(&mut table)?;
+        grant_charge_total(&table) == 1
+    };
+    junior.finish(None)?;
+    senior.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(GrantChargeRevokeAckOutcome {
+        junior_granted_charged,
+        replacement_dirtied_watermark,
+        senior_granted_and_junior_revoked,
+        revoked_stays_charged,
+        ack_releases_charge,
+    })
+}
+
+/// Crash a writer mid-transaction with a live GRANTED and a live REVOKED
+/// record, then prove dirty repair rebuilds the grant charge without
+/// underflow: the demotion loop releases the GRANTED record's charge through
+/// the `set_record_state` chokepoint over the just-zeroed count arrays, and
+/// the surviving REVOKED fence stays charged.
+#[cfg(test)]
+pub(super) fn exercise_dirty_repair_grant_charges_for_tests() -> Result<(bool, bool)> {
+    let coordinator_cpu = 2_500usize;
+    let granted_cpu = 2_501usize;
+    let revoked_cpu = 2_502usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let granted_claim = ClaimSet::new(std::iter::empty(), [granted_cpu], FlockMode::Exclusive);
+    let mut granted = Ticket::register(granted_claim.clone(), granted_claim.clone(), None)?;
+    let revoked_claim = ClaimSet::new(std::iter::empty(), [revoked_cpu], FlockMode::Exclusive);
+    let mut revoked = Ticket::register(revoked_claim.clone(), revoked_claim.clone(), None)?;
+    let (repaired_without_underflow, revoked_charge_preserved) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, granted_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, revoked_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+        anyhow::ensure!(
+            table
+                .record(granted.slot)?
+                .is_some_and(|record| record.state == STATE_GRANTED)
+                && table
+                    .record(revoked.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            "dirty-repair charge fixture did not grant both waiters",
+        );
+        table.begin_transaction()?;
+        table.set_record_state(revoked.slot, STATE_REVOKED)?;
+        table.finish_transaction()?;
+        // Model a writer dying mid-transaction after the states were
+        // published: the dirty marker alone forces a full rebuild.
+        atomic_u64(&table.header, H_AGGREGATE_DIRTY).store(1, Ordering::SeqCst);
+        table.repair_consistency_if_needed()?;
+        grant_charge_derived_matches(&mut table)?;
+        let repaired = table
+            .record(granted.slot)?
+            .is_some_and(|record| record.state == STATE_WAITING)
+            && table
+                .record(revoked.slot)?
+                .is_some_and(|record| record.state == STATE_REVOKED);
+        (repaired, grant_charge_total(&table) == 1)
+    };
+    revoked.finish(None)?;
+    granted.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((repaired_without_underflow, revoked_charge_preserved))
+}
+
+/// A granted-EX claim must stay planner *bias*: it appears in the grant
+/// counts but never in `exclusive_held` or the holder counts, so it can
+/// never become an absolute placement fence.
+#[cfg(test)]
+pub(super) fn exercise_exclusive_grant_bias_only_for_tests() -> Result<(bool, bool, bool, bool)> {
+    let coordinator_cpu = 2_600usize;
+    let granted_cpu = 2_601usize;
+    let granted_llc = 9usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, granted_cpu, true)?;
+        table.set_bitmap_bit(B_LLC_KNOWN, granted_llc, true)?;
+        table.set_bitmap_bit(B_LLC_SH_AVAILABLE, granted_llc, true)?;
+        table.set_bitmap_bit(B_LLC_EX_AVAILABLE, granted_llc, true)?;
+    }
+    let granted_claim = ClaimSet::with_modes(
+        [granted_llc],
+        [granted_cpu],
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let mut granted = Ticket::register(granted_claim.clone(), granted_claim, None)?;
+    let outcome = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        anyhow::ensure!(
+            table
+                .record(granted.slot)?
+                .is_some_and(|record| record.state == STATE_GRANTED),
+            "exclusive-bias fixture did not take the born-GRANTED fast path",
+        );
+        let snapshot = table.aggregate_claim_snapshot();
+        (
+            !snapshot.cpu_exclusive_held(granted_cpu)?,
+            !snapshot.llc_exclusive_held(granted_llc)?,
+            snapshot.cpu_grant_count(granted_cpu)? == 1,
+            snapshot.llc_grant_count(granted_llc)? == 1,
+        )
+    };
+    granted.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(outcome)
+}
+
 #[cfg(test)]
 fn exercise_pending_replan_grant_race_case(
     offset: usize,
@@ -14137,7 +14698,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .saturating_add(1)
         })
         .unwrap_or(0);
-    // The v24 mapping is deliberately overprovisioned once. It never needs a
+    // The v25 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
     // a disjoint internal bit range immediately after possible host CPUs.
@@ -14253,11 +14814,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-registry-v24")
+    active_protocol_dir().join("ktstr-acquire-registry-v25")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-events-v24")
+    active_protocol_dir().join("ktstr-acquire-events-v25")
 }
 
 #[cfg(test)]
@@ -14483,7 +15044,7 @@ fn lock_registry_for_initialization() -> Result<RegistryLock> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
     // Materialization order is protocol: once registry.lock is nameable, every
-    // v24 entrant must also be able to join the writer-intent gate ahead of it.
+    // v25 entrant must also be able to join the writer-intent gate ahead of it.
     let writer_intent = block_flock(registry_writer_intent_path(), FlockMode::Shared)?;
     let registry = block_flock(registry_lock_path(), FlockMode::Exclusive)?;
     let lock = finish_registry_lock(registry, writer_intent, FlockMode::Exclusive);
@@ -16005,6 +16566,10 @@ impl Table {
             llc_shared_holders: self.header_counts(B_HELD_LLC_SHARED),
             llc_exclusive_holders: self.header_counts(B_HELD_LLC_EXCLUSIVE),
             build_cpu_claims: self.header_counts(C_BUILD_CLAIM_CPUS),
+            cpu_grant_any: self.header_counts(C_GRANT_CPU_ANY),
+            cpu_grant_exclusive: self.header_counts(C_GRANT_CPU_EX),
+            llc_grant_any: self.header_counts(C_GRANT_LLC_ANY),
+            llc_grant_exclusive: self.header_counts(C_GRANT_LLC_EX),
         }
     }
 
@@ -16074,8 +16639,64 @@ impl Table {
                 llc_shared_holders: vec![0; layout.bits],
                 llc_exclusive_holders: vec![0; layout.bits],
                 build_cpu_claims: vec![0; layout.bits],
+                cpu_grant_any: vec![0; layout.bits],
+                cpu_grant_exclusive: vec![0; layout.bits],
+                llc_grant_any: vec![0; layout.bits],
+                llc_grant_exclusive: vec![0; layout.bits],
             },
         ))
+    }
+
+    /// Copy the live `C_GRANT_*` charge into a planning snapshot, optionally
+    /// subtracting one record's own charged claim (the
+    /// `claim_conflicts_aggregate_excluding` count-subtraction pattern): a
+    /// licensed GRANTED callback replanning must not soft-avoid its own
+    /// designated footprint.
+    fn fill_grant_occupancy(
+        &self,
+        snapshot: &mut AggregateSnapshot,
+        exclude: Option<&ClaimSet>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            snapshot.bits == self.layout.bits,
+            "queue grant-occupancy snapshot layout does not match this registry",
+        );
+        snapshot.cpu_grant_any = self.header_counts(C_GRANT_CPU_ANY);
+        snapshot.cpu_grant_exclusive = self.header_counts(C_GRANT_CPU_EX);
+        snapshot.llc_grant_any = self.header_counts(C_GRANT_LLC_ANY);
+        snapshot.llc_grant_exclusive = self.header_counts(C_GRANT_LLC_EX);
+        let Some(claim) = exclude else {
+            return Ok(());
+        };
+        let subtract = |counts: &mut [u32], index: usize| {
+            let count = counts.get_mut(index).ok_or_else(|| {
+                anyhow::anyhow!("resource index {index} exceeds queue registry capacity")
+            })?;
+            *count = count.checked_sub(1).ok_or_else(|| {
+                anyhow::anyhow!("queue grant charge omitted the excluded claim at resource {index}")
+            })?;
+            Ok::<_, anyhow::Error>(())
+        };
+        for &cpu in &claim.cpus {
+            subtract(&mut snapshot.cpu_grant_any, cpu)?;
+            if claim.cpu_mode == ClaimMode::Exclusive {
+                subtract(&mut snapshot.cpu_grant_exclusive, cpu)?;
+            }
+        }
+        for &permit in &claim.permits {
+            let index = permit_resource_index(permit)?;
+            subtract(&mut snapshot.cpu_grant_any, index)?;
+            if claim.permit_mode == ClaimMode::Exclusive {
+                subtract(&mut snapshot.cpu_grant_exclusive, index)?;
+            }
+        }
+        for &llc in &claim.llcs {
+            subtract(&mut snapshot.llc_grant_any, llc)?;
+            if claim.llc_mode == ClaimMode::Exclusive {
+                subtract(&mut snapshot.llc_grant_exclusive, llc)?;
+            }
+        }
+        Ok(())
     }
 
     fn cached_prefix_matches_words(
@@ -16333,6 +16954,17 @@ impl Table {
         self.clear_record_blocked(slot)?;
         self.adjust_claim_counts(old, false)?;
         self.adjust_claim_counts(new, true)?;
+        debug_assert!(
+            !charged_state(publish_state),
+            "claim replacement cannot publish a grant-charged state directly",
+        );
+        if charged_state(prior.state) && !charged_state(publish_state) {
+            // A GRANTED record replacing its claim (the licensed-replan
+            // ChangesPredecessorPrefix path) rewrites claim bytes before the
+            // state flip, so the chokepoint cannot see the OLD claim. Release
+            // the old charge here; the published state is never charged.
+            self.adjust_granted_occupancy(old, false)?;
+        }
         crash_at_for_tests("replace_counts_before_record");
         let layout = self.layout;
         {
@@ -16432,6 +17064,12 @@ impl Table {
         if claim_changed {
             self.adjust_claim_counts(&record.claim, false)?;
             self.adjust_claim_counts(exact, true)?;
+        }
+        if charged_state(record.state) {
+            // HELD is deliberately uncharged (the held counts take over), and
+            // the promotion may rewrite claim bytes, so release the OLD claim
+            // charge explicitly rather than through the chokepoint.
+            self.adjust_granted_occupancy(&record.claim, false)?;
         }
         self.adjust_watch_counts(&record.watch, false)?;
         self.adjust_held_counts(exact, true)?;
@@ -16549,6 +17187,12 @@ impl Table {
         self.mark_blockers_unknown(contention)?;
         self.clear_record_blocked(record.slot)?;
         self.adjust_claim_counts(&record.claim, false)?;
+        if charged_state(record.state) {
+            // Release the OLD (granted) claim's charge, not the preparation
+            // claim: PENDING is deliberately uncharged, and this transition
+            // rewrites claim bytes so the chokepoint cannot balance it.
+            self.adjust_granted_occupancy(&record.claim, false)?;
+        }
         self.adjust_watch_counts(&record.watch, false)?;
         let newly_watched = self.newly_watched(&pending_watch)?;
         self.adjust_claim_counts(&pending_claim, true)?;
@@ -16700,6 +17344,12 @@ impl Table {
         }
         self.clear_record_blocked(record.slot)?;
         self.adjust_claim_counts(&record.claim, false)?;
+        if charged_state(record.state) {
+            // Drop, cancel, and crash prune all remove charged records
+            // without a demoting state flip; release the grant charge in the
+            // same transaction that frees the record.
+            self.adjust_granted_occupancy(&record.claim, false)?;
+        }
         if record.state == STATE_HELD {
             self.adjust_held_counts(&record.claim, false)?;
         } else {
@@ -16723,12 +17373,50 @@ impl Table {
         Ok(())
     }
 
+    /// Decode only the exact claim of one record: modes plus the `RB_CLAIM_*`
+    /// bitsets. Deliberately skips the watch — expanding an alternative watch
+    /// into BTree nodes on every state flip would materialize thousands of
+    /// nodes per scan (the lazy-watch invariant the active-list traversal
+    /// exists to preserve).
+    fn record_charge_claim(&mut self, slot: u64) -> Result<ClaimSet> {
+        let layout = self.layout;
+        let bytes = self
+            .record_bytes(slot)?
+            .ok_or_else(|| anyhow::anyhow!("queue slot {slot} disappeared during charge read"))?;
+        let llc_mode = decode_mode(bytes, R_CLAIM_LLC_MODE, slot, "exact LLC claim")?;
+        let cpu_mode = decode_mode(bytes, R_CLAIM_CPU_MODE, slot, "exact CPU claim")?;
+        let permit_mode = decode_mode(bytes, R_CLAIM_PERMIT_MODE, slot, "exact permit claim")?;
+        Ok(ClaimSet::with_all_claim_modes(
+            decode_bitset(bytes, record_bitset_offset(layout, RB_CLAIM_LLCS), layout)?,
+            decode_bitset(bytes, record_bitset_offset(layout, RB_CLAIM_CPUS), layout)?,
+            decode_bitset(
+                bytes,
+                record_bitset_offset(layout, RB_CLAIM_PERMITS),
+                layout,
+            )?,
+            llc_mode,
+            cpu_mode,
+            permit_mode,
+        ))
+    }
+
     fn set_record_state(&mut self, slot: u64, state: u32) -> Result<()> {
         let old = self
             .record_bytes(slot)?
             .map(|bytes| read_u32(bytes, R_STATE))
             .ok_or_else(|| anyhow::anyhow!("queue slot {slot} disappeared during state update"))?;
         self.transition_replan_state(old, state)?;
+        // Grant-charge chokepoint. Every state-only transition into or out of
+        // the charged set {GRANTED, REVOKED} flows through here, so charging
+        // is keyed purely on the persisted claim bytes at flip time. Callers
+        // must not mutate a record's claim bytes before this state flip in
+        // the same transaction — replace/promote/pending rewrite claims and
+        // therefore handle their own charge swaps explicitly, bypassing this
+        // path. GRANTED -> REVOKED stays a no-op (both charged).
+        if charged_state(old) != charged_state(state) {
+            let claim = self.record_charge_claim(slot)?;
+            self.adjust_granted_occupancy(&claim, charged_state(state))?;
+        }
         let bytes = self.record_bytes_mut(slot)?.ok_or_else(|| {
             anyhow::anyhow!("queue slot {slot} disappeared during state publication")
         })?;
@@ -17772,7 +18460,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v24 publication validates
+            // and record states together. Current v25 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();
@@ -18976,6 +19664,34 @@ impl Table {
         Ok(())
     }
 
+    /// Mirror of [`Self::adjust_held_counts`] over the count-only
+    /// `C_GRANT_*` families: the planner-visible charge of one in-flight
+    /// grant (a GRANTED or REVOKED record's exact claim). Checked
+    /// over/underflow in `adjust_aggregate_count` is the leak tripwire —
+    /// every charge site must balance exactly or the next adjustment fails.
+    fn adjust_granted_occupancy(&mut self, claim: &impl ClaimView, add: bool) -> Result<()> {
+        for cpu in claim.cpus() {
+            self.adjust_aggregate_count(C_GRANT_CPU_ANY, cpu, add)?;
+            if claim.cpu_mode() == ClaimMode::Exclusive {
+                self.adjust_aggregate_count(C_GRANT_CPU_EX, cpu, add)?;
+            }
+        }
+        for permit in claim.permits() {
+            let index = permit_resource_index(permit)?;
+            self.adjust_aggregate_count(C_GRANT_CPU_ANY, index, add)?;
+            if claim.permit_mode() == ClaimMode::Exclusive {
+                self.adjust_aggregate_count(C_GRANT_CPU_EX, index, add)?;
+            }
+        }
+        for llc in claim.llcs() {
+            self.adjust_aggregate_count(C_GRANT_LLC_ANY, llc, add)?;
+            if claim.llc_mode() == ClaimMode::Exclusive {
+                self.adjust_aggregate_count(C_GRANT_LLC_EX, llc, add)?;
+            }
+        }
+        Ok(())
+    }
+
     fn adjust_watch_counts(&mut self, watch: &ClaimSet, add: bool) -> Result<()> {
         for &cpu in &watch.cpus {
             self.adjust_aggregate_bit(B_WATCH_CPUS, cpu, add)?;
@@ -19299,6 +20015,13 @@ impl Table {
         write_u64(&mut self.header, H_DEFERRED_RESCAN_DEADLINE_NS, 0);
         for record in &records {
             self.adjust_claim_counts(&record.claim, true)?;
+            if charged_state(record.state) {
+                // Recharge surviving GRANTED/REVOKED records over the
+                // just-zeroed count arrays. Mandatory: the demotion loop
+                // below releases through the `set_record_state` chokepoint
+                // and would underflow without this recompute.
+                self.adjust_granted_occupancy(&record.claim, true)?;
+            }
             if record.state == STATE_HELD {
                 self.adjust_held_counts(&record.claim, true)?;
             } else {

@@ -2773,6 +2773,12 @@ pub(crate) struct LlcSnapshot {
     /// alternative exists; the authoritative nonblocking flock still
     /// resolves races and hosts where procfs observation is unavailable.
     pub(crate) exclusive_held: bool,
+    /// Count of in-flight grant charges (GRANTED/REVOKED registry records)
+    /// covering this LLC. Subordinate rank key only: it biases both policies
+    /// toward grant-free LLCs but never partitions, filters, or fences —
+    /// folding it into `holder_count` would turn Consolidate's DESC primary
+    /// key into a magnet steering builds onto granted footprints.
+    pub(crate) granted_count: usize,
 }
 
 /// Output of [`acquire_llc_plan_interruptible`]: the concrete LLC reservation plus
@@ -2880,6 +2886,10 @@ fn discover_registered_placement_states(
         FlockMode::Shared,
     );
     let aggregate = protocol::registered_claim_snapshot(&required)?;
+    // The grant fields below are planner bias only. They must never fold
+    // into the holder scalars, the unshared filter in `live_cpu_capacity`,
+    // or `exclusive_held` — wiring them there re-creates the Consolidate
+    // attraction magnet and the elastic-shrink capacity miscounts.
     let snapshots = llcs
         .into_iter()
         .map(|llc_idx| {
@@ -2887,6 +2897,7 @@ fn discover_registered_placement_states(
                 llc_idx,
                 holder_count: aggregate.llc_holder_count(llc_idx)?,
                 exclusive_held: aggregate.llc_exclusive_held(llc_idx)?,
+                granted_count: aggregate.llc_grant_count(llc_idx)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2899,6 +2910,7 @@ fn discover_registered_placement_states(
                 CpuPlacementState {
                     exclusive_held: aggregate.cpu_exclusive_held(cpu)?,
                     other_holders: aggregate.cpu_holder_count(cpu)?,
+                    granted_holders: aggregate.cpu_grant_count(cpu)?,
                 },
             ))
         })
@@ -3035,9 +3047,16 @@ fn plan_from_snapshots_with_fresh_rotation(
                 .filter(|s| s.holder_count == 0)
                 .filter(eligible)
                 .collect();
+            // `granted_count` is a subordinate key in both partitions: the
+            // HELD-only holder count keeps its primary DESC sign (so grant
+            // charge can never become a consolidation magnet), and a
+            // granted-only LLC still partitions as fresh — grant avoidance
+            // is a preference among otherwise-equal candidates, never a
+            // fence.
             consolidation.sort_by(|a, b| {
                 b.holder_count
                     .cmp(&a.holder_count)
+                    .then(a.granted_count.cmp(&b.granted_count))
                     .then(a.llc_idx.cmp(&b.llc_idx))
             });
             fresh.sort_by_key(|s| s.llc_idx);
@@ -3047,6 +3066,10 @@ fn plan_from_snapshots_with_fresh_rotation(
                 let count = fresh.len();
                 fresh.rotate_left(rotation % count);
             }
+            // Prefer grant-free fresh LLCs while preserving the rotated
+            // symmetry-breaking order within each grant-charge class. The
+            // sort is stable, so equal-count candidates keep the rotation.
+            fresh.sort_by_key(|s| s.granted_count);
             consolidation.into_iter().chain(fresh).collect()
         }
         // Least-held first, ties broken by rotated eligible position
@@ -3074,6 +3097,7 @@ fn plan_from_snapshots_with_fresh_rotation(
                 spread.sort_by(|a, b| {
                     a.holder_count
                         .cmp(&b.holder_count)
+                        .then(a.granted_count.cmp(&b.granted_count))
                         .then(rotated_pos[&a.llc_idx].cmp(&rotated_pos[&b.llc_idx]))
                 });
             }
@@ -4930,6 +4954,74 @@ fn select_plan_permits(
     Ok(None)
 }
 
+/// Two-tier grant-aware permit selection: prefer permits no in-flight grant
+/// is counting on, then rerun grant-blind when the grant-free tier cannot
+/// satisfy the request. The fallback is mandatory — treating a grant charge
+/// as a hard `candidate_ready` failure livelocks the permit axis (a senior
+/// that never publishes an overlapping claim never triggers the scan's
+/// ticket-order revoke, while fast-path juniors re-grab freed permits), and
+/// under genuine scarcity the fallback restores today's behavior exactly, so
+/// the senior's reserved overlapping claim still wins via scan revocation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors select_plan_permits, which carries one complete permit request"
+)]
+fn select_plan_permits_grant_aware(
+    kind: PermitAdmission,
+    sizing: LlcPlanSizing,
+    cpu_pool: &AdmissionPermitPool,
+    memory_pool: Option<&MemoryPermitPool>,
+    maximum_cpus: usize,
+    required_memory: usize,
+    cpu_rotation: usize,
+    memory_rotation: usize,
+    preferred_cpu: &[usize],
+    preferred_memory: &[usize],
+    mut ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+    mut grant_conflicts: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+) -> Result<Option<PlanPermitSelection>> {
+    let diagnostics = crate::vmm::grant_flow::enabled();
+    if let Some(selection) = select_plan_permits(
+        kind,
+        sizing,
+        cpu_pool,
+        memory_pool,
+        maximum_cpus,
+        required_memory,
+        cpu_rotation,
+        memory_rotation,
+        preferred_cpu,
+        preferred_memory,
+        |candidate| {
+            if !ready(candidate)? {
+                return Ok(false);
+            }
+            let charged = grant_conflicts(candidate)?;
+            if diagnostics {
+                crate::vmm::grant_flow::note_permit_candidate(charged);
+            }
+            Ok(!charged)
+        },
+    )? {
+        crate::vmm::grant_flow::note_permit_selection(false);
+        return Ok(Some(selection));
+    }
+    crate::vmm::grant_flow::note_permit_selection(true);
+    select_plan_permits(
+        kind,
+        sizing,
+        cpu_pool,
+        memory_pool,
+        maximum_cpus,
+        required_memory,
+        cpu_rotation,
+        memory_rotation,
+        preferred_cpu,
+        preferred_memory,
+        ready,
+    )
+}
+
 fn apply_plan_permit_width(
     sizing: LlcPlanSizing,
     selection: &PlanPermitSelection,
@@ -6096,7 +6188,7 @@ where
             // This is transient contention, not a malformed static topology.
             return Ok(None);
         };
-        let Some(next_plan_permits) = select_plan_permits(
+        let Some(next_plan_permits) = select_plan_permits_grant_aware(
             permit_admission,
             sizing,
             &permit_pool,
@@ -6108,6 +6200,7 @@ where
             &preferred_cpu_permits,
             &preferred_memory_permits,
             |candidate| probe.candidate_ready(candidate),
+            |candidate| probe.grant_conflicts(candidate),
         )?
         else {
             return Ok(None);
@@ -6306,7 +6399,7 @@ where
                 &cpu_states,
                 live_capacity.target,
                 cpu_policy,
-            ) && let Some(plan_permits) = select_plan_permits(
+            ) && let Some(plan_permits) = select_plan_permits_grant_aware(
                 permit_admission,
                 sizing,
                 &permit_pool,
@@ -6318,6 +6411,7 @@ where
                 &preferred_cpu_permits,
                 &preferred_memory_permits,
                 |candidate| held.candidate_ready(candidate),
+                |candidate| held.grant_conflicts(candidate),
             )? {
                 apply_plan_permit_width(sizing, &plan_permits, topo, &mut selected, &mut cpus);
                 let permits = plan_permits.permits;
@@ -6452,6 +6546,7 @@ pub fn plan_llc_selection_only(
             llc_idx,
             holder_count: 0,
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     if snapshots.is_empty() {
@@ -6521,6 +6616,10 @@ pub fn plan_llc_selection_only(
 struct CpuPlacementState {
     exclusive_held: bool,
     other_holders: usize,
+    /// In-flight grant charge on this CPU. Subordinate rank key only (fixed
+    /// ASC sign under both policies) — never folded into `other_holders`,
+    /// the unshared filter, or the eligibility skip.
+    granted_holders: usize,
 }
 
 /// Resolve one admission turn's CPU width from the current placement image.
@@ -6631,7 +6730,19 @@ fn materialize_plan_cpus(
                 PlacementPolicy::Consolidate => b_holders.cmp(&a_holders),
                 PlacementPolicy::Spread { .. } => a_holders.cmp(&b_holders),
             };
-            occupancy.then_with(|| rotated_pos[a].cmp(&rotated_pos[b]).then(a.cmp(b)))
+            // Grant charge is a fixed-sign (ASC) subordinate key under both
+            // policies: among CPUs the primary holder key already ranks
+            // equal, prefer the ones no in-flight grant is counting on. The
+            // HELD-only primary key keeps its existing sign, so no held-SH
+            // footprint (e.g. an scx cell's) ever outranks anything it
+            // beats today.
+            let a_granted = states.get(a).map_or(0, |state| state.granted_holders);
+            let b_granted = states.get(b).map_or(0, |state| state.granted_holders);
+            occupancy.then_with(|| {
+                a_granted
+                    .cmp(&b_granted)
+                    .then_with(|| rotated_pos[a].cmp(&rotated_pos[b]).then(a.cmp(b)))
+            })
         });
     };
 

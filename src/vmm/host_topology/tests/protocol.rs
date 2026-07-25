@@ -1214,8 +1214,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v24");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v24");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v25");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v25");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1387,7 +1387,7 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v24");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v25");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
     crate::flock::materialize(wrong_registry.join("registry.turnstile"))
         .expect("materialize wrong registry writer-intent gate");
@@ -4828,9 +4828,9 @@ fn dirty_repair_preserves_exact_and_watch_cpu_modes() {
 }
 
 #[test]
-fn v24_scan_metadata_sparse_decodes_and_fails_closed() {
+fn v25_scan_metadata_sparse_decodes_and_fails_closed() {
     let outcome = protocol::exercise_scan_metadata_validation_for_tests()
-        .expect("exercise v24 scan metadata validation");
+        .expect("exercise v25 scan metadata validation");
     assert_eq!(outcome.layout_words, 64);
     assert_eq!(
         outcome.exact_word_reads, 3,
@@ -4848,7 +4848,7 @@ fn held_transition_canonicalizes_shared_watch_metadata() {
     assert!(
         protocol::exercise_shared_watch_held_metadata_for_tests()
             .expect("promote a shared-mode watch and full-decode its HELD record"),
-        "HELD publication must canonicalize emptied watch modes before publishing matching v24 metadata",
+        "HELD publication must canonicalize emptied watch modes before publishing matching v25 metadata",
     );
 }
 
@@ -4898,7 +4898,7 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
     );
     assert!(
         outcome.memo_identical_layout_words >= 64,
-        "the sparse scan fixture must retain the full-width v24 registry layout",
+        "the sparse scan fixture must retain the full-width v25 registry layout",
     );
     assert_eq!(
         outcome.memo_identical_exact_word_reads,
@@ -5322,6 +5322,108 @@ fn completed_replan_replacement_grants_before_straggler_wave_drains() {
             && outcome.straggler_still_replan
             && outcome.wave_deadline_not_reached,
         "the authoritative scan must grant completed compatible work and restore the disjoint later grant before the unrelated callback returns or its finite-wave lease expires",
+    );
+}
+
+/// Every stage of the two grant lifecycles must balance the `C_GRANT_*`
+/// planner charge exactly: scan grant charges, GRANTED -> PENDING releases
+/// the OLD claim (PENDING is deliberately uncharged), born-GRANTED
+/// registration charges without a state flip, promotion to HELD releases,
+/// and removal drains to zero.
+#[test]
+fn granted_occupancy_balances_across_pending_lifecycle() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_granted_charge_lifecycle_for_tests()
+        .expect("exercise grant-charge lifecycle");
+    assert!(
+        outcome.scan_granted_charged,
+        "a scan-issued grant must charge exactly its claim",
+    );
+    assert!(
+        outcome.pending_uncharged,
+        "GRANTED -> PENDING must release the old claim's charge (the open-leak pin)",
+    );
+    assert!(
+        outcome.born_granted_charged,
+        "a born-GRANTED registration must charge without passing the chokepoint",
+    );
+    assert!(
+        outcome.held_uncharged,
+        "promotion to HELD must release the grant charge unconditionally",
+    );
+    assert!(
+        outcome.drained_to_zero,
+        "removing every record must drain the grant charge to zero",
+    );
+}
+
+/// Crash-shaped repair over live GRANTED + REVOKED records: the rebuild must
+/// recharge both before the demotion loop releases through the
+/// `set_record_state` chokepoint (underflow otherwise), and the REVOKED
+/// fence must stay charged in the repaired image.
+#[test]
+fn dirty_repair_rebuilds_granted_and_revoked_charges() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (repaired_without_underflow, revoked_charge_preserved) =
+        protocol::exercise_dirty_repair_grant_charges_for_tests()
+            .expect("dirty repair over charged records");
+    assert!(
+        repaired_without_underflow,
+        "repair must demote the GRANTED record and preserve the REVOKED fence",
+    );
+    assert!(
+        revoked_charge_preserved,
+        "the repaired image must keep exactly the REVOKED record's charge",
+    );
+}
+
+/// End-to-end ticket-order win on a grant-charged resource, plus the REVOKED
+/// half of the charged set: the guard dirties the suffix for the overlapping
+/// replacement, the next scan grants the senior and revokes the junior, and
+/// the revoked claim stays charged until its acknowledgement.
+#[test]
+fn revoked_claim_stays_charged_until_ack() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_grant_charge_revoke_ack_for_tests()
+        .expect("exercise revoke/ack charge lifecycle");
+    assert!(
+        outcome.junior_granted_charged,
+        "the junior grant must charge its claim",
+    );
+    assert!(
+        outcome.replacement_dirtied_watermark,
+        "a replacement overlapping a grant charge must dirty the full suffix",
+    );
+    assert!(
+        outcome.senior_granted_and_junior_revoked,
+        "the authoritative scan must grant the senior and revoke the junior in ticket order",
+    );
+    assert!(
+        outcome.revoked_stays_charged,
+        "a REVOKED claim must stay charged through the revoke -> ack window",
+    );
+    assert!(
+        outcome.ack_releases_charge,
+        "acknowledgement must release exactly the revoked claim's charge",
+    );
+}
+
+/// A granted-EX claim is planner bias, never a fence: it must not surface
+/// through `exclusive_held` or the holder counts (which stay HELD-only), only
+/// through the grant-count accessors.
+#[test]
+fn exclusive_held_remains_held_only() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (cpu_not_exclusive_held, llc_not_exclusive_held, cpu_grant_counted, llc_grant_counted) =
+        protocol::exercise_exclusive_grant_bias_only_for_tests()
+            .expect("exercise granted-EX aggregate view");
+    assert!(
+        cpu_not_exclusive_held && llc_not_exclusive_held,
+        "granted-EX claims must never surface through exclusive_held",
+    );
+    assert!(
+        cpu_grant_counted && llc_grant_counted,
+        "granted-EX claims must surface through the grant-count bias accessors",
     );
 }
 
@@ -8115,7 +8217,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v24
+    // Leave the replacement as an external, unregistered flock. A current-v25
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -8332,6 +8434,16 @@ fn register_crash_after_record_before_counts_is_repaired() {
     let replacement = TicketChild::spawn(markers.path(), "replacement", "1", false);
     replacement.wait_for_acquired();
     replacement.release_and_wait();
+    assert_grant_charge_consistent("register_record_before_counts");
+}
+
+/// Post-recovery grant-charge audit shared by the crash-point tests: the
+/// repaired/pruned image's `C_GRANT_*` aggregates must equal a recomputation
+/// from the surviving records.
+fn assert_grant_charge_consistent(context: &str) {
+    protocol::grant_charge_matches_derived_for_tests().unwrap_or_else(|error| {
+        panic!("aggregate grant charge diverged from records after {context}: {error}")
+    });
 }
 
 #[test]
@@ -8408,6 +8520,7 @@ fn promote_held_crash_after_state_free_is_repaired_by_surviving_ticket() {
     crashing.wait_for_injected_crash();
 
     survivor.wait_for_acquired();
+    assert_grant_charge_consistent("promote_held_state_free_before_record");
     survivor.release_and_wait();
 }
 
@@ -8417,7 +8530,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v24 HELD lifecycle removes its registry record only after the
+    // The v25 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");
@@ -8425,6 +8538,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
 
     let replacement = TicketChild::spawn(markers.path(), "replacement", "1", false);
     replacement.wait_for_acquired();
+    assert_grant_charge_consistent("remove_counts_before_free");
     replacement.release_and_wait();
 }
 
@@ -8451,6 +8565,7 @@ fn replace_crash_after_counts_before_record_is_repaired() {
     let replacement = TicketChild::spawn(markers.path(), "replacement", "3", false);
     replacement.wait_for_acquired();
     replacement.release_and_wait();
+    assert_grant_charge_consistent("replace_counts_before_record");
     coordinator.kill_and_wait();
     drop(blocker_two);
     drop(blocker_one);
@@ -8479,6 +8594,7 @@ fn replace_crash_before_state_publish_cannot_reserve_a_partial_claim() {
     let replacement = TicketChild::spawn(markers.path(), "replacement", "3", false);
     replacement.wait_for_acquired();
     replacement.release_and_wait();
+    assert_grant_charge_consistent("replace_record_before_state_publish");
     coordinator.kill_and_wait();
     drop(blocker_two);
     drop(blocker_one);
@@ -8562,6 +8678,7 @@ fn granted_acquirer_crash_before_record_clear_is_pruned() {
     let replacement = TicketChild::spawn(markers.path(), "replacement", "2", false);
     replacement.wait_for_acquired();
     replacement.release_and_wait();
+    assert_grant_charge_consistent("granted_acquired_before_clear");
     coordinator.kill_and_wait();
     drop(blocker);
 }

@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v24
+//! Every ktstr process sharing a lock directory participates in one v25
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -649,6 +649,18 @@ impl RegisteredClaimSnapshot {
     pub(crate) fn llc_exclusive_held(&self, llc: usize) -> Result<bool> {
         self.inner.llc_exclusive_held(llc)
     }
+
+    /// Count of in-flight grant charges (GRANTED/REVOKED records) covering
+    /// this CPU. Planner rank-key bias only — never a fence, and never folded
+    /// into the holder counts above.
+    pub(crate) fn cpu_grant_count(&self, cpu: usize) -> Result<usize> {
+        self.inner.cpu_grant_count(cpu)
+    }
+
+    /// Count of in-flight grant charges covering this LLC. Bias only.
+    pub(crate) fn llc_grant_count(&self, llc: usize) -> Result<usize> {
+        self.inner.llc_grant_count(llc)
+    }
 }
 
 /// Copy the aggregate reservation bitsets once for a whole planning pass.
@@ -1223,6 +1235,17 @@ impl GrantedProbe {
         candidate.llcs.iter().try_fold(cpu, |total, &llc| {
             Ok::<_, anyhow::Error>(total.saturating_add(self.predecessors.llc_holder_count(llc)?))
         })
+    }
+
+    /// Whether `candidate` overlaps any in-flight grant charge other than
+    /// this ticket's own (a licensed GRANTED callback's charge is subtracted
+    /// when the snapshot is captured). Soft-avoid input for the grant-aware
+    /// selection tier only — callers MUST rerun grant-blind when no
+    /// grant-free candidate exists, or the permit axis livelocks: a senior
+    /// that never publishes an overlapping claim never triggers the scan's
+    /// ticket-order revoke, while fast-path juniors re-grab freed permits.
+    pub(crate) fn grant_conflicts(&self, candidate: &ClaimSet) -> Result<bool> {
+        self.predecessors.grant_conflicts(candidate)
     }
 
     pub(crate) fn try_acquire<T, O: IntoProbeOutcome<T>>(
@@ -2447,6 +2470,33 @@ pub(crate) fn exercise_pending_replan_grant_races_for_tests()
 }
 
 #[cfg(test)]
+pub(crate) fn grant_charge_matches_derived_for_tests() -> Result<()> {
+    registry::grant_charge_matches_derived_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_granted_charge_lifecycle_for_tests()
+-> Result<registry::GrantedChargeLifecycleOutcome> {
+    registry::exercise_granted_charge_lifecycle_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_grant_charge_revoke_ack_for_tests()
+-> Result<registry::GrantChargeRevokeAckOutcome> {
+    registry::exercise_grant_charge_revoke_ack_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_dirty_repair_grant_charges_for_tests() -> Result<(bool, bool)> {
+    registry::exercise_dirty_repair_grant_charges_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_exclusive_grant_bias_only_for_tests() -> Result<(bool, bool, bool, bool)> {
+    registry::exercise_exclusive_grant_bias_only_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_coordinator_pending_replan_for_tests()
 -> Result<registry::CoordinatorPendingReplanOutcome> {
     registry::exercise_coordinator_pending_replan_for_tests()
@@ -3491,6 +3541,16 @@ impl HeldLocks {
         }
 
         availability.allows(candidate)
+    }
+
+    /// Whether `candidate` overlaps any in-flight grant charge. The
+    /// coordinator record is never charged, so no self-exclusion applies.
+    /// Same soft-avoid-only contract as [`GrantedProbe::grant_conflicts`].
+    pub(crate) fn grant_conflicts(&self, candidate: &ClaimSet) -> Result<bool> {
+        self.predecessors
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("coordinator predecessor snapshot is missing"))?
+            .grant_conflicts(candidate)
     }
 
     fn designated(&self) -> Result<&ClaimSet> {

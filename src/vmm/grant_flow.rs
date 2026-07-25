@@ -18,8 +18,11 @@
 //! `note_*` calls are relaxed atomic updates and the expensive inputs
 //! (distinct-CPU popcount, discover timing) are computed only behind
 //! [`enabled`]. One aggregate line per process lands at
-//! `${KTSTR_BUILD_DIAGNOSTICS_DIR}/grant-flow-<pid>.txt` on exit, the same idiom
-//! as [`super::exit_timing`] and the coordinator-wake counters.
+//! `${KTSTR_BUILD_DIAGNOSTICS_DIR}/grant-flow-<pid>.txt`, rewritten on each
+//! authoritative grant scan and finally at exit, the same idiom as
+//! [`super::exit_timing`] and the coordinator-wake counters. The mid-run
+//! rewrite exists because the scan-running orchestrator's atexit line was
+//! historically lost, undercounting `grants_issued` to near zero.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -59,6 +62,14 @@ static REPLAN_REPLACE_PLACEMENT_SAME: AtomicU64 = AtomicU64::new(0);
 // Speculative REPLAN callbacks that re-planned/requeued without acquiring — the
 // elastic replanner's own churn, distinct from a licensed GRANTED grant loss.
 static REPLAN_REQUEUE: AtomicU64 = AtomicU64::new(0);
+// Two-tier permit selection: per-candidate grant-charge hits during the
+// grant-aware tier, and whether a planning pass had to fall back to the
+// grant-blind tier (the fallback binding persistently at wave peaks means the
+// residual contention is capacity truth, not planner blindness).
+static PERMIT_CANDIDATES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PERMIT_CANDIDATES_GRANT_CHARGED: AtomicU64 = AtomicU64::new(0);
+static PERMIT_SELECT_GRANT_AWARE: AtomicU64 = AtomicU64::new(0);
+static PERMIT_SELECT_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static HELD_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 static DISTINCT_HELD_CPUS_MAX: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -177,12 +188,40 @@ pub(crate) fn note_replan_requeue() {
     REPLAN_REQUEUE.fetch_add(1, Ordering::Relaxed);
 }
 
+/// One candidate evaluated by the grant-aware permit tier. Only called behind
+/// [`enabled`] (per-candidate volume).
+pub(crate) fn note_permit_candidate(grant_charged: bool) {
+    PERMIT_CANDIDATES_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if grant_charged {
+        PERMIT_CANDIDATES_GRANT_CHARGED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One two-tier permit selection pass; `fallback` means the grant-free tier
+/// found nothing and the grant-blind rerun decided the outcome.
+pub(crate) fn note_permit_selection(fallback: bool) {
+    if fallback {
+        PERMIT_SELECT_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PERMIT_SELECT_GRANT_AWARE.fetch_add(1, Ordering::Relaxed);
+    }
+    ensure_atexit();
+}
+
 /// Peak in-flight HELD run claims and the distinct host CPUs they cover,
 /// sampled once per authoritative grant scan. Only called behind [`enabled`].
+///
+/// Also persists the current counter image: the process running the
+/// authoritative scans is typically the long-lived orchestrator, whose
+/// `atexit` line was historically lost (its `grants_issued` never reached the
+/// diagnostics directory, making issued:held ratios meaningless). Each scan
+/// rewrites this process's file, so the last image survives however the
+/// process ends.
 pub(crate) fn note_held_in_flight(held_records: u64, distinct_cpus: u64) {
     bump_max(&HELD_IN_FLIGHT_MAX, held_records);
     bump_max(&DISTINCT_HELD_CPUS_MAX, distinct_cpus);
     ensure_atexit();
+    persist_now();
 }
 
 /// One placement contention-bail holder diagnostic, and its wall-time. Since
@@ -210,6 +249,8 @@ fn format_line(pid: u32) -> String {
          lost_stale_regrant={} lost_physical_probe={} replan_requeue={} \
          wmpark_wave={} \
          replan_replace_total={} replan_replace_noop={} replan_replace_placement_same={} \
+         permit_candidates_total={} permit_candidates_grant_charged={} \
+         permit_select_grant_aware={} permit_select_fallback={} \
          held_in_flight_max={} distinct_held_cpus_max={} discover_count={} \
          discover_ns_mean={discover_ns_mean} discover_ns_max={}\n",
         GRANTS_ISSUED.load(Ordering::Relaxed),
@@ -225,6 +266,10 @@ fn format_line(pid: u32) -> String {
         REPLAN_REPLACE_TOTAL.load(Ordering::Relaxed),
         REPLAN_REPLACE_NOOP.load(Ordering::Relaxed),
         REPLAN_REPLACE_PLACEMENT_SAME.load(Ordering::Relaxed),
+        PERMIT_CANDIDATES_TOTAL.load(Ordering::Relaxed),
+        PERMIT_CANDIDATES_GRANT_CHARGED.load(Ordering::Relaxed),
+        PERMIT_SELECT_GRANT_AWARE.load(Ordering::Relaxed),
+        PERMIT_SELECT_FALLBACK.load(Ordering::Relaxed),
         HELD_IN_FLIGHT_MAX.load(Ordering::Relaxed),
         DISTINCT_HELD_CPUS_MAX.load(Ordering::Relaxed),
         discover_count,
@@ -232,24 +277,31 @@ fn format_line(pid: u32) -> String {
     )
 }
 
+/// Rewrite this process's per-pid counter file with the current image. The
+/// file holds exactly one line; each persist (mid-run from the scan loop, and
+/// the final `atexit` image) replaces the previous one, so readers always see
+/// one complete, most-recent line per process.
+pub(crate) fn persist_now() {
+    let Some(dir) = dir() else {
+        return;
+    };
+    let pid = std::process::id();
+    let line = format_line(pid);
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(dir.join(format!("grant-flow-{pid}.txt")))
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 extern "C" fn emit() {
-    let _ = std::panic::catch_unwind(|| {
-        let Some(dir) = dir() else {
-            return;
-        };
-        let pid = std::process::id();
-        let line = format_line(pid);
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join(format!("grant-flow-{pid}.txt")))
-        {
-            let _ = file.write_all(line.as_bytes());
-        }
-    });
+    let _ = std::panic::catch_unwind(persist_now);
 }
 
 #[cfg(test)]
@@ -274,6 +326,10 @@ mod tests {
             "replan_replace_total=",
             "replan_replace_noop=",
             "replan_replace_placement_same=",
+            "permit_candidates_total=",
+            "permit_candidates_grant_charged=",
+            "permit_select_grant_aware=",
+            "permit_select_fallback=",
             "held_in_flight_max=",
             "distinct_held_cpus_max=",
             "discover_count=",

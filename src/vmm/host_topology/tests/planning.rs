@@ -312,6 +312,7 @@ fn plan_from_snapshots_returns_ascending_indices() {
             llc_idx: idx,
             holder_count: if idx >= 2 { 5 } else { 0 },
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
@@ -345,6 +346,7 @@ fn plan_from_snapshots_target_ge_all_selects_every_llc() {
             llc_idx: idx,
             holder_count: 0,
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..3).collect();
@@ -381,6 +383,7 @@ fn plan_from_snapshots_sparse_saturation_preserves_llc_indices() {
             llc_idx,
             holder_count: 0,
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect::<Vec<_>>();
     let allowed = (0..4).collect::<std::collections::BTreeSet<_>>();
@@ -408,6 +411,7 @@ fn plan_from_snapshots_target_zero_returns_empty() {
         llc_idx: 0,
         holder_count: 0,
         exclusive_held: false,
+        granted_count: 0,
     }];
     let allowed: std::collections::BTreeSet<usize> = [0].into_iter().collect();
     let selected = plan_from_snapshots(
@@ -429,6 +433,7 @@ fn overlapping_llc_groups_materialize_a_distinct_cpu_budget() {
             llc_idx,
             holder_count: 0,
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect::<Vec<_>>();
     let allowed = [0usize, 1, 2]
@@ -519,11 +524,13 @@ fn plan_from_snapshots_prefers_higher_holder_count() {
             llc_idx: 0,
             holder_count: 0,
             exclusive_held: false,
+            granted_count: 0,
         },
         LlcSnapshot {
             llc_idx: 1,
             holder_count: 5,
             exclusive_held: false,
+            granted_count: 0,
         },
     ];
     // Same-node distance closure so placement doesn't bias by
@@ -561,21 +568,25 @@ fn plan_from_snapshots_always_ascending_across_target_range() {
             llc_idx: 0,
             holder_count: 3,
             exclusive_held: false,
+            granted_count: 0,
         },
         LlcSnapshot {
             llc_idx: 1,
             holder_count: 0,
             exclusive_held: false,
+            granted_count: 0,
         },
         LlcSnapshot {
             llc_idx: 2,
             holder_count: 7,
             exclusive_held: false,
+            granted_count: 0,
         },
         LlcSnapshot {
             llc_idx: 3,
             holder_count: 1,
             exclusive_held: false,
+            granted_count: 0,
         },
     ];
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
@@ -1393,6 +1404,7 @@ fn plan_from_snapshots_consolidation_overrides_fresh_ordering() {
             llc_idx: idx,
             holder_count: if idx == 3 { 5 } else { 0 },
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
@@ -1433,6 +1445,7 @@ fn elastic_fresh_rotations_fan_out_cold_prefix_and_warm_spill_suffix() {
             llc_idx,
             holder_count: 0,
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..8).collect();
@@ -1491,6 +1504,7 @@ fn elastic_fresh_rotations_fan_out_cold_prefix_and_warm_spill_suffix() {
             llc_idx,
             holder_count: if llc_idx == 4 { 3 } else { 0 },
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     // The held LLC contributes only CPUs 16 and 17 inside this cpuset. A
@@ -1549,6 +1563,7 @@ fn plan_from_snapshots_single_node_fit_no_spill() {
             llc_idx: idx,
             holder_count: 0,
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     // Canonical distance: same-node 10, cross-node 20.
@@ -1587,6 +1602,7 @@ fn plan_from_snapshots_equal_scores_tiebreak_ascending() {
             llc_idx: idx,
             holder_count: 5,
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
@@ -2107,11 +2123,13 @@ fn elastic_build_width_prefers_unshared_capacity_then_falls_back_to_shared() {
             llc_idx: 0,
             holder_count: 1,
             exclusive_held: false,
+            granted_count: 0,
         },
         LlcSnapshot {
             llc_idx: 1,
             holder_count: 1,
             exclusive_held: false,
+            granted_count: 0,
         },
     ];
     let compatible = (0usize..4).collect::<std::collections::BTreeSet<_>>();
@@ -2616,6 +2634,7 @@ fn plan_from_snapshots_filters_llcs_outside_allowed_set() {
             llc_idx: idx,
             holder_count: 0,
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = [0, 1, 4, 5].into_iter().collect();
@@ -2694,6 +2713,7 @@ fn plan_from_snapshots_partial_llc_overlap_counted_correctly() {
             llc_idx: idx,
             holder_count: 0,
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = [0, 2].into_iter().collect();
@@ -2857,6 +2877,7 @@ fn spread_snapshots(holder_counts: &[usize]) -> Vec<LlcSnapshot> {
             llc_idx: idx,
             holder_count,
             exclusive_held: false,
+            granted_count: 0,
         })
         .collect()
 }
@@ -3850,5 +3871,231 @@ fn performance_permit_pool_cannot_select_the_reserved_suffix() {
     assert_eq!(
         selection.admission_class,
         admission_protocol::AdmissionClass::Ordinary,
+    );
+}
+
+// ---------------------------------------------------------------
+// Grant-aware planning bias — in-flight grant charge is a
+// subordinate preference, never a fence or a primary key
+// ---------------------------------------------------------------
+
+/// CPU rank: among CPUs whose HELD holder count ties, the in-flight
+/// grant charge decides with a fixed ASC sign under BOTH policies,
+/// and the HELD-only primary key keeps its existing per-policy sign.
+#[test]
+fn cpu_rank_prefers_free_over_granted_within_equal_holders() {
+    let topo = synth_host_topo(&[(vec![0, 1, 2, 3], 0)]);
+    let eligible: std::collections::BTreeSet<usize> = (0..4).collect();
+    let states: std::collections::BTreeMap<usize, CpuPlacementState> = [
+        // cpu0: free but grant-charged once.
+        (
+            0,
+            CpuPlacementState {
+                exclusive_held: false,
+                other_holders: 0,
+                granted_holders: 1,
+            },
+        ),
+        // cpu1: completely free.
+        (
+            1,
+            CpuPlacementState {
+                exclusive_held: false,
+                other_holders: 0,
+                granted_holders: 0,
+            },
+        ),
+        // cpu2: free but grant-charged twice.
+        (
+            2,
+            CpuPlacementState {
+                exclusive_held: false,
+                other_holders: 0,
+                granted_holders: 2,
+            },
+        ),
+        // cpu3: one live HELD holder, no grant charge.
+        (
+            3,
+            CpuPlacementState {
+                exclusive_held: false,
+                other_holders: 1,
+                granted_holders: 0,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let (spread, _) = materialize_plan_cpus(
+        &[0],
+        &topo,
+        &eligible,
+        &states,
+        3,
+        CpuSelectionPolicy::WithinEachLlc(PlacementPolicy::Spread { rotation: 0 }),
+    )
+    .expect("spread materialization must satisfy the target");
+    assert_eq!(
+        spread,
+        vec![1, 0, 2],
+        "Spread: least-held first, then grant charge ASC among the free CPUs",
+    );
+    let (consolidate, _) = materialize_plan_cpus(
+        &[0],
+        &topo,
+        &eligible,
+        &states,
+        3,
+        CpuSelectionPolicy::WithinEachLlc(PlacementPolicy::Consolidate),
+    )
+    .expect("consolidate materialization must satisfy the target");
+    assert_eq!(
+        consolidate,
+        vec![3, 1, 0],
+        "Consolidate: HELD holders keep the DESC primary key (grant charge \
+         must not outrank them), then grant charge ASC among the free CPUs",
+    );
+}
+
+/// LLC rank: a granted-only LLC stays in the FRESH Consolidate
+/// partition (grant charge never joins the `holder_count > 0`
+/// primary partition key), and within each partition the charge is
+/// only a subordinate ASC preference.
+#[test]
+fn consolidate_llc_ordering_ignores_grant_charge_in_primary_key() {
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0)]);
+    let allowed: std::collections::BTreeSet<usize> = (0..3).collect();
+    // llc0: held by a peer. llc1: heavily grant-charged, no holder.
+    // llc2: completely free.
+    let snapshots = vec![
+        LlcSnapshot {
+            llc_idx: 0,
+            holder_count: 1,
+            exclusive_held: false,
+            granted_count: 0,
+        },
+        LlcSnapshot {
+            llc_idx: 1,
+            holder_count: 0,
+            exclusive_held: false,
+            granted_count: 5,
+        },
+        LlcSnapshot {
+            llc_idx: 2,
+            holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
+        },
+    ];
+    // Target 1: the held LLC must still win — a granted-only LLC must
+    // not displace the consolidation partition.
+    assert_eq!(
+        plan_from_snapshots(
+            &snapshots,
+            1,
+            &topo,
+            &allowed,
+            |_, _| 10,
+            PlacementPolicy::Consolidate,
+        ),
+        vec![0],
+        "grant charge must not evict the peer-held consolidation winner",
+    );
+    // Target 2: within the fresh partition the grant-free LLC wins.
+    assert_eq!(
+        plan_from_snapshots(
+            &snapshots,
+            2,
+            &topo,
+            &allowed,
+            |_, _| 10,
+            PlacementPolicy::Consolidate,
+        ),
+        vec![0, 2],
+        "the fresh partition must prefer the grant-free LLC",
+    );
+    // Spread: holder count stays primary (llc1/llc2 before llc0), and
+    // the grant charge breaks the tie toward llc2.
+    assert_eq!(
+        plan_from_snapshots(
+            &snapshots,
+            1,
+            &topo,
+            &allowed,
+            |_, _| 10,
+            PlacementPolicy::Spread { rotation: 0 },
+        ),
+        vec![2],
+        "Spread must prefer the grant-free LLC among the least-held",
+    );
+}
+
+/// Two-tier permit selection: the grant-aware tier avoids charged
+/// permits while alternatives exist, and the grant-blind fallback
+/// fires — returning charged permits instead of `None` — when the
+/// charge covers the whole pool. The fallback is the livelock guard:
+/// a senior must be able to publish an overlapping claim to trigger
+/// the scan's ticket-order revoke.
+#[test]
+fn permit_selection_prefers_grant_free_and_falls_back() {
+    let pool = AdmissionPermitPool::for_host(2);
+    let all: Vec<usize> = pool.all().collect();
+    assert!(all.len() >= 3, "fixture needs at least 3 permits");
+    let charged: std::collections::BTreeSet<usize> = [all[0]].into_iter().collect();
+    let grant_conflicts = |charged: &std::collections::BTreeSet<usize>,
+                           candidate: &admission_protocol::ClaimSet| {
+        Ok(candidate
+            .permits
+            .iter()
+            .any(|permit| charged.contains(permit)))
+    };
+    let avoided = select_plan_permits_grant_aware(
+        PermitAdmission::Cooperative,
+        LlcPlanSizing::Exact,
+        &pool,
+        None,
+        2,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |_| Ok(true),
+        |candidate| grant_conflicts(&charged, candidate),
+    )
+    .expect("grant-aware permit selection")
+    .expect("a mostly-free pool must satisfy the request");
+    assert_eq!(avoided.permits.cpu_permits.len(), 2);
+    assert!(
+        !avoided
+            .permits
+            .cpu_permits
+            .iter()
+            .any(|permit| charged.contains(permit)),
+        "the grant-aware tier must avoid the charged permit while \
+         alternatives exist: {:?}",
+        avoided.permits.cpu_permits,
+    );
+    let all_charged: std::collections::BTreeSet<usize> = all.iter().copied().collect();
+    let fallback = select_plan_permits_grant_aware(
+        PermitAdmission::Cooperative,
+        LlcPlanSizing::Exact,
+        &pool,
+        None,
+        2,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |_| Ok(true),
+        |candidate| grant_conflicts(&all_charged, candidate),
+    )
+    .expect("grant-aware permit selection with a fully charged pool")
+    .expect("the grant-blind fallback must fire instead of returning None");
+    assert_eq!(
+        fallback.permits.cpu_permits.len(),
+        2,
+        "under total charge the fallback must restore today's selection",
     );
 }
