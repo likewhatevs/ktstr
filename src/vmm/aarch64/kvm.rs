@@ -10,7 +10,7 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::GuestMemoryMmap;
 use vmm_sys_util::ioctl_iow_nr;
 
 // `kvm_ioctls::VmFd::enable_cap` is cfg-gated to x86_64/s390x/powerpc even
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn memory_starts_at_dram() {
-        use vm_memory::GuestMemoryRegion;
+        use vm_memory::{GuestAddress, GuestMemoryRegion};
         let topo = Topology {
             llcs: 1,
             cores_per_llc: 1,
