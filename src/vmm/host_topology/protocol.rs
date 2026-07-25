@@ -580,6 +580,9 @@ impl ClaimSet {
     /// Whether two complete reservation claims are incompatible.
     ///
     /// CPU and LLC compatibility independently follow the flock SH/EX matrix.
+    /// Test-only since the entry-park overlap diagnostic was removed; the
+    /// mode-matrix tests remain its consumers.
+    #[cfg(test)]
     pub(crate) fn conflicts_with(&self, other: &Self) -> bool {
         if self.cpus.iter().any(|cpu| other.cpus.contains(cpu))
             && matches!(

@@ -39,15 +39,11 @@ static LOST_SUFFIX_WATERMARK: AtomicU64 = AtomicU64::new(0);
 static LOST_PREFIX_EPOCH: AtomicU64 = AtomicU64::new(0);
 static LOST_STALE_REGRANT: AtomicU64 = AtomicU64::new(0);
 static LOST_PHYSICAL_PROBE: AtomicU64 = AtomicU64::new(0);
-// Suffix-watermark park breakdown at the entry self-demote (registry.rs:2622),
-// to size the relevance-gate headroom vs the REPLAN-wave-coordination floor:
-// - no_overlap: the record's claim conflicts with no live claim — a candidate
-//   for the relevance-gate to commit instead of park.
-// - with_overlap: a real conflict exists — parking is a fairness fence.
-// - wave: a REPLAN wave was outstanding at park time — the park also shortens
-//   the wave's deferred rescan edge (load-bearing coordination, not churn).
-static WATERMARK_PARK_NO_OVERLAP: AtomicU64 = AtomicU64::new(0);
-static WATERMARK_PARK_WITH_OVERLAP: AtomicU64 = AtomicU64::new(0);
+// Suffix-watermark parks at the entry self-demote with a REPLAN wave
+// outstanding: the park also shortens the wave's deferred rescan edge
+// (load-bearing coordination, not churn). The former per-park O(N) overlap
+// classification walk is gone — it materialized every record's encoded watch
+// under the registry lock and convoyed CI-scale entrant herds.
 static WATERMARK_PARK_WAVE: AtomicU64 = AtomicU64::new(0);
 // Non-fencing REPLAN claim replacements (registry.rs:16427), split by whether
 // the replan reproduced the same claim. A `new == old` replacement still dirties
@@ -138,16 +134,9 @@ pub(crate) fn note_lost_suffix_watermark() {
     LOST_SUFFIX_WATERMARK.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Classify one entry-level suffix-watermark park (registry.rs:2622) by whether
-/// the parked claim actually overlaps a live claim and whether a REPLAN wave was
-/// outstanding. Sizes the relevance-gate headroom against the wave-coordination
-/// floor. Only called behind [`enabled`] (the overlap test is O(resources)).
-pub(crate) fn note_watermark_park(overlap: bool, wave_outstanding: bool) {
-    if overlap {
-        WATERMARK_PARK_WITH_OVERLAP.fetch_add(1, Ordering::Relaxed);
-    } else {
-        WATERMARK_PARK_NO_OVERLAP.fetch_add(1, Ordering::Relaxed);
-    }
+/// Count one entry-level suffix-watermark park that coincided with an
+/// outstanding REPLAN wave (the park doubles as wave-edge coordination).
+pub(crate) fn note_watermark_park(wave_outstanding: bool) {
     if wave_outstanding {
         WATERMARK_PARK_WAVE.fetch_add(1, Ordering::Relaxed);
     }
@@ -219,7 +208,7 @@ fn format_line(pid: u32) -> String {
         "grant-flow: pid={pid} grants_issued={} grants_reached_held={} grants_lost={} \
          lost_revoked={} lost_suffix_watermark={} lost_prefix_epoch={} \
          lost_stale_regrant={} lost_physical_probe={} replan_requeue={} \
-         wmpark_no_overlap={} wmpark_with_overlap={} wmpark_wave={} \
+         wmpark_wave={} \
          replan_replace_total={} replan_replace_noop={} replan_replace_placement_same={} \
          held_in_flight_max={} distinct_held_cpus_max={} discover_count={} \
          discover_ns_mean={discover_ns_mean} discover_ns_max={}\n",
@@ -232,8 +221,6 @@ fn format_line(pid: u32) -> String {
         LOST_STALE_REGRANT.load(Ordering::Relaxed),
         LOST_PHYSICAL_PROBE.load(Ordering::Relaxed),
         REPLAN_REQUEUE.load(Ordering::Relaxed),
-        WATERMARK_PARK_NO_OVERLAP.load(Ordering::Relaxed),
-        WATERMARK_PARK_WITH_OVERLAP.load(Ordering::Relaxed),
         WATERMARK_PARK_WAVE.load(Ordering::Relaxed),
         REPLAN_REPLACE_TOTAL.load(Ordering::Relaxed),
         REPLAN_REPLACE_NOOP.load(Ordering::Relaxed),
@@ -283,8 +270,6 @@ mod tests {
             "lost_stale_regrant=",
             "lost_physical_probe=",
             "replan_requeue=",
-            "wmpark_no_overlap=",
-            "wmpark_with_overlap=",
             "wmpark_wave=",
             "replan_replace_total=",
             "replan_replace_noop=",

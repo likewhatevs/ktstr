@@ -2621,41 +2621,7 @@ impl Ticket {
             }
             if record.state == STATE_GRANTED && table.min_changed_ticket() < record.ticket {
                 crate::vmm::grant_flow::note_lost_suffix_watermark();
-                if crate::vmm::grant_flow::enabled() {
-                    // Diagnostic-only: classify this entry park by whether an
-                    // EARLIER-ticket live claim actually overlaps this record's
-                    // claim — the exact fairness predicate a relevance-gate would
-                    // test. A later grant must yield only to a senior conflicting
-                    // claim, never to disjoint churn or a junior waiter, so the
-                    // aggregate "conflicts with any live claim" test overcounts;
-                    // scope it to tickets strictly ahead in line. Also record
-                    // whether a REPLAN wave was outstanding (the deferred-edge
-                    // coordination the park additionally serves). Pure
-                    // observation — the O(N) walk runs only behind the gate.
-                    let mut earlier_overlap = false;
-                    if let Ok(next_slot) = table.next_slot() {
-                        for other_slot in 0..next_slot {
-                            let Ok(Some(other)) = table.record(other_slot) else {
-                                continue;
-                            };
-                            if other.ticket != 0
-                                && other.ticket < record.ticket
-                                && matches!(
-                                    other.state,
-                                    STATE_WAITING | STATE_GRANTED | STATE_REPLAN | STATE_HELD
-                                )
-                                && other.claim.conflicts_with(&record.claim)
-                            {
-                                earlier_overlap = true;
-                                break;
-                            }
-                        }
-                    }
-                    crate::vmm::grant_flow::note_watermark_park(
-                        earlier_overlap,
-                        table.replan_outstanding() > 0,
-                    );
-                }
+                crate::vmm::grant_flow::note_watermark_park(table.replan_outstanding() > 0);
                 // Never run the O(N) authoritative scan from a callback
                 // entrant. An earlier non-fencing REPLAN replacement can
                 // dirty this suffix without advancing the global claim epoch,
