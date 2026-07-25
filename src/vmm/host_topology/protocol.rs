@@ -3412,7 +3412,13 @@ fn drive_registered_ticket<T>(
                     registry::GrantResult::Prepared(_, _) => {
                         unreachable!("prepared result returned through ordinary ticket drive")
                     }
-                    registry::GrantResult::Requeued | registry::GrantResult::LostGrant => continue,
+                    registry::GrantResult::Requeued | registry::GrantResult::LostGrant => {
+                        // A grant the coordinator issued did not convert to a
+                        // live HELD claim (registry revoke, stale prefix, or a
+                        // lost physical probe). Count the churn, then requeue.
+                        crate::vmm::grant_flow::note_grant_lost();
+                        continue;
+                    }
                 }
             }
             registry::State::Waiting => {}

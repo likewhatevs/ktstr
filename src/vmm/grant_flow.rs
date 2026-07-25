@@ -1,0 +1,196 @@
+//! Grant-flow diagnostics (diagnostic-only, pure observation).
+//!
+//! Discriminates the C≈1.3-concurrent admission wall between the candidate
+//! mechanisms by counting, per process:
+//! - `grants_issued`: WAITING→GRANTED transitions the coordinator scan makes.
+//! - `grants_reached_held`: grants that converted to a live HELD run claim.
+//! - `grants_lost`: grants a cell was told about but did not convert (registry
+//!   revoke, stale prefix, or a lost physical probe) — the revoke/thrash churn.
+//! - `held_in_flight` / `distinct_held_cpus`: peak count of in-flight HELD
+//!   claims and the distinct host CPUs they cover — the ramp indicator.
+//! - `discover` wall-time and `/proc/locks` line count: the per-cell placement
+//!   DISCOVER cost (the environmental /proc/locks-scaling suspect).
+//!
+//! Entirely inert unless `KTSTR_BUILD_DIAGNOSTICS_DIR` is set (CI only): the
+//! `note_*` calls are relaxed atomic updates and the expensive inputs
+//! (distinct-CPU popcount, discover timing) are computed only behind
+//! [`enabled`]. One aggregate line per process lands at
+//! `${KTSTR_BUILD_DIAGNOSTICS_DIR}/grant-flow-<pid>.txt` on exit, the same idiom
+//! as [`super::exit_timing`] and the coordinator-wake counters.
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+const DIR_ENV: &str = "KTSTR_BUILD_DIAGNOSTICS_DIR";
+
+static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+static GRANTS_ISSUED: AtomicU64 = AtomicU64::new(0);
+static GRANTS_REACHED_HELD: AtomicU64 = AtomicU64::new(0);
+static GRANTS_LOST: AtomicU64 = AtomicU64::new(0);
+static HELD_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
+static DISTINCT_HELD_CPUS_MAX: AtomicU64 = AtomicU64::new(0);
+static DISCOVER_COUNT: AtomicU64 = AtomicU64::new(0);
+static DISCOVER_NS_SUM: AtomicU64 = AtomicU64::new(0);
+static DISCOVER_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static PROC_LOCKS_LINES_SUM: AtomicU64 = AtomicU64::new(0);
+static PROC_LOCKS_LINES_MAX: AtomicU64 = AtomicU64::new(0);
+static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+fn dir() -> Option<&'static PathBuf> {
+    DIR.get_or_init(|| {
+        std::env::var_os(DIR_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    })
+    .as_ref()
+}
+
+/// Whether the diagnostics sink is active. Callers gate any input computation
+/// that is not itself free (distinct-CPU popcount, discover timing) on this.
+pub(crate) fn enabled() -> bool {
+    dir().is_some()
+}
+
+fn ensure_atexit() {
+    if ATEXIT_REGISTERED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: `emit` is a plain extern "C" fn with no arguments, registered at
+    // most once. `atexit` only stores the pointer.
+    unsafe {
+        libc::atexit(emit);
+    }
+}
+
+fn bump_max(cell: &AtomicU64, value: u64) {
+    let mut current = cell.load(Ordering::Relaxed);
+    while value > current {
+        match cell.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// One WAITING→GRANTED transition issued by the coordinator scan.
+pub(crate) fn note_grant_issued() {
+    GRANTS_ISSUED.fetch_add(1, Ordering::Relaxed);
+    ensure_atexit();
+}
+
+/// One grant that converted into a live HELD run claim.
+pub(crate) fn note_grant_reached_held() {
+    GRANTS_REACHED_HELD.fetch_add(1, Ordering::Relaxed);
+    ensure_atexit();
+}
+
+/// One grant a cell received but did not convert to HELD (revoke / stale
+/// prefix / lost physical probe) and requeued for.
+pub(crate) fn note_grant_lost() {
+    GRANTS_LOST.fetch_add(1, Ordering::Relaxed);
+    ensure_atexit();
+}
+
+/// Peak in-flight HELD run claims and the distinct host CPUs they cover,
+/// sampled once per authoritative grant scan. Only called behind [`enabled`].
+pub(crate) fn note_held_in_flight(held_records: u64, distinct_cpus: u64) {
+    bump_max(&HELD_IN_FLIGHT_MAX, held_records);
+    bump_max(&DISTINCT_HELD_CPUS_MAX, distinct_cpus);
+    ensure_atexit();
+}
+
+/// One placement DISCOVER pass: its wall-time and the `/proc/locks` line count
+/// it parsed. Only called behind [`enabled`].
+pub(crate) fn note_discover(elapsed_ns: u64, proc_locks_lines: u64) {
+    DISCOVER_COUNT.fetch_add(1, Ordering::Relaxed);
+    DISCOVER_NS_SUM.fetch_add(elapsed_ns, Ordering::Relaxed);
+    bump_max(&DISCOVER_NS_MAX, elapsed_ns);
+    PROC_LOCKS_LINES_SUM.fetch_add(proc_locks_lines, Ordering::Relaxed);
+    bump_max(&PROC_LOCKS_LINES_MAX, proc_locks_lines);
+    ensure_atexit();
+}
+
+fn format_line(pid: u32) -> String {
+    let discover_count = DISCOVER_COUNT.load(Ordering::Relaxed);
+    let discover_ns_mean = DISCOVER_NS_SUM
+        .load(Ordering::Relaxed)
+        .checked_div(discover_count)
+        .unwrap_or(0);
+    let proc_locks_lines_mean = PROC_LOCKS_LINES_SUM
+        .load(Ordering::Relaxed)
+        .checked_div(discover_count)
+        .unwrap_or(0);
+    format!(
+        "grant-flow: pid={pid} grants_issued={} grants_reached_held={} grants_lost={} \
+         held_in_flight_max={} distinct_held_cpus_max={} discover_count={} \
+         discover_ns_mean={discover_ns_mean} discover_ns_max={} \
+         proc_locks_lines_mean={proc_locks_lines_mean} proc_locks_lines_max={}\n",
+        GRANTS_ISSUED.load(Ordering::Relaxed),
+        GRANTS_REACHED_HELD.load(Ordering::Relaxed),
+        GRANTS_LOST.load(Ordering::Relaxed),
+        HELD_IN_FLIGHT_MAX.load(Ordering::Relaxed),
+        DISTINCT_HELD_CPUS_MAX.load(Ordering::Relaxed),
+        discover_count,
+        DISCOVER_NS_MAX.load(Ordering::Relaxed),
+        PROC_LOCKS_LINES_MAX.load(Ordering::Relaxed),
+    )
+}
+
+extern "C" fn emit() {
+    let _ = std::panic::catch_unwind(|| {
+        let Some(dir) = dir() else {
+            return;
+        };
+        let pid = std::process::id();
+        let line = format_line(pid);
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("grant-flow-{pid}.txt")))
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_shape_has_all_fields() {
+        let line = format_line(42);
+        for field in [
+            "grant-flow: pid=42",
+            "grants_issued=",
+            "grants_reached_held=",
+            "grants_lost=",
+            "held_in_flight_max=",
+            "distinct_held_cpus_max=",
+            "discover_count=",
+            "discover_ns_mean=",
+            "discover_ns_max=",
+            "proc_locks_lines_mean=",
+            "proc_locks_lines_max=",
+        ] {
+            assert!(line.contains(field), "missing {field} in {line}");
+        }
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn max_accumulator_keeps_the_largest() {
+        let cell = AtomicU64::new(0);
+        bump_max(&cell, 5);
+        bump_max(&cell, 3);
+        bump_max(&cell, 9);
+        bump_max(&cell, 1);
+        assert_eq!(cell.load(Ordering::Relaxed), 9);
+    }
+}

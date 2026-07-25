@@ -72,6 +72,7 @@ pub(crate) mod contention;
 pub(crate) mod exit_dispatch;
 pub(crate) mod exit_timing;
 pub(crate) mod freeze_coord;
+pub(crate) mod grant_flow;
 pub(crate) mod initramfs_cache;
 pub(crate) mod net_config;
 pub(crate) mod numa_mem;

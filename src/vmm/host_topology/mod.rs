@@ -3069,6 +3069,11 @@ fn discover_llc_snapshots_impl(
     // scan. The observation is advisory: on locked-down hosts, exact flock
     // acquisition remains authoritative and placement falls back to a
     // zero-holder view.
+    //
+    // The grant-flow diagnostic times this DISCOVER scan and records the
+    // `/proc/locks` line count it parsed — the environmental (host-wide flock
+    // storm) signal. Gated so a disabled sink reads no clock.
+    let discover_timer = crate::vmm::grant_flow::enabled().then(std::time::Instant::now);
     let states = match crate::flock::read_flock_states_batch_with_mountinfo(
         paths.iter().map(|(_, path)| path.as_path()),
         mountinfo,
@@ -3082,6 +3087,10 @@ fn discover_llc_snapshots_impl(
             vec![crate::flock::FlockResourceState::default(); paths.len()]
         }
     };
+    if let Some(timer) = discover_timer {
+        let elapsed_ns = timer.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+        crate::vmm::grant_flow::note_discover(elapsed_ns, crate::flock::last_proc_locks_lines());
+    }
     // Full HolderInfo/cmdline enrichment is reserved for explicit
     // diagnostics. Normal storm placement avoids one /proc/<pid>/cmdline read
     // per holder.

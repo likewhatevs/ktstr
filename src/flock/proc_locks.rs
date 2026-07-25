@@ -28,6 +28,18 @@
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Total line count of the most recent `/proc/locks` read on this process, for
+/// the grant-flow diagnostic's environmental (host-wide flock storm) signal.
+/// Advisory only; overwritten by each batch read.
+static LAST_PROC_LOCKS_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// `/proc/locks` line count observed by the most recent batched flock-state
+/// read on this process (0 before any read).
+pub(crate) fn last_proc_locks_lines() -> u64 {
+    LAST_PROC_LOCKS_LINES.load(Ordering::Relaxed)
+}
 
 use super::HolderInfo;
 use super::holder::holder_info_for_pid;
@@ -300,7 +312,9 @@ pub(crate) fn read_flock_states_batch_with_mountinfo<'a>(
     }
     let contents = read_proc_locks("read /proc/locks for batched flock-state observation")?;
     let mut states = vec![FlockResourceState::default(); needles.len()];
+    let mut total_lines = 0u64;
     for line in contents.lines() {
+        total_lines += 1;
         let Some((pid, mode, dev_inode)) = parse_held_flock_with_mode(line) else {
             continue;
         };
@@ -318,6 +332,7 @@ pub(crate) fn read_flock_states_batch_with_mountinfo<'a>(
         state.holder_pids.sort_unstable();
         state.holder_pids.dedup();
     }
+    LAST_PROC_LOCKS_LINES.store(total_lines, Ordering::Relaxed);
     Ok(states)
 }
 

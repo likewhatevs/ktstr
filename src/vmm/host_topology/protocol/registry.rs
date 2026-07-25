@@ -16470,6 +16470,7 @@ impl Table {
             write_u32(bytes, R_STATE, STATE_HELD);
         }
         self.finish_replan_state_publication(record.state, STATE_HELD);
+        crate::vmm::grant_flow::note_grant_reached_held();
         if claim_changed {
             self.mark_claim_changed(record.ticket)?;
         }
@@ -17115,6 +17116,16 @@ impl Table {
         let mut encoded_watch_serial_memo = BTreeMap::<EncodedWatchSerialMemoKey, u64>::new();
         self.bump_grant_scans();
         note_grant_scan(records.len());
+        // Grant-flow ramp gauge (diagnostics-only): count in-flight HELD/GRANTED
+        // run claims and the distinct host CPUs they cover this scan. Gated so a
+        // disabled sink pays no per-record accounting.
+        let sample_held_in_flight = crate::vmm::grant_flow::enabled();
+        let mut held_in_flight = 0u64;
+        let mut held_cpu_bits = if sample_held_in_flight {
+            vec![0u64; self.layout.words]
+        } else {
+            Vec::new()
+        };
 
         for record in records {
             // An expired planner callback is quarantined until its own owner
@@ -17363,6 +17374,7 @@ impl Table {
                 self.clear_record_blocked_known(record.slot, record.external_blocker)?;
                 crash_at_for_tests("grant_state_before_wake");
                 self.wake_slot(record.slot)?;
+                crate::vmm::grant_flow::note_grant_issued();
                 changed = true;
                 scan_state = STATE_GRANTED;
             } else if record.state == STATE_WAITING
@@ -17471,6 +17483,14 @@ impl Table {
 
             let preserves_fence = matches!(scan_state, STATE_GRANTED | STATE_REVOKED | STATE_HELD)
                 || (scan_state == STATE_COORDINATOR && acquisition_viable);
+            if sample_held_in_flight && matches!(scan_state, STATE_GRANTED | STATE_HELD) {
+                held_in_flight += 1;
+                for cpu in record.claim.cpus() {
+                    if cpu < self.layout.bits {
+                        held_cpu_bits[cpu / 64] |= 1u64 << (cpu % 64);
+                    }
+                }
+            }
             let mut selected_backfill_head = false;
             if preserves_fence {
                 add_claim_bits(
@@ -17575,6 +17595,13 @@ impl Table {
                 prep_granted_tokens,
                 prep_eligible_waiting,
             );
+        }
+        if sample_held_in_flight {
+            let distinct_cpus = held_cpu_bits
+                .iter()
+                .map(|word| word.count_ones() as u64)
+                .sum();
+            crate::vmm::grant_flow::note_held_in_flight(held_in_flight, distinct_cpus);
         }
         self.finish_claim_scan();
         self.clear_pending_flag(PENDING_RESCAN | PENDING_REPLAN_RESCAN);

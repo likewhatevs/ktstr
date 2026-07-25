@@ -117,7 +117,7 @@ pub(crate) use primitives::{
     InterruptibleFlockWaiter, TryFlockOutcome, materialize, try_flock_with_witness,
 };
 pub(crate) use proc_locks::{
-    FlockResourceState, read_flock_states_batch_with_mountinfo, read_holders,
+    FlockResourceState, last_proc_locks_lines, read_flock_states_batch_with_mountinfo, read_holders,
 };
 
 /// Subdirectory name (under whatever root each caller picks) that
