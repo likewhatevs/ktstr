@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ25");
-const VERSION: u32 = 25;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ26");
+const VERSION: u32 = 26;
 #[cfg(test)]
 const RETAINED_FUTEX_WAIT_MARKER_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 #[cfg(test)]
@@ -35,7 +35,7 @@ const RETAINED_FUTEX_WAIT_GATE_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_GATE"
 thread_local! {
     static GENERATION_WAIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-const HEADER_FIXED: usize = 264;
+const HEADER_FIXED: usize = 272;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 192;
 const RECORD_ALIGN: usize = 64;
@@ -43,8 +43,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v25-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v25-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v26-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v26-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 const WAIT_DIAGNOSTIC_BUCKET_SECS: u64 = 30;
@@ -201,7 +201,15 @@ const H_DEFERRED_RESCAN_DEADLINE_NS: usize = 248;
 /// this word, so a replacement provably unable to doom any in-flight grant
 /// still fences speculative REPLAN commits whose claims carry no grant charge.
 const H_MIN_CHANGED_TICKET_REPLAN: usize = 256;
-const _: () = assert!(H_MIN_CHANGED_TICKET_REPLAN + std::mem::size_of::<u64>() == HEADER_FIXED);
+/// Whether the changed-claims accumulator lost precision since the last
+/// authoritative scan: a suffix dirty arrived through the conservative
+/// conservative `Table::mark_suffix_dirty` entry point (test-only today)
+/// with no claim analysis, so every
+/// later in-flight grant must park (today's behavior). Reset with the
+/// watermark at `finish_claim_scan`. Fail-closed: any writer that cannot
+/// classify its change saturates rather than under-parks.
+const H_CHANGED_CLAIMS_SATURATED: usize = 264;
+const _: () = assert!(H_CHANGED_CLAIMS_SATURATED + std::mem::size_of::<u64>() == HEADER_FIXED);
 const _: () = assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
 const _: () = assert!(H_GENERATION_WAKE.is_multiple_of(std::mem::align_of::<AtomicU32>()));
 const _: () = assert!(H_REPLAN_CURSOR.is_multiple_of(std::mem::align_of::<u64>()));
@@ -376,7 +384,21 @@ const B_CANDIDATE_CPU_SH: usize = 22;
 const B_CANDIDATE_CPU_EX: usize = 23;
 const B_CANDIDATE_LLC_SH: usize = 24;
 const B_CANDIDATE_LLC_EX: usize = 25;
-const HEADER_BITMAPS: usize = 26;
+/// Since-last-scan changed-claims accumulator: the union of every claim that
+/// became newly fenceable while dirtying the main suffix watermark
+/// (replacements, promotions with a claim change, preparation transitions,
+/// completion/ack publications the pending scan can turn into fences).
+/// Grow-only between scans — reset together with the watermark at
+/// `finish_claim_scan` — so plain bitset OR suffices, no reference counts.
+/// A GRANTED entrant behind the watermark parks only when its claim
+/// overlaps this set (mode matrix as `first_conflict`); pure fence
+/// retirements (removals, revoke acks) dirty the watermark without joining
+/// the set because a shrinking prefix cannot doom an in-flight grant.
+const B_CHANGED_CPU_ANY: usize = 26;
+const B_CHANGED_CPU_EX: usize = 27;
+const B_CHANGED_LLC_ANY: usize = 28;
+const B_CHANGED_LLC_EX: usize = 29;
+const HEADER_BITMAPS: usize = 30;
 /// Per-CPU count of live Build-class exact claims. Preparation placement reads
 /// this aggregate once and prefers its complement, keeping immutable-image
 /// work off the physical CPUs currently licensed to Cargo/kernel builds while
@@ -2063,7 +2085,7 @@ impl Ticket {
             // Publish the complete record last.
             write_u32(bytes, R_STATE, STATE_WAITING);
         }
-        table.mark_claim_changed(self.ticket)?;
+        table.mark_claim_changed_fencing(self.ticket, &claim)?;
         table.advance_generation_and_wake_pending()?;
         table.elect_coordinator_in_transaction()?;
         table.finish_transaction()?;
@@ -2718,25 +2740,40 @@ impl Ticket {
                 return Ok(GrantResult::LostGrant);
             }
             if record.state == STATE_GRANTED && table.min_changed_ticket() < record.ticket {
-                crate::vmm::grant_flow::note_lost_suffix_watermark();
-                crate::vmm::grant_flow::note_watermark_park(table.replan_outstanding() > 0);
-                // Never run the O(N) authoritative scan from a callback
-                // entrant. An earlier non-fencing REPLAN replacement can
-                // dirty this suffix without advancing the global claim epoch,
-                // so the exact suffix watermark is the complete admission
-                // fence. Park this unentered token and publish one coalesced
-                // edge; the coordinator consumes it in its normal scan turn.
-                table.begin_transaction()?;
-                table.set_record_state(self.slot, STATE_WAITING)?;
-                table.clear_record_blocked(self.slot)?;
-                let notify = table.schedule_grant_completion_edge_in_transaction()?;
-                table.finish_transaction()?;
-                drop(table);
-                drop(_lock);
-                if notify {
-                    notify_coordinator();
+                if table.changed_claims_saturated()
+                    || table.changed_claims_conflict(&record.claim)?
+                {
+                    crate::vmm::grant_flow::note_lost_suffix_watermark();
+                    crate::vmm::grant_flow::note_watermark_park(table.replan_outstanding() > 0);
+                    // Never run the O(N) authoritative scan from a callback
+                    // entrant. An earlier non-fencing REPLAN replacement can
+                    // dirty this suffix without advancing the global claim
+                    // epoch, so the suffix watermark plus the changed-claims
+                    // accumulator is the complete admission fence. Park this
+                    // unentered token and publish one coalesced edge; the
+                    // coordinator consumes it in its normal scan turn.
+                    table.begin_transaction()?;
+                    table.set_record_state(self.slot, STATE_WAITING)?;
+                    table.clear_record_blocked(self.slot)?;
+                    let notify = table.schedule_grant_completion_edge_in_transaction()?;
+                    table.finish_transaction()?;
+                    drop(table);
+                    drop(_lock);
+                    if notify {
+                        notify_coordinator();
+                    }
+                    return Ok(GrantResult::LostGrant);
                 }
-                return Ok(GrantResult::LostGrant);
+                // The suffix is dirty, but every claim that became newly
+                // fenceable since the last authoritative scan is disjoint
+                // from this grant (new fences are a subset of the
+                // accumulator; retirements only shrink prefixes), so the
+                // pending scan cannot doom it. Proceed instead of parking:
+                // the probe runs now, and every completion path — promote,
+                // requeue, contention — publishes its own scan edge, so the
+                // wave-edge shortening a park would have provided is
+                // superseded by actual progress.
+                crate::vmm::grant_flow::note_watermark_proceed();
             }
             let state_epoch = if record.state == STATE_GRANTED {
                 record.grant_epoch
@@ -2749,7 +2786,7 @@ impl Ticket {
                 table.begin_transaction()?;
                 let replan_completion = record.state == STATE_REPLAN;
                 if replan_completion {
-                    table.mark_suffix_dirty(record.ticket);
+                    table.mark_suffix_dirty_fencing(record.ticket, &record.claim)?;
                 }
                 table.set_record_state(self.slot, STATE_WAITING)?;
                 table.clear_record_blocked(self.slot)?;
@@ -2912,7 +2949,17 @@ impl Ticket {
             }
             return Ok(GrantResult::LostGrant);
         }
-        let dirty_grant = acquisition_allowed && table.min_changed_ticket() < record.ticket;
+        let dirty_suffix = acquisition_allowed && table.min_changed_ticket() < record.ticket;
+        let dirty_grant = dirty_suffix
+            && (table.changed_claims_saturated()
+                || table.changed_claims_conflict(&record.claim)?);
+        if dirty_suffix && !dirty_grant {
+            // Same overlap test as the entry park: the accumulated changed
+            // claims are disjoint from this acquired grant, so the pending
+            // scan cannot revoke it — commit rather than releasing the
+            // physical payload.
+            crate::vmm::grant_flow::note_watermark_proceed();
+        }
         if dirty_grant && record.state == STATE_GRANTED && record.claim == designated {
             crate::vmm::grant_flow::note_lost_suffix_watermark();
             let released_acquired = result.acquired.is_some();
@@ -3345,7 +3392,7 @@ impl Ticket {
                 // The replan word still fences speculative acquire-commits.
                 if table.claim_grant_conflicts_header(&record.claim)? {
                     crate::vmm::grant_flow::note_completion_guard(false);
-                    table.mark_suffix_dirty(record.ticket);
+                    table.mark_suffix_dirty_fencing(record.ticket, &record.claim)?;
                 } else {
                     crate::vmm::grant_flow::note_completion_guard(true);
                     table.mark_replan_suffix_dirty(record.ticket);
@@ -5935,7 +5982,15 @@ pub(super) fn exercise_dead_waiter_takeover_skip_for_tests() -> Result<(bool, bo
 #[cfg(test)]
 pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
 -> Result<RepeatedCoordinatorTakeoverOutcome> {
-    let coordinator_a_claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
+    // A's claim deliberately OVERLAPS the intervening C grant (CPU 2): while
+    // A is coordinator its claim never fences (CPU 1 stays busy, so A is not
+    // acquisition-viable), and while A is standby it never fences either —
+    // so C is granted on CPU 2 with A's claim absent from its prefix. The
+    // second lease transfer re-fences A's claim, a genuinely NEW fence
+    // against C's grant token, which the changed-claims accumulator must
+    // recognize as an overlap and park C until the authoritative scan.
+    let coordinator_a_claim =
+        ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
     let mut coordinator_a =
         Ticket::register(coordinator_a_claim.clone(), coordinator_a_claim, None)?;
     let intervening_claim = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
@@ -11996,6 +12051,147 @@ pub(super) fn exercise_replacement_kept_overlap_guard_for_tests() -> Result<(boo
 }
 
 #[cfg(test)]
+pub(crate) struct DisjointEntrantProceedsOutcome {
+    pub(crate) watermark_dirty_below_juniors: bool,
+    pub(crate) overlapping_junior_parked: bool,
+    pub(crate) disjoint_junior_committed_held: bool,
+}
+
+/// The overlap-tested entry park: one senior replacement dirties the suffix
+/// with a claim overlapping junior1's grant. Junior1 must still park at
+/// entry (fairness for the genuine overlap), while junior2 — granted a
+/// claim disjoint from everything accumulated since the last scan —
+/// proceeds through BOTH the entry test and the acquired-commit test and
+/// converts to HELD, instead of the blanket park both juniors got before
+/// the changed-claims accumulator.
+#[cfg(test)]
+pub(super) fn exercise_disjoint_entrant_proceeds_for_tests()
+-> Result<DisjointEntrantProceedsOutcome> {
+    let coordinator_cpu = 3_000usize;
+    let senior_designated_cpu = 3_001usize;
+    let contended_cpu = 3_002usize;
+    let disjoint_cpu = 3_003usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let senior_designated = ClaimSet::new(
+        std::iter::empty(),
+        [senior_designated_cpu],
+        FlockMode::Exclusive,
+    );
+    let senior_watch = ClaimSet::new(
+        std::iter::empty(),
+        [senior_designated_cpu, contended_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut senior = Ticket::register(senior_designated.clone(), senior_watch, None)?;
+    let junior1_claim = ClaimSet::new(std::iter::empty(), [contended_cpu], FlockMode::Exclusive);
+    let mut junior1 = Ticket::register(junior1_claim.clone(), junior1_claim.clone(), None)?;
+    let junior2_claim = ClaimSet::new(std::iter::empty(), [disjoint_cpu], FlockMode::Exclusive);
+    let mut junior2 = Ticket::register(junior2_claim.clone(), junior2_claim.clone(), None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, senior_designated_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, contended_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, disjoint_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+        anyhow::ensure!(
+            table
+                .record(senior.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(junior1.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED)
+                && table
+                    .record(junior2.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            "disjoint-entrant fixture did not publish its callback and grants",
+        );
+    }
+    let senior_designated_for_wake = senior_designated.clone();
+    let replacement_for_wake = junior1_claim.clone();
+    let result = senior.run_granted(None, |current, _watch, acquisition_allowed, _, _| {
+        anyhow::ensure!(
+            !acquisition_allowed && current == &senior_designated_for_wake,
+            "disjoint-entrant senior callback received the wrong publication",
+        );
+        Ok(GrantAttempt::<()> {
+            acquired: None,
+            preparation_claim: None,
+            preparation_contention: None,
+            next_claim: replacement_for_wake.clone(),
+            contention: None,
+        })
+    })?;
+    anyhow::ensure!(
+        matches!(result, GrantResult::Requeued),
+        "disjoint-entrant senior completion did not requeue",
+    );
+    let watermark_dirty_below_juniors = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        table.min_changed_ticket() < junior1.ticket && !table.changed_claims_saturated()
+    };
+    let mut junior1_callback_ran = false;
+    let junior1_result =
+        later_grant_probe(&mut junior1, &junior1_claim, &mut junior1_callback_ran)?;
+    let overlapping_junior_parked = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        !junior1_callback_ran
+            && matches!(junior1_result, GrantResult::LostGrant)
+            && table
+                .record(junior1.slot)?
+                .is_some_and(|record| record.state == STATE_WAITING)
+    };
+    let junior2_claim_for_wake = junior2_claim.clone();
+    let mut junior2_callback_ran = false;
+    let junior2_result = junior2.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            junior2_callback_ran = true;
+            anyhow::ensure!(
+                acquisition_allowed && current == &junior2_claim_for_wake,
+                "disjoint junior grant received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: Some(()),
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: junior2_claim_for_wake.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let held = match junior2_result {
+        GrantResult::Acquired((), held) => Some(held),
+        _ => None,
+    };
+    let disjoint_junior_committed_held = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        junior2_callback_ran
+            && held.is_some()
+            && table
+                .record(junior2.slot)?
+                .is_some_and(|record| record.state == STATE_HELD)
+    };
+    drop(held);
+    junior2.finish(None)?;
+    junior1.finish(None)?;
+    senior.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(DisjointEntrantProceedsOutcome {
+        watermark_dirty_below_juniors,
+        overlapping_junior_parked,
+        disjoint_junior_committed_held,
+    })
+}
+
+#[cfg(test)]
 fn exercise_pending_replan_grant_race_case(
     offset: usize,
     complete_during_callback: bool,
@@ -15124,7 +15320,7 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .saturating_add(1)
         })
         .unwrap_or(0);
-    // The v25 mapping is deliberately overprovisioned once. It never needs a
+    // The v26 mapping is deliberately overprovisioned once. It never needs a
     // migration/grow protocol when the first low-index ticket is followed by a
     // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
     // a disjoint internal bit range immediately after possible host CPUs.
@@ -15240,11 +15436,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-registry-v25")
+    active_protocol_dir().join("ktstr-acquire-registry-v26")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-events-v25")
+    active_protocol_dir().join("ktstr-acquire-events-v26")
 }
 
 #[cfg(test)]
@@ -15470,7 +15666,7 @@ fn lock_registry_for_initialization() -> Result<RegistryLock> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
     // Materialization order is protocol: once registry.lock is nameable, every
-    // v25 entrant must also be able to join the writer-intent gate ahead of it.
+    // v26 entrant must also be able to join the writer-intent gate ahead of it.
     let writer_intent = block_flock(registry_writer_intent_path(), FlockMode::Shared)?;
     let registry = block_flock(registry_lock_path(), FlockMode::Exclusive)?;
     let lock = finish_registry_lock(registry, writer_intent, FlockMode::Exclusive);
@@ -15684,7 +15880,7 @@ fn publish_acquired_in_table(
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("queue ticket id overflow"))?,
     );
-    table.mark_claim_changed(ticket)?;
+    table.mark_claim_changed_fencing(ticket, claim)?;
     table.advance_generation()?;
     table.finish_transaction()?;
     Ok(HeldClaim {
@@ -16447,10 +16643,104 @@ impl Table {
             .min(read_u64(&self.header, H_MIN_CHANGED_TICKET_REPLAN))
     }
 
+    /// Dirty the suffix conservatively: no accompanying claim analysis, so
+    /// saturate the changed-claims accumulator and park every later
+    /// in-flight grant, exactly the pre-accumulator behavior. Every
+    /// production site classifies itself through the `_fencing` /
+    /// `_relaxation` variants; this stays the fail-closed entry point for
+    /// fixtures (and for any future site that cannot classify its change).
+    #[cfg(test)]
     fn mark_suffix_dirty(&mut self, ticket: u64) {
+        write_u64(&mut self.header, H_CHANGED_CLAIMS_SATURATED, 1);
+        self.mark_suffix_dirty_relaxation(ticket);
+    }
+
+    /// Dirty the suffix for a claim that becomes fenceable at (or before)
+    /// the pending scan, folding it into the changed-claims accumulator so
+    /// only the later grants that actually overlap it park at entry/commit.
+    fn mark_suffix_dirty_fencing(&mut self, ticket: u64, claim: &impl ClaimView) -> Result<()> {
+        self.mark_changed_claim(claim)?;
+        self.mark_suffix_dirty_relaxation(ticket);
+        Ok(())
+    }
+
+    /// Dirty the suffix for a pure fence retirement (record removal, revoke
+    /// acknowledgement): the event only shrinks later tickets' predecessor
+    /// prefixes, so no in-flight grant can be doomed by it and nothing joins
+    /// the accumulator — disjointly granted juniors proceed. The watermark
+    /// still moves: the epoch/scan bookkeeping and the unlicensed-REPLAN
+    /// fence (the replan word) keep their existing consumers.
+    fn mark_suffix_dirty_relaxation(&mut self, ticket: u64) {
         let minimum = self.min_changed_ticket().min(ticket);
         write_u64(&mut self.header, H_MIN_CHANGED_TICKET, minimum);
         self.mark_replan_suffix_dirty(ticket);
+    }
+
+    /// Fold one newly-fenceable claim into the changed-claims accumulator
+    /// (permits at their folded CPU-space indices, exclusive modes into the
+    /// EX maps). Grow-only until `finish_claim_scan` resets the set.
+    fn mark_changed_claim(&mut self, claim: &impl ClaimView) -> Result<()> {
+        for cpu in claim.cpus() {
+            self.set_bitmap_bit(B_CHANGED_CPU_ANY, cpu, true)?;
+            if claim.cpu_mode() == ClaimMode::Exclusive {
+                self.set_bitmap_bit(B_CHANGED_CPU_EX, cpu, true)?;
+            }
+        }
+        for permit in claim.permits() {
+            let index = permit_resource_index(permit)?;
+            self.set_bitmap_bit(B_CHANGED_CPU_ANY, index, true)?;
+            if claim.permit_mode() == ClaimMode::Exclusive {
+                self.set_bitmap_bit(B_CHANGED_CPU_EX, index, true)?;
+            }
+        }
+        for llc in claim.llcs() {
+            self.set_bitmap_bit(B_CHANGED_LLC_ANY, llc, true)?;
+            if claim.llc_mode() == ClaimMode::Exclusive {
+                self.set_bitmap_bit(B_CHANGED_LLC_EX, llc, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn changed_claims_saturated(&self) -> bool {
+        read_u64(&self.header, H_CHANGED_CLAIMS_SATURATED) != 0
+    }
+
+    /// Whether `claim` overlaps any claim accumulated since the last
+    /// authoritative scan, with the `first_conflict` mode matrix: an
+    /// exclusive resource conflicts with any accumulated bit, a shared one
+    /// only with an accumulated exclusive bit. O(claim) header bit reads —
+    /// never a record walk.
+    fn changed_claims_conflict(&self, claim: &ClaimSet) -> Result<bool> {
+        for &cpu in &claim.cpus {
+            let which = match claim.cpu_mode {
+                ClaimMode::Exclusive => B_CHANGED_CPU_ANY,
+                ClaimMode::Shared => B_CHANGED_CPU_EX,
+            };
+            if self.bitmap_bit(which, cpu)? {
+                return Ok(true);
+            }
+        }
+        for &permit in &claim.permits {
+            let index = permit_resource_index(permit)?;
+            let which = match claim.permit_mode {
+                ClaimMode::Exclusive => B_CHANGED_CPU_ANY,
+                ClaimMode::Shared => B_CHANGED_CPU_EX,
+            };
+            if self.bitmap_bit(which, index)? {
+                return Ok(true);
+            }
+        }
+        for &llc in &claim.llcs {
+            let which = match claim.llc_mode {
+                ClaimMode::Exclusive => B_CHANGED_LLC_ANY,
+                ClaimMode::Shared => B_CHANGED_LLC_EX,
+            };
+            if self.bitmap_bit(which, llc)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn mark_replan_suffix_dirty(&mut self, ticket: u64) {
@@ -16458,14 +16748,28 @@ impl Table {
         write_u64(&mut self.header, H_MIN_CHANGED_TICKET_REPLAN, minimum);
     }
 
-    fn mark_claim_changed_metadata(&mut self, ticket: u64) -> Result<()> {
+    /// Claim-epoch advance plus suffix dirty for a change whose
+    /// newly-fenceable claim is known: accumulate it instead of saturating
+    /// the accumulator.
+    fn mark_claim_changed_fencing(&mut self, ticket: u64, claim: &impl ClaimView) -> Result<()> {
         self.advance_claim_epoch()?;
-        self.mark_suffix_dirty(ticket);
+        self.mark_suffix_dirty_fencing(ticket, claim)?;
+        self.set_urgent_rescan();
         Ok(())
     }
 
-    fn mark_claim_changed(&mut self, ticket: u64) -> Result<()> {
-        self.mark_claim_changed_metadata(ticket)?;
+    /// Claim-epoch advance plus suffix dirty for a pure fence retirement,
+    /// without the urgent-rescan edge (callers coalesce their own).
+    fn mark_claim_changed_relaxation_metadata(&mut self, ticket: u64) -> Result<()> {
+        self.advance_claim_epoch()?;
+        self.mark_suffix_dirty_relaxation(ticket);
+        Ok(())
+    }
+
+    /// [`Self::mark_claim_changed_relaxation_metadata`] plus the urgent
+    /// rescan edge.
+    fn mark_claim_changed_relaxation(&mut self, ticket: u64) -> Result<()> {
+        self.mark_claim_changed_relaxation_metadata(ticket)?;
         self.set_urgent_rescan();
         Ok(())
     }
@@ -16473,6 +16777,16 @@ impl Table {
     fn finish_claim_scan(&mut self) {
         write_u64(&mut self.header, H_MIN_CHANGED_TICKET, u64::MAX);
         write_u64(&mut self.header, H_MIN_CHANGED_TICKET_REPLAN, u64::MAX);
+        write_u64(&mut self.header, H_CHANGED_CLAIMS_SATURATED, 0);
+        for which in [
+            B_CHANGED_CPU_ANY,
+            B_CHANGED_CPU_EX,
+            B_CHANGED_LLC_ANY,
+            B_CHANGED_LLC_EX,
+        ] {
+            let offset = self.layout.bitset_offset(which);
+            self.header[offset..offset + self.layout.words * 8].fill(0);
+        }
     }
 
     fn liveness_sweep(&self) -> u64 {
@@ -17501,7 +17815,7 @@ impl Table {
         self.transition_replan_state(prior.state, publish_state)?;
         match fence_effect {
             ReplacementFenceEffect::ChangesPredecessorPrefix => {
-                self.mark_claim_changed(ticket)?;
+                self.mark_claim_changed_fencing(ticket, new)?;
             }
             ReplacementFenceEffect::NonFencing => {
                 if crate::vmm::grant_flow::enabled() {
@@ -17532,7 +17846,7 @@ impl Table {
                 // replan word.
                 if self.claim_grant_conflicts_header(new)? {
                     crate::vmm::grant_flow::note_replace_guard(false);
-                    self.mark_suffix_dirty(ticket);
+                    self.mark_suffix_dirty_fencing(ticket, new)?;
                 } else {
                     crate::vmm::grant_flow::note_replace_guard(true);
                     self.mark_replan_suffix_dirty(ticket);
@@ -17640,7 +17954,7 @@ impl Table {
         self.finish_replan_state_publication(record.state, STATE_HELD);
         crate::vmm::grant_flow::note_grant_reached_held();
         if claim_changed {
-            self.mark_claim_changed(record.ticket)?;
+            self.mark_claim_changed_fencing(record.ticket, exact)?;
         }
         if self.coordinator_ticket() == record.ticket {
             self.set_coordinator(0, NONE_SLOT)?;
@@ -17772,7 +18086,7 @@ impl Table {
             write_u64(bytes, R_BLOCK_INDEX, 0);
             write_u32(bytes, R_STATE, STATE_PENDING);
         }
-        self.mark_claim_changed(record.ticket)?;
+        self.mark_claim_changed_fencing(record.ticket, &pending_claim)?;
         if self.coordinator_ticket() == record.ticket {
             self.set_coordinator(0, NONE_SLOT)?;
             self.elect_coordinator_in_transaction()?;
@@ -17791,10 +18105,12 @@ impl Table {
         self.remove_record_in_transaction(record, acquired)?;
         if !acquired {
             // Removal is a monotonic prefix relaxation. Preserve its claim
-            // epoch/suffix fence immediately, but coalesce the O(N) scan behind
-            // one short quantum. Physical release proof is independently
-            // observed and promotes urgent work.
-            self.mark_claim_changed_metadata(record.ticket)?;
+            // epoch/suffix watermark immediately (without joining the
+            // changed-claims accumulator — a shrinking prefix dooms no
+            // in-flight grant), but coalesce the O(N) scan behind one short
+            // quantum. Physical release proof is independently observed and
+            // promotes urgent work.
+            self.mark_claim_changed_relaxation_metadata(record.ticket)?;
         }
         crash_at_for_tests("remove_record_before_election");
         if removed_coordinator {
@@ -17976,9 +18292,11 @@ impl Table {
         // Removing the revoked exact fence changes every later ticket's
         // predecessor prefix. Give the successor scan a new publication epoch
         // so an already-running callback cannot mistake a refreshed, different
-        // prefix for its original token.
+        // prefix for its original token. The change is a pure relaxation —
+        // the prefix only shrinks — so it does not join the changed-claims
+        // accumulator and dooms no in-flight grant.
         let notify = self.schedule_rescan_edge_in_transaction()?;
-        self.mark_claim_changed(record.ticket)?;
+        self.mark_claim_changed_relaxation(record.ticket)?;
         self.finish_transaction()?;
         Ok(AcknowledgeResult {
             acknowledged: true,
@@ -18012,7 +18330,7 @@ impl Table {
             .ok_or_else(|| {
                 anyhow::anyhow!("expired REPLAN queue ticket {ticket} changed during ack")
             })?;
-        self.mark_suffix_dirty(record.ticket);
+        self.mark_suffix_dirty_fencing(record.ticket, &record.claim)?;
         self.set_record_state(record.slot, STATE_WAITING)?;
         self.clear_record_blocked(record.slot)?;
         self.invalidate_record_prefix(record.slot)?;
@@ -18861,7 +19179,7 @@ impl Table {
             }
         }
         if let Some(first) = dead.iter().map(|record| record.ticket).min() {
-            self.mark_claim_changed_metadata(first)?;
+            self.mark_claim_changed_relaxation_metadata(first)?;
         }
         crash_at_for_tests("remove_record_before_election");
         self.elect_coordinator_in_transaction()?;
@@ -18906,7 +19224,7 @@ impl Table {
             }
         }
         if let Some(first) = dead.iter().map(|record| record.ticket).min() {
-            self.mark_claim_changed_metadata(first)?;
+            self.mark_claim_changed_relaxation_metadata(first)?;
         }
         self.elect_coordinator_in_transaction()?;
         if removed_coordinator {
@@ -18968,7 +19286,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v25 publication validates
+            // and record states together. Current v26 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();
@@ -19068,8 +19386,10 @@ impl Table {
         // Transfer removes the displaced coordinator's potential fence and
         // adds the successor's. A repeated takeover can promote an older
         // standby ticket, so dirty from the earlier identity rather than
-        // assuming every successor lies later in queue order.
-        self.mark_claim_changed(changed_suffix)?;
+        // assuming every successor lies later in queue order. Only the
+        // successor's claim is newly fenceable; the displaced side is a
+        // relaxation.
+        self.mark_claim_changed_fencing(changed_suffix, &successor.claim)?;
         self.advance_generation()?;
         self.wake_slot(current.slot)?;
         self.wake_slot(successor.slot)?;

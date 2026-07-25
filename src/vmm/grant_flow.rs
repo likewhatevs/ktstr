@@ -48,6 +48,10 @@ static LOST_PHYSICAL_PROBE: AtomicU64 = AtomicU64::new(0);
 // classification walk is gone — it materialized every record's encoded watch
 // under the registry lock and convoyed CI-scale entrant herds.
 static WATERMARK_PARK_WAVE: AtomicU64 = AtomicU64::new(0);
+// Dirty-watermark entrants/commits that PROCEEDED because their claim was
+// disjoint from every claim accumulated since the last authoritative scan —
+// the overlap-tested park converting former blanket parks into progress.
+static WATERMARK_PROCEED_DISJOINT: AtomicU64 = AtomicU64::new(0);
 // Non-fencing REPLAN claim replacements (registry.rs:16427), split by whether
 // the replan reproduced the same claim. A `new == old` replacement still dirties
 // the later suffix and parks every junior grant, yet introduces no new fence —
@@ -159,6 +163,12 @@ pub(crate) fn note_watermark_park(wave_outstanding: bool) {
     if wave_outstanding {
         WATERMARK_PARK_WAVE.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// One dirty-watermark entrant or commit that proceeded on accumulator
+/// disjointness instead of parking.
+pub(crate) fn note_watermark_proceed() {
+    WATERMARK_PROCEED_DISJOINT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Count one non-fencing REPLAN claim replacement. `noop` flags an identical
@@ -274,7 +284,7 @@ fn format_line(pid: u32) -> String {
         "grant-flow: pid={pid} grants_issued={} grants_reached_held={} grants_lost={} \
          lost_revoked={} lost_suffix_watermark={} lost_prefix_epoch={} \
          lost_stale_regrant={} lost_physical_probe={} replan_requeue={} \
-         wmpark_wave={} \
+         wmpark_wave={} wmpark_proceed_disjoint={} \
          replan_replace_total={} replan_replace_noop={} replan_replace_placement_same={} \
          guard_replace_skip={} guard_replace_dirty={} \
          guard_completion_skip={} guard_completion_dirty={} \
@@ -292,6 +302,7 @@ fn format_line(pid: u32) -> String {
         LOST_PHYSICAL_PROBE.load(Ordering::Relaxed),
         REPLAN_REQUEUE.load(Ordering::Relaxed),
         WATERMARK_PARK_WAVE.load(Ordering::Relaxed),
+        WATERMARK_PROCEED_DISJOINT.load(Ordering::Relaxed),
         REPLAN_REPLACE_TOTAL.load(Ordering::Relaxed),
         REPLAN_REPLACE_NOOP.load(Ordering::Relaxed),
         REPLAN_REPLACE_PLACEMENT_SAME.load(Ordering::Relaxed),
@@ -356,6 +367,7 @@ mod tests {
             "lost_physical_probe=",
             "replan_requeue=",
             "wmpark_wave=",
+            "wmpark_proceed_disjoint=",
             "replan_replace_total=",
             "replan_replace_noop=",
             "replan_replace_placement_same=",

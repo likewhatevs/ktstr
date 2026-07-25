@@ -1,6 +1,6 @@
 //! Cross-process host-resource admission under nextest.
 //!
-//! Every ktstr process sharing a lock directory participates in one v25
+//! Every ktstr process sharing a lock directory participates in one v26
 //! fixed-record mmap registry. A ticket publishes one exact, non-empty CPU/LLC
 //! reservation claim plus the resources its planner may watch. Claims preserve
 //! the resource-lock semantics exactly: CPU and LLC claims independently use
@@ -2512,6 +2512,12 @@ pub(crate) fn exercise_unchanged_completion_guard_for_tests(
 #[cfg(test)]
 pub(crate) fn exercise_replacement_kept_overlap_guard_for_tests() -> Result<(bool, bool)> {
     registry::exercise_replacement_kept_overlap_guard_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_disjoint_entrant_proceeds_for_tests()
+-> Result<registry::DisjointEntrantProceedsOutcome> {
+    registry::exercise_disjoint_entrant_proceeds_for_tests()
 }
 
 #[cfg(test)]

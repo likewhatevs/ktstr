@@ -1214,8 +1214,8 @@ fn uncontended_fast_fence_does_not_create_registry_metadata() {
     let protocol_dir = std::path::Path::new(&cpu_path)
         .parent()
         .expect("resource lock parent");
-    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v25");
-    let event_dir = protocol_dir.join("ktstr-acquire-events-v25");
+    let registry_dir = protocol_dir.join("ktstr-acquire-registry-v26");
+    let event_dir = protocol_dir.join("ktstr-acquire-events-v26");
     assert!(!registry_dir.exists());
     assert!(!event_dir.exists());
 
@@ -1387,7 +1387,7 @@ fn tracked_acquired_drop_keeps_its_registry_namespace_across_threads() {
     let wrong = tempfile::TempDir::new().expect("wrong-namespace tempdir");
     let wrong_llc_prefix = format!("{}/llc-", wrong.path().display());
     let wrong_cpu_prefix = format!("{}/cpu-", wrong.path().display());
-    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v25");
+    let wrong_registry = wrong.path().join("ktstr-acquire-registry-v26");
     std::fs::create_dir_all(&wrong_registry).expect("create wrong registry directory");
     crate::flock::materialize(wrong_registry.join("registry.turnstile"))
         .expect("materialize wrong registry writer-intent gate");
@@ -4828,9 +4828,9 @@ fn dirty_repair_preserves_exact_and_watch_cpu_modes() {
 }
 
 #[test]
-fn v25_scan_metadata_sparse_decodes_and_fails_closed() {
+fn v26_scan_metadata_sparse_decodes_and_fails_closed() {
     let outcome = protocol::exercise_scan_metadata_validation_for_tests()
-        .expect("exercise v25 scan metadata validation");
+        .expect("exercise v26 scan metadata validation");
     assert_eq!(outcome.layout_words, 64);
     assert_eq!(
         outcome.exact_word_reads, 3,
@@ -4848,7 +4848,7 @@ fn held_transition_canonicalizes_shared_watch_metadata() {
     assert!(
         protocol::exercise_shared_watch_held_metadata_for_tests()
             .expect("promote a shared-mode watch and full-decode its HELD record"),
-        "HELD publication must canonicalize emptied watch modes before publishing matching v25 metadata",
+        "HELD publication must canonicalize emptied watch modes before publishing matching v26 metadata",
     );
 }
 
@@ -4898,7 +4898,7 @@ fn common_watch_replan_wave_is_work_conserving_and_finite() {
     );
     assert!(
         outcome.memo_identical_layout_words >= 64,
-        "the sparse scan fixture must retain the full-width v25 registry layout",
+        "the sparse scan fixture must retain the full-width v26 registry layout",
     );
     assert_eq!(
         outcome.memo_identical_exact_word_reads,
@@ -5508,6 +5508,31 @@ fn guard_dirties_on_kept_resource_overlap() {
     assert!(
         junior_parked,
         "the junior grant on the kept resource must park until the scan",
+    );
+}
+
+/// The overlap-tested entry park: a dirty watermark parks only the junior
+/// whose grant actually overlaps a claim accumulated since the last scan;
+/// a disjoint junior proceeds through entry AND commit and converts to
+/// HELD instead of riding the blanket park.
+#[test]
+fn disjoint_entrant_proceeds_past_dirty_watermark() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_disjoint_entrant_proceeds_for_tests()
+        .expect("exercise overlap-tested entry park");
+    assert!(
+        outcome.watermark_dirty_below_juniors,
+        "the senior replacement must dirty the watermark without saturating \
+         the changed-claims accumulator",
+    );
+    assert!(
+        outcome.overlapping_junior_parked,
+        "the junior whose grant overlaps the accumulated claim must park",
+    );
+    assert!(
+        outcome.disjoint_junior_committed_held,
+        "the junior disjoint from every accumulated claim must proceed and \
+         commit HELD",
     );
 }
 
@@ -8301,7 +8326,7 @@ fn failed_inflight_probe_blocks_at_the_current_resource_epoch() {
     let blocker_two = crate::flock::try_flock(cpu_lock_path(2), crate::flock::FlockMode::Exclusive)
         .unwrap()
         .expect("re-block waiter after epoch transition");
-    // Leave the replacement as an external, unregistered flock. A current-v25
+    // Leave the replacement as an external, unregistered flock. A current-v26
     // HELD publication would authoritatively revoke the in-flight grant before
     // its callback returned, bypassing the stale-negative-evidence path this
     // test is meant to pin.
@@ -8614,7 +8639,7 @@ fn remove_crash_after_counts_before_free_is_repaired() {
     let markers = tempfile::TempDir::new().expect("marker dir");
     let removing =
         TicketChild::spawn_crashing(markers.path(), "removing", "1", "remove_counts_before_free");
-    // The v25 HELD lifecycle removes its registry record only after the
+    // The v26 HELD lifecycle removes its registry record only after the
     // physical reservation is released. Let the helper pass its normal
     // release barrier so the injected crash observes that production ordering.
     std::fs::write(&removing.release, b"release").expect("release crash-test reservation");
