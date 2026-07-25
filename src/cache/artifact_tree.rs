@@ -1516,6 +1516,7 @@ impl ArtifactTreeCache {
             stable_parent,
             materialize_parent,
             progress_label,
+            || Ok(true),
             &validate_identity,
             &validate_identity,
             cancelled,
@@ -1525,13 +1526,20 @@ impl ArtifactTreeCache {
 
     /// Stable-output variant with a cheap cached-hit validator and a distinct
     /// post-build validator for mutable producer inputs.
+    ///
+    /// `coupled_output_usable` is consulted with the stable output's own
+    /// completeness before a hit is accepted. It exists for producers whose
+    /// published closure is usable only while a second producer-owned directory
+    /// survives beside it: returning `false` rejects the record and rebuilds,
+    /// which is recoverable, where a validator returning `false` fails the call.
     #[allow(clippy::too_many_arguments)] // Keep cache lifecycle hooks explicit at the API boundary.
-    pub fn load_or_build_with_stable_cargo_output_validators<F, VH, VP, C>(
+    pub fn load_or_build_with_stable_cargo_output_validators<F, U, VH, VP, C>(
         &self,
         identity: u64,
         stable_parent: &Path,
         materialize_parent: &Path,
         progress_label: &str,
+        coupled_output_usable: U,
         validate_cached_identity: VH,
         validate_published_identity: VP,
         cancelled: C,
@@ -1539,6 +1547,7 @@ impl ArtifactTreeCache {
     ) -> Result<MaterializedArtifactTree>
     where
         F: FnOnce(&StableCargoBuild) -> Result<ArtifactTreeSource>,
+        U: Fn() -> Result<bool>,
         VH: Fn() -> Result<bool>,
         VP: Fn() -> Result<bool>,
         C: Fn() -> bool,
@@ -1558,7 +1567,12 @@ impl ArtifactTreeCache {
             identity,
             materialize_parent,
             progress_label,
-            |record| stable_cargo_build_is_complete(&stable_root, identity, Some(record)),
+            |record| {
+                Ok(
+                    stable_cargo_build_is_complete(&stable_root, identity, Some(record))?
+                        && coupled_output_usable()?,
+                )
+            },
             validate_cached_identity,
             || {
                 Ok(

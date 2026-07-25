@@ -104,9 +104,9 @@ pub(crate) struct MaterializedNextestArtifacts {
     // `env!("OUT_DIR")` absolute paths, which nextest's build-dir remap cannot
     // rewrite. The build held it EXCLUSIVE only for the build; this SHARED hold
     // keeps the pressure sweep and aged GC (both take a non-blocking EXCLUSIVE
-    // lease) off the bucket until every test process using it has exited. `None`
-    // when the bucket was absent (a hit whose scratch was already reclaimed —
-    // nothing left to protect).
+    // lease) off the bucket until every test process using it has exited.
+    // `Option` only because the lease is attached after materialization; every
+    // producer of these artifacts installs one.
     _runtime_bucket_lease: Option<crate::run_cargo::CargoBuildOutputLease>,
 }
 
@@ -2973,12 +2973,24 @@ impl IdentityPlan {
         .with_build_space_reclaimer(Box::new(move |shortfall| {
             crate::run_cargo::reclaim_shared_build_scratch_under_pressure(shortfall, exempt_bucket)
         }));
+        let shared_build_dir = shared_build_scratch_dir(self.build_bucket)?;
         let tree = cache
             .load_or_build_with_stable_cargo_output_validators(
                 self.identity,
                 &cache_root.join("stable-builds-v1"),
                 &cache_root.join("nextest-materialized-v1"),
                 progress_label,
+                // The closure this record publishes is only half of what its
+                // test binaries need: they read build-script `OUT_DIR`
+                // artifacts from the shared build-scratch bucket at runtime,
+                // through absolute paths baked in at compile time. A reclaimed
+                // bucket therefore makes the record unusable, and rebuilding it
+                // is the recovery — the producer repopulates the bucket.
+                || {
+                    Ok(crate::run_cargo::shared_build_scratch_has_build_output(
+                        &shared_build_dir,
+                    ))
+                },
                 || Ok(true),
                 // `stable_source` was captured from the live checkout and
                 // publication-validated before the producer started. Cargo

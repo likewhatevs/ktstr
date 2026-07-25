@@ -3796,128 +3796,159 @@ pub(crate) fn load_or_build_nextest_artifacts(
     let shared_build_dir =
         crate::nextest_artifact_cache::shared_build_scratch_dir(plan.build_bucket)?;
     gc_stale_shared_build_scratch(std::time::SystemTime::now(), plan.build_bucket);
-    let mut materialized = plan.load_or_build(cli_label, |stable, stable_build| {
-        let stable_invocation_dir = stable.invocation_root.clone();
-        let build_args = stable.remap_cargo_args(build_args);
-        let build_args = remap_cached_build_paths(
-            &build_args,
-            metadata.workspace_root.as_std_path(),
-            &invocation_dir,
-            &stable.workspace_root,
-        );
-        let llvm_cov_environment_args = stable.remap_cargo_args(llvm_cov_environment_args);
-        let llvm_cov_environment_args = remap_cached_build_paths(
-            &llvm_cov_environment_args,
-            metadata.workspace_root.as_std_path(),
-            &invocation_dir,
-            &stable.workspace_root,
-        );
-        let output_target = &stable_build.target_directory;
-        // Cargo builds dependency objects, fingerprints, and build-script
-        // OUT_DIRs into a persistent directory shared across source digests of
-        // the same non-source bucket, so unchanged dependencies are not
-        // recompiled and OUT_DIR stays stable for sccache. Final artifacts still
-        // land in the per-source, sealed target directory. `capture_source`
-        // snapshots this build directory into the per-source materialized tree
-        // (under the build-dir lease held below), so nextest's build-dir-remap
-        // still resolves each test binary's OUT_DIR at execution time.
-        let output_build = shared_build_dir.clone();
-        let build_args = remap_nextest_store_output(
-            &build_args,
-            &stable.workspace_root,
-            &stable_invocation_dir,
-            output_target,
-        )?;
-        let mut environment = producer_environment.clone();
-        set_or_replace_environment(
-            &mut environment,
-            "CARGO_BUILD_BUILD_DIR",
-            output_build.as_os_str(),
-        );
-        if mode == CachedNextestMode::Coverage {
-            environment.extend(llvm_cov_build_environment(
+    // Named rather than inline so the retry loop below can run it twice.
+    let produce =
+        |stable: &crate::nextest_artifact_cache::StableCargoSource,
+         stable_build: &crate::nextest_artifact_cache::StableCargoBuild| {
+            let stable_invocation_dir = stable.invocation_root.clone();
+            let build_args = stable.remap_cargo_args(build_args);
+            let build_args = remap_cached_build_paths(
+                &build_args,
+                metadata.workspace_root.as_std_path(),
+                &invocation_dir,
+                &stable.workspace_root,
+            );
+            let llvm_cov_environment_args = stable.remap_cargo_args(llvm_cov_environment_args);
+            let llvm_cov_environment_args = remap_cached_build_paths(
+                &llvm_cov_environment_args,
+                metadata.workspace_root.as_std_path(),
+                &invocation_dir,
+                &stable.workspace_root,
+            );
+            let output_target = &stable_build.target_directory;
+            // Cargo builds dependency objects, fingerprints, and build-script
+            // OUT_DIRs into a persistent directory shared across source digests of
+            // the same non-source bucket, so unchanged dependencies are not
+            // recompiled and OUT_DIR stays stable for sccache. Final artifacts still
+            // land in the per-source, sealed target directory. `capture_source`
+            // snapshots this build directory into the per-source materialized tree
+            // (under the build-dir lease held below), so nextest's build-dir-remap
+            // still resolves each test binary's OUT_DIR at execution time.
+            let output_build = shared_build_dir.clone();
+            let build_args = remap_nextest_store_output(
+                &build_args,
+                &stable.workspace_root,
                 &stable_invocation_dir,
                 output_target,
-                &output_build,
-                &llvm_cov_environment_args,
-                &producer_environment,
-            )?);
-        }
-        let metadata_command = cargo_metadata_command(
-            &stable_invocation_dir,
-            output_target,
-            &build_args,
-            &environment,
-        );
-        let command = nextest_binary_list_command(
-            &stable_invocation_dir,
-            output_target,
-            &build_args,
-            release,
-            &environment,
-        );
-        // Serialize every same-bucket producer on the shared build directory,
-        // then purge workspace members so this digest recompiles its own members
-        // (never stale-reusing another digest's), and hold the lease through the
-        // capture below which snapshots the shared directory. Acquisition order
-        // is always build-dir lease then target-dir lease (inside the call), so
-        // it composes with Cargo's own build-dir lock without deadlock.
-        let _shared_build_lease = acquire_cargo_build_output_lease(&shared_build_dir, cli_label)?;
-        stamp_shared_build_scratch_use(&shared_build_dir);
-        purge_shared_build_dir_workspace_members(&shared_build_dir, metadata)?;
-        run_reserved_build_output_pair_under_lease(
-            command,
-            metadata_command,
-            cli_label,
-            "nextest binary-only build with reusable artifact capture",
-            crate::reserved_build_progress::ReservedBuildOutputKind::Opaque,
-            output_target,
-            |output| {
-                let cargo_metadata = validate_nextest_producer_pair(output, cli_label)?;
-                let build = &output.primary;
-                if mode == CachedNextestMode::Coverage {
-                    let producer_profdata = compact_coverage_producer_profiles(
-                        &stable_invocation_dir,
-                        &environment,
-                        output_target,
-                    )?;
-                    let source =
-                        crate::nextest_artifact_cache::capture_source_with_producer_profdata(
+            )?;
+            let mut environment = producer_environment.clone();
+            set_or_replace_environment(
+                &mut environment,
+                "CARGO_BUILD_BUILD_DIR",
+                output_build.as_os_str(),
+            );
+            if mode == CachedNextestMode::Coverage {
+                environment.extend(llvm_cov_build_environment(
+                    &stable_invocation_dir,
+                    output_target,
+                    &output_build,
+                    &llvm_cov_environment_args,
+                    &producer_environment,
+                )?);
+            }
+            let metadata_command = cargo_metadata_command(
+                &stable_invocation_dir,
+                output_target,
+                &build_args,
+                &environment,
+            );
+            let command = nextest_binary_list_command(
+                &stable_invocation_dir,
+                output_target,
+                &build_args,
+                release,
+                &environment,
+            );
+            // Serialize every same-bucket producer on the shared build directory,
+            // then purge workspace members so this digest recompiles its own members
+            // (never stale-reusing another digest's), and hold the lease through the
+            // capture below which snapshots the shared directory. Acquisition order
+            // is always build-dir lease then target-dir lease (inside the call), so
+            // it composes with Cargo's own build-dir lock without deadlock.
+            let _shared_build_lease =
+                acquire_cargo_build_output_lease(&shared_build_dir, cli_label)?;
+            stamp_shared_build_scratch_use(&shared_build_dir);
+            purge_shared_build_dir_workspace_members(&shared_build_dir, metadata)?;
+            run_reserved_build_output_pair_under_lease(
+                command,
+                metadata_command,
+                cli_label,
+                "nextest binary-only build with reusable artifact capture",
+                crate::reserved_build_progress::ReservedBuildOutputKind::Opaque,
+                output_target,
+                |output| {
+                    let cargo_metadata = validate_nextest_producer_pair(output, cli_label)?;
+                    let build = &output.primary;
+                    if mode == CachedNextestMode::Coverage {
+                        let producer_profdata = compact_coverage_producer_profiles(
+                            &stable_invocation_dir,
+                            &environment,
+                            output_target,
+                        )?;
+                        let source =
+                            crate::nextest_artifact_cache::capture_source_with_producer_profdata(
+                                &build.stdout,
+                                &cargo_metadata,
+                                producer_profdata.as_deref(),
+                            )?;
+                        let cleanup = remove_cached_profraw_shards(output_target);
+                        if let Some(error) = cleanup.failure_message(output_target) {
+                            return Err(error);
+                        }
+                        Ok(source)
+                    } else {
+                        crate::nextest_artifact_cache::capture_source(
                             &build.stdout,
                             &cargo_metadata,
-                            producer_profdata.as_deref(),
-                        )?;
-                    let cleanup = remove_cached_profraw_shards(output_target);
-                    if let Some(error) = cleanup.failure_message(output_target) {
-                        return Err(error);
+                        )
                     }
-                    Ok(source)
-                } else {
-                    crate::nextest_artifact_cache::capture_source(&build.stdout, &cargo_metadata)
-                }
-            },
-        )
-    })?;
+                },
+            )
+        };
     // The test binaries resolve build-script `OUT_DIR` artifacts (notably the
     // compiled BPF `probe.o`) from this scratch bucket AT RUNTIME through
     // `env!("OUT_DIR")` absolute paths baked in at compile time — nextest's
     // build-dir remap redirects only runtime `OUT_DIR` env lookups, not baked
-    // literals, so the materialized tree does not cover them. The build's
-    // EXCLUSIVE lease was released when its closure returned; take a SHARED
-    // lease now and hand it to the artifacts so it is held for the entire
-    // nextest run. The pressure sweep and aged GC take a non-blocking EXCLUSIVE
-    // lease, which fails against this SHARED hold, so neither reclaims the
-    // bucket mid-run. Skip when the bucket is absent (a hit whose scratch was
-    // already reclaimed): there is nothing left to protect, and locking would
-    // only resurrect an empty directory. The bucket this run just built is
-    // present; a hit reuses the same deterministic bucket path when it survives.
-    if shared_build_dir.is_dir() {
+    // literals, so the materialized tree does not cover them. A closure whose
+    // bucket was reclaimed is therefore unusable, which is why the cache
+    // rejects such a record and rebuilds (see `IdentityPlan::load_or_build`).
+    //
+    // That check runs under the record lease, before this run holds the bucket,
+    // so re-check with the runtime lease in hand and rebuild once if the bucket
+    // was reclaimed in between. One retry is the bound: the rebuild repopulates
+    // the bucket under the exclusive build lease, and this run's own sweeps
+    // already exempt it.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let mut materialized = plan.load_or_build(cli_label, produce)?;
+        // The build's EXCLUSIVE lease was released when its closure returned;
+        // take a SHARED lease now and hand it to the artifacts so it is held for
+        // the entire nextest run. The pressure sweep and aged GC take a
+        // non-blocking EXCLUSIVE lease, which fails against this SHARED hold, so
+        // neither reclaims the bucket mid-run.
         let runtime_lease = acquire_cargo_build_output_lease_shared(&shared_build_dir, cli_label)?;
-        stamp_shared_build_scratch_use(&shared_build_dir);
-        materialized.set_runtime_bucket_lease(runtime_lease);
+        // Contents, not existence: acquiring the lease just created the
+        // directory if a sweep had removed it.
+        if shared_build_scratch_has_build_output(&shared_build_dir)
+            || attempts == BUCKET_REBUILD_ATTEMPTS
+        {
+            stamp_shared_build_scratch_use(&shared_build_dir);
+            materialized.set_runtime_bucket_lease(runtime_lease);
+            return Ok(materialized);
+        }
+        drop(runtime_lease);
+        tracing::info!(
+            bucket = %shared_build_dir.display(),
+            "rebuilding cached nextest artifacts whose shared build-scratch bucket was reclaimed",
+        );
     }
-    Ok(materialized)
 }
+
+/// How many times [`load_or_build_nextest_artifacts`] may produce a closure
+/// before accepting whatever shared build-scratch bucket it ends up with: one
+/// ordinary attempt plus one rebuild for a bucket reclaimed under it.
+const BUCKET_REBUILD_ATTEMPTS: u32 = 2;
 
 const NEXTEST_ARCHIVE_BINARIES_METADATA: &str = "target/nextest/binaries-metadata.json";
 const NEXTEST_ARCHIVE_METADATA_MAX_BYTES: u64 = 64 << 20;
@@ -5601,6 +5632,17 @@ fn write_shared_build_scratch_stamp(bucket: &std::path::Path) -> std::io::Result
         .truncate(false)
         .open(&stamp)?
         .set_modified(std::time::SystemTime::now())
+}
+
+/// Whether a shared build-scratch bucket still holds the build output the
+/// binaries compiled against it resolve at runtime.
+///
+/// Existence is not the question: taking the bucket's build-output lease
+/// creates the directory, so a lease holder always finds one. Both reclaimers
+/// remove the bucket whole, which leaves exactly this signature — an empty
+/// directory, or none at all.
+pub(crate) fn shared_build_scratch_has_build_output(bucket: &std::path::Path) -> bool {
+    std::fs::read_dir(bucket).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 /// Remove a reclaimed bucket together with its last-use stamp.
@@ -7802,6 +7844,39 @@ mod tests {
             !stamp.exists(),
             "reclaiming a bucket removes its last-use stamp",
         );
+    }
+
+    /// Why the post-lease re-check tests bucket contents rather than existence:
+    /// taking a bucket's build-output lease creates the directory, so asking
+    /// whether a reclaimed bucket exists answers itself.
+    #[test]
+    fn leasing_a_reclaimed_bucket_recreates_it_without_build_output() {
+        let temp = tempfile::tempdir().expect("scratch parent");
+        let parent = temp.path().join("shared-build-scratch-v1");
+        let lock_root = temp.path().join("locks");
+        std::fs::create_dir_all(&parent).unwrap();
+        let bucket = parent.join("aaaaaaaaaaaaaaaa");
+        assert!(!shared_build_scratch_has_build_output(&bucket));
+
+        let lease = acquire_cargo_build_output_lease_at_root(
+            &bucket,
+            &lock_root,
+            ktstr::flock::FlockMode::Shared,
+            "cargo ktstr",
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("lease a reclaimed bucket");
+        assert!(
+            bucket.is_dir() && !shared_build_scratch_has_build_output(&bucket),
+            "the lease resurrects the directory but not the build output in it",
+        );
+
+        std::fs::write(bucket.join("obj.o"), b"obj").unwrap();
+        assert!(
+            shared_build_scratch_has_build_output(&bucket),
+            "a bucket holding build output is usable",
+        );
+        drop(lease);
     }
 
     /// The sweep runs before the calling run takes its own bucket lease, so
