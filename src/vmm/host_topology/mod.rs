@@ -2814,15 +2814,6 @@ pub struct LlcPlan {
     /// spilled to nearest-by-distance neighbors), `mems`
     /// contains every node — not just the seed node's.
     pub mems: std::collections::BTreeSet<usize>,
-    /// Per-LLC discovery trail. Preserved through the lifetime of the
-    /// plan so error-formatting (via `acquire_llc_plan`'s final
-    /// fresh snapshot) and future `ktstr locks` rendering don't
-    /// re-probe `/proc/locks`. In-tree consumers currently re-read
-    /// the snapshot only on the TOCTOU failure path; the field is
-    /// kept populated so downstream tooling can inspect the
-    /// plan-at-acquire holder set without a second pass.
-    #[allow(dead_code)]
-    pub(crate) snapshot: Vec<LlcSnapshot>,
     /// RAII flock holders. Dropped when the plan goes out of scope,
     /// releasing each LLC's `LOCK_SH` in declared order.
     #[allow(dead_code)] // RAII only — Drop releases flocks, no reads.
@@ -3292,8 +3283,7 @@ fn try_acquire_llc_plan_locks_with_evidence(
 /// On
 /// success returns an [`LlcPlan`] holding the selected LLCs, their
 /// flattened CPUs (intersected with the calling process's allowed
-/// cpuset), the derived `mems` set, the diagnostic snapshot, and the
-/// RAII flock handles.
+/// cpuset), the derived `mems` set, and the RAII flock handles.
 ///
 /// `cpu_cap == None` means "reserve 30% of the allowed-CPU set" (see
 /// [`default_cpu_budget`]). `cpu_cap == Some(cap)` where
@@ -5137,7 +5127,6 @@ fn cargo_test_mode_llc_plan(topo: &HostTopology) -> Result<LlcPlan> {
         cpus: allowed,
         permits: Vec::new(),
         mems,
-        snapshot: Vec::new(),
         locks: protocol::Acquired::untracked(Vec::new()),
     })
 }
@@ -5650,11 +5639,9 @@ where
                         exact,
                         (
                             selected.clone(),
-                            snapshots.clone(),
                             locks,
                             selected_cpus.clone(),
                             permit_selection.cpu_permits.clone(),
-                            permit_selection.memory_permits.clone(),
                             selected_mems.clone(),
                         ),
                     )
@@ -5662,30 +5649,15 @@ where
             })?;
             return match activated {
                 Some(acquired) => {
-                    let ((selected, snapshots, cpus, cpu_permits, memory_permits, mems), locks) =
-                        acquired.split_map(
-                            |(
-                                selected,
-                                snapshots,
-                                locks,
-                                cpus,
-                                cpu_permits,
-                                memory_permits,
-                                mems,
-                            )| {
-                                (
-                                    (selected, snapshots, cpus, cpu_permits, memory_permits, mems),
-                                    locks,
-                                )
-                            },
-                        );
+                    let ((selected, cpus, cpu_permits, mems), locks) =
+                        acquired.split_map(|(selected, locks, cpus, cpu_permits, mems)| {
+                            ((selected, cpus, cpu_permits, mems), locks)
+                        });
                     Ok(materialize_llc_plan(
                         selected,
-                        snapshots,
                         locks,
                         cpus,
                         cpu_permits,
-                        memory_permits,
                         mems,
                     ))
                 }
@@ -5781,17 +5753,11 @@ where
         if let Some(locks) = acquired {
             let plan = materialize_llc_plan(
                 selected,
-                snapshots,
                 locks,
                 selected_cpus,
                 permit_selection
-                    .as_ref()
                     .expect("successful acquisition has permit selection")
-                    .cpu_permits
-                    .clone(),
-                permit_selection
-                    .expect("successful acquisition has permit selection")
-                    .memory_permits,
+                    .cpu_permits,
                 selected_mems,
             );
             return Ok(plan);
@@ -6056,8 +6022,7 @@ where
         let selected: Vec<usize> = designated.llcs.iter().copied().collect();
         let cpus: Vec<usize> = designated.cpus.iter().copied().collect();
         let permits: Vec<usize> = designated.permits.iter().copied().collect();
-        let (cpu_permits, memory_permits) =
-            split_vm_permits(permits.iter().copied(), memory_pool.as_ref());
+        let (cpu_permits, _) = split_vm_permits(permits.iter().copied(), memory_pool.as_ref());
         let designated_is_live = selected
             .iter()
             .all(|idx| snapshots.iter().any(|snapshot| snapshot.llc_idx == *idx));
@@ -6094,11 +6059,9 @@ where
                     } {
                         LlcLockAttempt::Acquired(locks) => protocol::ProbeOutcome::Acquired((
                             selected.clone(),
-                            snapshots.clone(),
                             locks,
                             cpus.clone(),
                             cpu_permits.clone(),
-                            memory_permits.clone(),
                         )),
                         LlcLockAttempt::Contended(evidence) => {
                             protocol::ProbeOutcome::Contended(evidence)
@@ -6268,11 +6231,9 @@ where
                     } {
                         LlcLockAttempt::Acquired(locks) => protocol::ProbeOutcome::Acquired((
                             next_selected.clone(),
-                            snapshots.clone(),
                             locks,
                             next_cpus.clone(),
                             next_permits.cpu_permits.clone(),
-                            next_permits.memory_permits.clone(),
                         )),
                         LlcLockAttempt::Contended(evidence) => {
                             protocol::ProbeOutcome::Contended(evidence)
@@ -6304,25 +6265,12 @@ where
     };
     let coordinator = match ticket {
         protocol::TicketWork::Acquired(acquired) => {
-            let ((selected, snapshots, cpus, cpu_permits, memory_permits), locks) = acquired
-                .split_map(
-                    |(selected, snapshots, locks, cpus, cpu_permits, memory_permits)| {
-                        (
-                            (selected, snapshots, cpus, cpu_permits, memory_permits),
-                            locks,
-                        )
-                    },
-                );
+            let ((selected, cpus, cpu_permits), locks) =
+                acquired.split_map(|(selected, locks, cpus, cpu_permits)| {
+                    ((selected, cpus, cpu_permits), locks)
+                });
             let mems = plan_mems(&cpus, topo);
-            let plan = materialize_llc_plan(
-                selected,
-                snapshots,
-                locks,
-                cpus,
-                cpu_permits,
-                memory_permits,
-                mems,
-            );
+            let plan = materialize_llc_plan(selected, locks, cpus, cpu_permits, mems);
             return Ok(plan);
         }
         protocol::TicketWork::Coordinator(coordinator) => coordinator,
@@ -6441,8 +6389,7 @@ where
         let selected: Vec<usize> = coordinator_claim.llcs.iter().copied().collect();
         let cpus: Vec<usize> = coordinator_claim.cpus.iter().copied().collect();
         let permits: Vec<usize> = coordinator_claim.permits.iter().copied().collect();
-        let (cpu_permits, memory_permits) =
-            split_vm_permits(permits.iter().copied(), memory_pool.as_ref());
+        let (cpu_permits, _) = split_vm_permits(permits.iter().copied(), memory_pool.as_ref());
         match sizing {
             LlcPlanSizing::Exact => debug_assert_eq!(cpus.len(), target_cpus),
             LlcPlanSizing::Elastic => {
@@ -6460,15 +6407,7 @@ where
         if let Some(locks) = held.probe_complete_if_ready(&coordinator_claim, &target)? {
             Ok(protocol::CoordinatorStep::Complete {
                 claim: coordinator_claim.clone(),
-                value: (
-                    selected,
-                    snapshots,
-                    locks,
-                    cpus,
-                    cpu_permits,
-                    memory_permits,
-                    mems,
-                ),
+                value: (selected, locks, cpus, cpu_permits, mems),
             })
         } else {
             Ok(protocol::CoordinatorStep::Waiting {
@@ -6482,22 +6421,15 @@ where
     };
     match outcome {
         protocol::CoordinatorOutcome::Acquired(acquired) => {
-            let ((selected, snapshots, cpus, cpu_permits, memory_permits, mems), locks) = acquired
-                .split_map(
-                    |(selected, snapshots, locks, cpus, cpu_permits, memory_permits, mems)| {
-                        (
-                            (selected, snapshots, cpus, cpu_permits, memory_permits, mems),
-                            locks,
-                        )
-                    },
-                );
+            let ((selected, cpus, cpu_permits, mems), locks) =
+                acquired.split_map(|(selected, locks, cpus, cpu_permits, mems)| {
+                    ((selected, cpus, cpu_permits, mems), locks)
+                });
             Ok(materialize_llc_plan(
                 selected,
-                snapshots,
                 locks,
                 cpus,
                 cpu_permits,
-                memory_permits,
                 mems,
             ))
         }
@@ -6598,10 +6530,8 @@ pub fn plan_llc_selection_only(
     };
     Ok(materialize_llc_plan(
         selected,
-        snapshots,
         protocol::Acquired::untracked(Vec::new()),
         cpus,
-        Vec::new(),
         Vec::new(),
         mems,
     ))
@@ -6806,11 +6736,9 @@ fn plan_mems(cpus: &[usize], topo: &HostTopology) -> std::collections::BTreeSet<
 
 fn materialize_llc_plan(
     selected: Vec<usize>,
-    snapshots: Vec<LlcSnapshot>,
     locks: protocol::Acquired<Vec<protocol::AdmissionFlock>>,
     cpus: Vec<usize>,
     permits: Vec<usize>,
-    _memory_permits: Vec<usize>,
     mems: std::collections::BTreeSet<usize>,
 ) -> LlcPlan {
     LlcPlan {
@@ -6818,7 +6746,6 @@ fn materialize_llc_plan(
         cpus,
         permits,
         mems,
-        snapshot: snapshots,
         locks,
     }
 }

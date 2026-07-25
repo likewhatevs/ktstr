@@ -624,7 +624,6 @@ fn make_jobs_for_plan_matches_cpu_count() {
         cpus: vec![0, 1, 2, 3],
         permits: Vec::new(),
         mems: std::collections::BTreeSet::new(),
-        snapshot: Vec::new(),
         locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     assert_eq!(make_jobs_for_plan(&plan), 4);
@@ -641,7 +640,6 @@ fn make_jobs_for_plan_empty_cpus_floors_to_one() {
         cpus: Vec::new(),
         permits: Vec::new(),
         mems: std::collections::BTreeSet::new(),
-        snapshot: Vec::new(),
         locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     assert_eq!(
@@ -756,7 +754,6 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
         cpus: vec![0, 1],
         permits: Vec::new(),
         mems: [0usize, 1].into_iter().collect(),
-        snapshot: Vec::new(),
         locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     let msg = cross_node_spill_warning(&multi_plan, &topo)
@@ -788,7 +785,6 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
         cpus: vec![0],
         permits: Vec::new(),
         mems: [0usize].into_iter().collect(),
-        snapshot: Vec::new(),
         locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     assert!(
