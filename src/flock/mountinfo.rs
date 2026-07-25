@@ -35,11 +35,8 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 /// Read `/proc/self/mountinfo` once. Callers that need to derive
-/// needles for multiple lockfiles in a single pass (e.g.
-/// `acquire_llc_plan`'s DISCOVER phase, which visits every host
-/// LLC's lockfile on every DISCOVER attempt) read mountinfo via
-/// this helper once per batch and hand the resulting `String` to
-/// [`super::proc_locks::read_holders_batch_with_mountinfo`] /
+/// needles for multiple lockfiles in a single pass read mountinfo via
+/// this helper once and hand the resulting `String` to
 /// [`needle_from_path_with_mountinfo`].
 ///
 /// One-shot callers ([`needle_from_path`],

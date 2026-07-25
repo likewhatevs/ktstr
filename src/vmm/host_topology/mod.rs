@@ -2753,8 +2753,9 @@ impl CpuSelectionPolicy {
     }
 }
 
-/// Per-LLC discover snapshot: identity + current holder set.
-/// Constructed by [`discover_llc_snapshots`] before the PLAN phase.
+/// Per-LLC discover snapshot: identity + registered holder occupancy.
+/// Constructed by [`discover_registered_placement_states`] before the PLAN
+/// phase.
 /// `pub(crate)` so the in-crate PLAN pipeline and this module's tests
 /// can construct and inspect it; the `ktstr locks` observational
 /// command shares only [`crate::flock::HolderInfo`], not this
@@ -2763,13 +2764,9 @@ impl CpuSelectionPolicy {
 pub(crate) struct LlcSnapshot {
     /// Host LLC index — matches [`HostTopology::llc_groups`] ordering.
     pub(crate) llc_idx: usize,
-    /// Processes currently holding this LLC's flock (any mode). Empty
-    /// when no peer holds the lock. Derived from a single `/proc/locks`
-    /// read shared across every LLC in the discover phase.
-    pub(crate) holders: Vec<crate::flock::HolderInfo>,
-    /// Count of holder PIDs other than this process, cached for PLAN scoring.
-    /// Count-only discovery deliberately leaves `holders` empty, so this is
-    /// not derived from `holders.len()`.
+    /// Count of registered holder claims other than this process, cached for
+    /// PLAN scoring. Derived from the admission registry aggregate, not from a
+    /// `/proc/locks` walk.
     pub(crate) holder_count: usize,
     /// Whether `/proc/locks` observed an incompatible `LOCK_EX` holder.
     /// Advisory planning excludes these LLCs when a complete ready
@@ -2849,121 +2846,6 @@ const TOCTOU_RETRY_DELAYS: [std::time::Duration; ACQUIRE_MAX_TOCTOU_RETRIES as u
     std::time::Duration::from_millis(200),
 ];
 
-/// `/proc/locks` is a live seq-file rather than an atomic snapshot. Retry-
-/// exhausted diagnostics may therefore need a few independent reads to
-/// attribute a stable holder which the authoritative flock probe already
-/// observed. This budget is deliberately failure-only: successful admission
-/// and the bounded TOCTOU retry loop pay none of it.
-const HOLDER_DIAGNOSTIC_MAX_SAMPLES: usize = 4;
-const HOLDER_DIAGNOSTIC_RESCAN_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
-const HOLDER_DIAGNOSTIC_RESCAN_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
-
-fn holder_snapshot_covers_expected_llcs(
-    snapshots: &[LlcSnapshot],
-    expected_llcs: &std::collections::BTreeSet<usize>,
-) -> bool {
-    expected_llcs.iter().all(|expected| {
-        snapshots
-            .iter()
-            .find(|snapshot| snapshot.llc_idx == *expected)
-            .is_some_and(|snapshot| !snapshot.holders.is_empty())
-    })
-}
-
-fn retry_exhausted_holder_snapshots_with<Scan, Wait>(
-    expected_llcs: &std::collections::BTreeSet<usize>,
-    max_samples: usize,
-    mut scan: Scan,
-    mut wait_for_rescan: Wait,
-) -> Result<Vec<LlcSnapshot>>
-where
-    Scan: FnMut() -> Result<Vec<LlcSnapshot>>,
-    Wait: FnMut(usize) -> bool,
-{
-    anyhow::ensure!(max_samples > 0, "holder diagnostic sample budget is zero");
-    let mut snapshots = scan()?;
-    let mut completed_samples = 1usize;
-    while !holder_snapshot_covers_expected_llcs(&snapshots, expected_llcs)
-        && completed_samples < max_samples
-        && wait_for_rescan(completed_samples)
-    {
-        snapshots = scan()?;
-        completed_samples += 1;
-    }
-    Ok(snapshots)
-}
-
-fn retry_exhausted_holder_snapshots(
-    topo: &HostTopology,
-    allowed: &std::collections::BTreeSet<usize>,
-    mountinfo: &str,
-    expected_llcs: &std::collections::BTreeSet<usize>,
-) -> Result<Vec<LlcSnapshot>> {
-    let mut deadline = None;
-    retry_exhausted_holder_snapshots_with(
-        expected_llcs,
-        HOLDER_DIAGNOSTIC_MAX_SAMPLES,
-        || discover_llc_snapshots(topo, allowed, mountinfo),
-        |_| {
-            let deadline = *deadline
-                .get_or_insert_with(|| std::time::Instant::now() + HOLDER_DIAGNOSTIC_RESCAN_WINDOW);
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            std::thread::sleep(HOLDER_DIAGNOSTIC_RESCAN_DELAY.min(deadline - now));
-            true
-        },
-    )
-}
-
-/// DISCOVER phase — read-only LLC snapshot.
-///
-/// Walks ONLY the LLCs whose CPUs overlap `allowed` (the calling
-/// process's `sched_getaffinity` cpuset). LLCs entirely outside the
-/// cpuset are skipped — locking one would never contribute a
-/// schedulable CPU to `plan.cpus`, and on a heavily-pinned runner
-/// (CI cgroup with N out of M CPUs allowed) skipping them avoids
-/// O(host_llcs - allowed_llcs) lockfile materializations and
-/// /proc/locks lookups per attempt. The PLAN phase still receives a
-/// snapshot vector indexed by `LlcSnapshot.llc_idx`, not by
-/// position, so a sparse snapshot set works without any further
-/// adjustment downstream.
-///
-/// For every selected LLC: stat the canonical lockfile (materializing
-/// it with `O_CREAT | O_CLOEXEC | 0o666` if absent so subsequent
-/// ACQUIRE has a stable inode), then parse one `/proc/locks` read to
-/// populate every snapshot's holder list in a single pass. No flock
-/// acquires — DISCOVER never contends.
-///
-/// `mountinfo` is the `/proc/self/mountinfo` text read once per
-/// `acquire_llc_plan` invocation at [`acquire_llc_plan_impl`]
-/// and threaded through here so a host with N LLCs pays for exactly
-/// one mountinfo read per DISCOVER pass (DISCOVER runs once per retry
-/// attempt — up to ACQUIRE_MAX_TOCTOU_RETRIES+1 — plus once on the
-/// retry-exhausted diagnostic path, up to 5 passes, hence caching at
-/// the plan level rather than per snapshot walk).
-///
-/// Returns `Ok(snapshots)` on success. Propagates opening + stat
-/// errors so a missing `/tmp` or permission failure surfaces
-/// actionably.
-fn discover_llc_snapshots(
-    topo: &HostTopology,
-    allowed: &std::collections::BTreeSet<usize>,
-    mountinfo: &str,
-) -> Result<Vec<LlcSnapshot>> {
-    discover_llc_snapshots_impl(topo, allowed, mountinfo, true)
-}
-
-#[cfg(test)]
-fn discover_llc_snapshot_counts(
-    topo: &HostTopology,
-    allowed: &std::collections::BTreeSet<usize>,
-    mountinfo: &str,
-) -> Result<Vec<LlcSnapshot>> {
-    discover_llc_snapshots_impl(topo, allowed, mountinfo, false)
-}
-
 /// Read the current-version admission registry once and derive every
 /// placement score from that one coherent image.
 ///
@@ -3003,7 +2885,6 @@ fn discover_registered_placement_states(
         .map(|llc_idx| {
             Ok(LlcSnapshot {
                 llc_idx,
-                holders: Vec::new(),
                 holder_count: aggregate.llc_holder_count(llc_idx)?,
                 exclusive_held: aggregate.llc_exclusive_held(llc_idx)?,
             })
@@ -3023,132 +2904,6 @@ fn discover_registered_placement_states(
         })
         .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
     Ok((snapshots, cpu_states, aggregate))
-}
-
-fn discover_llc_snapshots_impl(
-    topo: &HostTopology,
-    allowed: &std::collections::BTreeSet<usize>,
-    mountinfo: &str,
-    enrich_holders: bool,
-) -> Result<Vec<LlcSnapshot>> {
-    let mut paths = Vec::with_capacity(topo.llc_groups.len());
-    for llc_idx in 0..topo.llc_groups.len() {
-        // Skip LLCs whose CPUs are entirely outside the calling
-        // process's allowed cpuset — they cannot contribute a
-        // schedulable CPU to `plan.cpus`, and locking one would just
-        // pay for a lockfile + /proc/locks pass without coordination
-        // value. The sparse snapshot vector keeps llc_idx as the
-        // identity key, so PLAN's index-based iteration is
-        // unaffected.
-        if !topo.llc_groups[llc_idx]
-            .cpus
-            .iter()
-            .any(|c| allowed.contains(c))
-        {
-            continue;
-        }
-        let path = std::path::PathBuf::from(llc_lock_path(llc_idx));
-        // Existing files need only a metadata lookup. Opening every inode
-        // O_RDWR during DISCOVER manufactures IN_CLOSE_WRITE traffic on the
-        // coordinator's resource watch, so materialize only the genuinely
-        // missing paths.
-        match std::fs::metadata(&path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                crate::flock::materialize(&path)?;
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect LLC reservation lock {}", path.display()));
-            }
-        }
-        paths.push((llc_idx, path));
-    }
-
-    // Compatibility mode plus holder PID counts come from one /proc/locks
-    // scan. The observation is advisory: on locked-down hosts, exact flock
-    // acquisition remains authoritative and placement falls back to a
-    // zero-holder view.
-    //
-    // The grant-flow diagnostic times this DISCOVER scan and records the
-    // `/proc/locks` line count it parsed — the environmental (host-wide flock
-    // storm) signal. Gated so a disabled sink reads no clock.
-    let discover_timer = crate::vmm::grant_flow::enabled().then(std::time::Instant::now);
-    let states = match crate::flock::read_flock_states_batch_with_mountinfo(
-        paths.iter().map(|(_, path)| path.as_path()),
-        mountinfo,
-    ) {
-        Ok(states) => states,
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "cannot observe LLC flock holders; planning with unknown holder state"
-            );
-            vec![crate::flock::FlockResourceState::default(); paths.len()]
-        }
-    };
-    if let Some(timer) = discover_timer {
-        let elapsed_ns = timer.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
-        crate::vmm::grant_flow::note_discover(elapsed_ns, crate::flock::last_proc_locks_lines());
-    }
-    // Full HolderInfo/cmdline enrichment is reserved for explicit
-    // diagnostics. Normal storm placement avoids one /proc/<pid>/cmdline read
-    // per holder.
-    let enriched = if enrich_holders {
-        Some(
-            match crate::flock::proc_locks::read_holders_batch_with_mountinfo(
-                paths.iter().map(|(_, path)| path.as_path()),
-                mountinfo,
-            ) {
-                Ok(holders) => holders,
-                Err(error) => {
-                    tracing::debug!(
-                        %error,
-                        "cannot attribute LLC flock holders; planning with empty holder snapshots"
-                    );
-                    (0..paths.len()).map(|_| Vec::new()).collect()
-                }
-            },
-        )
-    } else {
-        None
-    };
-    if states.len() != paths.len()
-        || enriched
-            .as_ref()
-            .is_some_and(|holders| holders.len() != paths.len())
-    {
-        anyhow::bail!(
-            "batched LLC holder snapshot returned {} state rows for {} lockfiles",
-            states.len(),
-            paths.len()
-        );
-    }
-
-    let mut snapshots = Vec::with_capacity(paths.len());
-    for (row, (llc_idx, _)) in paths.into_iter().enumerate() {
-        // Exclude the calling process from the PLAN-driving holder count.
-        // A process may already own a related probe or another run plan;
-        // treating that as peer load would make Spread flee its own claim.
-        // The full `holders` vec is kept intact for diagnostics /
-        // `ktstr locks`; only the sort key drops self.
-        let holder_count = states[row]
-            .holder_pids
-            .iter()
-            .filter(|pid| **pid != std::process::id())
-            .count();
-        let holders = enriched
-            .as_ref()
-            .map(|holders| holders[row].clone())
-            .unwrap_or_default();
-        snapshots.push(LlcSnapshot {
-            llc_idx,
-            holders,
-            holder_count,
-            exclusive_held: states[row].summary.exclusive_holder,
-        });
-    }
-    Ok(snapshots)
 }
 
 /// PLAN phase — NUMA-aware placement over discover snapshots.
@@ -5977,14 +5732,19 @@ where
     }
 
     if !wait {
-        // Rebuild holder diagnostics from a FRESH read so the error
-        // points at the peer that actually won. `/proc/locks` is a live
-        // seq-file, so an authoritative physical-contention marker whose
-        // holder is absent from one image gets a bounded failure-only rescan.
-        let mountinfo = crate::flock::read_mountinfo().map_err(|e| ResourceContention {
-            reason: format!("read /proc/self/mountinfo for holder diagnostics: {e}"),
-        })?;
-        let expected_holder_llcs = contention
+        // Name the contended LLCs WITHOUT a host-global `/proc/locks` walk.
+        // That seq-file read is O(host-wide flocks): a ~12k-entry `/proc/locks`
+        // costs ~7ms to read alone but ~180ms+ under concurrent readers because
+        // it serializes on the kernel lock-table lock, so under a many-lane
+        // flock storm every such diagnostic read poisons every peer's flock
+        // ops. Instead probe only the contended LLC lock files with a
+        // non-blocking flock: `None` means a peer holds it, `Some(fd)` means it
+        // is free (the transient probe fd is released immediately by RAII, so a
+        // free LLC is never held open). This is O(contended-LLCs) syscalls with
+        // no seq-file walk; holder identity moves to the `ktstr locks --json`
+        // pointer, and exact flock acquisition above stays authoritative.
+        let diag_timer = crate::vmm::grant_flow::enabled().then(std::time::Instant::now);
+        let contended_llcs = contention
             .marker_vec()
             .into_iter()
             .filter_map(|marker| match marker.blocker {
@@ -5992,28 +5752,34 @@ where
                 protocol::ResourceKey::Cpu(_) | protocol::ResourceKey::Permit(_) => None,
             })
             .collect::<std::collections::BTreeSet<_>>();
-        let final_snapshots =
-            retry_exhausted_holder_snapshots(topo, &allowed, &mountinfo, &expected_holder_llcs)?;
-        let holders: Vec<String> = final_snapshots
-            .iter()
-            .filter(|s| !s.holders.is_empty())
-            .map(|s| {
-                format!(
-                    "LLC {}: {}",
-                    s.llc_idx,
-                    crate::flock::format_holder_list(&s.holders)
+        let held_llcs = contended_llcs
+            .into_iter()
+            .filter(|&llc| {
+                // A held LLC rejects a non-blocking EX probe (`None`); a free
+                // one is momentarily acquired and released as the fd drops. A
+                // probe error is treated as "not observably held".
+                crate::flock::try_flock(
+                    std::path::Path::new(&llc_lock_path(llc)),
+                    FlockMode::Exclusive,
                 )
+                .map(|acquired| acquired.is_none())
+                .unwrap_or(false)
             })
-            .collect();
-        let holder_text = if holders.is_empty() {
-            "<none recorded>".to_string()
+            .map(|llc| format!("LLC {llc}"))
+            .collect::<Vec<_>>();
+        if let Some(timer) = diag_timer {
+            let elapsed_ns = timer.elapsed().as_nanos().try_into().unwrap_or(u64::MAX);
+            crate::vmm::grant_flow::note_discover(elapsed_ns);
+        }
+        let holder_text = if held_llcs.is_empty() {
+            "<none currently held>".to_string()
         } else {
-            holders.join("; ")
+            format!("{} held", held_llcs.join(", "))
         };
         return Err(anyhow::Error::new(ResourceContention {
             reason: format!(
                 "acquire_llc_plan: could not reserve {target_cpus} \
-                 CPU(s) after {attempts} attempts; holders: \
+                 CPU(s) after {attempts} attempts; contended: \
                  {holder_text}. Run `ktstr locks --json` to see \
                  every ktstr lock on this host.",
                 attempts = ACQUIRE_MAX_TOCTOU_RETRIES + 1,
@@ -6684,7 +6450,6 @@ pub fn plan_llc_selection_only(
         .filter(|(_, group)| group.cpus.iter().any(|cpu| allowed.contains(cpu)))
         .map(|(llc_idx, _)| LlcSnapshot {
             llc_idx,
-            holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         })

@@ -3,67 +3,6 @@ use super::super::*;
 use super::*;
 use crate::vmm::topology::Topology;
 
-/// Own a test helper and the fresh process group it leads.
-///
-/// Several placement tests use `flock(1) ... sleep` as a real peer process.
-/// Keeping cleanup in the test tail leaks that peer when an assertion panics;
-/// nextest may retry the test successfully, but the original `flock` then
-/// survives the test binary and keeps cargo-ktstr's owned-child wait alive.
-/// This guard makes both the normal and unwind paths kill the complete group
-/// and reap its leader.
-#[must_use = "dropping the guard is what kills and reaps the test process group"]
-struct ProcessGroupChild {
-    child: Option<std::process::Child>,
-    pgid: nix::unistd::Pid,
-}
-
-impl ProcessGroupChild {
-    fn spawn(command: &mut std::process::Command) -> std::io::Result<Self> {
-        use std::os::unix::process::CommandExt as _;
-
-        let mut child = command.process_group(0).spawn()?;
-        let Some(pgid) = libc::pid_t::try_from(child.id())
-            .ok()
-            .filter(|&pid| pid > 0)
-            .map(nix::unistd::Pid::from_raw)
-        else {
-            let _ = child.kill();
-            loop {
-                match child.wait() {
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    _ => break,
-                }
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "spawned child pid cannot name a safe process group",
-            ));
-        };
-        Ok(Self {
-            child: Some(child),
-            pgid,
-        })
-    }
-}
-
-impl Drop for ProcessGroupChild {
-    fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        let _ = nix::sys::signal::killpg(self.pgid, nix::sys::signal::Signal::SIGKILL);
-        // The leader fallback also makes a surprising process-group setup
-        // failure bounded instead of turning Drop into a 300-second wait.
-        let _ = child.kill();
-        loop {
-            match child.wait() {
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                _ => break,
-            }
-        }
-    }
-}
-
 /// `CpuCap::new(1)` succeeds — minimum legal cap.
 #[test]
 fn cpu_cap_new_accepts_one() {
@@ -371,7 +310,6 @@ fn plan_from_snapshots_returns_ascending_indices() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            holders: Vec::new(),
             holder_count: if idx >= 2 { 5 } else { 0 },
             exclusive_held: false,
         })
@@ -405,7 +343,6 @@ fn plan_from_snapshots_target_ge_all_selects_every_llc() {
     let snapshots: Vec<LlcSnapshot> = (0..3)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         })
@@ -442,7 +379,6 @@ fn plan_from_snapshots_sparse_saturation_preserves_llc_indices() {
         .into_iter()
         .map(|llc_idx| LlcSnapshot {
             llc_idx,
-            holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         })
@@ -470,7 +406,6 @@ fn plan_from_snapshots_target_zero_returns_empty() {
     let topo = synth_host_topo(&[(vec![0], 0)]);
     let snapshots: Vec<LlcSnapshot> = vec![LlcSnapshot {
         llc_idx: 0,
-        holders: Vec::new(),
         holder_count: 0,
         exclusive_held: false,
     }];
@@ -492,7 +427,6 @@ fn overlapping_llc_groups_materialize_a_distinct_cpu_budget() {
     let snapshots = (0..2)
         .map(|llc_idx| LlcSnapshot {
             llc_idx,
-            holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         })
@@ -583,13 +517,11 @@ fn plan_from_snapshots_prefers_higher_holder_count() {
     let snapshots: Vec<LlcSnapshot> = vec![
         LlcSnapshot {
             llc_idx: 0,
-            holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         },
         LlcSnapshot {
             llc_idx: 1,
-            holders: Vec::new(),
             holder_count: 5,
             exclusive_held: false,
         },
@@ -627,25 +559,21 @@ fn plan_from_snapshots_always_ascending_across_target_range() {
     let snapshots: Vec<LlcSnapshot> = vec![
         LlcSnapshot {
             llc_idx: 0,
-            holders: Vec::new(),
             holder_count: 3,
             exclusive_held: false,
         },
         LlcSnapshot {
             llc_idx: 1,
-            holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         },
         LlcSnapshot {
             llc_idx: 2,
-            holders: Vec::new(),
             holder_count: 7,
             exclusive_held: false,
         },
         LlcSnapshot {
             llc_idx: 3,
-            holders: Vec::new(),
             holder_count: 1,
             exclusive_held: false,
         },
@@ -930,307 +858,6 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
 
     drop(plan);
     drop(peer);
-}
-
-#[test]
-fn acquire_llc_plan_skips_an_exclusive_held_llc_when_a_ready_alternative_exists() {
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
-    let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
-    let peer_path = llc_lock_path(1);
-    crate::flock::materialize(&peer_path).expect("materialize peer EX lockfile");
-    let child = ProcessGroupChild::spawn(
-        std::process::Command::new("flock").args(["-x", "-n", &peer_path, "sleep", "300"]),
-    );
-    let peer = match child {
-        Ok(child) => child,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "acquire_llc_plan_skips_an_exclusive_held_llc_when_a_ready_alternative_exists: \
-                 flock(1) not available, skipping ({error})"
-            );
-            return;
-        }
-        Err(error) => panic!("spawn flock(1): {error}"),
-    };
-    let allowed: std::collections::BTreeSet<usize> = [0usize, 1].into_iter().collect();
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let peer_seen = loop {
-        let snapshots =
-            discover_llc_snapshot_counts(&topo, &allowed, &mountinfo).expect("discover EX peer");
-        if snapshots
-            .iter()
-            .find(|snapshot| snapshot.llc_idx == 1)
-            .is_some_and(|snapshot| snapshot.exclusive_held)
-        {
-            break true;
-        }
-        if std::time::Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    let test_topo = crate::topology::TestTopology::synthetic(2, 1);
-    let plan = peer_seen.then(|| {
-        acquire_llc_plan_interruptible(
-            &topo,
-            &test_topo,
-            CpuCap::new(1).ok(),
-            PlacementPolicy::Consolidate,
-            false,
-            None,
-            None,
-            None,
-        )
-    });
-    drop(peer);
-    assert!(peer_seen, "peer LLC EX hold did not become observable");
-    let plan = plan
-        .expect("peer was visible, so acquisition was attempted")
-        .expect("the free LLC must be selected without waiting");
-    assert_eq!(
-        plan.locked_llcs,
-        vec![0],
-        "Consolidate must not mistake an incompatible EX holder for compatible occupancy",
-    );
-}
-
-/// `discover_llc_snapshots` EXCLUDES the calling process from the
-/// PLAN-driving `holder_count`, but keeps it in the diagnostic
-/// `holders` vec — while a PEER process's hold DOES count.
-///
-/// A process can already own a related probe or a second run plan.
-/// If `holder_count` counted that self-owned fd, Spread — which
-/// prefers the least-held LLCs — would treat its own claim as peer
-/// pressure. This test holds `LOCK_SH` on LLC 0 from the test PROCESS
-/// and on LLC 1 from a `flock(1)` CHILD, then asserts LLC 0's
-/// `holder_count` is 0 (self excluded) with self still in the
-/// `holders` vec, and LLC 1's `holder_count` is 1 (the peer counts).
-///
-/// Uses `flock(1)` for the peer so the holder is a genuinely
-/// different pid; absent util-linux the test skips rather than fails
-/// (same convention as
-/// `acquire_llc_plan_skips_an_exclusive_held_llc_when_a_ready_alternative_exists`).
-#[test]
-fn discover_excludes_self_pid_from_holder_count() {
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    // 2 LLCs on the same node; both CPUs in `allowed` so neither LLC
-    // is skipped by discover's allowed-overlap filter.
-    let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
-    let allowed: std::collections::BTreeSet<usize> = [0usize, 1].into_iter().collect();
-
-    // Self-hold SH on LLC 0 from this process/thread.
-    let self_lock_path = llc_lock_path(0);
-    crate::flock::materialize(&self_lock_path).expect("materialize self lockfile");
-    let _self_hold = try_flock(&self_lock_path, FlockMode::Shared)
-        .expect("open self lockfile")
-        .expect("self SH on a fresh LLC 0 lockfile must succeed");
-
-    // Peer child holds SH on LLC 1 via flock(1). Materialize first so
-    // the child opens the same inode the parent's discover stats.
-    let peer_lock_path = llc_lock_path(1);
-    crate::flock::materialize(&peer_lock_path).expect("materialize peer lockfile");
-    // Lead a fresh process group so the guard reaches `flock`'s `sleep`
-    // grandchild too, not just `flock` (mirrors the make(1) spawn+killpg
-    // pattern in cli::kernel_build::make).
-    let child = ProcessGroupChild::spawn(std::process::Command::new("flock").args([
-        "-s",
-        "-n",
-        &peer_lock_path,
-        "sleep",
-        "300",
-    ]));
-    let peer = match child {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "discover_excludes_self_pid_from_holder_count: \
-                 flock(1) not available, skipping ({e})"
-            );
-            return;
-        }
-        Err(e) => panic!("spawn flock(1): {e}"),
-    };
-    // The peer child must be SCHEDULED and take its LOCK_SH before we
-    // stat /proc/locks. A fixed sleep races that acquisition on a loaded
-    // host — a freshly spawned process can sit unscheduled far longer
-    // than any guessed delay — so poll discover until the peer's hold is
-    // visible instead of assuming a fixed settle time. The child holds
-    // for the poll's whole lifetime (killed below), so the observation
-    // window can never fall outside the peer's hold.
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let self_pid = std::process::id();
-    let snapshots = loop {
-        let snaps =
-            discover_llc_snapshots(&topo, &allowed, &mountinfo).expect("discover must succeed");
-        // `/proc/locks` is a live seq-file, not an atomic image. Under a lock
-        // storm one traversal can see the new peer while momentarily omitting
-        // the stable self hold. Accept only a single traversal containing both
-        // facts this test asserts so a retry cannot leak through a half-image.
-        let self_seen = snaps
-            .iter()
-            .find(|snapshot| snapshot.llc_idx == 0)
-            .is_some_and(|snapshot| {
-                snapshot.holder_count == 0
-                    && snapshot.holders.iter().any(|holder| holder.pid == self_pid)
-            });
-        let peer_seen = snaps
-            .iter()
-            .find(|snapshot| snapshot.llc_idx == 1)
-            .is_some_and(|snapshot| snapshot.holder_count == 1);
-        if (self_seen && peer_seen) || std::time::Instant::now() >= deadline {
-            break snaps;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    drop(peer);
-
-    let llc0 = snapshots
-        .iter()
-        .find(|s| s.llc_idx == 0)
-        .expect("LLC 0 snapshot present");
-    let llc1 = snapshots
-        .iter()
-        .find(|s| s.llc_idx == 1)
-        .expect("LLC 1 snapshot present");
-
-    assert!(
-        llc0.holders.iter().any(|h| h.pid == self_pid),
-        "self must remain in the diagnostic holders vec for LLC 0; \
-         holders={:?}",
-        llc0.holders,
-    );
-    assert_eq!(
-        llc0.holder_count, 0,
-        "self-held SH must be EXCLUDED from LLC 0's holder_count (got \
-         {}, holders={:?})",
-        llc0.holder_count, llc0.holders,
-    );
-    assert!(
-        !llc0.exclusive_held,
-        "self-held SH remains compatible with another SH requester",
-    );
-    assert_eq!(
-        llc1.holder_count, 1,
-        "a peer process's SH must COUNT toward LLC 1's holder_count \
-         (got {}, holders={:?})",
-        llc1.holder_count, llc1.holders,
-    );
-    assert!(
-        !llc1.exclusive_held,
-        "peer-held SH remains compatible with another SH requester",
-    );
-    assert!(
-        llc1.holders.iter().all(|h| h.pid != self_pid),
-        "self never locked LLC 1, so must not appear there; holders={:?}",
-        llc1.holders,
-    );
-}
-
-#[test]
-fn discover_tracks_self_and_peer_exclusive_llc_holds_separately_from_occupancy() {
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
-    let allowed: std::collections::BTreeSet<usize> = [0usize, 1].into_iter().collect();
-
-    let self_path = llc_lock_path(0);
-    crate::flock::materialize(&self_path).expect("materialize self EX lockfile");
-    let _self_hold = try_flock(&self_path, FlockMode::Exclusive)
-        .expect("open self EX lockfile")
-        .expect("take self EX lock");
-
-    let peer_path = llc_lock_path(1);
-    crate::flock::materialize(&peer_path).expect("materialize peer EX lockfile");
-    let child = ProcessGroupChild::spawn(
-        std::process::Command::new("flock").args(["-x", "-n", &peer_path, "sleep", "300"]),
-    );
-    let peer = match child {
-        Ok(child) => child,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "discover_tracks_self_and_peer_exclusive_llc_holds_separately_from_occupancy: \
-                 flock(1) not available, skipping ({error})"
-            );
-            return;
-        }
-        Err(error) => panic!("spawn flock(1): {error}"),
-    };
-
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let snapshots = loop {
-        // This assertion needs only compatibility and occupancy, not holder
-        // cmdlines. More importantly, /proc/locks is a live seq-file rather
-        // than an atomic snapshot: under a lock storm one traversal can
-        // observe the newly spawned peer while momentarily skipping another
-        // stable entry. Accept only an image containing both facts that the
-        // test is about instead of breaking on the first half-image.
-        let snapshots =
-            discover_llc_snapshot_counts(&topo, &allowed, &mountinfo).expect("discover EX holders");
-        let self_seen = snapshots
-            .iter()
-            .find(|snapshot| snapshot.llc_idx == 0)
-            .is_some_and(|snapshot| snapshot.exclusive_held && snapshot.holder_count == 0);
-        let peer_seen = snapshots
-            .iter()
-            .find(|snapshot| snapshot.llc_idx == 1)
-            .is_some_and(|snapshot| snapshot.exclusive_held && snapshot.holder_count == 1);
-        if (self_seen && peer_seen) || std::time::Instant::now() >= deadline {
-            break snapshots;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    drop(peer);
-
-    let self_snapshot = snapshots
-        .iter()
-        .find(|snapshot| snapshot.llc_idx == 0)
-        .expect("self-held LLC snapshot");
-    assert_eq!(
-        (self_snapshot.exclusive_held, self_snapshot.holder_count),
-        (true, 0),
-        "self EX is incompatible but excluded only from occupancy scoring",
-    );
-    let peer_snapshot = snapshots
-        .iter()
-        .find(|snapshot| snapshot.llc_idx == 1)
-        .expect("peer-held LLC snapshot");
-    assert_eq!(
-        (peer_snapshot.exclusive_held, peer_snapshot.holder_count),
-        (true, 1),
-        "peer EX is both incompatible and counted for occupancy",
-    );
-}
-
-#[test]
-fn count_only_discover_resolves_no_holder_cmdlines() {
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
-    let allowed: std::collections::BTreeSet<usize> = [0usize].into_iter().collect();
-    let path = llc_lock_path(0);
-    crate::flock::materialize(&path).expect("materialize count-only lockfile");
-    let _held = try_flock(&path, FlockMode::Shared)
-        .expect("open count-only lockfile")
-        .expect("hold count-only lockfile");
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
-    let before = crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests();
-    let snapshots = discover_llc_snapshot_counts(&topo, &allowed, &mountinfo)
-        .expect("count-only LLC discovery");
-    let after = crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests();
-    assert_eq!(
-        after, before,
-        "normal placement must not resolve HolderInfo/cmdline data",
-    );
-    assert_eq!(
-        snapshots[0].holder_count, 0,
-        "PID-only discovery must still exclude this process from placement counts",
-    );
-    assert!(
-        snapshots[0].holders.is_empty(),
-        "count-only snapshots intentionally carry no diagnostic enrichment",
-    );
 }
 
 /// No-perf build planning must remain ownership-free, while the matching
@@ -1525,72 +1152,9 @@ fn live_ex_holder_uses_fresh_holder_diagnostics_not_registered_claim_error() {
         "a real flock holder is not a registry-claim-only fast failure: {message}",
     );
     assert!(
-        message.contains("holders:") && message.contains("LLC 0"),
-        "retry exhaustion must rebuild fresh holder diagnostics: {message}",
+        message.contains("contended:") && message.contains("LLC 0") && message.contains("held"),
+        "a live EX flock holder must be named by the per-needle probe bail: {message}",
     );
-}
-
-#[test]
-fn retry_exhausted_diagnostics_rescan_until_expected_holder_is_visible() {
-    let expected = std::collections::BTreeSet::from([0usize]);
-    let scans = std::cell::Cell::new(0usize);
-    let waits = std::cell::Cell::new(0usize);
-    let snapshots = retry_exhausted_holder_snapshots_with(
-        &expected,
-        4,
-        || {
-            let sample = scans.get() + 1;
-            scans.set(sample);
-            Ok(vec![LlcSnapshot {
-                llc_idx: 0,
-                holders: if sample == 1 {
-                    Vec::new()
-                } else {
-                    vec![crate::flock::HolderInfo {
-                        pid: 42,
-                        cmdline: "stable-holder".into(),
-                    }]
-                },
-                holder_count: 0,
-                exclusive_held: true,
-            }])
-        },
-        |_| {
-            waits.set(waits.get() + 1);
-            true
-        },
-    )
-    .expect("rescan injected holder snapshots");
-    assert_eq!(
-        scans.get(),
-        2,
-        "the coherent second image must stop rescans"
-    );
-    assert_eq!(waits.get(), 1);
-    assert!(holder_snapshot_covers_expected_llcs(&snapshots, &expected));
-}
-
-#[test]
-fn retry_exhausted_diagnostics_respect_the_sample_cap() {
-    let expected = std::collections::BTreeSet::from([0usize]);
-    let scans = std::cell::Cell::new(0usize);
-    let snapshots = retry_exhausted_holder_snapshots_with(
-        &expected,
-        3,
-        || {
-            scans.set(scans.get() + 1);
-            Ok(vec![LlcSnapshot {
-                llc_idx: 0,
-                holders: Vec::new(),
-                holder_count: 0,
-                exclusive_held: true,
-            }])
-        },
-        |_| true,
-    )
-    .expect("bound injected holder snapshots");
-    assert_eq!(scans.get(), 3, "diagnostics exceeded their sample cap");
-    assert!(!holder_snapshot_covers_expected_llcs(&snapshots, &expected));
 }
 
 /// A waiting caller performs one real fast attempt, then uses the registry as
@@ -1737,8 +1301,7 @@ fn registered_claim_fast_fails_without_acquire_or_diagnostic_enrichment() {
             }
         };
     let attempts = std::cell::Cell::new(0usize);
-    let enrichment_before =
-        crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests();
+    let proc_reads_before = crate::flock::proc_locks::proc_locks_read_count_for_tests();
     let error = acquire_llc_plan_with_acquire_fn(
         &topo,
         &test_topo,
@@ -1758,12 +1321,55 @@ fn registered_claim_fast_fails_without_acquire_or_diagnostic_enrichment() {
         0,
         "aggregate-proven claim contention must not touch the real acquire seam",
     );
+    // The wait=false bail diagnostic probes contended LLC lock files with a
+    // non-blocking flock; it never walks host-global /proc/locks. (Here the
+    // fence is registry-only, so no LLC is physically held and none is named.)
     assert_eq!(
-        crate::flock::proc_locks::batch_holder_info_resolution_count_for_tests(),
-        enrichment_before,
-        "aggregate-proven contention must not run enriched final diagnostics",
+        crate::flock::proc_locks::proc_locks_read_count_for_tests(),
+        proc_reads_before,
+        "the contention bail must not scan /proc/locks",
     );
     drop(coordinator);
+}
+
+/// The wait=false contention bail names the physically-held LLC via a
+/// per-needle non-blocking flock probe, never a host-global `/proc/locks`
+/// walk.
+#[test]
+fn contention_bail_names_held_llc_without_scanning_proc_locks() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0]);
+    let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    // A peer physically holds LLC 0's lock EX but registers no claim, so the
+    // registry-based discover sees LLC 0 free and plans it; the physical
+    // acquire then fails, yielding an LLC-0 contention marker the bail names.
+    let held = crate::flock::try_flock(llc_lock_path(0), FlockMode::Exclusive)
+        .expect("open LLC 0 lock")
+        .expect("hold LLC 0 EX");
+    let proc_reads_before = crate::flock::proc_locks::proc_locks_read_count_for_tests();
+    let error = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        Some(CpuCap::new(1).expect("cap=1 valid")),
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("a physically held LLC 0 must fail the nonblocking plan");
+    let reason = error.to_string();
+    assert!(
+        reason.contains("LLC 0") && reason.contains("held"),
+        "the bail must name the physically-held LLC 0; got: {reason}",
+    );
+    assert_eq!(
+        crate::flock::proc_locks::proc_locks_read_count_for_tests(),
+        proc_reads_before,
+        "the bail must probe the LLC lock files, not scan /proc/locks",
+    );
+    drop(held);
 }
 
 /// `plan_from_snapshots` MUST-CONSOLIDATE invariant: on a
@@ -1785,7 +1391,6 @@ fn plan_from_snapshots_consolidation_overrides_fresh_ordering() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            holders: Vec::new(),
             holder_count: if idx == 3 { 5 } else { 0 },
             exclusive_held: false,
         })
@@ -1826,7 +1431,6 @@ fn elastic_fresh_rotations_fan_out_cold_prefix_and_warm_spill_suffix() {
     let cold_snapshots: Vec<LlcSnapshot> = (0..8)
         .map(|llc_idx| LlcSnapshot {
             llc_idx,
-            holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         })
@@ -1885,7 +1489,6 @@ fn elastic_fresh_rotations_fan_out_cold_prefix_and_warm_spill_suffix() {
     let warm_snapshots: Vec<LlcSnapshot> = (0..5)
         .map(|llc_idx| LlcSnapshot {
             llc_idx,
-            holders: Vec::new(),
             holder_count: if llc_idx == 4 { 3 } else { 0 },
             exclusive_held: false,
         })
@@ -1944,7 +1547,6 @@ fn plan_from_snapshots_single_node_fit_no_spill() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         })
@@ -1983,7 +1585,6 @@ fn plan_from_snapshots_equal_scores_tiebreak_ascending() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            holders: Vec::new(),
             holder_count: 5,
             exclusive_held: false,
         })
@@ -2504,13 +2105,11 @@ fn elastic_build_width_prefers_unshared_capacity_then_falls_back_to_shared() {
     let snapshots = vec![
         LlcSnapshot {
             llc_idx: 0,
-            holders: Vec::new(),
             holder_count: 1,
             exclusive_held: false,
         },
         LlcSnapshot {
             llc_idx: 1,
-            holders: Vec::new(),
             holder_count: 1,
             exclusive_held: false,
         },
@@ -3015,7 +2614,6 @@ fn plan_from_snapshots_filters_llcs_outside_allowed_set() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         })
@@ -3094,7 +2692,6 @@ fn plan_from_snapshots_partial_llc_overlap_counted_correctly() {
     let snapshots: Vec<LlcSnapshot> = (0..2)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            holders: Vec::new(),
             holder_count: 0,
             exclusive_held: false,
         })
@@ -3258,7 +2855,6 @@ fn spread_snapshots(holder_counts: &[usize]) -> Vec<LlcSnapshot> {
         .enumerate()
         .map(|(idx, &holder_count)| LlcSnapshot {
             llc_idx: idx,
-            holders: Vec::new(),
             holder_count,
             exclusive_held: false,
         })

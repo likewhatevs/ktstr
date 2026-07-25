@@ -5,45 +5,22 @@
 //! lockfile path via [`super::mountinfo`]; this module owns the
 //! /proc/locks side of the pipeline.
 //!
-//! Three API tiers:
+//! [`read_holders`] is the one-shot entry point: it reads
+//! `/proc/self/mountinfo` and `/proc/locks`, then returns the [`HolderInfo`]
+//! list for one lockfile. Callers with only a path use it (the `ktstr locks`
+//! observational scan and the cache EWOULDBLOCK peer-holder lookup); admission
+//! placement does NOT — it derives holder counts from the registry aggregate.
 //!
-//!  - [`read_holders`] — one-shot, reads both `/proc/self/mountinfo`
-//!    and `/proc/locks` itself. Use when looking up one lockfile.
-//!  - [`read_flock_mode_summaries`],
-//!    [`read_flock_states_batch_with_mountinfo`],
-//!    [`read_holder_pids_batch_with_mountinfo`], and
-//!    [`read_holders_batch_with_mountinfo`] — accept N lockfile paths
-//!    or already-derived needles and scan `/proc/locks` once. Admission
-//!    placement uses the combined mode/PID form; other callers can use
-//!    the narrower summary or PID-only forms; diagnostics use the enriched
-//!    form, which resolves each
-//!    distinct PID's [`HolderInfo`] once for the whole batch.
-//!
-//! The pure parser seams [`parse_flock_pids_for_needle`] and
-//! [`parse_flock_pids_for_needles`] are exposed so tests can feed
-//! synthetic `/proc/locks` fixtures (POSIX / OFDLCK / FLOCK
-//! interleavings, malformed lines) without touching the real
-//! filesystem.
+//! The pure parser seam [`parse_flock_pids_for_needle`] is exposed so tests
+//! can feed synthetic `/proc/locks` fixtures (POSIX / OFDLCK / FLOCK
+//! interleavings, malformed lines) without touching the real filesystem.
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Total line count of the most recent `/proc/locks` read on this process, for
-/// the grant-flow diagnostic's environmental (host-wide flock storm) signal.
-/// Advisory only; overwritten by each batch read.
-static LAST_PROC_LOCKS_LINES: AtomicU64 = AtomicU64::new(0);
-
-/// `/proc/locks` line count observed by the most recent batched flock-state
-/// read on this process (0 before any read).
-pub(crate) fn last_proc_locks_lines() -> u64 {
-    LAST_PROC_LOCKS_LINES.load(Ordering::Relaxed)
-}
 
 use super::HolderInfo;
 use super::holder::holder_info_for_pid;
-use super::mountinfo::{needle_from_path, needle_from_path_with_mountinfo};
+use super::mountinfo::needle_from_path;
 
 fn read_proc_locks(context: &'static str) -> Result<String> {
     #[cfg(test)]
@@ -62,30 +39,6 @@ pub(crate) fn proc_locks_read_count_for_tests() -> usize {
     PROC_LOCKS_READS.with(std::cell::Cell::get)
 }
 
-/// Compatibility-relevant holder state for one flock inode.
-///
-/// `any_holder` is true for either a held READ (`LOCK_SH`) or WRITE
-/// (`LOCK_EX`) flock. `exclusive_holder` is true only for a held WRITE flock.
-/// Thus a shared CPU or LLC requester is compatible exactly when
-/// `exclusive_holder` is false, while an exclusive requester is compatible
-/// exactly when `any_holder` is false.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct FlockModeSummary {
-    pub(crate) any_holder: bool,
-    pub(crate) exclusive_holder: bool,
-}
-
-/// Compatibility state plus holder identities for one flock inode.
-///
-/// Admission planning uses this combined shape so one `/proc/locks` scan can
-/// both reject exclusive holders and discount this process's inherited shared
-/// hold from occupancy scoring.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct FlockResourceState {
-    pub(crate) summary: FlockModeSummary,
-    pub(crate) holder_pids: Vec<u32>,
-}
-
 /// Parse `/proc/locks` and return [`HolderInfo`] entries for every
 /// process holding an advisory `FLOCK` matching `needle`.
 ///
@@ -95,11 +48,8 @@ pub(crate) struct FlockResourceState {
 /// `(major, minor)` via `/proc/self/mountinfo` and `inode` via
 /// `stat().st_ino`. Used by path-only callers ([`read_holders`],
 /// the `ktstr locks` observational scan, and the EWOULDBLOCK-branch
-/// peer-holder lookup in `src/cache/cache_dir.rs`).
-/// `acquire_llc_plan`'s DISCOVER
-/// phase uses [`super::mountinfo::needle_from_path_with_mountinfo`]
-/// instead so the mountinfo read amortizes across every LLC in one
-/// invocation.
+/// peer-holder lookup in `src/cache/cache_dir.rs`). `acquire_llc_plan`
+/// derives holder occupancy from the registry aggregate, not this scan.
 ///
 /// Best-effort: returns `Ok(vec![])` when no /proc/locks entry
 /// matches the needle, and propagates only the hard `/proc/locks`
@@ -117,71 +67,16 @@ pub(super) fn read_holders_for_needle(needle: &str) -> Result<Vec<HolderInfo>> {
 
 /// Content-based seam behind [`read_holders_for_needle`]. Takes
 /// already-read `/proc/locks` `contents` plus one match `needle` and
-/// returns the [`HolderInfo`] vector. Batched production callers use
-/// [`read_holders_batch_with_mountinfo`] instead so both the text scan
-/// and per-PID cmdline resolution are shared across all needles.
+/// returns the [`HolderInfo`] vector.
 ///
 /// Thin shell over [`parse_flock_pids_for_needle`]: the latter
 /// filters `/proc/locks` lines to the matching FLOCK PIDs; this
 /// function adds the per-PID cmdline lookup via
 /// [`super::holder::holder_info_for_pid`] that the
-/// [`read_holders_for_needle`] caller expects. Extracted so batched
-/// callers and the per-needle wrapper both key against the same seam
-/// rather than duplicating the `.into_iter().map()` plumbing.
+/// [`read_holders_for_needle`] caller expects.
 pub(super) fn read_holders_from_contents(contents: &str, needle: &str) -> Vec<HolderInfo> {
     let pids = parse_flock_pids_for_needle(contents, needle);
     pids.into_iter().map(holder_info_for_pid).collect()
-}
-
-/// Resolver-injected seam behind
-/// [`read_holders_batch_with_mountinfo`]. Keeping PID resolution
-/// separate from parsing makes the once-per-distinct-PID guarantee
-/// directly testable without depending on live `/proc/{pid}` state.
-#[cfg(test)]
-fn read_holders_for_needles_from_contents_with(
-    contents: &str,
-    needles: &[String],
-    resolve: impl FnMut(u32) -> HolderInfo,
-) -> Vec<Vec<HolderInfo>> {
-    let pid_sets = parse_flock_pids_for_needles(contents, needles);
-    resolve_holder_pid_sets_with(pid_sets, resolve)
-}
-
-fn resolve_holder_pid_sets_with(
-    pid_sets: Vec<Vec<u32>>,
-    mut resolve: impl FnMut(u32) -> HolderInfo,
-) -> Vec<Vec<HolderInfo>> {
-    let mut holder_cache: HashMap<u32, HolderInfo> = HashMap::new();
-    pid_sets
-        .into_iter()
-        .map(|pids| {
-            pids.into_iter()
-                .map(|pid| {
-                    holder_cache
-                        .entry(pid)
-                        .or_insert_with(|| resolve(pid))
-                        .clone()
-                })
-                .collect()
-        })
-        .collect()
-}
-
-fn resolve_batched_holder_info(pid: u32) -> HolderInfo {
-    #[cfg(test)]
-    BATCH_HOLDER_INFO_RESOLUTIONS.with(|count| count.set(count.get().saturating_add(1)));
-    holder_info_for_pid(pid)
-}
-
-#[cfg(test)]
-thread_local! {
-    static BATCH_HOLDER_INFO_RESOLUTIONS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn batch_holder_info_resolution_count_for_tests() -> usize {
-    BATCH_HOLDER_INFO_RESOLUTIONS.with(std::cell::Cell::get)
 }
 
 /// Pure parser seam behind [`read_holders_for_needle`]. Takes
@@ -209,131 +104,6 @@ pub(crate) fn parse_flock_pids_for_needle(contents: &str, needle: &str) -> Vec<u
         }
     }
     pids
-}
-
-/// Parse one `/proc/locks` image for N needles in a single line scan.
-///
-/// The output is positional and preserves first-seen PID order for
-/// each needle. PIDs are deduplicated per needle, including when the
-/// input contains multiple FLOCK entries for the same process and
-/// inode. Duplicate input needles share the same parsed PID set.
-pub(crate) fn parse_flock_pids_for_needles(contents: &str, needles: &[String]) -> Vec<Vec<u32>> {
-    let mut unique_indices: HashMap<&str, usize> = HashMap::new();
-    let mut output_indices = Vec::with_capacity(needles.len());
-    let mut unique_pids: Vec<Vec<u32>> = Vec::new();
-    let mut unique_seen: Vec<HashSet<u32>> = Vec::new();
-
-    for needle in needles {
-        let index = match unique_indices.get(needle.as_str()).copied() {
-            Some(index) => index,
-            None => {
-                let index = unique_pids.len();
-                unique_indices.insert(needle, index);
-                unique_pids.push(Vec::new());
-                unique_seen.push(HashSet::new());
-                index
-            }
-        };
-        output_indices.push(index);
-    }
-
-    for line in contents.lines() {
-        let Some((pid, dev_inode)) = parse_held_flock(line) else {
-            continue;
-        };
-        let Some(&index) = unique_indices.get(dev_inode) else {
-            continue;
-        };
-        if unique_seen[index].insert(pid) {
-            unique_pids[index].push(pid);
-        }
-    }
-
-    output_indices
-        .into_iter()
-        .map(|index| unique_pids[index].clone())
-        .collect()
-}
-
-/// Parse one `/proc/locks` image into compatibility summaries for the
-/// requested inode needles.
-///
-/// The input and output are keyed by the exact
-/// `{major:02x}:{minor:02x}:{inode}` strings emitted by `/proc/locks`.
-/// Every requested needle is present in the output, including needles with no
-/// held flock. Waiting (`->`) entries and non-FLOCK lock classes are ignored.
-#[allow(dead_code)]
-pub(crate) fn parse_flock_mode_summaries(
-    contents: &str,
-    needles: &BTreeSet<String>,
-) -> BTreeMap<String, FlockModeSummary> {
-    let mut summaries: BTreeMap<String, FlockModeSummary> = needles
-        .iter()
-        .cloned()
-        .map(|needle| (needle, FlockModeSummary::default()))
-        .collect();
-
-    for line in contents.lines() {
-        let Some((_pid, mode, dev_inode)) = parse_held_flock_with_mode(line) else {
-            continue;
-        };
-        let Some(summary) = summaries.get_mut(dev_inode) else {
-            continue;
-        };
-        summary.any_holder = true;
-        summary.exclusive_holder |= mode != HeldFlockMode::Shared;
-    }
-    summaries
-}
-
-/// Read `/proc/locks` once and return compatibility summaries for every
-/// requested inode needle.
-#[allow(dead_code)]
-pub(crate) fn read_flock_mode_summaries(
-    needles: &BTreeSet<String>,
-) -> Result<BTreeMap<String, FlockModeSummary>> {
-    let contents = read_proc_locks("read /proc/locks for batched flock-mode observation")?;
-    Ok(parse_flock_mode_summaries(&contents, needles))
-}
-
-/// Derive needles for every path and read compatibility modes plus holder PIDs
-/// in one `/proc/locks` pass.
-pub(crate) fn read_flock_states_batch_with_mountinfo<'a>(
-    paths: impl IntoIterator<Item = &'a Path>,
-    mountinfo: &str,
-) -> Result<Vec<FlockResourceState>> {
-    let needles = paths
-        .into_iter()
-        .map(|path| needle_from_path_with_mountinfo(path, mountinfo))
-        .collect::<Result<Vec<_>>>()?;
-    let mut positions: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for (index, needle) in needles.iter().enumerate() {
-        positions.entry(needle).or_default().push(index);
-    }
-    let contents = read_proc_locks("read /proc/locks for batched flock-state observation")?;
-    let mut states = vec![FlockResourceState::default(); needles.len()];
-    let mut total_lines = 0u64;
-    for line in contents.lines() {
-        total_lines += 1;
-        let Some((pid, mode, dev_inode)) = parse_held_flock_with_mode(line) else {
-            continue;
-        };
-        let Some(indices) = positions.get(dev_inode) else {
-            continue;
-        };
-        for &index in indices {
-            let state = &mut states[index];
-            state.summary.any_holder = true;
-            state.summary.exclusive_holder |= mode != HeldFlockMode::Shared;
-            state.holder_pids.push(pid);
-        }
-    }
-    for state in &mut states {
-        state.holder_pids.sort_unstable();
-        state.holder_pids.dedup();
-    }
-    LAST_PROC_LOCKS_LINES.store(total_lines, Ordering::Relaxed);
-    Ok(states)
 }
 
 /// Return `(pid, dev:inode)` for a held FLOCK line.
@@ -381,12 +151,8 @@ fn parse_held_flock_with_mode(line: &str) -> Option<(u32, HeldFlockMode, &str)> 
 /// needle via [`super::mountinfo::needle_from_path`] and forwards.
 /// This is the stable entry point for callers that only have a
 /// lockfile path — cache EWOULDBLOCK diagnostics and `ktstr locks`.
-///
-/// `acquire_llc_plan`'s DISCOVER phase does NOT call this adapter —
-/// it threads a pre-read `/proc/self/mountinfo` through
-/// [`read_holders_batch_with_mountinfo`] so the whole per-LLC walk
-/// reads both mountinfo and `/proc/locks` once per plan invocation. See
-/// [`super::mountinfo::needle_from_path_with_mountinfo`] for the seam.
+/// `acquire_llc_plan` derives holder occupancy from the registry
+/// aggregate instead of this `/proc/locks` scan.
 ///
 /// Propagates stat failures on the path (context: "stat lockfile …
 /// for holder lookup") and mountinfo failures ("resolve kernel
@@ -394,40 +160,6 @@ fn parse_held_flock_with_mode(line: &str) -> Option<(u32, HeldFlockMode, &str)> 
 pub(crate) fn read_holders(path: &Path) -> Result<Vec<HolderInfo>> {
     let needle = needle_from_path(path)?;
     read_holders_for_needle(&needle)
-}
-
-/// Derives one `/proc/locks` needle per input path, reads
-/// `/proc/locks` exactly once, scans that text exactly once for all
-/// needles, and caches [`HolderInfo`] by PID across the entire batch.
-/// The returned vector is positional: entry `i` corresponds to input
-/// path `i`.
-pub(crate) fn read_holders_batch_with_mountinfo<'a>(
-    paths: impl IntoIterator<Item = &'a Path>,
-    mountinfo: &str,
-) -> Result<Vec<Vec<HolderInfo>>> {
-    let pid_sets = read_holder_pids_batch_with_mountinfo(paths, mountinfo)?;
-    Ok(resolve_holder_pid_sets_with(
-        pid_sets,
-        resolve_batched_holder_info,
-    ))
-}
-
-/// Read holder PIDs for N lockfile paths without cmdline enrichment.
-///
-/// This is the hot-path placement API. It derives every needle from
-/// the supplied mountinfo, reads and scans `/proc/locks` exactly once,
-/// deduplicates PIDs per path, and returns positional PID rows. It
-/// deliberately performs no `/proc/{pid}/cmdline` reads.
-pub(crate) fn read_holder_pids_batch_with_mountinfo<'a>(
-    paths: impl IntoIterator<Item = &'a Path>,
-    mountinfo: &str,
-) -> Result<Vec<Vec<u32>>> {
-    let needles = paths
-        .into_iter()
-        .map(|path| needle_from_path_with_mountinfo(path, mountinfo))
-        .collect::<Result<Vec<_>>>()?;
-    let contents = read_proc_locks("read /proc/locks for batched lockfile holder lookup")?;
-    Ok(parse_flock_pids_for_needles(&contents, &needles))
 }
 
 #[cfg(test)]
@@ -511,135 +243,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_flock_pids_for_needles_matches_all_needles_in_one_pass() {
-        let needles = vec![
-            "08:02:100".to_owned(),
-            "08:02:200".to_owned(),
-            "08:02:100".to_owned(),
-            "08:02:999".to_owned(),
-        ];
-        let contents = "\
-1: FLOCK  ADVISORY  WRITE 101 08:02:100 0 EOF
-2: FLOCK  ADVISORY  READ  202 08:02:200 0 EOF
-3: FLOCK  ADVISORY  WRITE 101 08:02:100 0 EOF
-4: FLOCK  ADVISORY  WRITE 303 08:02:100 0 EOF
-5: POSIX  ADVISORY  WRITE 404 08:02:200 0 EOF
-6: -> FLOCK ADVISORY WRITE 505 08:02:200 0 EOF
-7: FLOCK  ADVISORY  WRITE 606 08:02:300 0 EOF
-";
-
-        assert_eq!(
-            parse_flock_pids_for_needles(contents, &needles),
-            vec![vec![101, 303], vec![202], vec![101, 303], vec![]],
-            "one scan must route each held FLOCK to every requested needle, \
-             deduplicate repeated PID entries, preserve first-seen order, and \
-             reuse the parsed set for duplicate needles",
-        );
-    }
-
-    #[test]
-    fn parse_flock_mode_summaries_distinguishes_shared_and_exclusive_holders() {
-        let needles = BTreeSet::from([
-            "08:02:100".to_owned(),
-            "08:02:200".to_owned(),
-            "08:02:300".to_owned(),
-            "08:02:400".to_owned(),
-        ]);
-        let contents = "\
-1: FLOCK  ADVISORY  READ  101 08:02:100 0 EOF
-2: FLOCK  ADVISORY  READ  102 08:02:100 0 EOF
-3: FLOCK  ADVISORY  WRITE 201 08:02:200 0 EOF
-4: POSIX  ADVISORY  WRITE 301 08:02:300 0 EOF
-5: OFDLCK ADVISORY  WRITE 302 08:02:300 0 EOF
-6: -> FLOCK ADVISORY WRITE 303 08:02:300 0 EOF
-7: FLOCK  ADVISORY  UNKNOWN 304 08:02:300 0 EOF
-8: FLOCK  ADVISORY  WRITE 999 08:02:999 0 EOF
-malformed
-";
-
-        assert_eq!(
-            parse_flock_mode_summaries(contents, &needles),
-            BTreeMap::from([
-                (
-                    "08:02:100".to_owned(),
-                    FlockModeSummary {
-                        any_holder: true,
-                        exclusive_holder: false,
-                    },
-                ),
-                (
-                    "08:02:200".to_owned(),
-                    FlockModeSummary {
-                        any_holder: true,
-                        exclusive_holder: true,
-                    },
-                ),
-                (
-                    "08:02:300".to_owned(),
-                    FlockModeSummary {
-                        any_holder: true,
-                        exclusive_holder: true,
-                    },
-                ),
-                ("08:02:400".to_owned(), FlockModeSummary::default()),
-            ]),
-            "READ must block EX only, WRITE and unknown held modes must \
-             conservatively block SH and EX, and queued, non-FLOCK, malformed, \
-             and unrequested entries must not contribute",
-        );
-    }
-
-    #[test]
-    fn batched_holder_resolution_runs_once_per_distinct_pid() {
-        let needles = vec![
-            "08:02:100".to_owned(),
-            "08:02:200".to_owned(),
-            "08:02:100".to_owned(),
-        ];
-        let contents = "\
-1: FLOCK ADVISORY WRITE 101 08:02:100 0 EOF
-2: FLOCK ADVISORY READ  202 08:02:100 0 EOF
-3: FLOCK ADVISORY WRITE 202 08:02:200 0 EOF
-4: FLOCK ADVISORY WRITE 303 08:02:200 0 EOF
-";
-        let calls = std::cell::RefCell::new(std::collections::BTreeMap::<u32, usize>::new());
-
-        let holders = read_holders_for_needles_from_contents_with(contents, &needles, |pid| {
-            *calls.borrow_mut().entry(pid).or_default() += 1;
-            HolderInfo {
-                pid,
-                cmdline: format!("pid-{pid}"),
-            }
-        });
-
-        let holder_pids: Vec<Vec<u32>> = holders
-            .iter()
-            .map(|holders| holders.iter().map(|holder| holder.pid).collect())
-            .collect();
-        assert_eq!(
-            holder_pids,
-            vec![vec![101, 202], vec![202, 303], vec![101, 202]],
-        );
-        assert_eq!(
-            *calls.borrow(),
-            std::collections::BTreeMap::from([(101, 1), (202, 1), (303, 1)]),
-            "a PID shared by several needles or duplicate input entries must \
-             incur one /proc/<pid>/cmdline lookup for the whole batch",
-        );
-    }
-
-    #[test]
-    fn empty_batched_needle_set_does_not_resolve_holders() {
-        let mut calls = 0usize;
-        let holders = read_holders_for_needles_from_contents_with("malformed input", &[], |_| {
-            calls += 1;
-            unreachable!("an empty batch must never resolve a PID")
-        });
-        assert!(holders.is_empty());
-        assert_eq!(calls, 0);
-    }
-
     /// [`read_holders_from_contents`] preserves the HolderInfo shape
     /// for a single matching needle. `holder_info_for_pid` reads our
     /// own cmdline so we can assert the PID half deterministically on
@@ -692,40 +295,5 @@ malformed
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].pid, b[0].pid);
         assert_eq!(a[0].cmdline, b[0].cmdline);
-    }
-
-    #[test]
-    fn pid_only_batch_skips_cmdlines_and_enriched_batch_caches_by_pid() {
-        let our_pid = std::process::id();
-        let needles = vec!["08:02:100".to_owned(), "08:02:200".to_owned()];
-        let contents = format!(
-            "1: FLOCK ADVISORY WRITE {our_pid} 08:02:100 0 EOF\n\
-             2: FLOCK ADVISORY WRITE {our_pid} 08:02:200 0 EOF\n"
-        );
-        let before = batch_holder_info_resolution_count_for_tests();
-
-        let pid_rows = parse_flock_pids_for_needles(&contents, &needles);
-        assert!(
-            pid_rows.iter().all(|row| row.contains(&our_pid)),
-            "our PID must appear for both parsed lockfiles: {pid_rows:?}",
-        );
-        assert_eq!(
-            batch_holder_info_resolution_count_for_tests(),
-            before,
-            "the placement batch must not resolve any cmdlines",
-        );
-
-        let holder_rows = resolve_holder_pid_sets_with(pid_rows, resolve_batched_holder_info);
-        assert!(
-            holder_rows
-                .iter()
-                .all(|row| row.iter().any(|holder| holder.pid == our_pid)),
-            "our HolderInfo must appear for both held lockfiles: {holder_rows:?}",
-        );
-        assert_eq!(
-            batch_holder_info_resolution_count_for_tests(),
-            before + 1,
-            "one PID holding several requested lockfiles must be enriched once",
-        );
     }
 }

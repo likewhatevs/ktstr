@@ -8,8 +8,11 @@
 //!   revoke, stale prefix, or a lost physical probe) — the revoke/thrash churn.
 //! - `held_in_flight` / `distinct_held_cpus`: peak count of in-flight HELD
 //!   claims and the distinct host CPUs they cover — the ramp indicator.
-//! - `discover` wall-time and `/proc/locks` line count: the per-cell placement
-//!   DISCOVER cost (the environmental /proc/locks-scaling suspect).
+//! - `discover` count and wall-time: how often the placement contention-bail
+//!   holder diagnostic runs and how long it takes. The bail probes only the
+//!   contended LLC lock files with a non-blocking flock (no host-global
+//!   `/proc/locks` walk), so `discover_ns` staying at syscall scale is the
+//!   success metric for that fix.
 //!
 //! Entirely inert unless `KTSTR_BUILD_DIAGNOSTICS_DIR` is set (CI only): the
 //! `note_*` calls are relaxed atomic updates and the expensive inputs
@@ -35,8 +38,6 @@ static DISTINCT_HELD_CPUS_MAX: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_COUNT: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_NS_SUM: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_NS_MAX: AtomicU64 = AtomicU64::new(0);
-static PROC_LOCKS_LINES_SUM: AtomicU64 = AtomicU64::new(0);
-static PROC_LOCKS_LINES_MAX: AtomicU64 = AtomicU64::new(0);
 static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 fn dir() -> Option<&'static PathBuf> {
@@ -102,14 +103,16 @@ pub(crate) fn note_held_in_flight(held_records: u64, distinct_cpus: u64) {
     ensure_atexit();
 }
 
-/// One placement DISCOVER pass: its wall-time and the `/proc/locks` line count
-/// it parsed. Only called behind [`enabled`].
-pub(crate) fn note_discover(elapsed_ns: u64, proc_locks_lines: u64) {
+/// One placement contention-bail holder diagnostic, and its wall-time. Since
+/// the bail now probes only the contended LLC lock files with a non-blocking
+/// flock (no host-global `/proc/locks` walk), this both counts how often the
+/// diagnostic runs and proves the walk is gone: `discover_ns` should sit at
+/// per-needle syscall scale, not the hundreds of milliseconds the seq-file read
+/// cost under a many-lane flock storm. Only called behind [`enabled`].
+pub(crate) fn note_discover(elapsed_ns: u64) {
     DISCOVER_COUNT.fetch_add(1, Ordering::Relaxed);
     DISCOVER_NS_SUM.fetch_add(elapsed_ns, Ordering::Relaxed);
     bump_max(&DISCOVER_NS_MAX, elapsed_ns);
-    PROC_LOCKS_LINES_SUM.fetch_add(proc_locks_lines, Ordering::Relaxed);
-    bump_max(&PROC_LOCKS_LINES_MAX, proc_locks_lines);
     ensure_atexit();
 }
 
@@ -119,15 +122,10 @@ fn format_line(pid: u32) -> String {
         .load(Ordering::Relaxed)
         .checked_div(discover_count)
         .unwrap_or(0);
-    let proc_locks_lines_mean = PROC_LOCKS_LINES_SUM
-        .load(Ordering::Relaxed)
-        .checked_div(discover_count)
-        .unwrap_or(0);
     format!(
         "grant-flow: pid={pid} grants_issued={} grants_reached_held={} grants_lost={} \
          held_in_flight_max={} distinct_held_cpus_max={} discover_count={} \
-         discover_ns_mean={discover_ns_mean} discover_ns_max={} \
-         proc_locks_lines_mean={proc_locks_lines_mean} proc_locks_lines_max={}\n",
+         discover_ns_mean={discover_ns_mean} discover_ns_max={}\n",
         GRANTS_ISSUED.load(Ordering::Relaxed),
         GRANTS_REACHED_HELD.load(Ordering::Relaxed),
         GRANTS_LOST.load(Ordering::Relaxed),
@@ -135,7 +133,6 @@ fn format_line(pid: u32) -> String {
         DISTINCT_HELD_CPUS_MAX.load(Ordering::Relaxed),
         discover_count,
         DISCOVER_NS_MAX.load(Ordering::Relaxed),
-        PROC_LOCKS_LINES_MAX.load(Ordering::Relaxed),
     )
 }
 
@@ -176,8 +173,6 @@ mod tests {
             "discover_count=",
             "discover_ns_mean=",
             "discover_ns_max=",
-            "proc_locks_lines_mean=",
-            "proc_locks_lines_max=",
         ] {
             assert!(line.contains(field), "missing {field} in {line}");
         }
