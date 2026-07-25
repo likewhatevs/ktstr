@@ -12,7 +12,7 @@ use kvm_bindings::{
 use kvm_ioctls::{Cap, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::GuestMemoryMmap;
 
 use super::ioapic::{IOAPIC_BASE, IOAPIC_SIZE, Ioapic, MsiRoute};
 use super::topology::{apic_id, generate_cpuid, max_apic_id};
@@ -329,11 +329,10 @@ pub struct KtstrKvm {
     pub vcpus: Vec<VcpuFd>,
     pub guest_mem: ManuallyDrop<GuestMemoryMmap>,
     pub topology: Topology,
-    /// Per-node GPA layout used by ACPI SRAT/HMAT generation. `None`
-    /// in deferred mode before [`Self::allocate_memory`].
+    /// Per-node GPA layout used by ACPI SRAT/HMAT generation. Always
+    /// `Some` — guest memory is allocated in [`Self::new`].
     pub(crate) numa_layout: Option<NumaMemoryLayout>,
-    /// Actual backing selected by the allocator. `None` only before deferred
-    /// memory allocation.
+    /// Actual backing selected by the allocator.
     pub(crate) memory_backing: Option<MemoryBacking>,
     /// True only after every final guest-memory VMA has been published to KVM.
     /// Production setup keeps this false while installing the prepared-initrd
@@ -349,13 +348,6 @@ pub struct KtstrKvm {
     /// service IOAPIC MMIO and reprogram MSI routes; `None` for <=254-max-APIC-ID
     /// guests, which use the in-kernel IOAPIC.
     pub(crate) ioapic: Option<Arc<PiMutex<Ioapic>>>,
-    /// Whether hugepages were requested at construction time.
-    /// Stored so deferred memory allocation uses the same backing.
-    use_hugepages: bool,
-    /// Performance mode flag. Stored so deferred memory allocation
-    /// can check hugepage availability fresh when memory_mib was
-    /// unknown at construction time.
-    performance_mode: bool,
     /// Owns the VA reservation for per-node MAP_FIXED mmaps.
     /// Drop munmaps the entire reservation.
     _reservation: Option<ReservationGuard>,
@@ -422,68 +414,11 @@ impl KtstrKvm {
 
     /// Create a VM with allocated but deliberately unregistered guest RAM.
     ///
-    /// Production setup uses this when the requested memory size is known
-    /// up front. It can load the kernel and install the complete disjoint COW
-    /// initrd layout before exposing a single immutable HVA layout to KVM.
+    /// `memory_mib` is resolved from the immutable prepared inputs before
+    /// admission, so setup can load the kernel and install the complete
+    /// disjoint COW initrd layout before [`Self::register_memory`] exposes a
+    /// single immutable HVA layout to KVM.
     pub(crate) fn new(topo: Topology, memory_mib: u32, performance_mode: bool) -> Result<Self> {
-        Self::new_inner(topo, Some(memory_mib), false, performance_mode)
-    }
-
-    /// Allocate guest memory without registering it with KVM.
-    ///
-    /// Called exactly once on a deferred VM. The complete final COW layout may
-    /// then be installed before [`Self::register_memory`] freezes the HVA
-    /// layout visible to KVM.
-    pub(crate) fn allocate_memory(&mut self, memory_mib: u32) -> Result<()> {
-        anyhow::ensure!(
-            self._reservation.is_none() && self.numa_layout.is_none(),
-            "guest memory is already allocated"
-        );
-        let layout = NumaMemoryLayout::compute(
-            &self.topology,
-            memory_mib,
-            0,
-            Some((MMIO_GAP_START, MMIO_GAP_END)),
-        )?;
-        let cpuid = self
-            .kvm
-            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
-            .context("get supported CPUID for deferred RAM-top validation")?;
-        Self::validate_ram_top(&layout, cpuid.as_slice())?;
-        let alloc = layout.allocate(self.use_hugepages, self.performance_mode)?;
-        // SAFETY: this is the only call to ManuallyDrop::drop on
-        // self.guest_mem; the next line replaces it with
-        // ManuallyDrop::new(...).
-        unsafe { ManuallyDrop::drop(&mut self.guest_mem) };
-        self.guest_mem = ManuallyDrop::new(alloc.guest_mem);
-        self._reservation = Some(alloc.reservation);
-        self.memory_backing = Some(alloc.backing);
-        self.numa_layout = Some(layout);
-        self.memory_registered = false;
-        Ok(())
-    }
-
-    /// Publish the final guest-memory VMA layout to KVM exactly once.
-    pub(crate) fn register_memory(&mut self) -> Result<()> {
-        anyhow::ensure!(
-            !self.memory_registered,
-            "guest memory is already registered"
-        );
-        let layout = self
-            .numa_layout
-            .as_ref()
-            .context("cannot register guest memory before allocation")?;
-        layout.register(&self.vm_fd, &self.guest_mem)?;
-        self.memory_registered = true;
-        Ok(())
-    }
-
-    fn new_inner(
-        topo: Topology,
-        memory_mib: Option<u32>,
-        use_hugepages: bool,
-        performance_mode: bool,
-    ) -> Result<Self> {
         let kvm = Kvm::new().context("open /dev/kvm")?;
 
         // Check required capabilities (Firecracker pattern)
@@ -522,24 +457,12 @@ impl KtstrKvm {
 
         Self::tune_kvm_caps(&vm_fd, performance_mode)?;
 
-        let (guest_mem, numa_layout, reservation, memory_backing) = match memory_mib {
-            Some(mb) => {
-                let layout =
-                    NumaMemoryLayout::compute(&topo, mb, 0, Some((MMIO_GAP_START, MMIO_GAP_END)))?;
-                let alloc = layout.allocate(use_hugepages, performance_mode)?;
-                (
-                    alloc.guest_mem,
-                    Some(layout),
-                    Some(alloc.reservation),
-                    Some(alloc.backing),
-                )
-            }
-            None => {
-                let placeholder = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)])
-                    .context("allocate placeholder guest memory")?;
-                (placeholder, None, None, None)
-            }
-        };
+        let numa_layout =
+            NumaMemoryLayout::compute(&topo, memory_mib, 0, Some((MMIO_GAP_START, MMIO_GAP_END)))?;
+        // Hugepages are never requested up front: the allocator selects them
+        // itself under `performance_mode`, serializing its free-count check
+        // with MAP_HUGETLB so a process storm cannot overcommit the pool.
+        let alloc = numa_layout.allocate(false, performance_mode)?;
 
         let vcpus = Self::create_vcpus(
             &kvm,
@@ -554,20 +477,33 @@ impl KtstrKvm {
             kvm: ManuallyDrop::new(kvm),
             vm_fd: ManuallyDrop::new(vm_fd),
             vcpus,
-            guest_mem: ManuallyDrop::new(guest_mem),
+            guest_mem: ManuallyDrop::new(alloc.guest_mem),
             topology: topo,
-            numa_layout,
-            memory_backing,
+            numa_layout: Some(numa_layout),
+            memory_backing: Some(alloc.backing),
             memory_registered: false,
             has_immediate_exit,
             split_irqchip,
             ioapic,
-            use_hugepages,
-            performance_mode,
-            _reservation: reservation,
+            _reservation: Some(alloc.reservation),
             cow_overlay_guards: Vec::new(),
             pci_enabled: false,
         })
+    }
+
+    /// Publish the final guest-memory VMA layout to KVM exactly once.
+    pub(crate) fn register_memory(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.memory_registered,
+            "guest memory is already registered"
+        );
+        let layout = self
+            .numa_layout
+            .as_ref()
+            .context("cannot register guest memory before allocation")?;
+        layout.register(&self.vm_fd, &self.guest_mem)?;
+        self.memory_registered = true;
+        Ok(())
     }
 
     /// Set up the IRQ chip: split (LAPIC-only + x2APIC API + userspace
@@ -711,7 +647,7 @@ impl KtstrKvm {
         kvm: &Kvm,
         vm_fd: &VmFd,
         topo: &Topology,
-        numa_layout: &Option<NumaMemoryLayout>,
+        numa_layout: &NumaMemoryLayout,
         max_apic_id: u32,
         performance_mode: bool,
     ) -> Result<Vec<VcpuFd>> {
@@ -747,9 +683,7 @@ impl KtstrKvm {
         // of the firecracker/libkrun no-bound case. Bounds the RAM top only;
         // widen to max(RAM, MMIO) top if a high MMIO window above RAM is ever
         // added.
-        if let Some(layout) = &numa_layout {
-            Self::validate_ram_top(layout, base_cpuid.as_slice())?;
-        }
+        Self::validate_ram_top(numa_layout, base_cpuid.as_slice())?;
 
         // Create vCPUs with topology-specific CPUID. KVM_CREATE_VCPU
         // allocates per-vCPU kernel memory (struct kvm_vcpu, kvm_run

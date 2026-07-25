@@ -1341,14 +1341,14 @@ pub(crate) fn collect_verifier_output_with_memory_min(
     // at the builder boundary (the TryFrom above already enforces the
     // type-level invariants).
     //
-    // Feed the caller-selected memory floor through the deferred path.
+    // Feed the caller-selected memory floor through the budget model.
     // Direct API callers retain the historical vCPU-scaled floor, while
     // canned verifier cells cap it at the preset's declared budget. The
     // verifier /init is a large instrumented test
-    // binary, so the deferred budget model raises the actual
+    // binary, so the budget model raises the actual
     // allocation to fit the real initramfs (floor enforced at
     // `initramfs_min_memory_mib(&budget).max(self.memory_min_mib)` in
-    // `vmm::setup::join_compute_memory_and_load`). Verifier cells have
+    // `vmm::setup::KtstrVm::prepared_memory_mib`). Verifier cells have
     // no wprof, so no wprof floor applies here.
     // Bounded whole-boot retry on the guest AP-bring-up-gap infra fault
     // (an AP that missed its INIT-SIPI window → the guest PID-1 panics
