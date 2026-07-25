@@ -124,21 +124,9 @@ test(/^ktstr\//)
 slow-timeout = { period = "180s", terminate-after = 12 }
 
 [[profile.ci.overrides]]
-filter = "test(boot_kernel) | test(bench_boot)"
-slow-timeout = { period = "180s", terminate-after = 3 }
-
-[[profile.ci.overrides]]
-filter = "test(/^verifier\\//)"
-slow-timeout = { period = "180s", terminate-after = 3 }
-
-[[profile.ci.overrides]]
 filter = "test(demo_)"
 slow-timeout = { period = "120s", terminate-after = 3 }
 retries = 6
-
-[[profile.ci.overrides]]
-filter = "test(gauntlet/)"
-slow-timeout = { period = "120s", terminate-after = 3 }
 
 # disk_template_e2e drives a NESTED `cargo ktstr test` whose guest VM
 # brings up the disk-template lifecycle (one-shot template-build VM +
@@ -178,12 +166,17 @@ retries = 6
 # the watchdog must kill on the correct tier, so a watchdog kill is the
 # EXPECTED outcome, never a transient flake — retries=0 (a re-run of a
 # real net regression burns a full rail-length again and hides the
-# determinism of the failure). These tests are named `ktstr/…`, so the
-# resource-band block above already owns their slow-timeout by
-# first-match precedence — a slow-timeout here would be dead config, and
-# under CI dilation the fixtures legitimately charge queue-inclusive
-# wall like every other cell; the watchdog, not nextest, kills the
-# wedge and produces the dump the assertions consume.
+# determinism of the failure). The wedge cells are named `ktstr/…`, so
+# the resource-band block above already owns their slow-timeout by
+# first-match precedence, and under CI dilation they legitimately charge
+# queue-inclusive wall like every other cell; the watchdog, not nextest,
+# kills the wedge and produces the dump the assertions consume. This
+# binary also holds one plain host-side `#[test]`
+# (`boot_before_wedge_is_a_non_verdict_even_without_a_timeout`, a pure
+# classifier check) that the band does NOT cover — its slow-timeout
+# comes from the profile.default copy below, which nextest consults for
+# every setting no ci override supplies. So this block carries retries
+# only.
 [[profile.ci.overrides]]
 filter = "binary(progress_watchdog_e2e)"
 retries = 0
@@ -384,39 +377,11 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 
 # ── Overrides ─────────────────────────────────────────────────────────
 
-# Boot tests under coverage instrumentation (llvm-cov) are 5-10x slower.
-[[profile.default.overrides]]
-filter = "test(boot_kernel) | test(bench_boot)"
-slow-timeout = { period = "180s", terminate-after = 2 }
-
-# Verifier cells: the internal VM wall deadline (Tier-3 dead-man) is a
-# 120s lifecycle base plus vm_boot_headroom(vcpus) x 3 plus the
-# extend-only scheduler-attach reset (`verifier_vm_timeout` +
-# `VERIFIER_WORKLOAD_BUDGET` in test_support/runtime.rs) — worst case
-# ~415s for a 256-vCPU preset (295.2s + 60s); wedges die far earlier on
-# the progress watchdog's per-phase budgets. nextest must
-# exceed that so the watchdog verdict, not a nextest kill, decides the
-# cell (240s x 2 = 480s; the ci profile's 180s x 3 = 540s already
-# clears it). Cell names are slash-delimited
-# (`verifier/<sched>/<kernel>/<preset>`, emitted by the dispatch
-# macro) — the old `test(verifier_)` substring filter silently matched
-# nothing, leaving cells on the profile-base 60s x 2 budget that raced
-# the watchdog.
-[[profile.default.overrides]]
-filter = "test(/^verifier\\//)"
-slow-timeout = { period = "240s", terminate-after = 2 }
-
 # Demo tests: exploration/failure scenarios, should not retry.
 [[profile.default.overrides]]
 filter = "test(demo_)"
 slow-timeout = { period = "120s", terminate-after = 2 }
 retries = 0
-
-# Gauntlet tests: topology preset matrix, ignored by default.
-# Run with: cargo ktstr test -- --run-ignored ignored-only -E 'test(gauntlet/)'
-[[profile.default.overrides]]
-filter = "test(gauntlet/)"
-slow-timeout = { period = "120s", terminate-after = 2 }
 
 # Compile-fail tests: trybuild compiles the dependency tree on first run.
 # The driver is ignored in the ordinary suite and selected alone by
