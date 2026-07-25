@@ -15351,10 +15351,21 @@ impl KtstrVm {
                     // host load can never reach the outer nextest
                     // terminate-after without a ktstr kill + failure dump.
                     // Unconditional — NOT gated on `ordinary_overlay_active`,
-                    // since the overlays fail-closed on their own far-shorter
-                    // budgets long before this and a stuck overlay must not
-                    // defeat the net. The absolute-ceiling term is measured on
-                    // the PROCESS clock (`now_process_ns`), which includes the
+                    // so a stuck overlay cannot defeat the net. Only the
+                    // overlays' DELIVERED-service budgets are genuinely
+                    // shorter than this: a still-serviced vCPU spends them at
+                    // up to wall rate, so 35 s (attach) / 75 s (readiness)
+                    // fail closed well before this net. The readiness
+                    // overlay's BLOCKED path charges that same 75 s against
+                    // observer CPU, which accrues only a few µs per vCPU per
+                    // 100 ms tick and so needs far more wall than this net's
+                    // ceiling (see
+                    // `watchdog_step::DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS`)
+                    // — for a fully blocked readiness wait this net, not the
+                    // overlay, is the terminal bound.
+                    //
+                    // The absolute-ceiling term is measured on the PROCESS
+                    // clock (`now_process_ns`), which includes the
                     // in-process admission wait and so tracks nextest's rail —
                     // the VM-relative `now_wall_ns` can lag it by hundreds of
                     // seconds on a queued lane, leaving a ~1000 s ceiling

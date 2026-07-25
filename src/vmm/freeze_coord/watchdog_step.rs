@@ -456,6 +456,24 @@ pub(crate) fn evaluate_progress(
 /// one `/proc` snapshot needs and the blocked verdict is finite. The
 /// budget is only entered after the guest-derived wall boundary; it does
 /// not lengthen healthy runs.
+///
+/// REACHABILITY — this arm is a WIDE-VM backstop, not the ordinary terminal
+/// bound, and the currency choice is exactly why. The observer only accrues
+/// CPU on its 100 ms timerfd tick, so wall-to-fire is
+/// `budget_ns / observer_duty`, where the duty is the watchdog thread's CPU
+/// per tick over the tick period. The only term in that duty that grows with
+/// the guest is [`super::deadman_host_vcpu_samples`]' O(vCPU) two-file
+/// (`schedstat` + `stat`) `/proc` walk, measured at ~4.5 µs per vCPU per walk
+/// on x86-64 — ~0.005% duty at 1 vCPU, ~0.9% at 200. Charging that walk as if
+/// it were the WHOLE duty (an upper bound on wall-to-fire, since the rest of
+/// the tick spends observer CPU too), two CPU seconds need ~4e4 s of wall at
+/// 1 vCPU and ~2e2 s at 200 — so the walk term alone holds wall-to-fire above
+/// the liveness-independent wall net's own [`WALL_NET_ABSOLUTE_CEILING_NS`]
+/// until roughly 44 vCPUs. Below that width this arm simply cannot fire inside
+/// a run, and [`wall_net_tripped`] is what actually terminates a stably-blocked
+/// cell; this arm becomes the earlier of the two only once the walk dominates
+/// the duty. A width-INDEPENDENT bound would have to be counted in
+/// OBSERVATIONS rather than in observer CPU; this budget is not.
 pub(crate) const DEADMAN_BLOCKED_OBSERVER_CPU_BUDGET_NS: u64 = 2_000_000_000;
 
 /// Minimum PER-vCPU guest-CPU advance BETWEEN two Tier-3 observations that

@@ -17,6 +17,19 @@ use super::watchdog_step;
 /// Raw PMU-currency and blocked-observer allowance for one readiness
 /// generation. Pthread vCPU currency is widened by the shared 3/2 policy;
 /// observer thread CPU is already exact and uses this value directly.
+///
+/// The two arms are NOT equally reachable, and only the delivered-service one
+/// bounds a wait on its own. Delivered vCPU service accrues at up to wall
+/// rate, so a still-serviced wait fails closed on a wall scale near the
+/// budget. Observer CPU accrues only from the watchdog's own per-tick work: its
+/// width-scaling term is the O(vCPU) two-file `/proc` walk, ~4.5 µs per vCPU
+/// per 100 ms tick (measured, x86-64). Charging that walk as the whole duty —
+/// an upper bound on wall-to-fire — 75 observer-CPU seconds need ~8e3 s of
+/// wall even at 200 vCPUs, and would only come inside
+/// [`watchdog_step::WALL_NET_ABSOLUTE_CEILING_NS`] past ~1600 vCPUs. So a
+/// readiness wait whose vCPU tasks stay stably blocked is terminated by the
+/// unconditional wall net ([`watchdog_step::wall_net_tripped`]), not by this
+/// budget, at every width these tests run.
 pub(super) const READINESS_WAIT_SERVICE_BUDGET_NS: u64 = 75_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
