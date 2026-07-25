@@ -1408,6 +1408,7 @@ const CACHED_CARGO_BUILD_KTSTR_RUNTIME_ENVIRONMENT: &[&str] = &[
     "KTSTR_NO_SKIP_MODE",
     "KTSTR_ORCHESTRATED",
     "KTSTR_PERF_ONLY",
+    "KTSTR_PRODUCTION_LOCK_DIR",
     "KTSTR_PROJECT_COMMIT",
     "KTSTR_RUN_EPOCH",
     "KTSTR_RUNS_ROOT",
@@ -3216,6 +3217,19 @@ mod tests {
             1,
             "an explicit rebased target-dir remains authoritative",
         );
+    }
+
+    /// Named explicitly because the classification tests below iterate the same
+    /// constant they assert about and so cannot notice a missing entry. This is
+    /// the nextest-side spelling of the lock directory `KTSTR_LOCK_DIR` already
+    /// covers — cargo-ktstr resolves it in the parent and stamps it onto every
+    /// nextest run, so a nested cargo-ktstr inherits it — and it must be
+    /// classified the same on both sides of the identity/sanitization contract.
+    #[test]
+    fn the_production_lock_dir_reference_is_runtime_state() {
+        assert!(cached_cargo_build_environment_is_runtime(
+            std::ffi::OsStr::new(ktstr::KTSTR_PRODUCTION_LOCK_DIR_ENV)
+        ));
     }
 
     #[test]
