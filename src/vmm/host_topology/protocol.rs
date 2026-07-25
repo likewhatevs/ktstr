@@ -3672,10 +3672,6 @@ impl HeldLocks {
         let mut published_target = target.to_vec();
         for lock in &mut published_target {
             if matches!(lock.resource, ResourceKey::Cpu(_)) {
-                anyhow::ensure!(
-                    matches!(lock.mode, FlockMode::Shared | FlockMode::Exclusive),
-                    "default exact probe target has an invalid CPU flock mode",
-                );
                 lock.mode = FlockMode::Shared;
             }
         }
