@@ -6904,6 +6904,7 @@ pub(super) fn exercise_preparation_pool_budget_for_tests() -> Result<Preparation
         waiter.finish(None)?;
     }
     coordinator.finish(None)?;
+    exercise_preparation_pool_revoked_cohort_for_tests()?;
     Ok(PreparationPoolBudgetOutcome {
         pool: POOL,
         waiters: WAITERS,
@@ -6912,6 +6913,116 @@ pub(super) fn exercise_preparation_pool_budget_for_tests() -> Result<Preparation
         surplus_none_granted: surplus_none,
         surplus_none_pinned: surplus_unpinned,
     })
+}
+
+/// Budget accounting for a grant revoked inside the scan that observes it: the
+/// revoked callback may already own the token it raced, so its slot stays
+/// charged until its own REVOKED acknowledgement retires the record. A
+/// disjoint successor must therefore stay WAITING in that same scan and win
+/// the slot only once the revoked intent is gone. Asserted in place because
+/// the exercise is a phase of the pool-budget test, not a separate outcome.
+#[cfg(test)]
+fn exercise_preparation_pool_revoked_cohort_for_tests() -> Result<()> {
+    let tokens = super::super::preparation_token_range()?;
+    anyhow::ensure!(
+        !tokens.is_empty(),
+        "host preparation pool is empty for the revoked-cohort test",
+    );
+    let pool = tokens.start..tokens.start + 1;
+    let victim_cpu = 6usize;
+    let successor_cpu = 8usize;
+    let coord_claim = ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coord_claim.clone(), coord_claim, None)?;
+    // Disjoint run CPUs: withdrawing the victim's CPU revokes its grant while
+    // leaving the successor physically viable, so only the pool budget can
+    // hold the successor back.
+    let register_intent = |cpu: usize| -> Result<Ticket> {
+        let claim = ClaimSet::with_modes(
+            std::iter::empty(),
+            [cpu],
+            FlockMode::Shared,
+            FlockMode::Shared,
+        );
+        let watch = ClaimSet::with_permits(
+            std::iter::empty(),
+            [cpu],
+            [tokens.start],
+            FlockMode::Shared,
+            FlockMode::Shared,
+            FlockMode::Exclusive,
+        );
+        Ticket::register(claim, watch, None)
+    };
+    let mut victim = register_intent(victim_cpu)?;
+    let mut successor = register_intent(successor_cpu)?;
+
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.restage_coordinator_for_tests(&coordinator, [&victim, &successor].into_iter())?;
+        set_cpu_free_for_tests(&mut table, victim_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, successor_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, 3, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), Some(&pool))?;
+        anyhow::ensure!(
+            table
+                .record(victim.slot)?
+                .is_some_and(|record| record.state == STATE_GRANTED),
+            "the oldest preparation intent must first win the single pool slot",
+        );
+        anyhow::ensure!(
+            table
+                .record(successor.slot)?
+                .is_some_and(|record| record.state != STATE_GRANTED),
+            "the successor must not be granted while the single pool slot is taken",
+        );
+    }
+
+    // Withdraw the victim's run CPU so the next scan revokes its grant.
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, victim_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, successor_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, 3, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), Some(&pool))?;
+        anyhow::ensure!(
+            table
+                .record(victim.slot)?
+                .is_some_and(|record| record.state == STATE_REVOKED),
+            "withdrawing the granted intent's run CPU must revoke its grant",
+        );
+        anyhow::ensure!(
+            table
+                .record(successor.slot)?
+                .is_some_and(|record| record.state != STATE_GRANTED),
+            "a grant revoked in this scan still holds its pool slot; the successor must not be granted against it",
+        );
+    }
+
+    // Retiring the revoked intent frees the slot: the same successor, under
+    // the same host availability, is granted by the next scan.
+    victim.finish(None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, victim_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, successor_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, 3, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), Some(&pool))?;
+        anyhow::ensure!(
+            table
+                .record(successor.slot)?
+                .is_some_and(|record| record.state == STATE_GRANTED),
+            "the successor must win the pool slot once the revoked intent retires",
+        );
+    }
+    successor.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -19016,9 +19127,14 @@ impl Table {
                 // reserves one pool token it has not yet turned into a PENDING
                 // claim. Charge it here (its run claim names no token) so a
                 // junior waiter later in ticket order cannot be granted against
-                // a slot this cohort is already racing for. HELD has released
+                // a slot this cohort is already racing for. A grant revoked
+                // just above is charged the same way: its callback may already
+                // own the token it raced, and only that ticket's own REVOKED
+                // acknowledgement releases it — the same reason a record which
+                // entered this scan REVOKED is charged above. HELD has released
                 // its token; the coordinator is charged via the head reserve.
-                if scan_state == STATE_GRANTED && record.preparation_intent {
+                if matches!(scan_state, STATE_GRANTED | STATE_REVOKED) && record.preparation_intent
+                {
                     prep_granted_tokens += 1;
                 }
             } else if backfill_head.is_none()
