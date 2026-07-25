@@ -912,6 +912,100 @@ fn shared_intent_candidates(
     candidates
 }
 
+/// Enumerate default mode's candidate footprints: each 1:1 mapped placement
+/// grown out to the cooperative LLC-SH/CPU-SH envelope that both admission
+/// outcomes publish and retain, with the mapped CPUs kept as the exact subset
+/// probed CPU-EX first.
+///
+/// The pre-exec intent queue and the run-time acquisition must derive
+/// byte-identical footprints from the same inputs. They are separate
+/// transactions, so a divergence here does not surface as a failed claim —
+/// `activate_pending` republishes the run-side claim, so the run still
+/// acquires what it asks for. It desynchronizes the queue instead: the
+/// pre-exec cell is ranked, and its watch envelope sized, against a footprint
+/// the run never takes. Hence one producer rather than two call sites
+/// open-coding the same rotation, spill order, and LLC union.
+///
+/// An empty result means this host has no exact placement for `topology`;
+/// each caller dispatches its own shared fallback, which differ (intent
+/// publishes shared candidates, the run enters a different acquire path).
+fn default_candidate_footprints(
+    host_topo: &host_topology::HostTopology,
+    topology: &Topology,
+    allowed: &[usize],
+    target: usize,
+) -> Result<Vec<DefaultCandidateFootprint>> {
+    let mapped = match host_topo.default_pinning_candidates_for_cpus(topology, allowed) {
+        Ok(mapped) if !mapped.is_empty() => mapped,
+        Ok(_) => return Ok(Vec::new()),
+        Err(error)
+            if error
+                .downcast_ref::<host_topology::TopologyInsufficient>()
+                .is_some() =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    let start = host_topology::pid_window_offset(std::process::id(), mapped.len());
+    let cpu_start = host_topology::pid_window_offset(std::process::id(), allowed.len());
+    let mut footprints = Vec::with_capacity(mapped.len());
+    for offset in 0..mapped.len() {
+        let mapped = &mapped[(start + offset) % mapped.len()];
+        let mut shared_cpus = mapped.cpu_reservations.clone();
+        shared_cpus.sort_unstable();
+        shared_cpus.dedup();
+
+        // Prefer service headroom in an LLC already used by the mapped
+        // vCPUs, then spill across the remaining allowed CPUs in the same
+        // process-rotated order. CPU-SH on every selected CPU remains the
+        // hard bridge to topology-unavailable performance claimants.
+        for prefer_mapped_llc in [true, false] {
+            for index in 0..allowed.len() {
+                if shared_cpus.len() == target {
+                    break;
+                }
+                let cpu = allowed[(cpu_start + index) % allowed.len()];
+                if shared_cpus.contains(&cpu) {
+                    continue;
+                }
+                let llc = host_topo
+                    .llc_groups
+                    .iter()
+                    .position(|group| group.cpus.contains(&cpu));
+                let in_mapped_llc =
+                    llc.is_some_and(|llc| mapped.plan.llc_indices.binary_search(&llc).is_ok());
+                if in_mapped_llc == prefer_mapped_llc {
+                    shared_cpus.push(cpu);
+                }
+            }
+        }
+        anyhow::ensure!(
+            shared_cpus.len() == target,
+            "default candidate footprint contains {} CPUs, expected {target}",
+            shared_cpus.len(),
+        );
+        shared_cpus.sort_unstable();
+
+        let mut shared_llcs = mapped.plan.llc_indices.clone();
+        shared_llcs.extend(shared_cpus.iter().filter_map(|cpu| {
+            host_topo
+                .llc_groups
+                .iter()
+                .position(|group| group.cpus.contains(cpu))
+        }));
+        shared_llcs.sort_unstable();
+        shared_llcs.dedup();
+        footprints.push(DefaultCandidateFootprint {
+            plan: mapped.plan.clone_unlocked(),
+            exact_cpus: mapped.cpu_reservations.clone(),
+            shared_llcs,
+            shared_cpus,
+        });
+    }
+    Ok(footprints)
+}
+
 /// Build the same default candidate footprints used by final activation.
 /// Each published claim is the cooperative LLC-SH/CPU-SH envelope retained by
 /// either outcome; `preferred_ex_cpus` records the 1:1 subset that default
@@ -925,70 +1019,20 @@ fn default_intent_candidates(
     let Some(host_topo) = host_topo else {
         return Ok(shared_intent_candidates(None, allowed, target));
     };
-    let mapped = match host_topo.default_pinning_candidates_for_cpus(topology, allowed) {
-        Ok(mapped) if !mapped.is_empty() => mapped,
-        Ok(_) => return Ok(shared_intent_candidates(Some(host_topo), allowed, target)),
-        Err(error)
-            if error
-                .downcast_ref::<host_topology::TopologyInsufficient>()
-                .is_some() =>
-        {
-            return Ok(shared_intent_candidates(Some(host_topo), allowed, target));
-        }
-        Err(error) => return Err(error),
-    };
-    let start = host_topology::pid_window_offset(std::process::id(), mapped.len());
-    let cpu_start = host_topology::pid_window_offset(std::process::id(), allowed.len());
-    let mut candidates = Vec::with_capacity(mapped.len());
-    for offset in 0..mapped.len() {
-        let mapped = &mapped[(start + offset) % mapped.len()];
-        let mut cpus = mapped.cpu_reservations.clone();
-        cpus.sort_unstable();
-        cpus.dedup();
-        for prefer_mapped_llc in [true, false] {
-            for index in 0..allowed.len() {
-                if cpus.len() == target {
-                    break;
-                }
-                let cpu = allowed[(cpu_start + index) % allowed.len()];
-                if cpus.contains(&cpu) {
-                    continue;
-                }
-                let llc = host_topo
-                    .llc_groups
-                    .iter()
-                    .position(|group| group.cpus.contains(&cpu));
-                let in_mapped_llc =
-                    llc.is_some_and(|llc| mapped.plan.llc_indices.binary_search(&llc).is_ok());
-                if in_mapped_llc == prefer_mapped_llc {
-                    cpus.push(cpu);
-                }
-            }
-        }
-        anyhow::ensure!(
-            cpus.len() == target,
-            "default admission intent contains {} CPUs, expected {target}",
-            cpus.len(),
-        );
-        cpus.sort_unstable();
-        let mut llcs = mapped.plan.llc_indices.clone();
-        llcs.extend(cpus.iter().filter_map(|cpu| {
-            host_topo
-                .llc_groups
-                .iter()
-                .position(|group| group.cpus.contains(cpu))
-        }));
-        llcs.sort_unstable();
-        llcs.dedup();
-        candidates.push(AdmissionIntentCandidate {
-            llcs,
-            llc_mode: host_topology::LlcLockMode::Shared,
-            cpus,
-            cpu_mode: crate::flock::FlockMode::Shared,
-            preferred_ex_cpus: mapped.cpu_reservations.clone(),
-        });
+    let footprints = default_candidate_footprints(host_topo, topology, allowed, target)?;
+    if footprints.is_empty() {
+        return Ok(shared_intent_candidates(Some(host_topo), allowed, target));
     }
-    Ok(candidates)
+    Ok(footprints
+        .into_iter()
+        .map(|footprint| AdmissionIntentCandidate {
+            llcs: footprint.shared_llcs,
+            llc_mode: host_topology::LlcLockMode::Shared,
+            cpus: footprint.shared_cpus,
+            cpu_mode: crate::flock::FlockMode::Shared,
+            preferred_ex_cpus: footprint.exact_cpus,
+        })
+        .collect())
 }
 
 fn admission_intent_plan(
@@ -1377,7 +1421,10 @@ impl AdmissionIntentPlan {
 /// footprint retained for either outcome. The exact subset is probed CPU-EX,
 /// while the service-headroom remainder is acquired CPU-SH from the outset;
 /// both outcomes publish and retain the same full shared claim.
-struct DefaultRunCandidate {
+///
+/// Built once by [`default_candidate_footprints`] and consumed by both the
+/// pre-exec intent queue and the run-time acquisition.
+struct DefaultCandidateFootprint {
     plan: host_topology::PinningPlan,
     exact_cpus: Vec<usize>,
     shared_llcs: Vec<usize>,
@@ -2644,93 +2691,20 @@ impl KtstrVm {
                 memory_mib,
             );
         };
-        let flat = match host_topo.default_pinning_candidates_for_cpus(topology, &allowed) {
-            Ok(flat) if !flat.is_empty() => flat,
-            Ok(_) => {
-                return Self::acquire_default_shared_run_locks(
-                    Some(host_topo),
-                    allowed,
-                    topology.total_cpus() as usize,
-                    wait,
-                    cancelled,
-                    pending,
-                    memory_mib,
-                );
-            }
-            Err(error)
-                if error
-                    .downcast_ref::<host_topology::TopologyInsufficient>()
-                    .is_some() =>
-            {
-                return Self::acquire_default_shared_run_locks(
-                    Some(host_topo),
-                    allowed,
-                    topology.total_cpus() as usize,
-                    wait,
-                    cancelled,
-                    pending,
-                    memory_mib,
-                );
-            }
-            Err(error) => return Err(error),
-        };
-        let start = host_topology::pid_window_offset(std::process::id(), flat.len());
         let shared_target =
             host_topology::no_perf_cpu_budget(allowed.len(), topology.total_cpus() as usize);
-        let cpu_start = host_topology::pid_window_offset(std::process::id(), allowed.len());
-        let mut candidates = Vec::with_capacity(flat.len());
-        for offset in 0..flat.len() {
-            let mapped = &flat[(start + offset) % flat.len()];
-            let mut shared_cpus = mapped.cpu_reservations.clone();
-            shared_cpus.sort_unstable();
-            shared_cpus.dedup();
-
-            // Prefer service headroom in an LLC already used by the mapped
-            // vCPUs, then spill across the remaining allowed CPUs in the same
-            // process-rotated order. CPU-SH on every selected CPU remains the
-            // hard bridge to topology-unavailable performance claimants.
-            for prefer_mapped_llc in [true, false] {
-                for index in 0..allowed.len() {
-                    if shared_cpus.len() == shared_target {
-                        break;
-                    }
-                    let cpu = allowed[(cpu_start + index) % allowed.len()];
-                    if shared_cpus.contains(&cpu) {
-                        continue;
-                    }
-                    let llc = host_topo
-                        .llc_groups
-                        .iter()
-                        .position(|group| group.cpus.contains(&cpu));
-                    let in_mapped_llc =
-                        llc.is_some_and(|llc| mapped.plan.llc_indices.binary_search(&llc).is_ok());
-                    if in_mapped_llc == prefer_mapped_llc {
-                        shared_cpus.push(cpu);
-                    }
-                }
-            }
-            anyhow::ensure!(
-                shared_cpus.len() == shared_target,
-                "default shared candidate contains {} CPUs, expected {shared_target}",
-                shared_cpus.len(),
+        let candidates =
+            default_candidate_footprints(host_topo, topology, &allowed, shared_target)?;
+        if candidates.is_empty() {
+            return Self::acquire_default_shared_run_locks(
+                Some(host_topo),
+                allowed,
+                topology.total_cpus() as usize,
+                wait,
+                cancelled,
+                pending,
+                memory_mib,
             );
-            shared_cpus.sort_unstable();
-
-            let mut shared_llcs = mapped.plan.llc_indices.clone();
-            shared_llcs.extend(shared_cpus.iter().filter_map(|cpu| {
-                host_topo
-                    .llc_groups
-                    .iter()
-                    .position(|group| group.cpus.contains(cpu))
-            }));
-            shared_llcs.sort_unstable();
-            shared_llcs.dedup();
-            candidates.push(DefaultRunCandidate {
-                plan: mapped.plan.clone_unlocked(),
-                exact_cpus: mapped.cpu_reservations.clone(),
-                shared_llcs,
-                shared_cpus,
-            });
         }
         let permit_pool = host_topology::VmPermitPool::new_with_preparation(
             allowed.len(),
@@ -2864,7 +2838,7 @@ impl KtstrVm {
         let initial_permits = permit_pool
             .select_registered()?
             .expect("a validated default permit pool can seed admission");
-        let claim_for = |candidate: &DefaultRunCandidate,
+        let claim_for = |candidate: &DefaultCandidateFootprint,
                          permits: &host_topology::VmPermitReservation| {
             host_topology::resource_claim_with_permits(
                 &candidate.shared_llcs,
@@ -2899,7 +2873,8 @@ impl KtstrVm {
             // Ordinary watch represents both selection classes.
             protocol::AdmissionClass::Ordinary,
         );
-        let matches_designation = |candidate: &DefaultRunCandidate, claim: &protocol::ClaimSet| {
+        let matches_designation = |candidate: &DefaultCandidateFootprint,
+                                   claim: &protocol::ClaimSet| {
             candidate
                 .shared_llcs
                 .iter()
