@@ -1798,8 +1798,7 @@ pub(crate) fn register_intent_for_preparation(
                         // Same rule as the ordinary ticket drive: a licensed
                         // GRANTED grant that failed to reach preparation is
                         // headline churn, while an unlicensed REPLAN completion
-                        // is already tallied as a replan requeue and must not
-                        // inflate grants_lost.
+                        // never held a grant to lose.
                         if licensed_grant {
                             crate::vmm::grant_flow::note_grant_lost();
                         }
@@ -3513,9 +3512,9 @@ fn drive_registered_ticket<T>(
                         // convert to a live HELD claim (registry revoke, stale
                         // prefix, or a lost physical probe) as headline churn. An
                         // unlicensed REPLAN completion that re-plans without
-                        // acquiring is not a lost grant — it is already tallied
-                        // in `replan_requeue` — so it must not inflate the
-                        // grants_lost headline. Then requeue either way.
+                        // acquiring never held a grant to lose, so it must not
+                        // inflate the grants_lost headline. Then requeue either
+                        // way.
                         if licensed_grant {
                             crate::vmm::grant_flow::note_grant_lost();
                         }
