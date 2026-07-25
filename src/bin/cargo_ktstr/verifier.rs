@@ -1735,7 +1735,7 @@ fn build_scheduler_workspace(
     // bucket (dependency and OUT_DIR reuse); final scheduler binaries still land
     // in the per-source sealed target directory.
     let shared_build_dir = crate::nextest_artifact_cache::shared_build_scratch_dir(build_bucket)?;
-    crate::run_cargo::gc_stale_shared_build_scratch(std::time::SystemTime::now());
+    crate::run_cargo::gc_stale_shared_build_scratch(std::time::SystemTime::now(), build_bucket);
     let stable_build_options = stable_source.remap_cargo_args(build_options);
     let (build_args, _identity_target_dir) =
         scheduler_workspace_execution(group, profile, &stable_build_options);
@@ -1778,6 +1778,7 @@ fn build_scheduler_workspace(
             // order is build-dir lease then target-dir lease (inside the call).
             let _shared_build_lease =
                 crate::run_cargo::acquire_cargo_build_output_lease(&shared_build_dir, cli_label)?;
+            crate::run_cargo::stamp_shared_build_scratch_use(&shared_build_dir);
             crate::run_cargo::purge_shared_build_dir_workspace_members(
                 &shared_build_dir,
                 metadata,

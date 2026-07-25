@@ -3795,7 +3795,7 @@ pub(crate) fn load_or_build_nextest_artifacts(
     )?;
     let shared_build_dir =
         crate::nextest_artifact_cache::shared_build_scratch_dir(plan.build_bucket)?;
-    gc_stale_shared_build_scratch(std::time::SystemTime::now());
+    gc_stale_shared_build_scratch(std::time::SystemTime::now(), plan.build_bucket);
     let mut materialized = plan.load_or_build(cli_label, |stable, stable_build| {
         let stable_invocation_dir = stable.invocation_root.clone();
         let build_args = stable.remap_cargo_args(build_args);
@@ -3863,6 +3863,7 @@ pub(crate) fn load_or_build_nextest_artifacts(
         // is always build-dir lease then target-dir lease (inside the call), so
         // it composes with Cargo's own build-dir lock without deadlock.
         let _shared_build_lease = acquire_cargo_build_output_lease(&shared_build_dir, cli_label)?;
+        stamp_shared_build_scratch_use(&shared_build_dir);
         purge_shared_build_dir_workspace_members(&shared_build_dir, metadata)?;
         run_reserved_build_output_pair_under_lease(
             command,
@@ -3912,6 +3913,7 @@ pub(crate) fn load_or_build_nextest_artifacts(
     // present; a hit reuses the same deterministic bucket path when it survives.
     if shared_build_dir.is_dir() {
         let runtime_lease = acquire_cargo_build_output_lease_shared(&shared_build_dir, cli_label)?;
+        stamp_shared_build_scratch_use(&shared_build_dir);
         materialized.set_runtime_bucket_lease(runtime_lease);
     }
     Ok(materialized)
@@ -5533,6 +5535,90 @@ fn purge_member_products_in(
 const SHARED_BUILD_SCRATCH_MAX_IDLE: std::time::Duration =
     std::time::Duration::from_secs(14 * 24 * 60 * 60);
 
+/// Directory of per-bucket last-use stamps, a sibling of the buckets themselves.
+///
+/// Deliberately outside the buckets: a bucket is handed to Cargo as its
+/// `build-dir`, so anything ktstr writes inside it is indistinguishable from
+/// build output — including to the mtime fallback below, which would then read
+/// ktstr's own stamp as evidence that a build ran. The name is not 16 hex
+/// digits, so neither sweep mistakes it for a bucket.
+const SHARED_BUILD_SCRATCH_STAMP_DIR: &str = ".ktstr-last-used";
+
+/// Bucket id encoded by a shared build-scratch directory name, if it is one.
+fn shared_build_scratch_bucket_id(name: &std::ffi::OsStr) -> Option<u64> {
+    let name = name.to_str()?;
+    if name.len() != 16 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(name, 16).ok()
+}
+
+fn shared_build_scratch_stamp_path(bucket: &std::path::Path) -> Option<PathBuf> {
+    let name = bucket.file_name()?;
+    Some(
+        bucket
+            .parent()?
+            .join(SHARED_BUILD_SCRATCH_STAMP_DIR)
+            .join(name),
+    )
+}
+
+/// Record that this run is using `bucket`.
+///
+/// Called under the bucket's build-output lease by every producer and by every
+/// cache hit that reuses the bucket at runtime. Cargo's own writes cannot serve
+/// as the liveness signal: on cargo 1.94.1 a rebuild moves only
+/// `<bucket>/<profile>/deps` and a no-op build moves no directory mtime at all,
+/// so a continuously reused bucket can still present a months-old root and
+/// per-profile mtime. Best-effort: a failed stamp only leaves the bucket judged
+/// by those mtimes, as it was before any stamp existed.
+pub(crate) fn stamp_shared_build_scratch_use(bucket: &std::path::Path) {
+    if let Err(error) = write_shared_build_scratch_stamp(bucket) {
+        tracing::debug!(
+            bucket = %bucket.display(),
+            error = %error,
+            "could not stamp shared build-scratch bucket use",
+        );
+    }
+}
+
+fn write_shared_build_scratch_stamp(bucket: &std::path::Path) -> std::io::Result<()> {
+    let stamp = shared_build_scratch_stamp_path(bucket).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "shared build-scratch bucket has no parent directory: {}",
+                bucket.display()
+            ),
+        )
+    })?;
+    if let Some(parent) = stamp.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&stamp)?
+        .set_modified(std::time::SystemTime::now())
+}
+
+/// Remove a reclaimed bucket together with its last-use stamp.
+fn remove_shared_build_scratch_bucket(bucket: &std::path::Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(bucket)?;
+    if let Some(stamp) = shared_build_scratch_stamp_path(bucket)
+        && let Err(error) = std::fs::remove_file(&stamp)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(
+            stamp = %stamp.display(),
+            error = %error,
+            "could not remove last-use stamp of a reclaimed shared build-scratch bucket",
+        );
+    }
+    Ok(())
+}
+
 /// Reclaim shared, non-source-keyed Cargo build-scratch buckets that no builder
 /// is using and that have been idle past [`SHARED_BUILD_SCRATCH_MAX_IDLE`].
 ///
@@ -5547,7 +5633,13 @@ const SHARED_BUILD_SCRATCH_MAX_IDLE: std::time::Duration =
 ///
 /// Best-effort: any per-bucket error is logged and skipped so cleanup never
 /// fails a build.
-pub(crate) fn gc_stale_shared_build_scratch(now: std::time::SystemTime) {
+///
+/// `exempt_bucket` is the bucket the calling run is about to lease, exempted
+/// exactly as in [`reclaim_shared_build_scratch_under_pressure`]: this sweep
+/// runs before that lease is taken, so the non-blocking lock below would
+/// otherwise succeed against the caller's own bucket and delete the very
+/// directory it is about to build in or reuse at runtime.
+pub(crate) fn gc_stale_shared_build_scratch(now: std::time::SystemTime, exempt_bucket: u64) {
     let Ok(parent) = crate::nextest_artifact_cache::shared_build_scratch_dir(0)
         .map(|bucket_zero| bucket_zero.parent().map(std::path::Path::to_path_buf))
     else {
@@ -5560,13 +5652,14 @@ pub(crate) fn gc_stale_shared_build_scratch(now: std::time::SystemTime) {
         Ok(root) => root,
         Err(_) => return,
     };
-    gc_stale_shared_build_scratch_in(&parent, &lock_root, now);
+    gc_stale_shared_build_scratch_in(&parent, &lock_root, now, Some(exempt_bucket));
 }
 
 fn gc_stale_shared_build_scratch_in(
     parent: &std::path::Path,
     lock_root: &std::path::Path,
     now: std::time::SystemTime,
+    exempt_bucket: Option<u64>,
 ) {
     let entries = match std::fs::read_dir(parent) {
         Ok(entries) => entries,
@@ -5574,6 +5667,12 @@ fn gc_stale_shared_build_scratch_in(
     };
     for entry in entries.flatten() {
         if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(bucket_id) = shared_build_scratch_bucket_id(&entry.file_name()) else {
+            continue;
+        };
+        if exempt_bucket == Some(bucket_id) {
             continue;
         }
         let bucket = entry.path();
@@ -5595,7 +5694,7 @@ fn gc_stale_shared_build_scratch_in(
         if !shared_build_scratch_bucket_is_idle(&bucket, now) {
             continue;
         }
-        if let Err(error) = std::fs::remove_dir_all(&bucket)
+        if let Err(error) = remove_shared_build_scratch_bucket(&bucket)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(
@@ -5607,10 +5706,21 @@ fn gc_stale_shared_build_scratch_in(
     }
 }
 
-/// Newest mtime of a bucket root and its immediate children. Cargo touches the
-/// per-profile subdirectories on every build, so this rises whenever a build
-/// ran; a still-building or recently-finished bucket reports a recent time.
-fn bucket_newest_modified(bucket: &std::path::Path) -> Option<std::time::SystemTime> {
+/// When a ktstr run last used a bucket, as far as this host can tell.
+///
+/// The last-use stamp is authoritative when present: every producer and every
+/// reusing hit writes it under the bucket's lease (see
+/// [`stamp_shared_build_scratch_use`]). Buckets left by ktstr versions that
+/// predate the stamp carry none and fall back to the mtimes of the bucket root
+/// and its immediate children — a weak proxy for use, but the only one such a
+/// bucket offers.
+fn bucket_last_used(bucket: &std::path::Path) -> Option<std::time::SystemTime> {
+    if let Some(stamp) = shared_build_scratch_stamp_path(bucket)
+        && let Ok(modified) =
+            std::fs::symlink_metadata(&stamp).and_then(|metadata| metadata.modified())
+    {
+        return Some(modified);
+    }
     let mut newest = std::fs::symlink_metadata(bucket)
         .ok()
         .and_then(|metadata| metadata.modified().ok());
@@ -5624,13 +5734,13 @@ fn bucket_newest_modified(bucket: &std::path::Path) -> Option<std::time::SystemT
     newest
 }
 
-/// Whether every recorded timestamp under a bucket is older than the idle
-/// threshold, used by the no-pressure [`SHARED_BUILD_SCRATCH_MAX_IDLE`] sweep.
+/// Whether a bucket's last recorded use is older than the idle threshold, used
+/// by the no-pressure [`SHARED_BUILD_SCRATCH_MAX_IDLE`] sweep.
 fn shared_build_scratch_bucket_is_idle(
     bucket: &std::path::Path,
     now: std::time::SystemTime,
 ) -> bool {
-    match bucket_newest_modified(bucket) {
+    match bucket_last_used(bucket) {
         Some(newest) => now
             .duration_since(newest)
             .map(|idle| idle >= SHARED_BUILD_SCRATCH_MAX_IDLE)
@@ -5716,27 +5826,23 @@ fn reclaim_shared_build_scratch_under_pressure_in(
         Ok(entries) => entries,
         Err(_) => return 0,
     };
-    // (newest_mtime, path, bucket_id) for every reclaimable bucket except the
-    // one the pending build will use. Ordered oldest-idle first so the
+    // (last_used, path, bucket_id) for every reclaimable bucket except the one
+    // the pending build will use. Ordered oldest-idle first so the
     // least-recently-built configurations go before hotter ones.
     let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, u64)> = Vec::new();
     for entry in entries.flatten() {
         if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             continue;
         }
-        let Some(bucket_id) = entry.file_name().to_str().and_then(|name| {
-            (name.len() == 16 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
-                .then(|| u64::from_str_radix(name, 16).ok())
-                .flatten()
-        }) else {
+        let Some(bucket_id) = shared_build_scratch_bucket_id(&entry.file_name()) else {
             continue;
         };
         if exempt_bucket == Some(bucket_id) {
             continue;
         }
         let path = entry.path();
-        let newest = bucket_newest_modified(&path).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        candidates.push((newest, path, bucket_id));
+        let last_used = bucket_last_used(&path).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        candidates.push((last_used, path, bucket_id));
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2)));
 
@@ -5761,7 +5867,7 @@ fn reclaim_shared_build_scratch_under_pressure_in(
             continue;
         }
         let size = bucket_size_bytes(&bucket);
-        match std::fs::remove_dir_all(&bucket) {
+        match remove_shared_build_scratch_bucket(&bucket) {
             Ok(()) => {
                 reclaimed = reclaimed.saturating_add(size);
                 tracing::info!(
@@ -7609,7 +7715,7 @@ mod tests {
 
         // A recent build keeps every bucket: nothing is older than the idle
         // window relative to "now".
-        gc_stale_shared_build_scratch_in(&parent, &lock_root, std::time::SystemTime::now());
+        gc_stale_shared_build_scratch_in(&parent, &lock_root, std::time::SystemTime::now(), None);
         assert!(idle.exists() && recent.exists() && leased.exists());
 
         // Fast-forward past the idle window. Hold the build-output lease on
@@ -7622,7 +7728,7 @@ mod tests {
         let _held = ktstr::flock::try_flock(&lock_path, ktstr::flock::FlockMode::Exclusive)
             .unwrap()
             .expect("acquire bucket lease for the test");
-        gc_stale_shared_build_scratch_in(&parent, &lock_root, far_future);
+        gc_stale_shared_build_scratch_in(&parent, &lock_root, far_future, None);
         assert!(!idle.exists(), "idle unleased bucket must be reclaimed");
         assert!(
             !recent.exists(),
@@ -7631,6 +7737,107 @@ mod tests {
         assert!(
             leased.exists(),
             "a bucket under an active build-output lease must never be deleted",
+        );
+    }
+
+    /// A bucket in continuous use can still present ancient mtimes: Cargo moves
+    /// only `<bucket>/<profile>/deps` on a rebuild and nothing at all on a no-op
+    /// build, so the last-use stamp — not the build output — is what records
+    /// that a run took the bucket.
+    #[test]
+    fn gc_keeps_a_stamped_bucket_whose_build_output_mtimes_are_ancient() {
+        let temp = tempfile::tempdir().expect("scratch parent");
+        let parent = temp.path().join("shared-build-scratch-v1");
+        let lock_root = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_root).unwrap();
+        let now = std::time::SystemTime::now();
+        let ancient = now - SHARED_BUILD_SCRATCH_MAX_IDLE * 2;
+        let make_ancient_bucket = |name: &str| -> std::path::PathBuf {
+            let bucket = parent.join(name);
+            let deps = bucket.join("release/deps");
+            std::fs::create_dir_all(&deps).unwrap();
+            let product = deps.join("libdep.rlib");
+            std::fs::write(&product, b"dep").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&product)
+                .unwrap()
+                .set_modified(ancient)
+                .unwrap();
+            // Deepest directory first: every write above bumps its parent.
+            for directory in [&deps, &bucket.join("release"), &bucket] {
+                std::fs::File::open(directory)
+                    .unwrap()
+                    .set_modified(ancient)
+                    .unwrap();
+            }
+            bucket
+        };
+        let stamped = make_ancient_bucket("aaaaaaaaaaaaaaaa");
+        let unstamped = make_ancient_bucket("bbbbbbbbbbbbbbbb");
+        stamp_shared_build_scratch_use(&stamped);
+        let stamp = parent
+            .join(SHARED_BUILD_SCRATCH_STAMP_DIR)
+            .join("aaaaaaaaaaaaaaaa");
+        assert!(
+            stamp.is_file() && !stamped.join(SHARED_BUILD_SCRATCH_STAMP_DIR).exists(),
+            "the stamp belongs beside the buckets, never inside the one Cargo builds into",
+        );
+
+        gc_stale_shared_build_scratch_in(&parent, &lock_root, now, None);
+        assert!(
+            stamped.exists(),
+            "a bucket this run stamped must survive however old its build output is",
+        );
+        assert!(
+            !unstamped.exists(),
+            "a bucket with no stamp is still judged by the mtimes it does have",
+        );
+
+        // The stamp records use; it does not pin a bucket nobody comes back to.
+        let far_future = now + SHARED_BUILD_SCRATCH_MAX_IDLE + std::time::Duration::from_secs(60);
+        gc_stale_shared_build_scratch_in(&parent, &lock_root, far_future, None);
+        assert!(!stamped.exists(), "a stamped bucket still ages out");
+        assert!(
+            !stamp.exists(),
+            "reclaiming a bucket removes its last-use stamp",
+        );
+    }
+
+    /// The sweep runs before the calling run takes its own bucket lease, so
+    /// without the exemption a run's own GC pass deletes the bucket it is about
+    /// to build in (or, on a cache hit, to read `OUT_DIR` artifacts from) —
+    /// a same-process window no lease can cover.
+    #[test]
+    fn gc_spares_the_pending_bucket_of_the_run_that_swept() {
+        let temp = tempfile::tempdir().expect("scratch parent");
+        let parent = temp.path().join("shared-build-scratch-v1");
+        let lock_root = temp.path().join("locks");
+        std::fs::create_dir_all(&lock_root).unwrap();
+        let make_bucket = |name: &str| -> std::path::PathBuf {
+            let bucket = parent.join(name);
+            std::fs::create_dir_all(bucket.join("release/deps")).unwrap();
+            bucket
+        };
+        let pending = make_bucket("aaaaaaaaaaaaaaaa");
+        let other = make_bucket("bbbbbbbbbbbbbbbb");
+
+        let far_future = std::time::SystemTime::now()
+            + SHARED_BUILD_SCRATCH_MAX_IDLE
+            + std::time::Duration::from_secs(60);
+        gc_stale_shared_build_scratch_in(
+            &parent,
+            &lock_root,
+            far_future,
+            Some(0xaaaa_aaaa_aaaa_aaaa),
+        );
+        assert!(
+            pending.exists(),
+            "the bucket this run is about to lease is never reclaimed by its own sweep",
+        );
+        assert!(
+            !other.exists(),
+            "every other idle unleased bucket is still reclaimed",
         );
     }
 
@@ -7654,7 +7861,7 @@ mod tests {
                 .set_modified(target)
                 .unwrap();
             // Set the bucket dir mtime LAST: adding the marker bumped it to ~now,
-            // which would otherwise dominate `bucket_newest_modified`.
+            // which would otherwise dominate `bucket_last_used`.
             std::fs::File::open(&bucket)
                 .unwrap()
                 .set_modified(target)
@@ -7774,7 +7981,7 @@ mod tests {
         let far_future = std::time::SystemTime::now()
             + SHARED_BUILD_SCRATCH_MAX_IDLE
             + std::time::Duration::from_secs(60);
-        gc_stale_shared_build_scratch_in(&parent, &lock_root, far_future);
+        gc_stale_shared_build_scratch_in(&parent, &lock_root, far_future, None);
         assert!(
             bucket.exists(),
             "a SHARED-leased bucket is never reclaimed by the aged GC",
