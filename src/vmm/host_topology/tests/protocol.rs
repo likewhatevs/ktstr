@@ -5318,10 +5318,10 @@ fn completed_replan_replacement_grants_before_straggler_wave_drains() {
     );
     assert!(
         outcome.completed_replacement_granted
-            && outcome.later_disjoint_grant_regranted_after_scan
+            && outcome.later_conflicting_grant_not_regranted
             && outcome.straggler_still_replan
             && outcome.wave_deadline_not_reached,
-        "the authoritative scan must grant completed compatible work and restore the disjoint later grant before the unrelated callback returns or its finite-wave lease expires",
+        "the authoritative scan must grant the senior's completed replacement and keep the demoted conflicting junior waiting, before the unrelated callback returns or its finite-wave lease expires",
     );
 }
 
@@ -5424,6 +5424,90 @@ fn exclusive_held_remains_held_only() {
     assert!(
         cpu_grant_counted && llc_grant_counted,
         "granted-EX claims must surface through the grant-count bias accessors",
+    );
+}
+
+/// The grant-disjointness guard skip: a NonFencing replacement disjoint from
+/// every grant charge leaves the GRANTED watermark clean — the in-flight
+/// junior grant enters and commits to HELD while the wave is outstanding —
+/// while the always-dirtied replan word still releases and requeues an
+/// unlicensed same-wake REPLAN acquire (the split-watermark inversion pin).
+#[test]
+fn placement_same_guard_skips_dirty_when_grant_disjoint() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_grant_disjoint_completion_for_tests()
+        .expect("exercise grant-disjoint guard skip");
+    assert!(
+        outcome.main_watermark_clean,
+        "a grant-disjoint replacement must leave the GRANTED watermark clean",
+    );
+    assert!(
+        outcome.replan_watermark_dirty,
+        "the replan watermark word must be dirtied by every NonFencing replacement",
+    );
+    assert!(
+        outcome.junior_committed_held_during_wave,
+        "the disjoint junior grant must enter and commit HELD without parking",
+    );
+    assert!(
+        outcome.straggler_same_wake_fenced && outcome.straggler_requeued_waiting,
+        "an unlicensed REPLAN acquire must release and requeue via the replan word",
+    );
+}
+
+/// Site-B guard skip: an unchanged REPLAN completion disjoint from every
+/// grant charge leaves the GRANTED watermark clean and the junior enters.
+#[test]
+fn unchanged_completion_skips_dirty_when_grant_disjoint() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (guarded_as_expected, junior_entered) =
+        protocol::exercise_unchanged_completion_guard_for_tests(false)
+            .expect("exercise disjoint unchanged completion");
+    assert!(
+        guarded_as_expected,
+        "a disjoint unchanged completion must dirty only the replan word",
+    );
+    assert!(
+        junior_entered,
+        "the disjoint junior grant must enter without parking",
+    );
+}
+
+/// Site-B guard trip: an unchanged completion whose claim sits on a junior
+/// grant must dirty the full suffix and park that junior until the scan.
+#[test]
+fn unchanged_completion_dirties_on_grant_overlap() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (guarded_as_expected, junior_parked) =
+        protocol::exercise_unchanged_completion_guard_for_tests(true)
+            .expect("exercise overlapping unchanged completion");
+    assert!(
+        guarded_as_expected,
+        "an overlapping unchanged completion must dirty both watermark words",
+    );
+    assert!(
+        junior_parked,
+        "the overlapped junior grant must park until the authoritative scan",
+    );
+}
+
+/// Full-claim (not delta) disjointness: a replacement KEEPING a resource a
+/// junior grant sits on must dirty the full suffix even though the kept
+/// resource is not part of the change.
+#[test]
+fn guard_dirties_on_kept_resource_overlap() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (both_words_dirty, junior_parked) =
+        protocol::exercise_replacement_kept_overlap_guard_for_tests()
+            .expect("exercise kept-resource overlap");
+    assert!(
+        both_words_dirty,
+        "a kept-resource overlap must dirty both watermark words — delta \
+         cleanliness is not grant disjointness",
+    );
+    assert!(
+        junior_parked,
+        "the junior grant on the kept resource must park until the scan",
     );
 }
 

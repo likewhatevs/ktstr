@@ -62,6 +62,14 @@ static REPLAN_REPLACE_PLACEMENT_SAME: AtomicU64 = AtomicU64::new(0);
 // Speculative REPLAN callbacks that re-planned/requeued without acquiring — the
 // elastic replanner's own churn, distinct from a licensed GRANTED grant loss.
 static REPLAN_REQUEUE: AtomicU64 = AtomicU64::new(0);
+// Grant-disjointness damping guard outcomes, per site. `skip` means the
+// replacement/completion dirtied only the replan watermark word (no junior
+// grant parks); `dirty` means it overlapped a live grant charge and dirtied
+// the full suffix as before.
+static GUARD_REPLACE_SKIP: AtomicU64 = AtomicU64::new(0);
+static GUARD_REPLACE_DIRTY: AtomicU64 = AtomicU64::new(0);
+static GUARD_COMPLETION_SKIP: AtomicU64 = AtomicU64::new(0);
+static GUARD_COMPLETION_DIRTY: AtomicU64 = AtomicU64::new(0);
 // Two-tier permit selection: per-candidate grant-charge hits during the
 // grant-aware tier, and whether a planning pass had to fall back to the
 // grant-blind tier (the fallback binding persistently at wave peaks means the
@@ -188,6 +196,25 @@ pub(crate) fn note_replan_requeue() {
     REPLAN_REQUEUE.fetch_add(1, Ordering::Relaxed);
 }
 
+/// One NonFencing replacement through the grant-disjointness guard.
+/// `skipped` means the main suffix watermark stayed clean.
+pub(crate) fn note_replace_guard(skipped: bool) {
+    if skipped {
+        GUARD_REPLACE_SKIP.fetch_add(1, Ordering::Relaxed);
+    } else {
+        GUARD_REPLACE_DIRTY.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One unchanged REPLAN completion through the grant-disjointness guard.
+pub(crate) fn note_completion_guard(skipped: bool) {
+    if skipped {
+        GUARD_COMPLETION_SKIP.fetch_add(1, Ordering::Relaxed);
+    } else {
+        GUARD_COMPLETION_DIRTY.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// One candidate evaluated by the grant-aware permit tier. Only called behind
 /// [`enabled`] (per-candidate volume).
 pub(crate) fn note_permit_candidate(grant_charged: bool) {
@@ -249,6 +276,8 @@ fn format_line(pid: u32) -> String {
          lost_stale_regrant={} lost_physical_probe={} replan_requeue={} \
          wmpark_wave={} \
          replan_replace_total={} replan_replace_noop={} replan_replace_placement_same={} \
+         guard_replace_skip={} guard_replace_dirty={} \
+         guard_completion_skip={} guard_completion_dirty={} \
          permit_candidates_total={} permit_candidates_grant_charged={} \
          permit_select_grant_aware={} permit_select_fallback={} \
          held_in_flight_max={} distinct_held_cpus_max={} discover_count={} \
@@ -266,6 +295,10 @@ fn format_line(pid: u32) -> String {
         REPLAN_REPLACE_TOTAL.load(Ordering::Relaxed),
         REPLAN_REPLACE_NOOP.load(Ordering::Relaxed),
         REPLAN_REPLACE_PLACEMENT_SAME.load(Ordering::Relaxed),
+        GUARD_REPLACE_SKIP.load(Ordering::Relaxed),
+        GUARD_REPLACE_DIRTY.load(Ordering::Relaxed),
+        GUARD_COMPLETION_SKIP.load(Ordering::Relaxed),
+        GUARD_COMPLETION_DIRTY.load(Ordering::Relaxed),
         PERMIT_CANDIDATES_TOTAL.load(Ordering::Relaxed),
         PERMIT_CANDIDATES_GRANT_CHARGED.load(Ordering::Relaxed),
         PERMIT_SELECT_GRANT_AWARE.load(Ordering::Relaxed),
@@ -326,6 +359,10 @@ mod tests {
             "replan_replace_total=",
             "replan_replace_noop=",
             "replan_replace_placement_same=",
+            "guard_replace_skip=",
+            "guard_replace_dirty=",
+            "guard_completion_skip=",
+            "guard_completion_dirty=",
             "permit_candidates_total=",
             "permit_candidates_grant_charged=",
             "permit_select_grant_aware=",

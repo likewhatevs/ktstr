@@ -2497,6 +2497,24 @@ pub(crate) fn exercise_exclusive_grant_bias_only_for_tests() -> Result<(bool, bo
 }
 
 #[cfg(test)]
+pub(crate) fn exercise_grant_disjoint_completion_for_tests()
+-> Result<registry::GrantDisjointCompletionOutcome> {
+    registry::exercise_grant_disjoint_completion_for_tests()
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_unchanged_completion_guard_for_tests(
+    conflicting: bool,
+) -> Result<(bool, bool)> {
+    registry::exercise_unchanged_completion_guard_for_tests(conflicting)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_replacement_kept_overlap_guard_for_tests() -> Result<(bool, bool)> {
+    registry::exercise_replacement_kept_overlap_guard_for_tests()
+}
+
+#[cfg(test)]
 pub(crate) fn exercise_coordinator_pending_replan_for_tests()
 -> Result<registry::CoordinatorPendingReplanOutcome> {
     registry::exercise_coordinator_pending_replan_for_tests()

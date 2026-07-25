@@ -35,7 +35,7 @@ const RETAINED_FUTEX_WAIT_GATE_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_GATE"
 thread_local! {
     static GENERATION_WAIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-const HEADER_FIXED: usize = 256;
+const HEADER_FIXED: usize = 264;
 const HEADER_ALIGN: usize = 4096;
 const RECORD_FIXED: usize = 192;
 const RECORD_ALIGN: usize = 64;
@@ -195,6 +195,13 @@ const H_REPLAN_CAPACITY: usize = 240;
 /// the coordinator heartbeat, ordinary event turns never renew this value, so
 /// a continuous inotify stream cannot postpone a partial planning wave.
 const H_DEFERRED_RESCAN_DEADLINE_NS: usize = 248;
+/// Suffix watermark consumed only by unlicensed REPLAN acquire-commits
+/// (`dirty_redesignation`). `mark_suffix_dirty` writes it together with
+/// [`H_MIN_CHANGED_TICKET`]; the grant-disjointness damping guard writes only
+/// this word, so a replacement provably unable to doom any in-flight grant
+/// still fences speculative REPLAN commits whose claims carry no grant charge.
+const H_MIN_CHANGED_TICKET_REPLAN: usize = 256;
+const _: () = assert!(H_MIN_CHANGED_TICKET_REPLAN + std::mem::size_of::<u64>() == HEADER_FIXED);
 const _: () = assert!(H_AGGREGATE_DIRTY.is_multiple_of(std::mem::align_of::<AtomicU64>()));
 const _: () = assert!(H_GENERATION_WAKE.is_multiple_of(std::mem::align_of::<AtomicU32>()));
 const _: () = assert!(H_REPLAN_CURSOR.is_multiple_of(std::mem::align_of::<u64>()));
@@ -2980,7 +2987,7 @@ impl Ticket {
         let dirty_redesignation = !acquisition_allowed
             && record.state == STATE_REPLAN
             && result.acquired.is_some()
-            && table.min_changed_ticket() < record.ticket;
+            && table.min_changed_ticket_replan() < record.ticket;
         if dirty_redesignation {
             crate::vmm::grant_flow::note_replan_requeue();
             table.begin_transaction()?;
@@ -3329,8 +3336,20 @@ impl Ticket {
             if !acquisition_allowed {
                 // Completing an unchanged speculative callback can still turn
                 // this previously non-fencing ticket into a predecessor fence
-                // when the pending scan grants it.
-                table.mark_suffix_dirty(record.ticket);
+                // when the pending scan grants it. Apply the same
+                // grant-disjointness damping as a NonFencing replacement — a
+                // fortiori sound with an empty delta: the dirty exists only
+                // because completion makes this claim fenceable at the
+                // pending scan, and disjointness from every GRANTED/REVOKED
+                // charge proves that new fence can doom no in-flight grant.
+                // The replan word still fences speculative acquire-commits.
+                if table.claim_grant_conflicts_header(&record.claim)? {
+                    crate::vmm::grant_flow::note_completion_guard(false);
+                    table.mark_suffix_dirty(record.ticket);
+                } else {
+                    crate::vmm::grant_flow::note_completion_guard(true);
+                    table.mark_replan_suffix_dirty(record.ticket);
+                }
             }
             if let Some(evidence) = blocked_evidence {
                 let marker = evidence.marker();
@@ -5121,7 +5140,7 @@ fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<WaitDia
             "bucket={bucket}\ncaptured_unix_secs={unix_secs}\nregistry_version={VERSION} \
          coordinator={} coordinator_slot={} coordinator_epoch={} coordinator_heartbeat_ns={} \
          last_progress_ns={} stalled_ns={} generation={} generation_wake={} claim_epoch={} min_changed_ticket={} \
-         pending_flags={:#x} replan_outstanding={} replan_capacity={} replan_cursor={} replan_horizon={} \
+         min_changed_ticket_replan={} pending_flags={:#x} replan_outstanding={} replan_capacity={} replan_cursor={} replan_horizon={} \
          replan_wave_started_ns={} replan_wave_deadline_ns={} \
          global_serial={} grant_scans={} next_slot={} active_tail={} \
          active_records={} records_rendered={} records_truncated={}\n{}\n",
@@ -5135,6 +5154,7 @@ fn bounded_wait_diagnostic(bucket: u64, unix_secs: u64) -> Result<Option<WaitDia
             table.generation_wake(),
             table.claim_epoch(),
             table.min_changed_ticket(),
+            table.min_changed_ticket_replan(),
             table.pending_flags(),
             table.replan_outstanding(),
             table.replan_capacity(),
@@ -5503,7 +5523,7 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
     Ok(format!(
         "coordinator={} coordinator_slot={} coordinator_epoch={} coordinator_heartbeat_ns={} \
          last_progress_ns={} generation={} generation_wake={} claim_epoch={} min_changed_ticket={} \
-         pending_flags={:#x} replan_outstanding={} replan_capacity={} replan_cursor={} \
+         min_changed_ticket_replan={} pending_flags={:#x} replan_outstanding={} replan_capacity={} replan_cursor={} \
          replan_horizon={} global_serial={} grant_scans={}; [{}]",
         table.coordinator_ticket(),
         table.coordinator_slot()?,
@@ -5514,6 +5534,7 @@ pub(super) fn diagnostics_for_tests() -> Result<String> {
         table.generation_wake(),
         table.claim_epoch(),
         table.min_changed_ticket(),
+        table.min_changed_ticket_replan(),
         table.pending_flags(),
         table.replan_outstanding(),
         table.replan_capacity(),
@@ -8655,7 +8676,7 @@ pub(crate) struct ReplanStragglerProgressOutcome {
     pub(crate) later_grant_demotion_shortened_deferred_edge: bool,
     pub(crate) later_grant_demotion_notified_once: bool,
     pub(crate) later_grant_demotion_deadline_exact: bool,
-    pub(crate) later_disjoint_grant_regranted_after_scan: bool,
+    pub(crate) later_conflicting_grant_not_regranted: bool,
     pub(crate) authoritative_scan_delta: u64,
     pub(crate) completed_replacement_granted: bool,
     pub(crate) straggler_still_replan: bool,
@@ -10888,7 +10909,12 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
     let first_replacement_cpu = 1_202usize;
     let straggler_designated_cpu = 1_203usize;
     let straggler_replacement_cpu = 1_204usize;
-    let later_grant_cpu = 1_205usize;
+    // The later grant lands exactly on the completion's replacement CPU, so
+    // the grant-disjointness damping guard must dirty the full suffix and
+    // preserve the old fencing/demotion behavior. The grant-disjoint shape
+    // (main watermark stays clean, junior commits) is pinned separately by
+    // `exercise_grant_disjoint_completion_for_tests`.
+    let later_grant_cpu = first_replacement_cpu;
     let coordinator_claim =
         ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
@@ -10950,7 +10976,7 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
                 && table
                     .record(later_grant.slot)?
                     .is_some_and(|record| record.state == STATE_GRANTED),
-            "straggler progress fixture did not publish both callbacks and its disjoint later grant",
+            "straggler progress fixture did not publish both callbacks and its conflicting later grant",
         );
         (
             read_u64(&table.header, H_GRANT_SCANS),
@@ -11089,12 +11115,8 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
     let mut later_callback_ran = false;
     let later_result = later_grant.run_granted(
         None,
-        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+        |_current, _watch, _acquisition_allowed, _predecessors, _availability| {
             later_callback_ran = true;
-            anyhow::ensure!(
-                acquisition_allowed && current == &later_grant_claim,
-                "rescanned disjoint grant received the wrong publication",
-            );
             Ok(GrantAttempt::<()> {
                 acquired: None,
                 preparation_claim: None,
@@ -11104,8 +11126,11 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
             })
         },
     )?;
-    let later_disjoint_grant_regranted_after_scan =
-        later_callback_ran && matches!(later_result, GrantResult::Requeued);
+    // The authoritative scan granted the SENIOR completed replacement onto
+    // this CPU, so the demoted junior must stay WAITING — never regranted
+    // ahead of the conflicting senior.
+    let later_conflicting_grant_not_regranted =
+        !later_callback_ran && matches!(later_result, GrantResult::LostGrant);
 
     later_grant.finish(None)?;
     straggler.finish(None)?;
@@ -11123,7 +11148,7 @@ pub(super) fn exercise_replan_straggler_progress_for_tests()
         later_grant_demotion_shortened_deferred_edge,
         later_grant_demotion_notified_once,
         later_grant_demotion_deadline_exact,
-        later_disjoint_grant_regranted_after_scan,
+        later_conflicting_grant_not_regranted,
         authoritative_scan_delta,
         completed_replacement_granted,
         straggler_still_replan,
@@ -11420,8 +11445,9 @@ pub(super) fn exercise_grant_charge_revoke_ack_for_tests() -> Result<GrantCharge
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
         // The replacement overlaps the junior grant's charge, so the guard
-        // must have dirtied the full suffix.
-        let replacement_dirtied_watermark = table.min_changed_ticket() < junior.ticket;
+        // must have dirtied the full suffix (both watermark words).
+        let replacement_dirtied_watermark = table.min_changed_ticket() < junior.ticket
+            && table.min_changed_ticket_replan() < junior.ticket;
         table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
         let senior_granted_and_junior_revoked = table
@@ -11567,6 +11593,406 @@ pub(super) fn exercise_exclusive_grant_bias_only_for_tests() -> Result<(bool, bo
     granted.finish(None)?;
     coordinator.finish(None)?;
     Ok(outcome)
+}
+
+#[cfg(test)]
+pub(crate) struct GrantDisjointCompletionOutcome {
+    pub(crate) main_watermark_clean: bool,
+    pub(crate) replan_watermark_dirty: bool,
+    pub(crate) junior_committed_held_during_wave: bool,
+    pub(crate) straggler_same_wake_fenced: bool,
+    pub(crate) straggler_requeued_waiting: bool,
+}
+
+/// The guard-skip canary: a NonFencing replacement disjoint from every grant
+/// charge leaves the GRANTED-facing watermark clean, so the in-flight
+/// disjoint junior grant enters and commits to HELD while the wave is still
+/// outstanding — while the always-dirtied replan word still releases and
+/// requeues an unlicensed same-wake REPLAN acquire (the split-watermark
+/// inversion fix). Disjoint grants forgo park-driven deferred-edge
+/// shortening and ride the batched rescan deadline instead.
+#[cfg(test)]
+pub(super) fn exercise_grant_disjoint_completion_for_tests()
+-> Result<GrantDisjointCompletionOutcome> {
+    let coordinator_cpu = 2_700usize;
+    let first_designated_cpu = 2_701usize;
+    let first_replacement_cpu = 2_702usize;
+    let straggler_designated_cpu = 2_703usize;
+    let straggler_replacement_cpu = 2_704usize;
+    let later_grant_cpu = 2_705usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let first_designated = ClaimSet::new(
+        std::iter::empty(),
+        [first_designated_cpu],
+        FlockMode::Exclusive,
+    );
+    let first_replacement = ClaimSet::new(
+        std::iter::empty(),
+        [first_replacement_cpu],
+        FlockMode::Exclusive,
+    );
+    let first_watch = ClaimSet::new(
+        std::iter::empty(),
+        [first_designated_cpu, first_replacement_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut first = Ticket::register(first_designated.clone(), first_watch, None)?;
+    let straggler_designated = ClaimSet::new(
+        std::iter::empty(),
+        [straggler_designated_cpu],
+        FlockMode::Exclusive,
+    );
+    let straggler_replacement = ClaimSet::new(
+        std::iter::empty(),
+        [straggler_replacement_cpu],
+        FlockMode::Exclusive,
+    );
+    let straggler_watch = ClaimSet::new(
+        std::iter::empty(),
+        [straggler_designated_cpu, straggler_replacement_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut straggler = Ticket::register(straggler_designated.clone(), straggler_watch, None)?;
+    let later_grant_claim =
+        ClaimSet::new(std::iter::empty(), [later_grant_cpu], FlockMode::Exclusive);
+    let mut later_grant =
+        Ticket::register(later_grant_claim.clone(), later_grant_claim.clone(), None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        for cpu in [
+            coordinator_cpu,
+            first_designated_cpu,
+            first_replacement_cpu,
+            straggler_designated_cpu,
+            straggler_replacement_cpu,
+        ] {
+            set_cpu_free_for_tests(&mut table, cpu, false)?;
+        }
+        set_cpu_free_for_tests(&mut table, later_grant_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+        anyhow::ensure!(
+            table.replan_outstanding() == 2
+                && table
+                    .record(first.slot)?
+                    .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(straggler.slot)?
+                    .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(later_grant.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            "disjoint-completion fixture did not publish both callbacks and its later grant",
+        );
+    }
+    let first_designated_for_wake = first_designated.clone();
+    let first_replacement_for_wake = first_replacement.clone();
+    let result = first.run_granted(None, |current, _watch, acquisition_allowed, _, _| {
+        anyhow::ensure!(
+            !acquisition_allowed && current == &first_designated_for_wake,
+            "disjoint-completion callback received the wrong publication",
+        );
+        Ok(GrantAttempt::<()> {
+            acquired: None,
+            preparation_claim: None,
+            preparation_contention: None,
+            next_claim: first_replacement_for_wake.clone(),
+            contention: None,
+        })
+    })?;
+    anyhow::ensure!(
+        matches!(result, GrantResult::Requeued),
+        "disjoint-completion replacement did not requeue",
+    );
+    let (main_watermark_clean, replan_watermark_dirty) = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        (
+            table.min_changed_ticket() == u64::MAX,
+            table.min_changed_ticket_replan() <= first.ticket,
+        )
+    };
+    let later_grant_claim_for_wake = later_grant_claim.clone();
+    let mut later_callback_ran = false;
+    let later_result = later_grant.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            later_callback_ran = true;
+            anyhow::ensure!(
+                acquisition_allowed && current == &later_grant_claim_for_wake,
+                "disjoint later grant received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: Some(()),
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: later_grant_claim_for_wake.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let held = match later_result {
+        GrantResult::Acquired((), held) => Some(held),
+        _ => None,
+    };
+    let junior_committed_held_during_wave = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        later_callback_ran
+            && held.is_some()
+            && table.replan_outstanding() == 1
+            && table
+                .record(later_grant.slot)?
+                .is_some_and(|record| record.state == STATE_HELD)
+            && table
+                .record(straggler.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN)
+    };
+    // The unlicensed straggler acquires physically in the same wake. The
+    // replan watermark word — dirtied by the guard-skipped replacement whose
+    // claim it cannot see in any charge — must release and requeue it.
+    let straggler_designated_for_wake = straggler_designated.clone();
+    let straggler_replacement_for_wake = straggler_replacement.clone();
+    let mut straggler_callback_ran = false;
+    let straggler_result = straggler.run_granted(
+        None,
+        |current, _watch, acquisition_allowed, _predecessors, _availability| {
+            straggler_callback_ran = true;
+            anyhow::ensure!(
+                !acquisition_allowed && current == &straggler_designated_for_wake,
+                "straggler same-wake callback received the wrong publication",
+            );
+            Ok(GrantAttempt::<()> {
+                acquired: Some(()),
+                preparation_claim: None,
+                preparation_contention: None,
+                next_claim: straggler_replacement_for_wake.clone(),
+                contention: None,
+            })
+        },
+    )?;
+    let straggler_same_wake_fenced =
+        straggler_callback_ran && matches!(straggler_result, GrantResult::LostGrant);
+    let straggler_requeued_waiting = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.record(straggler.slot)?.is_some_and(|record| {
+            record.state == STATE_WAITING && record.claim == straggler_designated
+        }) && table.replan_outstanding() == 0
+    };
+    drop(held);
+    later_grant.finish(None)?;
+    straggler.finish(None)?;
+    first.finish(None)?;
+    coordinator.finish(None)?;
+    Ok(GrantDisjointCompletionOutcome {
+        main_watermark_clean,
+        replan_watermark_dirty,
+        junior_committed_held_during_wave,
+        straggler_same_wake_fenced,
+        straggler_requeued_waiting,
+    })
+}
+
+/// Site-B guard (unchanged REPLAN completion): grant-disjoint completions
+/// leave the main watermark clean and the junior grant enters; overlapping
+/// completions dirty the full suffix and park the junior.
+#[cfg(test)]
+pub(super) fn exercise_unchanged_completion_guard_for_tests(
+    conflicting: bool,
+) -> Result<(bool, bool)> {
+    let base = if conflicting { 2_800usize } else { 2_820usize };
+    let coordinator_cpu = base;
+    let shared_cpu = base + 1;
+    let busy_cpu = base + 2;
+    let junior_cpu = if conflicting { shared_cpu } else { base + 3 };
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    // The senior's exact claim spans a free CPU (the potential overlap) and a
+    // busy one, so the wave publishes it as a speculative callback while a
+    // junior grant can still land on the free CPU (WAITING/REPLAN claims do
+    // not fence the grant scan).
+    let senior_claim = ClaimSet::new(
+        std::iter::empty(),
+        [shared_cpu, busy_cpu],
+        FlockMode::Exclusive,
+    );
+    let senior_watch = ClaimSet::new(
+        std::iter::empty(),
+        [shared_cpu, busy_cpu, base + 4],
+        FlockMode::Exclusive,
+    );
+    let mut senior = Ticket::register(senior_claim.clone(), senior_watch, None)?;
+    let junior_claim = ClaimSet::new(std::iter::empty(), [junior_cpu], FlockMode::Exclusive);
+    let mut junior = Ticket::register(junior_claim.clone(), junior_claim.clone(), None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, shared_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, busy_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, junior_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+        anyhow::ensure!(
+            table
+                .record(senior.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(junior.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            "unchanged-completion fixture did not publish its callback and junior grant",
+        );
+    }
+    let senior_claim_for_wake = senior_claim.clone();
+    let result = senior.run_granted(None, |current, _watch, acquisition_allowed, _, _| {
+        anyhow::ensure!(
+            !acquisition_allowed && current == &senior_claim_for_wake,
+            "unchanged-completion callback received the wrong publication",
+        );
+        Ok(GrantAttempt::<()> {
+            acquired: None,
+            preparation_claim: None,
+            preparation_contention: None,
+            next_claim: senior_claim_for_wake.clone(),
+            contention: None,
+        })
+    })?;
+    anyhow::ensure!(
+        matches!(result, GrantResult::Requeued),
+        "unchanged completion did not requeue",
+    );
+    let guarded_as_expected = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        let main_dirty = table.min_changed_ticket() < junior.ticket;
+        let replan_dirty = table.min_changed_ticket_replan() < junior.ticket;
+        replan_dirty && main_dirty == conflicting
+    };
+    let junior_claim_for_wake = junior_claim.clone();
+    let mut junior_callback_ran = false;
+    let junior_result = later_grant_probe(
+        &mut junior,
+        &junior_claim_for_wake,
+        &mut junior_callback_ran,
+    )?;
+    let junior_behaved_as_expected = if conflicting {
+        !junior_callback_ran && matches!(junior_result, GrantResult::LostGrant)
+    } else {
+        junior_callback_ran && matches!(junior_result, GrantResult::Requeued)
+    };
+    junior.finish(None)?;
+    senior.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((guarded_as_expected, junior_behaved_as_expected))
+}
+
+/// One non-acquiring probe of a GRANTED junior: records whether its callback
+/// entered, returning the raw grant result.
+#[cfg(test)]
+fn later_grant_probe(
+    junior: &mut Ticket,
+    claim: &ClaimSet,
+    callback_ran: &mut bool,
+) -> Result<GrantResult<()>> {
+    let claim = claim.clone();
+    junior.run_granted(None, |_current, _watch, _acquisition_allowed, _, _| {
+        *callback_ran = true;
+        Ok(GrantAttempt::<()> {
+            acquired: None,
+            preparation_claim: None,
+            preparation_contention: None,
+            next_claim: claim.clone(),
+            contention: None,
+        })
+    })
+}
+
+/// Site-A guard, kept-resource inversion: a changed replacement that KEEPS a
+/// resource a junior grant sits on must dirty the full suffix — delta
+/// cleanliness is not disjointness.
+#[cfg(test)]
+pub(super) fn exercise_replacement_kept_overlap_guard_for_tests() -> Result<(bool, bool)> {
+    let coordinator_cpu = 2_900usize;
+    let busy_cpu = 2_901usize;
+    let kept_cpu = 2_902usize;
+    let fresh_cpu = 2_903usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    let senior_designated = ClaimSet::new(
+        std::iter::empty(),
+        [busy_cpu, kept_cpu],
+        FlockMode::Exclusive,
+    );
+    let senior_replacement = ClaimSet::new(
+        std::iter::empty(),
+        [kept_cpu, fresh_cpu],
+        FlockMode::Exclusive,
+    );
+    let senior_watch = ClaimSet::new(
+        std::iter::empty(),
+        [busy_cpu, kept_cpu, fresh_cpu],
+        FlockMode::Exclusive,
+    );
+    let mut senior = Ticket::register(senior_designated.clone(), senior_watch, None)?;
+    let junior_claim = ClaimSet::new(std::iter::empty(), [kept_cpu], FlockMode::Exclusive);
+    let mut junior = Ticket::register(junior_claim.clone(), junior_claim.clone(), None)?;
+    {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, coordinator_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, busy_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, kept_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, fresh_cpu, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+        anyhow::ensure!(
+            table
+                .record(senior.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(junior.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            "kept-overlap fixture did not publish its callback and junior grant",
+        );
+    }
+    let senior_designated_for_wake = senior_designated.clone();
+    let senior_replacement_for_wake = senior_replacement.clone();
+    let result = senior.run_granted(None, |current, _watch, acquisition_allowed, _, _| {
+        anyhow::ensure!(
+            !acquisition_allowed && current == &senior_designated_for_wake,
+            "kept-overlap callback received the wrong publication",
+        );
+        Ok(GrantAttempt::<()> {
+            acquired: None,
+            preparation_claim: None,
+            preparation_contention: None,
+            next_claim: senior_replacement_for_wake.clone(),
+            contention: None,
+        })
+    })?;
+    anyhow::ensure!(
+        matches!(result, GrantResult::Requeued),
+        "kept-overlap replacement did not requeue",
+    );
+    let both_words_dirty = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let table = Table::open_existing()?;
+        table.min_changed_ticket() < junior.ticket
+            && table.min_changed_ticket_replan() < junior.ticket
+    };
+    let mut junior_callback_ran = false;
+    let junior_result = later_grant_probe(&mut junior, &junior_claim, &mut junior_callback_ran)?;
+    let junior_parked = !junior_callback_ran && matches!(junior_result, GrantResult::LostGrant);
+    junior.finish(None)?;
+    senior.finish(None)?;
+    coordinator.finish(None)?;
+    Ok((both_words_dirty, junior_parked))
 }
 
 #[cfg(test)]
@@ -16011,9 +16437,25 @@ impl Table {
         read_u64(&self.header, H_MIN_CHANGED_TICKET)
     }
 
+    /// The watermark consumed by unlicensed REPLAN acquire-commits: the
+    /// minimum of the GRANTED-facing word and the always-dirtied replan word.
+    /// A guard-skipped replacement is invisible to GRANTED entrants (its
+    /// grant-disjointness proof covers them) but must still fence speculative
+    /// commits whose claims carry no grant charge.
+    fn min_changed_ticket_replan(&self) -> u64 {
+        self.min_changed_ticket()
+            .min(read_u64(&self.header, H_MIN_CHANGED_TICKET_REPLAN))
+    }
+
     fn mark_suffix_dirty(&mut self, ticket: u64) {
         let minimum = self.min_changed_ticket().min(ticket);
         write_u64(&mut self.header, H_MIN_CHANGED_TICKET, minimum);
+        self.mark_replan_suffix_dirty(ticket);
+    }
+
+    fn mark_replan_suffix_dirty(&mut self, ticket: u64) {
+        let minimum = read_u64(&self.header, H_MIN_CHANGED_TICKET_REPLAN).min(ticket);
+        write_u64(&mut self.header, H_MIN_CHANGED_TICKET_REPLAN, minimum);
     }
 
     fn mark_claim_changed_metadata(&mut self, ticket: u64) -> Result<()> {
@@ -16030,6 +16472,7 @@ impl Table {
 
     fn finish_claim_scan(&mut self) {
         write_u64(&mut self.header, H_MIN_CHANGED_TICKET, u64::MAX);
+        write_u64(&mut self.header, H_MIN_CHANGED_TICKET_REPLAN, u64::MAX);
     }
 
     fn liveness_sweep(&self) -> u64 {
@@ -16647,6 +17090,51 @@ impl Table {
         ))
     }
 
+    /// Whether `claim` overlaps any live `C_GRANT_*` charge (GRANTED and
+    /// REVOKED records), read directly from the header count arrays under the
+    /// registry EX transaction — O(claim), no snapshot copy, no TOCTOU. Mode
+    /// matrix matches [`AggregateSnapshot::grant_conflicts`].
+    fn claim_grant_conflicts_header(&self, claim: &ClaimSet) -> Result<bool> {
+        let count = |which: usize, index: usize| -> Result<u32> {
+            if index >= self.layout.bits {
+                anyhow::bail!("resource index {index} exceeds queue registry capacity");
+            }
+            Ok(read_u32(
+                &self.header,
+                self.layout.count_offset(which) + index * std::mem::size_of::<u32>(),
+            ))
+        };
+        for &cpu in &claim.cpus {
+            let which = match claim.cpu_mode {
+                ClaimMode::Exclusive => C_GRANT_CPU_ANY,
+                ClaimMode::Shared => C_GRANT_CPU_EX,
+            };
+            if count(which, cpu)? != 0 {
+                return Ok(true);
+            }
+        }
+        for &permit in &claim.permits {
+            let index = permit_resource_index(permit)?;
+            let which = match claim.permit_mode {
+                ClaimMode::Exclusive => C_GRANT_CPU_ANY,
+                ClaimMode::Shared => C_GRANT_CPU_EX,
+            };
+            if count(which, index)? != 0 {
+                return Ok(true);
+            }
+        }
+        for &llc in &claim.llcs {
+            let which = match claim.llc_mode {
+                ClaimMode::Exclusive => C_GRANT_LLC_ANY,
+                ClaimMode::Shared => C_GRANT_LLC_EX,
+            };
+            if count(which, llc)? != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Copy the live `C_GRANT_*` charge into a planning snapshot, optionally
     /// subtracting one record's own charged claim (the
     /// `claim_conflicts_aggregate_excluding` count-subtraction pattern): a
@@ -17028,7 +17516,27 @@ impl Table {
                 // next authoritative scan, though: dirty precisely the later
                 // ticket suffix so no old GRANTED callback can enter or commit
                 // across that scan edge.
-                self.mark_suffix_dirty(ticket);
+                //
+                // Grant-disjointness damping: the GRANTED consumers of the
+                // main watermark exist so an in-flight grant cannot enter or
+                // commit across a scan edge that could revoke it. The set of
+                // claims a pending scan can newly conflict with is exactly
+                // the fence-preserving states {GRANTED, REVOKED, HELD}; a
+                // replacement whose FULL new claim (not the delta — a kept
+                // permit overlapping a junior grant must still park it) is
+                // disjoint from every GRANTED and REVOKED charge can doom no
+                // in-flight grant, and HELD overlap cannot revoke a grant
+                // either, so parking juniors would serve neither the proof
+                // nor ordering. Unlicensed REPLAN acquire-commits carry no
+                // grant charge and stay fenced through the always-dirtied
+                // replan word.
+                if self.claim_grant_conflicts_header(new)? {
+                    crate::vmm::grant_flow::note_replace_guard(false);
+                    self.mark_suffix_dirty(ticket);
+                } else {
+                    crate::vmm::grant_flow::note_replace_guard(true);
+                    self.mark_replan_suffix_dirty(ticket);
+                }
             }
         }
         crash_at_for_tests("replace_record_before_state_publish");
@@ -20279,6 +20787,7 @@ fn initialize_header_file(path: &PathBuf, layout: HeaderLayout) -> Result<File> 
         write_u64(&mut header, H_CLAIM_EPOCH, 1);
         write_u64(&mut header, H_COORDINATOR_EPOCH, 1);
         write_u64(&mut header, H_MIN_CHANGED_TICKET, u64::MAX);
+        write_u64(&mut header, H_MIN_CHANGED_TICKET_REPLAN, u64::MAX);
         write_u64(&mut header, H_COORDINATOR_SLOT, NONE_SLOT);
         write_u64(&mut header, H_OBSERVATION_REQUEST, 1);
         write_u64(&mut header, H_ACTIVE_HEAD, NONE_SLOT);
