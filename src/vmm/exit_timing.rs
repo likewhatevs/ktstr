@@ -159,9 +159,10 @@ pub(crate) fn mark_released() {
 }
 
 /// True only when the sink is set AND this cell has passed run-locks release —
-/// the exact window where an ordinary [`stamp`] would emit. Lets a hot caller
-/// skip building a label that would otherwise be discarded, keeping the
-/// instrumentation zero-cost off the diagnostics path.
+/// the exact window where [`stamp`] emits. Now that every stamp carries only a
+/// static label, no production caller has to pre-check it; the tests assert the
+/// window through this predicate.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn post_release_active() -> bool {
     dir().is_some() && RELEASED_NS.load(Ordering::Relaxed) != 0
 }
@@ -169,17 +170,6 @@ pub(crate) fn post_release_active() -> bool {
 /// Stamp one labelled point in the post-release teardown. No-op before
 /// [`mark_released`] or when the sink is unset.
 pub(crate) fn stamp(label: &str) {
-    stamp_inner(label, None);
-}
-
-/// Stamp a point where the teardown is about to block, naming what it waits on
-/// (a futex ticket/state, an flock path) so a stall between stamps is
-/// attributable to a concrete resource.
-pub(crate) fn stamp_waiting(label: &str, waiting_on: &str) {
-    stamp_inner(label, Some(waiting_on));
-}
-
-fn stamp_inner(label: &str, _waiting_on: Option<&str>) {
     // Cheapest gate first: `RELEASED_NS` is 0 both before this cell's release
     // AND whenever the sink is unset (`mark_released` never ran), so the common
     // no-op path is one relaxed load with no directory clone.

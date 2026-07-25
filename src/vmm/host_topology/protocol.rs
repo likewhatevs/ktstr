@@ -4539,14 +4539,9 @@ fn acquire_as_coordinator_impl<T>(
             let syscall_wait = super::reservation_wait_progress_poll()
                 .map_or(semantic_wait, |poll| semantic_wait.min(poll));
             // A process that has already released its run claim yet is blocking
-            // here is the exit-seam suspect: name what its coordinator turn
-            // waits on. Gated so pre-release/unset sleeps allocate nothing.
-            if crate::vmm::exit_timing::post_release_active() {
-                crate::vmm::exit_timing::stamp_waiting(
-                    "coordinator_watch_wait",
-                    &format_watched_resources(&watched_resources),
-                );
-            }
+            // here is the exit-seam suspect. The stamp's own relaxed-load gate
+            // keeps pre-release and sink-unset sleeps free.
+            crate::vmm::exit_timing::stamp("coordinator_watch_wait");
             match check_result(watch.wait(syscall_wait, &watched_resources), cancelled)? {
                 Some(events) => {
                     COORDINATOR_EVENT_WAKES.fetch_add(1, Ordering::Relaxed);
