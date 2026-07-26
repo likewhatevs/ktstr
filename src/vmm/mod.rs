@@ -3789,9 +3789,12 @@ impl KtstrVm {
             // so no parked_evt / thaw_evt to plumb. The
             // `vcpu_run_loop_unified` honours `freeze` only when it
             // flips, which never happens in this path; the
-            // eventfds remain unused.
+            // eventfds remain unused. Likewise no watchdog runs here,
+            // so the kill-reason latch below stays Unset forever and
+            // the APs' kill-time state report never prints.
             None,
             None,
+            &Arc::new(std::sync::atomic::AtomicU8::new(0)),
         )?;
         // From this point onward every spawned thread has one owner. Any
         // fallible helper setup below unwinds through the same bounded AP

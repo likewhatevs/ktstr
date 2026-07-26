@@ -450,6 +450,41 @@ fn decode_watchdog_kill_reason(raw: u8) -> Option<crate::vmm::WatchdogKillReason
     }
 }
 
+/// Kill-time vCPU state evidence for watchdog kills. When a watchdog tier
+/// fired (`kill_reason` left [`KillReasonTag::Unset`]), each vCPU thread
+/// reports the registers it carried out of its final `KVM_RUN` as it exits
+/// its run loop — for a guest wedged in a kernel hot spin this names the
+/// exact guest address being executed, resolvable against the kernel's
+/// vmlinux. Must run on the vCPU's own thread (the get-regs ioctls are
+/// fd-thread-bound, same contract as [`exit_dispatch::capture_vcpu_regs`]).
+/// Quiet on every ordinary teardown: the tag is only ever stored on the
+/// watchdog fire path, so green runs print nothing.
+fn report_kill_time_vcpu_state(
+    label: &str,
+    vcpu: &kvm_ioctls::VcpuFd,
+    kill_reason: &std::sync::atomic::AtomicU8,
+) {
+    let raw = kill_reason.load(Ordering::Relaxed);
+    if KillReasonTag::from_u8(raw) == KillReasonTag::Unset {
+        return;
+    }
+    match exit_dispatch::capture_vcpu_regs(vcpu) {
+        Some(regs) => eprintln!(
+            "ktstr-watchdog: kill-time vcpu state: vcpu={label} pc={:#x} sp={:#x} pgd={:#x} user_pgd={} tcr={}",
+            regs.instruction_pointer,
+            regs.stack_pointer,
+            regs.page_table_root,
+            regs.user_page_table_root
+                .map_or_else(|| "-".to_owned(), |v| format!("{v:#x}")),
+            regs.tcr_el1
+                .map_or_else(|| "-".to_owned(), |v| format!("{v:#x}")),
+        ),
+        None => {
+            eprintln!("ktstr-watchdog: kill-time vcpu state: vcpu={label} registers unavailable")
+        }
+    }
+}
+
 /// Decode the ledger's raw lifecycle-stage byte into the public
 /// [`crate::vmm::GuestLifecyclePhase`] mirror for `VmResult`. Routes
 /// through `LifecycleStage::from_u8` so the conservative unknown→Boot
@@ -5608,6 +5643,18 @@ impl KtstrVm {
         let bsp_done = Arc::new(AtomicBool::new(false));
         let bsp_done_evt = Arc::new(EventFd::new(EFD_NONBLOCK).context("create bsp_done EventFd")?);
 
+        // Kill-reason latch, shared between the watchdog thread (sole
+        // writer, on its fire path), the `VmRunState` build (read after
+        // the watchdog join, so the value is final), and every vCPU
+        // thread's kill-time state report (read at run-loop exit, after
+        // the fire path stored it). Surfaces the dump's `cause=` verdict
+        // on `VmResult::watchdog_kill_reason` — the mechanism signal
+        // wedge fixtures assert instead of wall bounds. Created before
+        // the AP spawn so each AP closure can carry a clone.
+        let watchdog_kill_reason: Arc<std::sync::atomic::AtomicU8> =
+            Arc::new(std::sync::atomic::AtomicU8::new(KillReasonTag::Unset as u8));
+        let watchdog_kill_reason_for_wd = watchdog_kill_reason.clone();
+
         let (ap_threads, ap_freeze_handles) = self.spawn_ap_threads(
             vcpus,
             has_immediate_exit,
@@ -5629,6 +5676,7 @@ impl KtstrVm {
             &ap_boot_latches,
             Some(&parked_evt),
             Some(&thaw_evt),
+            &watchdog_kill_reason,
         )?;
 
         // UAF guard: from the first spawn onward, any `?` early-return or panic
@@ -6131,14 +6179,6 @@ impl KtstrVm {
         // fixtures can distinguish "guest reached the phase under test"
         // from "guest never booted" (see `VmResult::final_guest_phase`).
         let progress_ledger_for_result = progress_ledger.clone();
-        // Kill-reason latch, shared between the watchdog thread (sole
-        // writer, on its fire path) and the `VmRunState` build (read after
-        // the watchdog join, so the value is final). Surfaces the dump's
-        // `cause=` verdict on `VmResult::watchdog_kill_reason` — the
-        // mechanism signal wedge fixtures assert instead of wall bounds.
-        let watchdog_kill_reason: Arc<std::sync::atomic::AtomicU8> =
-            Arc::new(std::sync::atomic::AtomicU8::new(KillReasonTag::Unset as u8));
-        let watchdog_kill_reason_for_wd = watchdog_kill_reason.clone();
         // Kill-time publish-state evidence for the watchdog dump (see the
         // `kern_addrs_frames= (kill-time)` line): the pre-latch diag's
         // one-shot ~10 s snapshot cannot distinguish a publish that never
@@ -15928,6 +15968,7 @@ impl KtstrVm {
         if crate::vmm::debug_logging_enabled() {
             eprintln!("BSP: loop exit reason={bsp_exit_reason:?}");
         }
+        report_kill_time_vcpu_state("bsp", &bsp, &watchdog_kill_reason);
         bsp_done.store(true, Ordering::Release);
         // Wake the freeze coordinator's epoll loop. Failure
         // (counter overflow / EAGAIN under EFD_NONBLOCK) is benign
@@ -16329,6 +16370,7 @@ impl KtstrVm {
         ap_boot_latches: &[Arc<crate::sync::Latch>],
         parked_evt: Option<&Arc<EventFd>>,
         thaw_evt: Option<&Arc<EventFd>>,
+        watchdog_kill_reason: &Arc<std::sync::atomic::AtomicU8>,
     ) -> Result<(Vec<VcpuThread>, ApFreezeHandles)> {
         // Register the process-wide panic hook that flips `kill` +
         // `exited` on a panicking vCPU thread before the
@@ -16431,6 +16473,7 @@ impl KtstrVm {
             // `wp_clone.hit` so the late-trigger poll observes the
             // watchpoint fire.
             let wp_clone = watchpoint.clone();
+            let kill_reason_clone = watchdog_kill_reason.clone();
 
             let rt = self.performance_mode;
             // Per-AP exit eventfd for `VcpuThread::wait_for_exit` so
@@ -16556,6 +16599,11 @@ impl KtstrVm {
                             has_immediate_exit_clone,
                             parked_evt_clone.as_ref(),
                             thaw_evt_clone.as_ref(),
+                        );
+                        report_kill_time_vcpu_state(
+                            &format!("{}", i + 1),
+                            &vcpu,
+                            &kill_reason_clone,
                         );
                         // `/proc/self/task/<tid>` vanishes as soon as this closure
                         // returns. Preserve one final self-snapshot so host
