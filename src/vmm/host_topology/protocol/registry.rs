@@ -20253,55 +20253,22 @@ impl Table {
         observation: &AvailabilityObservation,
     ) -> Result<bool> {
         let mut improved = false;
-        for (&cpu, &(sh_request, ex_request)) in &request.cpus {
-            let Some(observed) = observation.cpus.get(&cpu).copied() else {
-                continue;
-            };
-            let sh_matches = if let Some(serial) = sh_request {
-                observed.sh_resolved
-                    && self.bitmap_bit(B_PENDING_CPU_SH, cpu)?
-                    && self.resource_request(Q_CPU_SH, cpu)? == serial
-            } else {
-                false
-            };
-            let ex_matches = if let Some(serial) = ex_request {
-                observed.ex_resolved
-                    && self.bitmap_bit(B_PENDING_CPU_EX, cpu)?
-                    && self.resource_request(Q_CPU_EX, cpu)? == serial
-            } else {
-                false
-            };
-            if !sh_matches && !ex_matches {
-                continue;
-            }
-            let availability = observed.availability;
-            let sh_available = availability != ResourceAvailability::ExclusiveHeld;
-            let ex_available = availability == ResourceAvailability::Free;
-            let sh_candidate = self.bitmap_bit(B_CANDIDATE_CPU_SH, cpu)?;
-            let ex_candidate = self.bitmap_bit(B_CANDIDATE_CPU_EX, cpu)?;
-            self.set_bitmap_bit(B_CPU_KNOWN, cpu, true)?;
-            if sh_matches {
-                self.set_bitmap_bit(B_CPU_SH_AVAILABLE, cpu, sh_available)?;
-                self.set_bitmap_bit(B_PENDING_CPU_SH, cpu, false)?;
-                self.set_bitmap_bit(B_CANDIDATE_CPU_SH, cpu, false)?;
-            }
-            if ex_matches {
-                self.set_bitmap_bit(B_CPU_EX_AVAILABLE, cpu, ex_available)?;
-                self.set_bitmap_bit(B_PENDING_CPU_EX, cpu, false)?;
-                self.set_bitmap_bit(B_CANDIDATE_CPU_EX, cpu, false)?;
-            }
-            if sh_matches && sh_candidate && sh_available {
-                self.stamp_resource_improvement(S_CPU_SH, cpu)?;
-                improved = true;
-            }
-            if ex_matches && ex_candidate && ex_available {
-                self.stamp_resource_improvement(S_CPU_EX, cpu)?;
-                improved = true;
-            }
-        }
-        for (&permit, &(sh_request, ex_request)) in &request.permits {
-            let index = permit_resource_index(permit)?;
-            let Some(observed) = observation.permits.get(&permit).copied() else {
+        let cpu_units = request.cpus.iter().map(|(&cpu, &req)| {
+            Ok::<_, anyhow::Error>((cpu, req, observation.cpus.get(&cpu).copied()))
+        });
+        let permit_units = request.permits.iter().map(|(&permit, &req)| {
+            Ok((
+                permit_resource_index(permit)?,
+                req,
+                observation.permits.get(&permit).copied(),
+            ))
+        });
+        // Permits live in CPU resource-index space (see observation_request), so
+        // both kinds resolve against the same CPU bitmaps once the permit id is
+        // folded back to its index.
+        for unit in cpu_units.chain(permit_units) {
+            let (index, (sh_request, ex_request), observed) = unit?;
+            let Some(observed) = observed else {
                 continue;
             };
             let sh_matches = if let Some(serial) = sh_request {
