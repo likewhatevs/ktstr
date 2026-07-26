@@ -96,7 +96,6 @@ use btf_rs::Btf;
 use serde::{Deserialize, Serialize};
 
 use super::btf_offsets::{StructOrFwd, find_struct_or_fwd, member_byte_offset};
-use super::reader::GuestMem;
 
 /// Width of `struct scx_static` in bytes on every kernel that ships
 /// the bump allocator.
@@ -134,22 +133,6 @@ pub const SCX_STATIC_STRUCT_SIZE: usize = 24;
 /// this bound (conservatively rejecting the exact-4-GiB edge the
 /// kernel would allow).
 const MAX_REASONABLE_REGION_BYTES: u64 = 1u64 << 32;
-
-/// Sanity cap on `off` (high-water mark within a region) the walker
-/// will trust. `off` is bounded above by `max_alloc_bytes` per the
-/// bump allocator's overflow check at line 600 (per-request fit) /
-/// 613 (roll-forward). The walker
-/// rejects `off > max_alloc_bytes` as a torn-snapshot signal.
-///
-/// Documented as a derived constant rather than a literal: the
-/// authoritative bound is `max_alloc_bytes` from the same instance,
-/// not a fixed number — different instances declare different region
-/// sizes — so the function-level check uses the per-instance bound,
-/// not this constant. The constant lives here only to surface the
-/// upper-most reasonable value (the same 4 GiB cap as
-/// [`MAX_REASONABLE_REGION_BYTES`]) for documentation parity.
-#[allow(dead_code)]
-const MAX_REASONABLE_OFF: u64 = MAX_REASONABLE_REGION_BYTES;
 
 /// Byte offsets within `struct scx_static`, resolved from the
 /// scheduler's program BTF.
@@ -517,40 +500,6 @@ fn read_u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(slice);
     Some(u64::from_le_bytes(buf))
-}
-
-/// Read a `struct scx_static` instance's tuple direct from guest
-/// memory via a [`GuestMem`] reader.
-///
-/// Convenience wrapper for callers that have a full guest physical
-/// address rather than a pre-read .bss slice. Returns the same
-/// `(memory_low32, off, max_alloc_bytes)` triple as
-/// [`read_one_scx_static`] applies the same sanity gates.
-///
-/// `instance_pa` is the guest physical address of the
-/// `struct scx_static` instance's first byte. Callers typically
-/// resolve this via the kernel's direct-mapping translation (the
-/// .bss is in the direct map) but the walker accepts any PA the
-/// caller supplies.
-#[allow(dead_code)]
-pub fn read_scx_static_from_pa(
-    mem: &GuestMem,
-    instance_pa: u64,
-    offsets: &ScxStaticOffsets,
-) -> Option<(u32, u64, u64)> {
-    let max_alloc_bytes = mem.read_u64(instance_pa, offsets.max_alloc_bytes);
-    if max_alloc_bytes == 0 || max_alloc_bytes >= MAX_REASONABLE_REGION_BYTES {
-        return None;
-    }
-    let memory = mem.read_u64(instance_pa, offsets.memory);
-    if memory == 0 {
-        return None;
-    }
-    let off = mem.read_u64(instance_pa, offsets.off);
-    if off > max_alloc_bytes {
-        return None;
-    }
-    Some((memory as u32, off, max_alloc_bytes))
 }
 
 #[cfg(test)]

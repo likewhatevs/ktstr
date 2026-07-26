@@ -3058,12 +3058,8 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             None => (None, Vec::new()),
         };
     let mut report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
         active_map_kvas,
         maps: Vec::with_capacity(maps.len()),
-        vcpu_regs: Vec::new(),
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
         prog_runtime_stats,
         prog_runtime_stats_unavailable,
         per_cpu_time,
@@ -3080,12 +3076,9 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         scx_sched_state,
         scx_walker_unavailable,
         vcpu_perf_at_freeze,
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
         probe_counters,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
         active_obj_name,
+        ..Default::default()
     };
 
     // Per-map program-BTF cache, keyed by `btf_kva`. Each unique

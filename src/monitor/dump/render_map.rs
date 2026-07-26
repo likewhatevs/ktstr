@@ -1738,16 +1738,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         map_type: info.map_type,
         value_size: info.value_size,
         max_entries: info.max_entries,
-        value: None,
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
 
     match info.map_type {

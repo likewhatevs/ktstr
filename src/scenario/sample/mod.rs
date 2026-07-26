@@ -526,20 +526,11 @@ mod tests {
         };
         let bss_map = FailureDumpMap {
             name: "scx_obj.bss".into(),
-            map_kva: 0,
             map_type: 2,
             value_size: 16,
             max_entries: 1,
             value: Some(bss_value),
-            entries: Vec::new(),
-            array_entries: Vec::new(),
-            percpu_entries: Vec::new(),
-            percpu_hash_entries: Vec::new(),
-            arena: None,
-            ringbuf: None,
-            stack_trace: None,
-            fd_array: None,
-            error: None,
+            ..Default::default()
         };
         FailureDumpReport {
             schema: SCHEMA_SINGLE.to_string(),

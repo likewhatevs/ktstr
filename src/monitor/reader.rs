@@ -4812,6 +4812,17 @@ mod tests {
     /// tick (typically 10 ms in tests) wakes `epoll_wait` within
     /// one interval — but production callers MUST write so the
     /// shutdown latency stays in the microsecond range.
+    fn kill_after(
+        kill: &std::sync::Arc<AtomicBool>,
+        after: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let kill = std::sync::Arc::clone(kill);
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            kill.store(true, Ordering::Release);
+        })
+    }
+
     fn test_kill_evt() -> vmm_sys_util::eventfd::EventFd {
         vmm_sys_util::eventfd::EventFd::new(vmm_sys_util::eventfd::EFD_NONBLOCK)
             .expect("create kill EventFd")
@@ -5002,13 +5013,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(50));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -5138,13 +5143,7 @@ mod tests {
         let kernel_offsets = test_offsets();
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(50));
         let result = monitor_loop(
             &mem,
             &[0],
@@ -5284,13 +5283,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(50));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -5327,13 +5320,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(200));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -5565,13 +5552,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let ev_pas = vec![ev_pa];
         let cfg = MonitorConfig {
@@ -5609,13 +5590,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -5698,13 +5673,7 @@ mod tests {
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             rq_refresh: Some(&refresh),
@@ -5807,13 +5776,7 @@ mod tests {
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             rq_refresh: Some(&refresh),
@@ -6042,13 +6005,7 @@ mod tests {
                 kaslr.store(SLIDE + 1, Ordering::Release);
             })
         };
-        let stopper = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(120));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let stopper = kill_after(&kill, Duration::from_millis(120));
 
         let cfg = MonitorConfig {
             rq_refresh: Some(&refresh),
@@ -6138,13 +6095,7 @@ mod tests {
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(0)),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             rq_refresh: Some(&refresh),
@@ -6228,13 +6179,7 @@ mod tests {
             jiffies_64_pa: None,
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_override: Some(&wd),
@@ -6293,13 +6238,7 @@ mod tests {
             jiffies_64_pa: None,
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_override: Some(&wd),
@@ -6363,13 +6302,7 @@ mod tests {
             reset_tag: &reset_tag,
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_reset: Some(wr),
@@ -6434,13 +6367,7 @@ mod tests {
             reset_tag: &reset_tag,
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_reset: Some(wr),
@@ -6493,13 +6420,7 @@ mod tests {
             jiffies_64_pa: None,
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_override: Some(&wd),
@@ -6653,13 +6574,7 @@ mod tests {
             jiffies_64_pa: Some(jiffies_64_pa),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_override: Some(&wd),
@@ -6843,13 +6758,7 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(200));
 
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
@@ -6923,13 +6832,7 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(150));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(150));
 
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
@@ -7019,13 +6922,7 @@ mod tests {
         // assertion would succeed, the test still pays the full
         // budget in wall time, but that's a one-time cost per test
         // run and a non-flake outcome is worth the seconds.
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(2));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_secs(2));
 
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
@@ -7098,13 +6995,7 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(200));
 
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
@@ -7185,13 +7076,7 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(200));
 
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
@@ -7358,13 +7243,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -7397,13 +7276,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -8826,13 +8699,7 @@ mod tests {
         };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(run_ms));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(run_ms));
         let _ = monitor_loop(
             &mem,
             &[0],
@@ -8960,13 +8827,7 @@ mod tests {
         };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(80));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(80));
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[],

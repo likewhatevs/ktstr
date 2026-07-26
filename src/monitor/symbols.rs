@@ -1275,6 +1275,39 @@ pub(crate) fn compute_rq_pas(
 mod tests {
     use super::*;
 
+    /// A `KernelSymbols` with every field at its "symbol not found"
+    /// value. Tests override only the field under test via struct
+    /// update. Deliberately a helper rather than `#[derive(Default)]`
+    /// on the type: `runqueues == 0` is invalid in production (see the
+    /// construction-time check in `from_vmlinux`), so a crate-visible
+    /// `Default` would let a real code path build an unresolved table.
+    fn bare_symbols() -> KernelSymbols {
+        KernelSymbols {
+            runqueues: 0,
+            per_cpu_offset: 0,
+            page_offset_base_kva: None,
+            memstart_addr_kva: None,
+            phys_base_kva: None,
+            scx_root: None,
+            scx_tasks: None,
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
+            prog_idr: None,
+            scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
+            jiffies_64: None,
+            psi_system: None,
+            cgrp_dfl_root: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
+            node_data: None,
+            entry_syscall_64_kva: None,
+            kernel_text_kva: None,
+        }
+    }
+
     #[test]
     fn arm64_direct_map_base_rebases_randomized_memstart_to_guest_offsets() {
         let page_offset = 0xffff_0000_0000_0000u64;
@@ -1932,28 +1965,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert_eq!(
@@ -1970,30 +1983,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
-            page_offset_base_kva: None,
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
-        };
+        let symbols = bare_symbols();
 
         assert_eq!(
             resolve_page_offset(&mem, &symbols, START_KERNEL_MAP),
@@ -2012,28 +2002,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert_eq!(
@@ -2056,28 +2026,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert_eq!(
@@ -2103,28 +2053,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert_eq!(
@@ -2146,28 +2076,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
-            page_offset_base_kva: None,
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert!(resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
@@ -2186,28 +2096,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
-            page_offset_base_kva: None,
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
@@ -2221,30 +2111,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
-            page_offset_base_kva: None,
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
-        };
+        let symbols = bare_symbols();
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
     }

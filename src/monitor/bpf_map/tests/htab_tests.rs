@@ -54,20 +54,12 @@ fn iter_htab_entries_non_hash_map_returns_empty() {
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
     let offsets = test_htab_map_offsets();
     let map = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
         name_bytes: super::name_from_str("test.bss").0,
         name_len: super::name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
         key_size: 4,
         value_size: 8,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let entries = iter_htab_entries(&lookup_ctx(&mem, 0, 0, &offsets, false), &map);
     assert!(entries.is_empty());
@@ -82,20 +74,12 @@ fn iter_htab_entries_no_htab_offsets_returns_empty() {
     let mut offsets = test_htab_map_offsets();
     offsets.htab_offsets = None;
     let map = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
         name_bytes: super::name_from_str("test").0,
         name_len: super::name_from_str("test").1,
         map_type: BPF_MAP_TYPE_HASH,
-        map_flags: 0,
         key_size: 4,
         value_size: 8,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let entries = iter_htab_entries(&lookup_ctx(&mem, 0, 0, &offsets, false), &map);
     assert!(entries.is_empty());
@@ -214,15 +198,9 @@ fn setup_htab_direct(
         name_bytes: super::name_from_str("test_hash").0,
         name_len: super::name_from_str("test_hash").1,
         map_type: BPF_MAP_TYPE_HASH,
-        map_flags: 0,
         key_size,
         value_size,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     (buf, page_offset, map, offsets)
@@ -382,15 +360,9 @@ fn iter_htab_entries_multi_bucket() {
         name_bytes: super::name_from_str("multi_bucket").0,
         name_len: super::name_from_str("multi_bucket").1,
         map_type: BPF_MAP_TYPE_HASH,
-        map_flags: 0,
         key_size,
         value_size,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
@@ -675,15 +647,10 @@ fn setup_percpu_array(
         name_bytes: super::name_from_str("test_percpu").0,
         name_len: super::name_from_str("test_percpu").1,
         map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
-        map_flags: 0,
         key_size: 4,
         value_size,
         max_entries,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     (buf, pgd_pa, page_offset, info, offsets, per_cpu_offsets)
@@ -1064,20 +1031,14 @@ fn read_percpu_array_unmapped_bpf_array() {
     // map_kva points to an untranslatable address: outside direct
     // mapping range and page table (cr3=0) is all zeros.
     let info = BpfMapInfo {
-        map_pa: 0,
         map_kva: 0xFFFF_C900_DEAD_0000,
         name_bytes: super::name_from_str("test_percpu").0,
         name_len: super::name_from_str("test_percpu").1,
         map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
-        map_flags: 0,
         key_size: 4,
         value_size: 8,
         max_entries: 1,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     let per_cpu_offsets = vec![0u64, 0x1000];
@@ -1193,15 +1154,10 @@ fn read_percpu_array_kva_via_page_table() {
         name_bytes: super::name_from_str("vmalloc_percpu").0,
         name_len: super::name_from_str("vmalloc_percpu").1,
         map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
-        map_flags: 0,
         key_size: 4,
         value_size: 8,
         max_entries: 1,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     // Direct-mapping math for the percpu KVA would yield
@@ -1404,15 +1360,9 @@ fn setup_percpu_htab_direct(
         name_bytes: super::name_from_str("test_percpu_hash").0,
         name_len: super::name_from_str("test_percpu_hash").1,
         map_type: BPF_MAP_TYPE_PERCPU_HASH,
-        map_flags: 0,
         key_size,
         value_size,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     (buf, page_offset, map, offsets, per_cpu_offsets)
@@ -1695,15 +1645,10 @@ fn read_percpu_array_value_spans_nonadjacent_frames() {
         name_bytes: super::name_from_str("test_percpu").0,
         name_len: super::name_from_str("test_percpu").1,
         map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
-        map_flags: 0,
         key_size: 4,
         value_size: value_size as u32,
         max_entries: 1,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     // SAFETY: buf is a live local buffer whose storage outlives mem.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
@@ -1750,15 +1695,10 @@ fn read_percpu_array_value_spans_three_nonadjacent_frames() {
         name_bytes: super::name_from_str("test_percpu").0,
         name_len: super::name_from_str("test_percpu").1,
         map_type: BPF_MAP_TYPE_PERCPU_ARRAY,
-        map_flags: 0,
         key_size: 4,
         value_size: value_size as u32,
         max_entries: 1,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     // SAFETY: buf is a live local buffer whose storage outlives mem.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
@@ -1850,15 +1790,9 @@ fn iter_percpu_htab_entries_spans_nonadjacent_frames() {
         name_bytes: super::name_from_str("test_percpu_hash").0,
         name_len: super::name_from_str("test_percpu_hash").1,
         map_type: BPF_MAP_TYPE_PERCPU_HASH,
-        map_flags: 0,
         key_size: 4,
         value_size: value_size as u32,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let entries = iter_percpu_htab_entries(
         &lookup_ctx(&mem, cr3_pa, page_offset, &offsets, false),

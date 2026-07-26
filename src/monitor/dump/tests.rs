@@ -179,11 +179,8 @@ fn event_counter_sample_serde_roundtrip() {
 #[test]
 fn report_serde_roundtrip() {
     let report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
         maps: vec![FailureDumpMap {
             name: "scx_demo.bss".into(),
-            map_kva: 0,
             map_type: BPF_MAP_TYPE_ARRAY,
             value_size: 8,
             max_entries: 1,
@@ -191,39 +188,9 @@ fn report_serde_roundtrip() {
                 bits: 32,
                 value: 42,
             }),
-            entries: Vec::new(),
-            array_entries: Vec::new(),
-            percpu_entries: Vec::new(),
-            percpu_hash_entries: Vec::new(),
-            arena: None,
-            ringbuf: None,
-            stack_trace: None,
-            fd_array: None,
-            error: None,
+            ..Default::default()
         }],
-        vcpu_regs: Vec::new(),
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
-        prog_runtime_stats: Vec::new(),
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let json = serde_json::to_string(&report).unwrap();
     let parsed: FailureDumpReport = serde_json::from_str(&json).unwrap();
@@ -273,7 +240,6 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
         maps: vec![
             FailureDumpMap {
                 name: "synthetic_array.bss".into(),
-                map_kva: 0,
                 map_type: BPF_MAP_TYPE_ARRAY,
                 value_size: 8,
                 max_entries: 1,
@@ -281,61 +247,31 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
                     bits: 32,
                     value: 0xCAFE,
                 }),
-                entries: Vec::new(),
-                array_entries: Vec::new(),
-                percpu_entries: Vec::new(),
-                percpu_hash_entries: Vec::new(),
-                arena: None,
-                ringbuf: None,
-                stack_trace: None,
-                fd_array: None,
-                error: None,
+                ..Default::default()
             },
             FailureDumpMap {
                 name: "synthetic_hash.hash".into(),
-                map_kva: 0,
                 map_type: BPF_MAP_TYPE_HASH,
                 value_size: 16,
                 max_entries: 64,
-                value: None,
-                entries: Vec::new(),
-                array_entries: Vec::new(),
-                percpu_entries: Vec::new(),
-                percpu_hash_entries: Vec::new(),
-                arena: None,
-                ringbuf: None,
-                stack_trace: None,
-                fd_array: None,
                 error: Some("synthetic walker failure (test fixture)".into()),
+                ..Default::default()
             },
             FailureDumpMap {
                 name: "synthetic_unsupported.queue".into(),
-                map_kva: 0,
                 map_type: BPF_MAP_TYPE_QUEUE,
                 value_size: 4,
-                max_entries: 0,
-                value: None,
-                entries: Vec::new(),
-                array_entries: Vec::new(),
-                percpu_entries: Vec::new(),
-                percpu_hash_entries: Vec::new(),
-                arena: None,
-                ringbuf: None,
-                stack_trace: None,
-                fd_array: None,
                 error: Some("type not supported".into()),
+                ..Default::default()
             },
             // Multi-entry ARRAY: exercises the `array_entries`
             // serializer dispatch (key-0 readable, key-1 None) so the
             // Drop-path panic-free precondition covers this field too.
             FailureDumpMap {
                 name: "synthetic_array.cells".into(),
-                map_kva: 0,
                 map_type: BPF_MAP_TYPE_ARRAY,
                 value_size: 8,
                 max_entries: 3,
-                value: None,
-                entries: Vec::new(),
                 array_entries: vec![
                     FailureDumpArrayEntry {
                         key: 0,
@@ -349,13 +285,7 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
                         value: None,
                     },
                 ],
-                percpu_entries: Vec::new(),
-                percpu_hash_entries: Vec::new(),
-                arena: None,
-                ringbuf: None,
-                stack_trace: None,
-                fd_array: None,
-                error: None,
+                ..Default::default()
             },
         ],
         // Multi-vCPU mix of Some / None to stress the
@@ -447,11 +377,8 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
 fn dual_failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
     fn max_inner() -> FailureDumpReport {
         FailureDumpReport {
-            schema: SCHEMA_SINGLE.to_string(),
-            active_map_kvas: Vec::new(),
             maps: vec![FailureDumpMap {
                 name: "synthetic_array.bss".into(),
-                map_kva: 0,
                 map_type: BPF_MAP_TYPE_ARRAY,
                 value_size: 8,
                 max_entries: 1,
@@ -459,39 +386,21 @@ fn dual_failure_dump_report_serialization_is_infallible_for_max_synthetic_input(
                     bits: 32,
                     value: 0xCAFE,
                 }),
-                entries: Vec::new(),
-                array_entries: Vec::new(),
-                percpu_entries: Vec::new(),
-                percpu_hash_entries: Vec::new(),
-                arena: None,
-                ringbuf: None,
-                stack_trace: None,
-                fd_array: None,
-                error: None,
+                ..Default::default()
             }],
             vcpu_regs: vec![None, None],
-            sdt_allocations: Vec::new(),
             sdt_alloc_unavailable: Some(super::REASON_SDT_ALLOC_NO_INSTANCE.into()),
-            prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: Some(super::REASON_PROG_ACCESSOR_UNAVAILABLE.into()),
             per_cpu_time: vec![PerCpuTimeStats::default(); 2],
-            cgroup_psi: Vec::new(),
             per_node_numa: vec![PerNodeNumaStats::default(); 1],
             per_node_numa_unavailable: Some(super::REASON_NO_NUMA_WALKER.into()),
-            task_enrichments: Vec::new(),
             task_enrichments_unavailable: Some(super::REASON_NO_TASK_WALKER.into()),
             event_counter_timeline: vec![EventCounterSample::default(); 4],
-            rq_scx_states: Vec::new(),
-            dsq_states: Vec::new(),
-            scx_sched_state: None,
             scx_walker_unavailable: Some(super::REASON_NO_SCX_WALKER.into()),
             vcpu_perf_at_freeze: vec![None, None],
             dump_truncated_at_us: Some(7_777),
-            maps_truncated: 0,
             probe_counters: Some(ProbeBssCounters::default()),
-            scx_static_ranges: Default::default(),
-            is_placeholder: false,
-            active_obj_name: None,
+            ..Default::default()
         }
     }
 
@@ -604,7 +513,6 @@ fn all_snapshot_tags_enumerates_every_pub_const_in_module() {
 fn make_simple_map() -> FailureDumpMap {
     FailureDumpMap {
         name: "scx_demo.bss".into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_ARRAY,
         value_size: 8,
         max_entries: 1,
@@ -618,15 +526,7 @@ fn make_simple_map() -> FailureDumpMap {
                 },
             }],
         }),
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     }
 }
 
@@ -674,32 +574,8 @@ fn report_display_appends_truncation_footer_after_sections() {
 #[test]
 fn report_display_one_map_with_value() {
     let report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
         maps: vec![make_simple_map()],
-        vcpu_regs: Vec::new(),
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
-        prog_runtime_stats: Vec::new(),
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let out = format!("{report}");
     // Map header line.
@@ -717,32 +593,8 @@ fn report_display_one_map_with_value() {
 #[test]
 fn report_display_multiple_maps_separated() {
     let report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
         maps: vec![make_simple_map(), make_simple_map()],
-        vcpu_regs: Vec::new(),
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
-        prog_runtime_stats: Vec::new(),
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let out = format!("{report}");
     // Maps separated by a blank line (\n\n).
@@ -883,12 +735,9 @@ fn array_entry_display_marks_unreadable() {
 fn array_entries_serde_roundtrip() {
     let map = FailureDumpMap {
         name: "scx_demo.cells".into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_ARRAY,
         value_size: 8,
         max_entries: 3,
-        value: None,
-        entries: Vec::new(),
         array_entries: vec![
             FailureDumpArrayEntry {
                 key: 0,
@@ -909,13 +758,7 @@ fn array_entries_serde_roundtrip() {
                 value: None,
             },
         ],
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let json = serde_json::to_string(&map).unwrap();
     let parsed: FailureDumpMap = serde_json::from_str(&json).unwrap();
@@ -959,9 +802,6 @@ fn percpu_entry_display_shows_each_cpu() {
 #[test]
 fn report_display_includes_vcpu_regs_section() {
     let report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
-        maps: Vec::new(),
         vcpu_regs: vec![
             Some(VcpuRegSnapshot {
                 instruction_pointer: 0x1,
@@ -979,28 +819,7 @@ fn report_display_includes_vcpu_regs_section() {
                 tcr_el1: None,
             }),
         ],
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
-        prog_runtime_stats: Vec::new(),
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let out = format!("{report}");
     // Section header.
@@ -1017,8 +836,6 @@ fn report_display_includes_vcpu_regs_section() {
 #[test]
 fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
     let report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
         maps: vec![make_simple_map()],
         vcpu_regs: vec![Some(VcpuRegSnapshot {
             instruction_pointer: 0x1,
@@ -1027,28 +844,7 @@ fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
             user_page_table_root: None,
             tcr_el1: None,
         })],
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
-        prog_runtime_stats: Vec::new(),
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let out = format!("{report}");
     // Map block, blank line, vcpu_regs section.
@@ -1060,32 +856,8 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
     // An all-empty maps Vec but populated vcpu_regs must still
     // render rather than fall through to "(empty failure dump)".
     let report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
-        maps: Vec::new(),
         vcpu_regs: vec![None],
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
-        prog_runtime_stats: Vec::new(),
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let out = format!("{report}");
     assert_eq!(out, "vcpu_regs:\n  vcpu 0: <unavailable>");
@@ -1106,9 +878,6 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
 #[test]
 fn report_display_partial_with_populated_regs_and_empty_maps() {
     let report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
-        maps: Vec::new(),
         vcpu_regs: vec![Some(VcpuRegSnapshot {
             instruction_pointer: 0xdead,
             stack_pointer: 0xbeef,
@@ -1116,28 +885,7 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
             user_page_table_root: None,
             tcr_el1: None,
         })],
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
-        prog_runtime_stats: Vec::new(),
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
 
     // (a) Display: vcpu_regs section present, no fallback.
@@ -1180,60 +928,12 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
 #[test]
 fn dual_report_serde_roundtrip_with_early() {
     let early = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
-        maps: Vec::new(),
         vcpu_regs: vec![None],
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
-        prog_runtime_stats: Vec::new(),
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let late = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
-        maps: Vec::new(),
         vcpu_regs: vec![None, None],
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
-        prog_runtime_stats: Vec::new(),
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let dual = DualFailureDumpReport {
         schema: SCHEMA_DUAL.to_string(),
@@ -1722,12 +1422,6 @@ fn early_snapshot_serializes_as_schema_single() {
 #[test]
 fn prog_runtime_stats_serde_roundtrip_with_saturation() {
     let report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
-        maps: Vec::new(),
-        vcpu_regs: Vec::new(),
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
         prog_runtime_stats: vec![
             super::super::bpf_prog::ProgRuntimeStats {
                 name: "dispatch".to_string(),
@@ -1742,25 +1436,7 @@ fn prog_runtime_stats_serde_roundtrip_with_saturation() {
                 misses: u64::MAX,
             },
         ],
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let json = serde_json::to_string(&report).expect("serialize");
     let parsed: FailureDumpReport = serde_json::from_str(&json).expect("deserialize");
@@ -1798,12 +1474,6 @@ fn prog_runtime_stats_empty_skips_serialization() {
 #[test]
 fn report_display_renders_prog_runtime_stats() {
     let report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
-        maps: Vec::new(),
-        vcpu_regs: Vec::new(),
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
         prog_runtime_stats: vec![
             super::super::bpf_prog::ProgRuntimeStats {
                 name: "dispatch".to_string(),
@@ -1818,25 +1488,7 @@ fn report_display_renders_prog_runtime_stats() {
                 misses: 7,
             },
         ],
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let out = format!("{report}");
     assert!(
@@ -1861,37 +1513,13 @@ fn report_display_renders_prog_runtime_stats() {
 #[test]
 fn report_display_only_prog_runtime_stats_does_not_say_empty_dump() {
     let report = FailureDumpReport {
-        schema: SCHEMA_SINGLE.to_string(),
-        active_map_kvas: Vec::new(),
-        maps: Vec::new(),
-        vcpu_regs: Vec::new(),
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
         prog_runtime_stats: vec![super::super::bpf_prog::ProgRuntimeStats {
             name: "lone".to_string(),
             cnt: 1,
             nsecs: 2,
             misses: 0,
         }],
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     };
     let out = format!("{report}");
     assert!(
@@ -2532,14 +2160,9 @@ fn percpu_hash_entry_key_skips_when_none() {
 fn map_display_percpu_hash_entries_render() {
     let m = FailureDumpMap {
         name: "percpu_hash".into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_PERCPU_HASH,
         value_size: 4,
         max_entries: 100,
-        value: None,
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
         percpu_hash_entries: vec![FailureDumpPercpuHashEntry {
             key: Some(RenderedValue::Uint { bits: 32, value: 1 }),
             key_hex: "01 00 00 00".into(),
@@ -2554,11 +2177,7 @@ fn map_display_percpu_hash_entries_render() {
                 }),
             ],
         }],
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let out = format!("{m}");
     assert!(out.contains("map percpu_hash (type="), "header: {out}");
@@ -2684,20 +2303,10 @@ fn pinned_error_unknown_map_type_format() {
 fn map_percpu_hash_entries_skips_when_empty() {
     let m = FailureDumpMap {
         name: "test".into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 4,
         max_entries: 1,
-        value: None,
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let json = serde_json::to_string(&m).unwrap();
     assert!(
@@ -2710,14 +2319,9 @@ fn map_percpu_hash_entries_skips_when_empty() {
 fn map_percpu_hash_entries_round_trip_when_populated() {
     let m = FailureDumpMap {
         name: "ph".into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_PERCPU_HASH,
         value_size: 4,
         max_entries: 1,
-        value: None,
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
         percpu_hash_entries: vec![FailureDumpPercpuHashEntry {
             key: Some(RenderedValue::Uint { bits: 32, value: 1 }),
             key_hex: "01 00 00 00".into(),
@@ -2726,11 +2330,7 @@ fn map_percpu_hash_entries_round_trip_when_populated() {
                 value: 99,
             })],
         }],
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let json = serde_json::to_string(&m).expect("serialize");
     assert!(
@@ -5202,20 +4802,11 @@ fn build_ringbuf_scene(
 fn ringbuf_map_info(map_kva: u64) -> super::super::bpf_map::BpfMapInfo {
     let (name_bytes, name_len) = name_from_str("test_ringbuf");
     super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva,
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_RINGBUF,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 0,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     }
 }
 
@@ -5494,20 +5085,13 @@ fn build_stackmap_scene(
     let map_kva = pa_to_kva(map_pa, page_offset);
     let (name_bytes, name_len) = name_from_str("test_stack");
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva,
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_STACK_TRACE,
         map_flags,
-        key_size: 0,
-        value_size: 0,
         max_entries: n_buckets,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     (
@@ -5708,20 +5292,12 @@ fn build_fd_array_scene(
     let map_kva = pa_to_kva(map_pa, page_offset);
     let (name_bytes, name_len) = name_from_str("test_fd_array");
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva,
         name_bytes,
         name_len,
         map_type,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 0,
         max_entries,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     (
         RenderScene {
@@ -5811,22 +5387,16 @@ fn render_map_hash_shaped_fd_map_sets_error() {
         super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
     let (name_bytes, name_len) = name_from_str("test_sockhash");
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva: pa_to_kva(0x1000, page_offset),
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_SOCKHASH,
-        map_flags: 0,
         key_size: 4,
         value_size: 4,
         // Large max_entries: a scanning walker would report on these;
         // the bail must ignore the count entirely.
         max_entries: 1024,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let arena_page_index = super::render_map::ArenaPageIndex::new();
     let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
@@ -5964,20 +5534,13 @@ fn render_map_struct_ops_no_offsets_returns_error() {
         super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
     let (name_bytes, name_len) = name_from_str("test_struct_ops");
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva: pa_to_kva(0x1000, page_offset),
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS,
-        map_flags: 0,
-        key_size: 0,
         value_size: 256,
         max_entries: 1,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let arena_page_index = super::render_map::ArenaPageIndex::new();
     let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
@@ -6034,20 +5597,15 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
     // the read_value translate fails.
     let (name_bytes, name_len) = name_from_str("test_struct_ops");
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva: pa_to_kva(0x1000, page_offset),
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS,
-        map_flags: 0,
-        key_size: 0,
         value_size: 256,
         max_entries: 1,
         value_kva: Some(page_offset + 0x100_0000), // far past buffer
         btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let arena_page_index = super::render_map::ArenaPageIndex::new();
     let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
@@ -6106,20 +5664,15 @@ fn render_map_multi_entry_array_all_keys_unreadable() {
         super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
     let (name_bytes, name_len) = name_from_str("test_cells");
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva: pa_to_kva(0x1000, page_offset),
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
         key_size: 4,
         value_size: 4,
         max_entries: 3,
         value_kva: Some(pa_to_kva(0x2000, page_offset)),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let arena_page_index = super::render_map::ArenaPageIndex::new();
     let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
@@ -6191,20 +5744,15 @@ fn render_map_multi_entry_array_truncates_at_cap() {
     // Declare more keys than the cap so the render arm truncates.
     let max_entries: u32 = MAX_ARRAY_KEYS + 904;
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva: pa_to_kva(0x1000, page_offset),
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
         key_size: 4,
         value_size: 4,
         max_entries,
         value_kva: Some(pa_to_kva(0x2000, page_offset)),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let arena_page_index = super::render_map::ArenaPageIndex::new();
     let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
@@ -6285,20 +5833,15 @@ fn render_map_percpu_array_truncates_at_cap() {
     // Declare more keys than the cap so the render arm truncates.
     let max_entries: u32 = MAX_PERCPU_KEYS + 71;
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva: pa_to_kva(0x1000, page_offset),
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_PERCPU_ARRAY,
-        map_flags: 0,
         key_size: 4,
         value_size: 4,
         max_entries,
         value_kva: Some(pa_to_kva(0x2000, page_offset)),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let arena_page_index = super::render_map::ArenaPageIndex::new();
     let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
@@ -6437,20 +5980,14 @@ fn render_map_hash_truncates_at_cap() {
         super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
     let (name_bytes, name_len) = name_from_str("test_hash");
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva: pa_to_kva(htab_pa, page_offset),
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_HASH,
-        map_flags: 0,
         key_size,
         value_size,
         max_entries: n_elems as u32,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let arena_page_index = super::render_map::ArenaPageIndex::new();
     let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
@@ -6580,20 +6117,14 @@ fn render_map_percpu_hash_truncates_at_cap() {
         super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
     let (name_bytes, name_len) = name_from_str("test_percpu_hash");
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva: pa_to_kva(htab_pa, page_offset),
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_PERCPU_HASH,
-        map_flags: 0,
         key_size,
         value_size,
         max_entries: n_elems as u32,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let arena_page_index = super::render_map::ArenaPageIndex::new();
     let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
@@ -6731,20 +6262,12 @@ fn render_map_local_storage_truncates_at_cap() {
         super::super::bpf_map::GuestMemMapAccessor::new_for_test(kernel_ref, &offsets, 0);
     let (name_bytes, name_len) = name_from_str("test_task_storage");
     let info = super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva: pa_to_kva(smap_pa, page_offset),
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_TASK_STORAGE,
-        map_flags: 0,
-        key_size: 0,
         value_size,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
     let arena_page_index = super::render_map::ArenaPageIndex::new();
     let sdt_alloc_metas: Vec<super::render_map::SdtAllocMeta> = Vec::new();
@@ -7064,11 +6587,9 @@ fn entry_display_payload_renders_below_value() {
 fn map_display_table_for_homogeneous_entries() {
     let m = FailureDumpMap {
         name: "cbw".into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
-        value: None,
         entries: vec![
             FailureDumpEntry {
                 key: Some(make_small_struct(
@@ -7110,14 +6631,7 @@ fn map_display_table_for_homogeneous_entries() {
                 payload: None,
             },
         ],
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let out = format!("{m}");
     // Header row carries column names with `|` separating key
@@ -7143,11 +6657,9 @@ fn map_display_skips_table_for_single_entry() {
     // table header overhead exceeds the savings.
     let m = FailureDumpMap {
         name: "single".into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
-        value: None,
         entries: vec![FailureDumpEntry {
             key: Some(make_small_struct("k", &[("a", 1)])),
             key_hex: "01".into(),
@@ -7155,14 +6667,7 @@ fn map_display_skips_table_for_single_entry() {
             value_hex: "02".into(),
             payload: None,
         }],
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let out = format!("{m}");
     // Per-entry rendering uses the indent-based format, with each
@@ -7185,11 +6690,9 @@ fn map_display_skips_table_when_payload_present() {
     // table can't carry the per-entry typed payload below each row.
     let m = FailureDumpMap {
         name: "with_payload".into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
-        value: None,
         entries: vec![
             FailureDumpEntry {
                 key: Some(make_small_struct("k", &[("a", 1)])),
@@ -7209,14 +6712,7 @@ fn map_display_skips_table_when_payload_present() {
                 payload: None,
             },
         ],
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let out = format!("{m}");
     // Per-entry rendering used (each entry has `entry {` opener).
@@ -7232,11 +6728,9 @@ fn map_display_skips_table_for_heterogeneous_types() {
     // Different key type names → not homogeneous → no table.
     let m = FailureDumpMap {
         name: "het".into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
-        value: None,
         entries: vec![
             FailureDumpEntry {
                 key: Some(make_small_struct("k1", &[("a", 1)])),
@@ -7253,14 +6747,7 @@ fn map_display_skips_table_for_heterogeneous_types() {
                 payload: None,
             },
         ],
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let out = format!("{m}");
     // Per-entry rendering, NOT a table.
@@ -7276,11 +6763,9 @@ fn map_display_skips_table_when_entry_has_no_btf_render() {
     // disqualifies the table.
     let m = FailureDumpMap {
         name: "no_btf".into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
-        value: None,
         entries: vec![
             FailureDumpEntry {
                 key: None,
@@ -7297,14 +6782,7 @@ fn map_display_skips_table_when_entry_has_no_btf_render() {
                 payload: None,
             },
         ],
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let out = format!("{m}");
     assert!(
@@ -8162,20 +7640,12 @@ impl super::super::bpf_prog::BpfProgAccessor for TestProgAccessor {
 fn synthetic_global_section_map(map_kva: u64, name: &str) -> super::super::bpf_map::BpfMapInfo {
     let (name_bytes, name_len) = name_from_str(name);
     super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva,
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 0,
         max_entries: 1,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     }
 }
 
@@ -8186,20 +7656,13 @@ fn synthetic_struct_ops_map(
 ) -> super::super::bpf_map::BpfMapInfo {
     let (name_bytes, name_len) = name_from_str(name);
     super::super::bpf_map::BpfMapInfo {
-        map_pa: 0,
         map_kva,
         name_bytes,
         name_len,
         map_type: super::super::bpf_map::BPF_MAP_TYPE_STRUCT_OPS,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 0,
         max_entries: 1,
         value_kva: Some(sched_kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     }
 }
 
@@ -8760,20 +8223,11 @@ fn failure_dump_map_zero_kva_is_no_identity_sentinel_not_real_capture() {
 fn map_with_entries(name: &str, entries: Vec<FailureDumpEntry>) -> FailureDumpMap {
     FailureDumpMap {
         name: name.into(),
-        map_kva: 0,
         map_type: BPF_MAP_TYPE_HASH,
         value_size: 8,
         max_entries: 64,
-        value: None,
         entries,
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     }
 }
 

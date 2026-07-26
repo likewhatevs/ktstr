@@ -73,20 +73,13 @@ fn test_local_storage_map_offsets() -> BpfMapOffsets {
 fn make_storage_map(map_kva: u64, value_size: u32, map_type: u32) -> BpfMapInfo {
     let (name_bytes, name_len) = super::name_from_str("test_storage");
     BpfMapInfo {
-        map_pa: 0,
         map_kva,
         name_bytes,
         name_len,
         map_type,
-        map_flags: 0,
         key_size: 0, // unused — walker emits owner KVA as the "key"
         value_size,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     }
 }
 
