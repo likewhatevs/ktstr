@@ -47,6 +47,76 @@ mod registry;
 pub(crate) use exec_handoff::EXEC_HANDOFF_ENV;
 pub(crate) use exec_handoff::{prepare_pending_exec_handoff, take_pending_exec_handoff};
 
+#[cfg(test)]
+pub(crate) use registry::{
+    active_free_head_is_rejected_for_tests, aggregate_conflicts as registered_claim_conflicts,
+    aggregate_snapshot_read_count_for_tests, churn_registry_generation_for_tests,
+    coordinator_liveness_probe_for_tests, defer_liveness_maintenance_for_tests,
+    diagnostics_for_tests as ticket_registry_diagnostics_for_tests,
+    exercise_acknowledgement_payload_notify_order_for_tests,
+    exercise_bounded_replan_window_for_tests, exercise_busy_to_free_close_for_tests,
+    exercise_changed_replan_wave_completions_for_tests,
+    exercise_clean_coordinator_mismatch_recovery_for_tests,
+    exercise_coordinator_heartbeat_deadline_for_tests,
+    exercise_coordinator_pending_replan_for_tests, exercise_coordinator_turnover_for_tests,
+    exercise_cpu_ex_contention_shared_wake_for_tests, exercise_cpu_mode_repair_for_tests,
+    exercise_cpu_shared_commit_improvement_for_tests, exercise_dead_waiter_takeover_skip_for_tests,
+    exercise_deferred_rescan_policy_for_tests, exercise_dirty_repair_grant_charges_for_tests,
+    exercise_dirty_repair_notification_for_tests, exercise_disjoint_entrant_proceeds_for_tests,
+    exercise_exact_commit_scan_elision_for_tests, exercise_exclusive_grant_bias_only_for_tests,
+    exercise_fresh_waiting_coordinator_takeover_for_tests,
+    exercise_generation_timeout_takeover_for_tests, exercise_grant_charge_revoke_ack_for_tests,
+    exercise_grant_completion_batch_for_tests, exercise_grant_disjoint_completion_for_tests,
+    exercise_grant_scan_crash_fence_for_tests, exercise_granted_charge_lifecycle_for_tests,
+    exercise_granted_only_drain_election_reads_for_tests, exercise_granted_serial_scope_for_tests,
+    exercise_granular_prefix_invalidation_for_tests, exercise_held_teardown_notify_count_for_tests,
+    exercise_intrascan_fence_epoch_for_tests, exercise_issue_serial_race_for_tests,
+    exercise_known_free_close_storm_for_tests, exercise_llc_ex_contention_shared_wake_for_tests,
+    exercise_llc_sh_only_shared_to_free_close_for_tests,
+    exercise_mismatched_commit_rescan_for_tests, exercise_n_entrants_read_under_churn_for_tests,
+    exercise_one_shot_replacement_for_tests, exercise_pending_activation_overlap_watch_for_tests,
+    exercise_pending_replan_grant_races_for_tests, exercise_prefix_epoch_validation_for_tests,
+    exercise_prefix_order_and_repair_for_tests,
+    exercise_prefix_refresh_after_predecessor_release_for_tests,
+    exercise_preparation_pool_budget_for_tests, exercise_preparation_pool_crash_recovery_for_tests,
+    exercise_preparation_pool_starvation_for_tests, exercise_quiet_generation_additions_for_tests,
+    exercise_release_coalesce_for_tests, exercise_repeated_coordinator_takeover_for_tests,
+    exercise_replacement_kept_overlap_guard_for_tests,
+    exercise_replan_capacity_validation_for_tests, exercise_replan_completion_election_for_tests,
+    exercise_replan_crash_repair_for_tests, exercise_replan_expiry_publication_crash_for_tests,
+    exercise_replan_straggler_progress_for_tests, exercise_replan_token_wave_for_tests,
+    exercise_replan_wave_expiry_for_tests,
+    exercise_resource_weighted_backfill_accounting_for_tests,
+    exercise_retained_mapping_slot_reuse_for_tests, exercise_retained_shared_publication_for_tests,
+    exercise_revocation_ack_for_tests, exercise_revoke_crash_repair_for_tests,
+    exercise_revoked_owner_death_for_tests, exercise_same_wake_own_designation_grant_for_tests,
+    exercise_same_wake_redesignation_expired_release_for_tests,
+    exercise_same_wake_redesignation_fallback_for_tests,
+    exercise_same_wake_redesignation_grant_for_tests,
+    exercise_same_wake_redesignation_older_fence_for_tests,
+    exercise_scan_metadata_validation_for_tests, exercise_shared_commit_improvement_for_tests,
+    exercise_shared_watch_held_metadata_for_tests, exercise_stale_acquired_release_order_for_tests,
+    exercise_stale_contention_commit_for_tests,
+    exercise_stale_heartbeat_known_free_close_for_tests,
+    exercise_stalled_takeover_notification_for_tests, exercise_superset_commit_rescan_for_tests,
+    exercise_unchanged_completion_guard_for_tests,
+    exercise_waiting_publication_release_progress_for_tests,
+    exercise_waiting_release_wake_for_tests, exercise_work_conserving_backfill_for_tests,
+    exercise_writer_intent_initialization_race_for_tests, expire_coordinator_lease_for_tests,
+    generation_wait_calls_for_tests, grant_charge_matches_derived_for_tests,
+    hold_registry_exclusive_after_intent_for_tests, hold_registry_exclusive_for_tests,
+    hold_registry_shared_for_tests,
+    initializer_temp_count_for_tests as registry_initializer_temp_count_for_tests,
+    missing_liveness_probe_does_not_create_for_tests,
+    observer_preserves_uninitialized_header_for_tests,
+    prepare_zeroed_uninitialized_header_for_tests, registry_ex_acquisition_count_for_tests,
+    resource_epoch_for_tests, round_trip_claim_modes_for_tests, shared_state_read_count_for_tests,
+    snapshot as ticket_registry_snapshot_for_tests, ticket_blocked_at_current_serial_for_tests,
+    ticket_is_granted_for_tests, ticket_is_revoked_for_tests, ticket_is_waiting_for_tests,
+    ticket_shared_mapping_build_count_for_tests, try_hold_registry_exclusive_for_tests,
+    try_hold_registry_shared_for_tests, union_claims_for_tests,
+};
+
 /// Stable identity of one host reservation lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ResourceKey {
@@ -620,14 +690,6 @@ impl ClaimSet {
     }
 }
 
-/// Whether a fast-path reservation conflicts with an exact live ticket claim.
-/// Three registry aggregates answer the common case in O(host bitset) rather
-/// than scanning O(waiters).
-#[cfg(test)]
-pub(crate) fn registered_claim_conflicts(candidate: &ClaimSet) -> Result<bool> {
-    registry::aggregate_conflicts(candidate)
-}
-
 pub(crate) struct RegisteredClaimSnapshot {
     inner: registry::AggregateSnapshot,
 }
@@ -686,35 +748,6 @@ pub(crate) fn try_registered_claim_snapshot(
     required: &ClaimSet,
 ) -> Result<Option<RegisteredClaimSnapshot>> {
     Ok(registry::try_aggregate_snapshot(required)?.map(|inner| RegisteredClaimSnapshot { inner }))
-}
-
-#[cfg(test)]
-pub(crate) fn aggregate_snapshot_read_count_for_tests() -> usize {
-    registry::aggregate_snapshot_read_count_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn union_claims_for_tests(a: &ClaimSet, b: &ClaimSet) -> ClaimSet {
-    registry::union_claims_for_tests(a, b)
-}
-
-#[cfg(test)]
-pub(crate) fn round_trip_claim_modes_for_tests(
-    claim: &ClaimSet,
-    watch: &ClaimSet,
-) -> Result<(ClaimSet, ClaimSet)> {
-    registry::round_trip_claim_modes_for_tests(claim, watch)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_scan_metadata_validation_for_tests()
--> Result<registry::ScanMetadataValidationOutcome> {
-    registry::exercise_scan_metadata_validation_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_shared_watch_held_metadata_for_tests() -> Result<bool> {
-    registry::exercise_shared_watch_held_metadata_for_tests()
 }
 
 pub(crate) enum RegistryFence<T> {
@@ -2024,23 +2057,8 @@ pub(crate) fn exercise_preparation_continuity_for_tests() -> Result<PreparationC
 }
 
 #[cfg(test)]
-pub(crate) fn ticket_registry_snapshot_for_tests() -> Result<Vec<(u64, u32, ClaimSet)>> {
-    registry::snapshot()
-}
-
-#[cfg(test)]
-pub(crate) fn ticket_registry_diagnostics_for_tests() -> Result<String> {
-    registry::diagnostics_for_tests()
-}
-
-#[cfg(test)]
 pub(crate) fn persist_wait_diagnostic_for_tests(root: &std::path::Path, bucket: u64) -> Result<()> {
     registry::persist_wait_diagnostic(root, bucket, bucket * 30)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(bool, bool, bool)> {
-    registry::exercise_pending_activation_overlap_watch_for_tests()
 }
 
 #[cfg(test)]
@@ -2110,118 +2128,8 @@ pub(crate) fn register_pending_claim_for_tests(claim: ClaimSet) -> Result<Pendin
 }
 
 #[cfg(test)]
-pub(crate) fn registry_ex_acquisition_count_for_tests() -> u64 {
-    registry::registry_ex_acquisition_count_for_tests()
-}
-
-#[cfg(test)]
 pub(crate) fn reset_generation_wait_calls_for_tests() {
     registry::reset_generation_wait_calls_for_tests();
-}
-
-#[cfg(test)]
-pub(crate) fn generation_wait_calls_for_tests() -> usize {
-    registry::generation_wait_calls_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32, u32, u32, u32) {
-    registry::exercise_resource_weighted_backfill_accounting_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_work_conserving_backfill_for_tests()
--> Result<registry::WorkConservingBackfillOutcome> {
-    registry::exercise_work_conserving_backfill_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_preparation_pool_budget_for_tests()
--> Result<registry::PreparationPoolBudgetOutcome> {
-    registry::exercise_preparation_pool_budget_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_preparation_pool_starvation_for_tests()
--> Result<registry::PreparationPoolStarvationOutcome> {
-    registry::exercise_preparation_pool_starvation_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_preparation_pool_crash_recovery_for_tests()
--> Result<registry::PreparationPoolCrashRecoveryOutcome> {
-    registry::exercise_preparation_pool_crash_recovery_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_coordinator_heartbeat_deadline_for_tests()
--> Result<registry::CoordinatorHeartbeatDeadlineOutcome> {
-    registry::exercise_coordinator_heartbeat_deadline_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_repeated_coordinator_takeover_for_tests()
--> Result<registry::RepeatedCoordinatorTakeoverOutcome> {
-    registry::exercise_repeated_coordinator_takeover_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
--> Result<registry::FreshWaitingCoordinatorTakeoverOutcome> {
-    registry::exercise_fresh_waiting_coordinator_takeover_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_dead_waiter_takeover_skip_for_tests() -> Result<(bool, bool, bool)> {
-    registry::exercise_dead_waiter_takeover_skip_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn expire_coordinator_lease_for_tests() -> Result<()> {
-    registry::expire_coordinator_lease_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_stalled_takeover_notification_for_tests(
-    watch: &LockDirWatch,
-) -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_stalled_takeover_notification_for_tests(watch)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_dirty_repair_notification_for_tests(
-    watch: &LockDirWatch,
-) -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_dirty_repair_notification_for_tests(watch)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_clean_coordinator_mismatch_recovery_for_tests() -> Result<()> {
-    registry::exercise_clean_coordinator_mismatch_recovery_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
-    registry::churn_registry_generation_for_tests(rounds)
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn exercise_n_entrants_read_under_churn_for_tests(
-    n: usize,
-    reads_each: usize,
-    llc_prefix: Option<String>,
-    cpu_prefix: Option<String>,
-    deadline: std::time::Duration,
-) -> Result<(bool, std::time::Duration)> {
-    registry::exercise_n_entrants_read_under_churn_for_tests(
-        n, reads_each, llc_prefix, cpu_prefix, deadline,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn active_free_head_is_rejected_for_tests() -> Result<()> {
-    registry::active_free_head_is_rejected_for_tests()
 }
 
 #[cfg(test)]
@@ -2232,147 +2140,6 @@ pub(crate) fn cancel_granted_after_commit_for_tests() {
 #[cfg(test)]
 pub(crate) fn cancel_coordinator_after_commit_for_tests() {
     registry::cancel_coordinator_after_commit_for_tests();
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_known_free_close_storm_for_tests(
-    closes: usize,
-) -> Result<(usize, u64, usize, u64, u64)> {
-    registry::exercise_known_free_close_storm_for_tests(closes)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_stale_heartbeat_known_free_close_for_tests()
--> Result<(usize, u64, usize, u64, u64)> {
-    registry::exercise_stale_heartbeat_known_free_close_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(bool, bool, u64, u64)>
-{
-    registry::exercise_llc_sh_only_shared_to_free_close_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usize, u32, u32)> {
-    registry::exercise_busy_to_free_close_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64, bool, bool, bool)>
-{
-    registry::exercise_llc_ex_contention_shared_wake_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_cpu_ex_contention_shared_wake_for_tests() -> Result<CpuExContentionSharedWake>
-{
-    registry::exercise_cpu_ex_contention_shared_wake_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_coordinator_turnover_for_tests(
-    coordinators: usize,
-) -> Result<(u64, usize, u64, bool)> {
-    registry::exercise_coordinator_turnover_for_tests(coordinators)
-}
-
-#[cfg(test)]
-pub(crate) fn defer_liveness_maintenance_for_tests() -> Result<()> {
-    registry::defer_liveness_maintenance_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Result<u64> {
-    registry::exercise_exact_commit_scan_elision_for_tests(commits)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_mismatched_commit_rescan_for_tests() -> Result<(u64, bool)> {
-    registry::exercise_mismatched_commit_rescan_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_superset_commit_rescan_for_tests() -> Result<(u64, bool)> {
-    registry::exercise_superset_commit_rescan_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_shared_commit_improvement_for_tests() -> Result<(u64, bool)> {
-    registry::exercise_shared_commit_improvement_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64, bool)> {
-    registry::exercise_cpu_shared_commit_improvement_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_cpu_mode_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_cpu_mode_repair_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_replan_token_wave_for_tests(
-    waiters: usize,
-) -> Result<registry::ReplanTokenWaveOutcome> {
-    registry::exercise_replan_token_wave_for_tests(waiters)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_bounded_replan_window_for_tests(
-    capacity: usize,
-    waiters: usize,
-) -> Result<registry::BoundedReplanWindowOutcome> {
-    registry::exercise_bounded_replan_window_for_tests(capacity, waiters)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_replan_capacity_validation_for_tests() -> Result<(bool, bool, bool)> {
-    registry::exercise_replan_capacity_validation_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_generation_timeout_takeover_for_tests() -> Result<(bool, bool)> {
-    registry::exercise_generation_timeout_takeover_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_quiet_generation_additions_for_tests(
-    additions: usize,
-) -> Result<registry::QuietGenerationAdditionsOutcome> {
-    registry::exercise_quiet_generation_additions_for_tests(additions)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_changed_replan_wave_completions_for_tests(
-    callbacks: usize,
-) -> Result<registry::ReplanChangedWaveOutcome> {
-    registry::exercise_changed_replan_wave_completions_for_tests(callbacks)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_same_wake_redesignation_grant_for_tests()
--> Result<registry::SameWakeRedesignationOutcome> {
-    registry::exercise_same_wake_redesignation_grant_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_same_wake_redesignation_fallback_for_tests() -> Result<(bool, bool, bool)> {
-    registry::exercise_same_wake_redesignation_fallback_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_same_wake_redesignation_older_fence_for_tests() -> Result<(bool, bool, bool)>
-{
-    registry::exercise_same_wake_redesignation_older_fence_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_same_wake_own_designation_grant_for_tests(
-    fenced: bool,
-) -> Result<registry::SameWakeOwnDesignationOutcome> {
-    registry::exercise_same_wake_own_designation_grant_for_tests(fenced)
 }
 
 #[cfg(test)]
@@ -2438,215 +2205,11 @@ pub(crate) fn exercise_level_probe_head_of_line_promotion() -> Result<(bool, boo
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_same_wake_redesignation_expired_release_for_tests()
--> Result<(bool, bool, bool)> {
-    registry::exercise_same_wake_redesignation_expired_release_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_deferred_rescan_policy_for_tests()
--> Result<registry::DeferredRescanPolicyOutcome> {
-    registry::exercise_deferred_rescan_policy_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_grant_completion_batch_for_tests()
--> Result<registry::GrantCompletionBatchOutcome> {
-    registry::exercise_grant_completion_batch_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_release_coalesce_for_tests() -> Result<registry::ReleaseCoalesceOutcome> {
-    registry::exercise_release_coalesce_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_replan_straggler_progress_for_tests()
--> Result<registry::ReplanStragglerProgressOutcome> {
-    registry::exercise_replan_straggler_progress_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_pending_replan_grant_races_for_tests()
--> Result<registry::PendingReplanGrantRaceOutcome> {
-    registry::exercise_pending_replan_grant_races_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn grant_charge_matches_derived_for_tests() -> Result<()> {
-    registry::grant_charge_matches_derived_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_granted_charge_lifecycle_for_tests()
--> Result<registry::GrantedChargeLifecycleOutcome> {
-    registry::exercise_granted_charge_lifecycle_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_grant_charge_revoke_ack_for_tests()
--> Result<registry::GrantChargeRevokeAckOutcome> {
-    registry::exercise_grant_charge_revoke_ack_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_dirty_repair_grant_charges_for_tests() -> Result<(bool, bool)> {
-    registry::exercise_dirty_repair_grant_charges_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_exclusive_grant_bias_only_for_tests() -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_exclusive_grant_bias_only_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_grant_disjoint_completion_for_tests()
--> Result<registry::GrantDisjointCompletionOutcome> {
-    registry::exercise_grant_disjoint_completion_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_unchanged_completion_guard_for_tests(
-    conflicting: bool,
-) -> Result<(bool, bool)> {
-    registry::exercise_unchanged_completion_guard_for_tests(conflicting)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_replacement_kept_overlap_guard_for_tests() -> Result<(bool, bool)> {
-    registry::exercise_replacement_kept_overlap_guard_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_disjoint_entrant_proceeds_for_tests()
--> Result<registry::DisjointEntrantProceedsOutcome> {
-    registry::exercise_disjoint_entrant_proceeds_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_coordinator_pending_replan_for_tests()
--> Result<registry::CoordinatorPendingReplanOutcome> {
-    registry::exercise_coordinator_pending_replan_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_replan_completion_election_for_tests() -> Result<(bool, u64)> {
-    registry::exercise_replan_completion_election_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_replan_wave_expiry_for_tests() -> Result<registry::ReplanWaveExpiryOutcome> {
-    registry::exercise_replan_wave_expiry_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_replan_expiry_publication_crash_for_tests() -> Result<bool> {
-    registry::exercise_replan_expiry_publication_crash_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_replan_crash_repair_for_tests() -> Result<registry::ReplanCrashRepairOutcome>
-{
-    registry::exercise_replan_crash_repair_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_intrascan_fence_epoch_for_tests() -> Result<(bool, bool, bool)> {
-    registry::exercise_intrascan_fence_epoch_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_grant_scan_crash_fence_for_tests() -> Result<(bool, bool, bool)> {
-    registry::exercise_grant_scan_crash_fence_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_granular_prefix_invalidation_for_tests()
--> Result<registry::GranularPrefixInvalidationOutcome> {
-    registry::exercise_granular_prefix_invalidation_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_granted_serial_scope_for_tests() -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_granted_serial_scope_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_revocation_ack_for_tests() -> Result<registry::RevocationAckOutcome> {
-    registry::exercise_revocation_ack_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_revoked_owner_death_for_tests() -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_revoked_owner_death_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_revoke_crash_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_revoke_crash_repair_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_waiting_release_wake_for_tests() -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_waiting_release_wake_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_one_shot_replacement_for_tests()
--> Result<(usize, bool, bool, bool, bool, usize)> {
-    registry::exercise_one_shot_replacement_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, bool, bool)> {
-    registry::exercise_prefix_epoch_validation_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_prefix_order_and_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_prefix_order_and_repair_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
--> Result<(bool, bool, bool, bool)> {
-    registry::exercise_prefix_refresh_after_predecessor_release_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_waiting_publication_release_progress_for_tests()
--> Result<(bool, bool, bool, bool)> {
-    registry::exercise_waiting_publication_release_progress_for_tests()
-}
-
-#[cfg(test)]
 pub(crate) fn waiting_publication_requires_immediate_turn_for_tests(
     should_step: bool,
     observation_pending: bool,
 ) -> bool {
     waiting_publication_requires_immediate_turn(should_step, observation_pending)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_issue_serial_race_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_stale_acquired_release_order_for_tests()
--> Result<(bool, bool, bool, bool, bool, bool)> {
-    registry::exercise_stale_acquired_release_order_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_acknowledgement_payload_notify_order_for_tests()
--> Result<(bool, bool, bool, bool, bool, bool)> {
-    registry::exercise_acknowledgement_payload_notify_order_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_held_teardown_notify_count_for_tests() -> Result<u64> {
-    registry::exercise_held_teardown_notify_count_for_tests()
 }
 
 #[cfg(test)]
@@ -2959,11 +2522,6 @@ pub(crate) fn exercise_stale_coordinator_preparation_retention_for_tests()
 }
 
 #[cfg(test)]
-pub(crate) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool, bool, bool)> {
-    registry::exercise_stale_contention_commit_for_tests()
-}
-
-#[cfg(test)]
 pub(crate) fn exercise_candidate_ready_matrix_for_tests() -> Result<()> {
     let build_watch = ClaimSet::with_permits(
         0usize..96,
@@ -3115,108 +2673,6 @@ pub(crate) fn exercise_candidate_ready_matrix_for_tests() -> Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) fn registry_initializer_temp_count_for_tests() -> Result<usize> {
-    registry::initializer_temp_count_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn observer_preserves_uninitialized_header_for_tests() -> Result<bool> {
-    registry::observer_preserves_uninitialized_header_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn prepare_zeroed_uninitialized_header_for_tests() -> Result<()> {
-    registry::prepare_zeroed_uninitialized_header_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn hold_registry_shared_for_tests() -> Result<registry::RegistryLock> {
-    registry::hold_registry_shared_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn hold_registry_exclusive_for_tests() -> Result<registry::RegistryLock> {
-    registry::hold_registry_exclusive_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn hold_registry_exclusive_after_intent_for_tests(
-    on_intent: impl FnOnce() -> Result<()>,
-) -> Result<registry::RegistryLock> {
-    registry::hold_registry_exclusive_after_intent_for_tests(on_intent)
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_writer_intent_initialization_race_for_tests() -> Result<bool> {
-    registry::exercise_writer_intent_initialization_race_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn try_hold_registry_shared_for_tests() -> Result<Option<registry::RegistryLock>> {
-    registry::try_hold_registry_shared_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn try_hold_registry_exclusive_for_tests() -> Result<Option<registry::RegistryLock>> {
-    registry::try_hold_registry_exclusive_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn shared_state_read_count_for_tests() -> usize {
-    registry::shared_state_read_count_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn ticket_shared_mapping_build_count_for_tests() -> usize {
-    registry::ticket_shared_mapping_build_count_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_retained_shared_publication_for_tests() -> Result<(bool, bool, bool)> {
-    registry::exercise_retained_shared_publication_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_retained_mapping_slot_reuse_for_tests() -> Result<(bool, bool)> {
-    registry::exercise_retained_mapping_slot_reuse_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn resource_epoch_for_tests() -> Result<u64> {
-    registry::resource_epoch_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<bool> {
-    registry::ticket_blocked_at_current_serial_for_tests(pid)
-}
-
-#[cfg(test)]
-pub(crate) fn ticket_is_waiting_for_tests(pid: u32) -> Result<bool> {
-    registry::ticket_is_waiting_for_tests(pid)
-}
-
-#[cfg(test)]
-pub(crate) fn ticket_is_granted_for_tests(pid: u32) -> Result<bool> {
-    registry::ticket_is_granted_for_tests(pid)
-}
-
-#[cfg(test)]
-pub(crate) fn ticket_is_revoked_for_tests(pid: u32) -> Result<bool> {
-    registry::ticket_is_revoked_for_tests(pid)
-}
-
-#[cfg(test)]
-pub(crate) fn coordinator_liveness_probe_for_tests() -> Result<((u64, u64), bool)> {
-    registry::coordinator_liveness_probe_for_tests()
-}
-
-#[cfg(test)]
-pub(crate) fn missing_liveness_probe_does_not_create_for_tests() -> Result<bool> {
-    registry::missing_liveness_probe_does_not_create_for_tests()
-}
-
-#[cfg(test)]
 pub(crate) fn registry_event_dir_for_tests() -> PathBuf {
     registry::event_dir()
 }
@@ -3262,13 +2718,6 @@ pub(crate) fn exercise_registry_high_water_for_tests(waiters: usize) -> Result<u
     }
     drop(tickets);
     Ok(snapshot.len())
-}
-
-#[cfg(test)]
-pub(crate) fn exercise_granted_only_drain_election_reads_for_tests(
-    waiters: usize,
-) -> Result<usize> {
-    registry::exercise_granted_only_drain_election_reads_for_tests(waiters)
 }
 
 /// Register one exact, non-empty priority claim in the fixed-record registry.

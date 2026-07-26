@@ -1476,7 +1476,7 @@ pub(super) fn set_held_drop_hook_for_tests(hook: impl FnOnce() + 'static) {
 }
 
 #[cfg(test)]
-pub(super) fn exercise_held_teardown_notify_count_for_tests() -> Result<u64> {
+pub(crate) fn exercise_held_teardown_notify_count_for_tests() -> Result<u64> {
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let held = publish_acquired(&claim)?;
     let before = NOTIFY_CALLS.with(std::cell::Cell::get);
@@ -1490,7 +1490,7 @@ pub(super) fn abandon_held_for_tests(held: HeldClaim) {
 }
 
 #[cfg(test)]
-pub(super) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(bool, bool, bool)> {
+pub(crate) fn exercise_pending_activation_overlap_watch_for_tests() -> Result<(bool, bool, bool)> {
     let initial = ClaimSet::with_modes(
         std::iter::empty(),
         [1usize],
@@ -1547,7 +1547,7 @@ pub(super) fn register_pending_claim_for_tests(claim: ClaimSet) -> Result<Ticket
 }
 
 #[cfg(test)]
-pub(super) fn registry_ex_acquisition_count_for_tests() -> u64 {
+pub(crate) fn registry_ex_acquisition_count_for_tests() -> u64 {
     REGISTRY_EX_ACQUISITIONS.with(std::cell::Cell::get)
 }
 
@@ -4163,8 +4163,11 @@ impl Drop for Ticket {
     }
 }
 
+/// Whether a fast-path reservation conflicts with an exact live ticket claim.
+/// Three registry aggregates answer the common case in O(host bitset) rather
+/// than scanning O(waiters).
 #[cfg(test)]
-pub(super) fn aggregate_conflicts(candidate: &ClaimSet) -> Result<bool> {
+pub(crate) fn aggregate_conflicts(candidate: &ClaimSet) -> Result<bool> {
     Ok(matches!(
         with_aggregate_fence(candidate, || Ok(()))?,
         FenceResult::Fenced
@@ -4317,17 +4320,17 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(super) fn aggregate_snapshot_read_count_for_tests() -> usize {
+pub(crate) fn aggregate_snapshot_read_count_for_tests() -> usize {
     AGGREGATE_SNAPSHOT_READS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
-pub(super) fn union_claims_for_tests(a: &ClaimSet, b: &ClaimSet) -> ClaimSet {
+pub(crate) fn union_claims_for_tests(a: &ClaimSet, b: &ClaimSet) -> ClaimSet {
     union_claims(a, b)
 }
 
 #[cfg(test)]
-pub(super) fn round_trip_claim_modes_for_tests(
+pub(crate) fn round_trip_claim_modes_for_tests(
     claim: &ClaimSet,
     watch: &ClaimSet,
 ) -> Result<(ClaimSet, ClaimSet)> {
@@ -4400,7 +4403,7 @@ pub(crate) struct ScanMetadataValidationOutcome {
 }
 
 #[cfg(test)]
-pub(super) fn exercise_scan_metadata_validation_for_tests() -> Result<ScanMetadataValidationOutcome>
+pub(crate) fn exercise_scan_metadata_validation_for_tests() -> Result<ScanMetadataValidationOutcome>
 {
     let layout = HeaderLayout::new(4096)?;
     let claim = ClaimSet::with_permits(
@@ -4499,7 +4502,7 @@ pub(super) fn exercise_scan_metadata_validation_for_tests() -> Result<ScanMetada
 }
 
 #[cfg(test)]
-pub(super) fn exercise_shared_watch_held_metadata_for_tests() -> Result<bool> {
+pub(crate) fn exercise_shared_watch_held_metadata_for_tests() -> Result<bool> {
     let claim = ClaimSet::with_permits(
         [1usize],
         [2usize],
@@ -5045,7 +5048,7 @@ fn record_state_name(state: u32) -> &'static str {
 }
 
 #[cfg(test)]
-pub(super) fn snapshot() -> Result<Vec<(u64, u32, ClaimSet)>> {
+pub(crate) fn snapshot() -> Result<Vec<(u64, u32, ClaimSet)>> {
     let Some(_lock) = try_lock_registry_existing(FlockMode::Exclusive)? else {
         // The uncontended fast path deliberately creates no registry
         // metadata. Test pollers therefore observe a missing lock as the
@@ -5101,7 +5104,7 @@ pub(super) fn registration_batch_kept_initial_coordinator_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_replan_capacity_validation_for_tests() -> Result<(bool, bool, bool)> {
+pub(crate) fn exercise_replan_capacity_validation_for_tests() -> Result<(bool, bool, bool)> {
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let mut ticket = Ticket::register(claim.clone(), claim, None)?;
     let (preserved_by_repair, zero_rejected, oversized_rejected) = {
@@ -5129,7 +5132,7 @@ pub(super) fn exercise_replan_capacity_validation_for_tests() -> Result<(bool, b
 }
 
 #[cfg(test)]
-pub(super) fn exercise_generation_timeout_takeover_for_tests() -> Result<(bool, bool)> {
+pub(crate) fn exercise_generation_timeout_takeover_for_tests() -> Result<(bool, bool)> {
     let blocked_claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let disjoint_claim = ClaimSet::new(std::iter::empty(), [2usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(blocked_claim.clone(), blocked_claim.clone(), None)?;
@@ -5182,7 +5185,7 @@ pub(super) fn exercise_generation_timeout_takeover_for_tests() -> Result<(bool, 
 /// proving additions advance the structural image without changing the futex
 /// word; synchronous teardown then proves improvements still broadcast.
 #[cfg(test)]
-pub(super) fn exercise_quiet_generation_additions_for_tests(
+pub(crate) fn exercise_quiet_generation_additions_for_tests(
     additions: usize,
 ) -> Result<QuietGenerationAdditionsOutcome> {
     anyhow::ensure!(additions > 0, "quiet-generation fixture needs additions");
@@ -5327,7 +5330,7 @@ pub(super) fn exercise_quiet_generation_additions_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn diagnostics_for_tests() -> Result<String> {
+pub(crate) fn diagnostics_for_tests() -> Result<String> {
     let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Exclusive)? else {
         return Ok(if registry_lock_path().exists() {
             "registry=busy".to_owned()
@@ -5440,7 +5443,7 @@ pub(crate) struct FreshWaitingCoordinatorTakeoverOutcome {
 }
 
 #[cfg(test)]
-pub(super) fn exercise_coordinator_heartbeat_deadline_for_tests()
+pub(crate) fn exercise_coordinator_heartbeat_deadline_for_tests()
 -> Result<CoordinatorHeartbeatDeadlineOutcome> {
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(claim.clone(), claim.clone(), None)?;
@@ -5542,7 +5545,7 @@ pub(super) fn exercise_coordinator_heartbeat_deadline_for_tests()
 /// below: A -> B parks A, then stale B must promote waiting C rather than
 /// immediately returning the lease to A.
 #[cfg(test)]
-pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
+pub(crate) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
 -> Result<FreshWaitingCoordinatorTakeoverOutcome> {
     let claim_a = ClaimSet::new(std::iter::empty(), [11usize], FlockMode::Exclusive);
     let mut coordinator_a = Ticket::register(claim_a.clone(), claim_a, None)?;
@@ -5705,7 +5708,7 @@ pub(super) fn exercise_fresh_waiting_coordinator_takeover_for_tests()
 /// it, but it must never receive a live coordinator lease ahead of the next
 /// live waiter.
 #[cfg(test)]
-pub(super) fn exercise_dead_waiter_takeover_skip_for_tests() -> Result<(bool, bool, bool)> {
+pub(crate) fn exercise_dead_waiter_takeover_skip_for_tests() -> Result<(bool, bool, bool)> {
     let claim_a = ClaimSet::new(std::iter::empty(), [21usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(claim_a.clone(), claim_a, None)?;
     let dead_claim = ClaimSet::new(std::iter::empty(), [22usize], FlockMode::Exclusive);
@@ -5786,7 +5789,7 @@ pub(super) fn exercise_dead_waiter_takeover_skip_for_tests() -> Result<(bool, bo
 /// dirty the suffix from the older successor A, not merely from the displaced
 /// B, or C could enter with a predecessor snapshot from the previous lease.
 #[cfg(test)]
-pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
+pub(crate) fn exercise_repeated_coordinator_takeover_for_tests()
 -> Result<RepeatedCoordinatorTakeoverOutcome> {
     // A's claim deliberately OVERLAPS the intervening C grant (CPU 2): while
     // A is coordinator its claim never fences (CPU 1 stays busy, so A is not
@@ -5992,7 +5995,7 @@ pub(super) fn exercise_repeated_coordinator_takeover_for_tests()
 }
 
 #[cfg(test)]
-pub(super) fn expire_coordinator_lease_for_tests() -> Result<()> {
+pub(crate) fn expire_coordinator_lease_for_tests() -> Result<()> {
     let _lock = lock_registry_existing(FlockMode::Exclusive)?;
     let mut table = Table::open_existing()?;
     table.repair_consistency_if_needed()?;
@@ -6062,7 +6065,7 @@ pub(super) fn invalidate_coordinator_commit_token_for_tests() -> Result<()> {
 }
 
 #[cfg(test)]
-pub(super) fn exercise_stalled_takeover_notification_for_tests(
+pub(crate) fn exercise_stalled_takeover_notification_for_tests(
     watch: &super::LockDirWatch,
 ) -> Result<(bool, bool, bool, bool)> {
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
@@ -6119,7 +6122,7 @@ pub(super) fn exercise_stalled_takeover_notification_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_dirty_repair_notification_for_tests(
+pub(crate) fn exercise_dirty_repair_notification_for_tests(
     watch: &super::LockDirWatch,
 ) -> Result<(bool, bool, bool, bool)> {
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
@@ -6171,7 +6174,7 @@ pub(super) fn exercise_dirty_repair_notification_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_clean_coordinator_mismatch_recovery_for_tests() -> Result<()> {
+pub(crate) fn exercise_clean_coordinator_mismatch_recovery_for_tests() -> Result<()> {
     let first_claim = ClaimSet::with_modes(
         std::iter::empty(),
         [1usize],
@@ -6226,7 +6229,7 @@ pub(super) fn exercise_clean_coordinator_mismatch_recovery_for_tests() -> Result
 }
 
 #[cfg(test)]
-pub(super) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
+pub(crate) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
     let _lock = lock_registry_existing(FlockMode::Exclusive)?;
     let mut table = Table::open_existing()?;
     table.repair_consistency_if_needed()?;
@@ -6248,7 +6251,7 @@ pub(super) fn churn_registry_generation_for_tests(rounds: usize) -> Result<()> {
 /// `n` must finish their reads well inside `deadline`; returns `(all_ok,
 /// elapsed)`.
 #[cfg(test)]
-pub(super) fn exercise_n_entrants_read_under_churn_for_tests(
+pub(crate) fn exercise_n_entrants_read_under_churn_for_tests(
     n: usize,
     reads_each: usize,
     llc_prefix: Option<String>,
@@ -6327,17 +6330,17 @@ pub(super) fn exercise_n_entrants_read_under_churn_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn hold_registry_shared_for_tests() -> Result<RegistryLock> {
+pub(crate) fn hold_registry_shared_for_tests() -> Result<RegistryLock> {
     lock_registry_existing(FlockMode::Shared)
 }
 
 #[cfg(test)]
-pub(super) fn hold_registry_exclusive_for_tests() -> Result<RegistryLock> {
+pub(crate) fn hold_registry_exclusive_for_tests() -> Result<RegistryLock> {
     lock_registry_interruptible(None)
 }
 
 #[cfg(test)]
-pub(super) fn hold_registry_exclusive_after_intent_for_tests(
+pub(crate) fn hold_registry_exclusive_after_intent_for_tests(
     on_intent: impl FnOnce() -> Result<()>,
 ) -> Result<RegistryLock> {
     try_lock_registry_existing_with_writer_intent_hook(FlockMode::Exclusive, on_intent)?.ok_or_else(
@@ -6346,7 +6349,7 @@ pub(super) fn hold_registry_exclusive_after_intent_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_writer_intent_initialization_race_for_tests() -> Result<bool> {
+pub(crate) fn exercise_writer_intent_initialization_race_for_tests() -> Result<bool> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
     anyhow::ensure!(
@@ -6363,27 +6366,27 @@ pub(super) fn exercise_writer_intent_initialization_race_for_tests() -> Result<b
 }
 
 #[cfg(test)]
-pub(super) fn try_hold_registry_shared_for_tests() -> Result<Option<RegistryLock>> {
+pub(crate) fn try_hold_registry_shared_for_tests() -> Result<Option<RegistryLock>> {
     try_lock_registry_existing_nonblocking(FlockMode::Shared)
 }
 
 #[cfg(test)]
-pub(super) fn try_hold_registry_exclusive_for_tests() -> Result<Option<RegistryLock>> {
+pub(crate) fn try_hold_registry_exclusive_for_tests() -> Result<Option<RegistryLock>> {
     try_lock_registry_existing_nonblocking(FlockMode::Exclusive)
 }
 
 #[cfg(test)]
-pub(super) fn shared_state_read_count_for_tests() -> usize {
+pub(crate) fn shared_state_read_count_for_tests() -> usize {
     SHARED_STATE_READS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
-pub(super) fn ticket_shared_mapping_build_count_for_tests() -> usize {
+pub(crate) fn ticket_shared_mapping_build_count_for_tests() -> usize {
     TICKET_SHARED_MAPPING_BUILDS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
-pub(super) fn exercise_retained_shared_publication_for_tests() -> Result<(bool, bool, bool)> {
+pub(crate) fn exercise_retained_shared_publication_for_tests() -> Result<(bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     let waiting_claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
@@ -6423,7 +6426,7 @@ pub(super) fn exercise_retained_shared_publication_for_tests() -> Result<(bool, 
 }
 
 #[cfg(test)]
-pub(super) fn exercise_retained_mapping_slot_reuse_for_tests() -> Result<(bool, bool)> {
+pub(crate) fn exercise_retained_mapping_slot_reuse_for_tests() -> Result<(bool, bool)> {
     let claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let mut first = Ticket::register(claim.clone(), claim.clone(), None)?;
     let first_slot = first.slot;
@@ -6444,7 +6447,7 @@ pub(super) fn exercise_retained_mapping_slot_reuse_for_tests() -> Result<(bool, 
 }
 
 #[cfg(test)]
-pub(super) fn resource_epoch_for_tests() -> Result<u64> {
+pub(crate) fn resource_epoch_for_tests() -> Result<u64> {
     let _lock = lock_registry_existing(FlockMode::Shared)?;
     let path = header_path();
     let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
@@ -6455,7 +6458,7 @@ pub(super) fn resource_epoch_for_tests() -> Result<u64> {
 }
 
 #[cfg(test)]
-pub(super) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<bool> {
+pub(crate) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<bool> {
     let Some(_lock) = try_lock_registry_existing(FlockMode::Exclusive)? else {
         return Ok(false);
     };
@@ -6479,7 +6482,7 @@ pub(super) fn ticket_blocked_at_current_serial_for_tests(pid: u32) -> Result<boo
 }
 
 #[cfg(test)]
-pub(super) fn ticket_is_waiting_for_tests(pid: u32) -> Result<bool> {
+pub(crate) fn ticket_is_waiting_for_tests(pid: u32) -> Result<bool> {
     let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Shared)? else {
         return Ok(false);
     };
@@ -6492,7 +6495,7 @@ pub(super) fn ticket_is_waiting_for_tests(pid: u32) -> Result<bool> {
 }
 
 #[cfg(test)]
-pub(super) fn ticket_is_granted_for_tests(pid: u32) -> Result<bool> {
+pub(crate) fn ticket_is_granted_for_tests(pid: u32) -> Result<bool> {
     let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Shared)? else {
         return Ok(false);
     };
@@ -6505,7 +6508,7 @@ pub(super) fn ticket_is_granted_for_tests(pid: u32) -> Result<bool> {
 }
 
 #[cfg(test)]
-pub(super) fn ticket_is_revoked_for_tests(pid: u32) -> Result<bool> {
+pub(crate) fn ticket_is_revoked_for_tests(pid: u32) -> Result<bool> {
     let Some(_lock) = try_lock_registry_existing_nonblocking(FlockMode::Shared)? else {
         return Ok(false);
     };
@@ -6518,7 +6521,7 @@ pub(super) fn ticket_is_revoked_for_tests(pid: u32) -> Result<bool> {
 }
 
 #[cfg(test)]
-pub(super) fn coordinator_liveness_probe_for_tests() -> Result<((u64, u64), bool)> {
+pub(crate) fn coordinator_liveness_probe_for_tests() -> Result<((u64, u64), bool)> {
     let _lock = lock_registry_existing(FlockMode::Exclusive)?;
     let mut table = Table::open_existing()?;
     table.repair_consistency_if_needed()?;
@@ -6531,7 +6534,7 @@ pub(super) fn coordinator_liveness_probe_for_tests() -> Result<((u64, u64), bool
 }
 
 #[cfg(test)]
-pub(super) fn missing_liveness_probe_does_not_create_for_tests() -> Result<bool> {
+pub(crate) fn missing_liveness_probe_does_not_create_for_tests() -> Result<bool> {
     let slot = MAX_REGISTRY_SLOTS - 1;
     let ticket = u64::MAX - 1;
     let path = liveness_path(slot, ticket);
@@ -6540,7 +6543,7 @@ pub(super) fn missing_liveness_probe_does_not_create_for_tests() -> Result<bool>
 }
 
 #[cfg(test)]
-pub(super) fn active_free_head_is_rejected_for_tests() -> Result<()> {
+pub(crate) fn active_free_head_is_rejected_for_tests() -> Result<()> {
     let _lock = lock_registry_existing(FlockMode::Exclusive)?;
     let mut table = Table::open_existing()?;
     table.repair_consistency_if_needed()?;
@@ -6618,7 +6621,7 @@ fn set_cpu_free_for_tests(table: &mut Table, cpu: usize, free: bool) -> Result<(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32, u32, u32, u32) {
+pub(crate) fn exercise_resource_weighted_backfill_accounting_for_tests() -> (u32, u32, u32, u32) {
     let cooperative_end = super::super::cooperative_cpu_permit_end();
     let heavy_units = cooperative_end.min(4);
     let watch = ClaimSet::with_permits(
@@ -6676,7 +6679,7 @@ pub(crate) struct PreparationPoolBudgetOutcome {
 /// grant exactly `min(WAITERS, POOL)` of them, the oldest by ticket, and leave
 /// the surplus WAITING without pinning any to a token.
 #[cfg(test)]
-pub(super) fn exercise_preparation_pool_budget_for_tests() -> Result<PreparationPoolBudgetOutcome> {
+pub(crate) fn exercise_preparation_pool_budget_for_tests() -> Result<PreparationPoolBudgetOutcome> {
     const POOL: usize = 2;
     const WAITERS: usize = 5;
     let tokens = super::super::preparation_token_range()?;
@@ -6880,7 +6883,7 @@ pub(crate) struct PreparationPoolStarvationOutcome {
 /// waiter and a newcomer both wait; when the held slot frees, the very next
 /// scan grants the oldest — never the newcomer — in bounded time (one scan).
 #[cfg(test)]
-pub(super) fn exercise_preparation_pool_starvation_for_tests()
+pub(crate) fn exercise_preparation_pool_starvation_for_tests()
 -> Result<PreparationPoolStarvationOutcome> {
     let tokens = super::super::preparation_token_range()?;
     anyhow::ensure!(
@@ -6985,7 +6988,7 @@ pub(crate) struct PreparationPoolCrashRecoveryOutcome {
 /// until liveness pruning removes it, after which the next scan hands the slot
 /// to a waiting successor.
 #[cfg(test)]
-pub(super) fn exercise_preparation_pool_crash_recovery_for_tests()
+pub(crate) fn exercise_preparation_pool_crash_recovery_for_tests()
 -> Result<PreparationPoolCrashRecoveryOutcome> {
     let tokens = super::super::preparation_token_range()?;
     anyhow::ensure!(
@@ -7080,7 +7083,7 @@ pub(crate) struct WorkConservingBackfillOutcome {
 }
 
 #[cfg(test)]
-pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConservingBackfillOutcome>
+pub(crate) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConservingBackfillOutcome>
 {
     const TEST_CAPACITY: u32 = 3;
     const CONFLICTING: usize = TEST_CAPACITY as usize + 2;
@@ -7297,7 +7300,7 @@ pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConser
 }
 
 #[cfg(test)]
-pub(super) fn exercise_granted_only_drain_election_reads_for_tests(
+pub(crate) fn exercise_granted_only_drain_election_reads_for_tests(
     waiters: usize,
 ) -> Result<usize> {
     if waiters == 0 {
@@ -7327,14 +7330,14 @@ pub(super) fn exercise_granted_only_drain_election_reads_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_known_free_close_storm_for_tests(
+pub(crate) fn exercise_known_free_close_storm_for_tests(
     closes: usize,
 ) -> Result<(usize, u64, usize, u64, u64)> {
     exercise_known_free_close_storm_impl(closes, false)
 }
 
 #[cfg(test)]
-pub(super) fn exercise_stale_heartbeat_known_free_close_for_tests()
+pub(crate) fn exercise_stale_heartbeat_known_free_close_for_tests()
 -> Result<(usize, u64, usize, u64, u64)> {
     exercise_known_free_close_storm_impl(1, true)
 }
@@ -7424,7 +7427,7 @@ fn exercise_known_free_close_storm_impl(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(bool, bool, u64, u64)>
+pub(crate) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(bool, bool, u64, u64)>
 {
     let claim = ClaimSet::new([1usize], std::iter::empty(), FlockMode::Shared);
     let mut ticket = Ticket::register(claim.clone(), claim, None)?;
@@ -7491,7 +7494,7 @@ pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(b
 }
 
 #[cfg(test)]
-pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usize, u32, u32)> {
+pub(crate) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usize, u32, u32)> {
     fn generation_wake() -> Result<u32> {
         let _lock = lock_registry_existing(FlockMode::Shared)?;
         let table = Table::open_existing()?;
@@ -7575,7 +7578,7 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
 }
 
 #[cfg(test)]
-pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64, bool, bool, bool)>
+pub(crate) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64, bool, bool, bool)>
 {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let coordinator_watch = ClaimSet::new([1usize], [0usize], FlockMode::Exclusive);
@@ -7667,7 +7670,7 @@ pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
 }
 
 #[cfg(test)]
-pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests() -> Result<CpuExContentionSharedWake>
+pub(crate) fn exercise_cpu_ex_contention_shared_wake_for_tests() -> Result<CpuExContentionSharedWake>
 {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let coordinator_watch =
@@ -7797,7 +7800,7 @@ pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests() -> Result<CpuEx
 }
 
 #[cfg(test)]
-pub(super) fn exercise_coordinator_turnover_for_tests(
+pub(crate) fn exercise_coordinator_turnover_for_tests(
     coordinators: usize,
 ) -> Result<(u64, usize, u64, bool)> {
     if coordinators == 0 {
@@ -7882,7 +7885,7 @@ pub(super) fn exercise_coordinator_turnover_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Result<u64> {
+pub(crate) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Result<u64> {
     if commits == 0 {
         anyhow::bail!("exact-commit exercise needs at least one waiter");
     }
@@ -7997,7 +8000,7 @@ pub(super) fn exercise_exact_commit_scan_elision_for_tests(commits: usize) -> Re
 }
 
 #[cfg(test)]
-pub(super) fn exercise_mismatched_commit_rescan_for_tests() -> Result<(u64, bool)> {
+pub(crate) fn exercise_mismatched_commit_rescan_for_tests() -> Result<(u64, bool)> {
     let old = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let watch = ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
     let mut first = Ticket::register(old, watch, None)?;
@@ -8048,7 +8051,7 @@ pub(super) fn exercise_mismatched_commit_rescan_for_tests() -> Result<(u64, bool
 }
 
 #[cfg(test)]
-pub(super) fn exercise_superset_commit_rescan_for_tests() -> Result<(u64, bool)> {
+pub(crate) fn exercise_superset_commit_rescan_for_tests() -> Result<(u64, bool)> {
     let old = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let watch = ClaimSet::new(std::iter::empty(), [1usize, 2usize], FlockMode::Exclusive);
     let mut first = Ticket::register(old, watch, None)?;
@@ -8129,7 +8132,7 @@ pub(super) fn exercise_superset_commit_rescan_for_tests() -> Result<(u64, bool)>
 }
 
 #[cfg(test)]
-pub(super) fn exercise_shared_commit_improvement_for_tests() -> Result<(u64, bool)> {
+pub(crate) fn exercise_shared_commit_improvement_for_tests() -> Result<(u64, bool)> {
     let shared = ClaimSet::new([1usize], std::iter::empty(), FlockMode::Shared);
     let mut first = Ticket::register(shared.clone(), shared, None)?;
     let middle_claim = ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
@@ -8184,7 +8187,7 @@ pub(super) fn exercise_shared_commit_improvement_for_tests() -> Result<(u64, boo
 }
 
 #[cfg(test)]
-pub(super) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64, bool)> {
+pub(crate) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64, bool)> {
     let shared = ClaimSet::with_modes(
         std::iter::empty(),
         [1usize],
@@ -8237,7 +8240,7 @@ pub(super) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64,
 }
 
 #[cfg(test)]
-pub(super) fn exercise_cpu_mode_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_cpu_mode_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     let flexible_claim = ClaimSet::with_modes(
@@ -8714,7 +8717,7 @@ pub(crate) struct ReplanCrashRepairOutcome {
 /// published the callback prefix, REPLAN state, finite-round horizon, and
 /// cursor, but neither the futex wake nor the clean transaction marker.
 #[cfg(test)]
-pub(super) fn exercise_replan_crash_repair_for_tests() -> Result<ReplanCrashRepairOutcome> {
+pub(crate) fn exercise_replan_crash_repair_for_tests() -> Result<ReplanCrashRepairOutcome> {
     let coordinator_cpu = 40usize;
     let common_cpu = 41usize;
     let first_cpu = 42usize;
@@ -8868,7 +8871,7 @@ pub(super) fn exercise_replan_crash_repair_for_tests() -> Result<ReplanCrashRepa
 }
 
 #[cfg(test)]
-pub(super) fn exercise_intrascan_fence_epoch_for_tests() -> Result<(bool, bool, bool)> {
+pub(crate) fn exercise_intrascan_fence_epoch_for_tests() -> Result<(bool, bool, bool)> {
     let coordinator_cpu = 50usize;
     let earlier_cpu = 51usize;
     let later_cpu = 52usize;
@@ -8962,7 +8965,7 @@ pub(super) fn exercise_intrascan_fence_epoch_for_tests() -> Result<(bool, bool, 
 }
 
 #[cfg(test)]
-pub(super) fn exercise_grant_scan_crash_fence_for_tests() -> Result<(bool, bool, bool)> {
+pub(crate) fn exercise_grant_scan_crash_fence_for_tests() -> Result<(bool, bool, bool)> {
     let coordinator_cpu = 60usize;
     let replacement_cpu = 61usize;
     let initial_cpu = 62usize;
@@ -9075,7 +9078,7 @@ pub(super) fn exercise_grant_scan_crash_fence_for_tests() -> Result<(bool, bool,
 /// callback becomes eligible again. The cyclic cursor must visit the later
 /// tickets instead of letting that changing prefix monopolize each refill.
 #[cfg(test)]
-pub(super) fn exercise_bounded_replan_window_for_tests(
+pub(crate) fn exercise_bounded_replan_window_for_tests(
     capacity: usize,
     waiter_count: usize,
 ) -> Result<BoundedReplanWindowOutcome> {
@@ -9221,7 +9224,7 @@ pub(super) fn exercise_bounded_replan_window_for_tests(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_replan_token_wave_for_tests(
+pub(crate) fn exercise_replan_token_wave_for_tests(
     waiter_count: usize,
 ) -> Result<ReplanTokenWaveOutcome> {
     if waiter_count < 4 {
@@ -9829,7 +9832,7 @@ pub(super) fn exercise_replan_token_wave_for_tests(
 /// coalesced rescan edge; none performs the authoritative O(N) scan or a
 /// global generation wake while the coordinator remains live.
 #[cfg(test)]
-pub(super) fn exercise_changed_replan_wave_completions_for_tests(
+pub(crate) fn exercise_changed_replan_wave_completions_for_tests(
     callback_count: usize,
 ) -> Result<ReplanChangedWaveOutcome> {
     if callback_count < 2 {
@@ -10092,7 +10095,7 @@ pub(crate) struct SameWakeRedesignationOutcome {
 /// the re-designated claim, its ring slot drains, and NO additional
 /// authoritative scan runs between the REPLAN publication and HELD.
 #[cfg(test)]
-pub(super) fn exercise_same_wake_redesignation_grant_for_tests()
+pub(crate) fn exercise_same_wake_redesignation_grant_for_tests()
 -> Result<SameWakeRedesignationOutcome> {
     let (mut coordinator, mut waiter, designated, replacement, scans_before) =
         stage_same_wake_replan_waiter(900, 1_000, 1_001, true)?;
@@ -10146,7 +10149,7 @@ pub(super) fn exercise_same_wake_redesignation_grant_for_tests()
 /// its ring slot drained for a later authoritative scan — the pre-existing
 /// re-plan contract, preserved.
 #[cfg(test)]
-pub(super) fn exercise_same_wake_redesignation_fallback_for_tests() -> Result<(bool, bool, bool)> {
+pub(crate) fn exercise_same_wake_redesignation_fallback_for_tests() -> Result<(bool, bool, bool)> {
     let (mut coordinator, mut waiter, designated, replacement, _scans_before) =
         stage_same_wake_replan_waiter(900, 1_000, 1_001, false)?;
     let designated_for_wake = designated.clone();
@@ -10192,7 +10195,7 @@ pub(super) fn exercise_same_wake_redesignation_fallback_for_tests() -> Result<(b
 /// (`min_changed_ticket`) below this ticket forces the acquired alternative to
 /// be released and the ticket requeued, exactly as the GRANTED dirty path does.
 #[cfg(test)]
-pub(super) fn exercise_same_wake_redesignation_older_fence_for_tests() -> Result<(bool, bool, bool)>
+pub(crate) fn exercise_same_wake_redesignation_older_fence_for_tests() -> Result<(bool, bool, bool)>
 {
     let (mut coordinator, mut waiter, designated, replacement, _scans_before) =
         stage_same_wake_replan_waiter(900, 1_000, 1_001, true)?;
@@ -10267,7 +10270,7 @@ pub(crate) struct SameWakeOwnDesignationOutcome {
 /// the same unlicensed acquire — own-designation and all — is released and
 /// requeued by the suffix watermark rather than overtaking the older waiter.
 #[cfg(test)]
-pub(super) fn exercise_same_wake_own_designation_grant_for_tests(
+pub(crate) fn exercise_same_wake_own_designation_grant_for_tests(
     fenced: bool,
 ) -> Result<SameWakeOwnDesignationOutcome> {
     // `replacement_free = false`: the only capacity this waiter can take is its
@@ -10356,7 +10359,7 @@ pub(super) fn exercise_same_wake_own_designation_grant_for_tests(
 /// silently commit it: the expired-replan path marks the acquired footprint
 /// unknown and returns the ticket to WAITING.
 #[cfg(test)]
-pub(super) fn exercise_same_wake_redesignation_expired_release_for_tests()
+pub(crate) fn exercise_same_wake_redesignation_expired_release_for_tests()
 -> Result<(bool, bool, bool)> {
     let (mut coordinator, mut waiter, designated, replacement, _scans_before) =
         stage_same_wake_replan_waiter(900, 1_000, 1_001, true)?;
@@ -10409,7 +10412,7 @@ pub(super) fn exercise_same_wake_redesignation_expired_release_for_tests()
 /// rescan deadline instead of handing registry EX back to the coordinator
 /// between individual negative completions.
 #[cfg(test)]
-pub(super) fn exercise_grant_completion_batch_for_tests() -> Result<GrantCompletionBatchOutcome> {
+pub(crate) fn exercise_grant_completion_batch_for_tests() -> Result<GrantCompletionBatchOutcome> {
     // Deflake: the fixture arms its speculative deadline one deferred-rescan
     // interval ahead and asserts the first completion shortens it. Inject a
     // five-minute interval so test-process descheduling cannot cross the
@@ -10553,7 +10556,7 @@ pub(super) fn exercise_grant_completion_batch_for_tests() -> Result<GrantComplet
 /// scan re-arms the next one (no lost edge). No sleeping: the armed absolute
 /// deadline is read back and probed on either side.
 #[cfg(test)]
-pub(super) fn exercise_release_coalesce_for_tests() -> Result<ReleaseCoalesceOutcome> {
+pub(crate) fn exercise_release_coalesce_for_tests() -> Result<ReleaseCoalesceOutcome> {
     const K: usize = 4;
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [1_770usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
@@ -10676,7 +10679,7 @@ pub(super) fn exercise_release_coalesce_for_tests() -> Result<ReleaseCoalesceOut
 /// monotonic times prove both the heartbeat causal fallback and exact absolute
 /// deadline without sleeping.
 #[cfg(test)]
-pub(super) fn exercise_deferred_rescan_policy_for_tests() -> Result<DeferredRescanPolicyOutcome> {
+pub(crate) fn exercise_deferred_rescan_policy_for_tests() -> Result<DeferredRescanPolicyOutcome> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [1_800usize], FlockMode::Exclusive);
     let mut coordinator =
         Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
@@ -10899,7 +10902,7 @@ pub(super) fn exercise_deferred_rescan_policy_for_tests() -> Result<DeferredResc
 /// normal coordinator scan while the second callback is still in REPLAN and
 /// the finite-wave deadline remains in the future.
 #[cfg(test)]
-pub(super) fn exercise_replan_straggler_progress_for_tests()
+pub(crate) fn exercise_replan_straggler_progress_for_tests()
 -> Result<ReplanStragglerProgressOutcome> {
     let coordinator_cpu = 1_200usize;
     let first_designated_cpu = 1_201usize;
@@ -11219,7 +11222,7 @@ fn grant_charge_total(table: &Table) -> u64 {
 /// Assert aggregate == derived for the grant-charge families in the shared
 /// registry image, running dirty repair first exactly like any entrant.
 #[cfg(test)]
-pub(super) fn grant_charge_matches_derived_for_tests() -> Result<()> {
+pub(crate) fn grant_charge_matches_derived_for_tests() -> Result<()> {
     let _lock = lock_registry_existing(FlockMode::Exclusive)?;
     let mut table = Table::open_existing()?;
     table.repair_consistency_if_needed()?;
@@ -11241,7 +11244,7 @@ pub(crate) struct GrantedChargeLifecycleOutcome {
 /// GRANTED->PENDING release (the old claim, not the preparation claim), the
 /// born-GRANTED registration charge, and the unconditional promote release.
 #[cfg(test)]
-pub(super) fn exercise_granted_charge_lifecycle_for_tests() -> Result<GrantedChargeLifecycleOutcome>
+pub(crate) fn exercise_granted_charge_lifecycle_for_tests() -> Result<GrantedChargeLifecycleOutcome>
 {
     let coordinator_cpu = 2_300usize;
     let scan_cpu = 2_301usize;
@@ -11379,7 +11382,7 @@ pub(crate) struct GrantChargeRevokeAckOutcome {
 /// the suffix), the next authoritative scan grants the senior and revokes the
 /// junior, and the revoked claim stays charged until its acknowledgement.
 #[cfg(test)]
-pub(super) fn exercise_grant_charge_revoke_ack_for_tests() -> Result<GrantChargeRevokeAckOutcome> {
+pub(crate) fn exercise_grant_charge_revoke_ack_for_tests() -> Result<GrantChargeRevokeAckOutcome> {
     let coordinator_cpu = 2_400usize;
     let senior_designated_cpu = 2_401usize;
     let contended_cpu = 2_402usize;
@@ -11495,7 +11498,7 @@ pub(super) fn exercise_grant_charge_revoke_ack_for_tests() -> Result<GrantCharge
 /// the `set_record_state` chokepoint over the just-zeroed count arrays, and
 /// the surviving REVOKED fence stays charged.
 #[cfg(test)]
-pub(super) fn exercise_dirty_repair_grant_charges_for_tests() -> Result<(bool, bool)> {
+pub(crate) fn exercise_dirty_repair_grant_charges_for_tests() -> Result<(bool, bool)> {
     let coordinator_cpu = 2_500usize;
     let granted_cpu = 2_501usize;
     let revoked_cpu = 2_502usize;
@@ -11548,7 +11551,7 @@ pub(super) fn exercise_dirty_repair_grant_charges_for_tests() -> Result<(bool, b
 /// counts but never in `exclusive_held` or the holder counts, so it can
 /// never become an absolute placement fence.
 #[cfg(test)]
-pub(super) fn exercise_exclusive_grant_bias_only_for_tests() -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_exclusive_grant_bias_only_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_cpu = 2_600usize;
     let granted_cpu = 2_601usize;
     let granted_llc = 9usize;
@@ -11609,7 +11612,7 @@ pub(crate) struct GrantDisjointCompletionOutcome {
 /// inversion fix). Disjoint grants forgo park-driven deferred-edge
 /// shortening and ride the batched rescan deadline instead.
 #[cfg(test)]
-pub(super) fn exercise_grant_disjoint_completion_for_tests()
+pub(crate) fn exercise_grant_disjoint_completion_for_tests()
 -> Result<GrantDisjointCompletionOutcome> {
     let coordinator_cpu = 2_700usize;
     let first_designated_cpu = 2_701usize;
@@ -11798,7 +11801,7 @@ pub(super) fn exercise_grant_disjoint_completion_for_tests()
 /// leave the main watermark clean and the junior grant enters; overlapping
 /// completions dirty the full suffix and park the junior.
 #[cfg(test)]
-pub(super) fn exercise_unchanged_completion_guard_for_tests(
+pub(crate) fn exercise_unchanged_completion_guard_for_tests(
     conflicting: bool,
 ) -> Result<(bool, bool)> {
     let base = if conflicting { 2_800usize } else { 2_820usize };
@@ -11913,7 +11916,7 @@ fn later_grant_probe(
 /// resource a junior grant sits on must dirty the full suffix — delta
 /// cleanliness is not disjointness.
 #[cfg(test)]
-pub(super) fn exercise_replacement_kept_overlap_guard_for_tests() -> Result<(bool, bool)> {
+pub(crate) fn exercise_replacement_kept_overlap_guard_for_tests() -> Result<(bool, bool)> {
     let coordinator_cpu = 2_900usize;
     let busy_cpu = 2_901usize;
     let kept_cpu = 2_902usize;
@@ -12007,7 +12010,7 @@ pub(crate) struct DisjointEntrantProceedsOutcome {
 /// converts to HELD, instead of the blanket park both juniors got before
 /// the changed-claims accumulator.
 #[cfg(test)]
-pub(super) fn exercise_disjoint_entrant_proceeds_for_tests()
+pub(crate) fn exercise_disjoint_entrant_proceeds_for_tests()
 -> Result<DisjointEntrantProceedsOutcome> {
     let coordinator_cpu = 3_000usize;
     let senior_designated_cpu = 3_001usize;
@@ -12299,7 +12302,7 @@ fn exercise_pending_replan_grant_race_case(
 /// not advance the public claim epoch. A later exact grant must therefore be
 /// rejected both before callback entry and at the callback commit boundary.
 #[cfg(test)]
-pub(super) fn exercise_pending_replan_grant_races_for_tests()
+pub(crate) fn exercise_pending_replan_grant_races_for_tests()
 -> Result<PendingReplanGrantRaceOutcome> {
     let entry = exercise_pending_replan_grant_race_case(1_300, false)?;
     let commit = exercise_pending_replan_grant_race_case(1_310, true)?;
@@ -12318,7 +12321,7 @@ pub(super) fn exercise_pending_replan_grant_races_for_tests()
 /// RESCAN edge was already pending. Election must run after REPLAN -> WAITING
 /// publication even though no new transport edge is needed.
 #[cfg(test)]
-pub(super) fn exercise_replan_completion_election_for_tests() -> Result<(bool, u64)> {
+pub(crate) fn exercise_replan_completion_election_for_tests() -> Result<(bool, u64)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [1_250usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     let designated = ClaimSet::new(std::iter::empty(), [1_251usize], FlockMode::Exclusive);
@@ -12391,7 +12394,7 @@ pub(super) fn exercise_replan_completion_election_for_tests() -> Result<(bool, u
 /// quarantined, and one has not entered yet. This covers both acknowledgement
 /// paths while proving that expiration unblocks the completed work first.
 #[cfg(test)]
-pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiryOutcome> {
+pub(crate) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiryOutcome> {
     let coordinator_cpu = 1_300usize;
     let designated_cpus = [1_301usize, 1_303, 1_305];
     let replacement_cpus = [1_302usize, 1_304, 1_306];
@@ -12659,7 +12662,7 @@ pub(super) fn exercise_replan_wave_expiry_for_tests() -> Result<ReplanWaveExpiry
 /// before publishing the corresponding record state. The retained deadline
 /// must let dirty repair recognize and quarantine the still-REPLAN record.
 #[cfg(test)]
-pub(super) fn exercise_replan_expiry_publication_crash_for_tests() -> Result<bool> {
+pub(crate) fn exercise_replan_expiry_publication_crash_for_tests() -> Result<bool> {
     let coordinator_cpu = 1_310usize;
     let callback_cpu = 1_311usize;
     let alternative_cpu = 1_312usize;
@@ -13352,7 +13355,7 @@ fn exercise_coordinator_pending_replan_case(
 }
 
 #[cfg(test)]
-pub(super) fn exercise_coordinator_pending_replan_for_tests()
+pub(crate) fn exercise_coordinator_pending_replan_for_tests()
 -> Result<CoordinatorPendingReplanOutcome> {
     let acquisition_conflict = exercise_coordinator_pending_replan_case(1_400, false, true)?;
     let acquisition_disjoint = exercise_coordinator_pending_replan_case(1_410, false, false)?;
@@ -13371,7 +13374,7 @@ pub(super) fn exercise_coordinator_pending_replan_for_tests()
 }
 
 #[cfg(test)]
-pub(super) fn exercise_granular_prefix_invalidation_for_tests()
+pub(crate) fn exercise_granular_prefix_invalidation_for_tests()
 -> Result<GranularPrefixInvalidationOutcome> {
     let granted = exercise_granular_prefix_invalidation_case(100, STATE_GRANTED)?;
     let replan = exercise_granular_prefix_invalidation_case(200, STATE_REPLAN)?;
@@ -13402,7 +13405,7 @@ pub(super) fn exercise_granular_prefix_invalidation_for_tests()
 }
 
 #[cfg(test)]
-pub(super) fn exercise_granted_serial_scope_for_tests() -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_granted_serial_scope_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [810usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     let designated = ClaimSet::new(std::iter::empty(), [800usize], FlockMode::Exclusive);
@@ -13759,7 +13762,7 @@ fn exercise_flexible_revocation_replan_case(offset: usize) -> Result<bool> {
 }
 
 #[cfg(test)]
-pub(super) fn exercise_revocation_ack_for_tests() -> Result<RevocationAckOutcome> {
+pub(crate) fn exercise_revocation_ack_for_tests() -> Result<RevocationAckOutcome> {
     let before = exercise_revocation_ack_case(1000, false)?;
     let during = exercise_revocation_ack_case(1010, true)?;
     let flexible_replanned_without_serial_churn = exercise_flexible_revocation_replan_case(1020)?;
@@ -13773,7 +13776,7 @@ pub(super) fn exercise_revocation_ack_for_tests() -> Result<RevocationAckOutcome
 }
 
 #[cfg(test)]
-pub(super) fn exercise_revoked_owner_death_for_tests() -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_revoked_owner_death_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_cpu = 1030usize;
     let contested_cpu = 1031usize;
     let coordinator_claim =
@@ -13863,7 +13866,7 @@ pub(super) fn exercise_revoked_owner_death_for_tests() -> Result<(bool, bool, bo
 }
 
 #[cfg(test)]
-pub(super) fn exercise_revoke_crash_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_revoke_crash_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_cpu = 1040usize;
     let contested_cpu = 1041usize;
     let coordinator_claim =
@@ -13951,7 +13954,7 @@ pub(super) fn exercise_revoke_crash_repair_for_tests() -> Result<(bool, bool, bo
 /// WAITING before any scan has run. A free physical observation must durably
 /// request the scan that grants and wakes that ticket.
 #[cfg(test)]
-pub(super) fn exercise_waiting_release_wake_for_tests() -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_waiting_release_wake_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [40usize], FlockMode::Exclusive);
     let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
     {
@@ -14022,7 +14025,7 @@ pub(super) fn exercise_waiting_release_wake_for_tests() -> Result<(bool, bool, b
 }
 
 #[cfg(test)]
-pub(super) fn exercise_one_shot_replacement_for_tests()
+pub(crate) fn exercise_one_shot_replacement_for_tests()
 -> Result<(usize, bool, bool, bool, bool, usize)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let mut coordinator =
@@ -14085,7 +14088,7 @@ pub(super) fn exercise_one_shot_replacement_for_tests()
 }
 
 #[cfg(test)]
-pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, bool, bool)> {
+pub(crate) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let mut coordinator =
         Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
@@ -14191,7 +14194,7 @@ pub(super) fn exercise_prefix_epoch_validation_for_tests() -> Result<(usize, boo
 }
 
 #[cfg(test)]
-pub(super) fn exercise_prefix_order_and_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_prefix_order_and_repair_for_tests() -> Result<(bool, bool, bool, bool)> {
     let predecessor_claim = ClaimSet::with_modes(
         std::iter::empty(),
         [1usize],
@@ -14272,7 +14275,7 @@ pub(super) fn exercise_prefix_order_and_repair_for_tests() -> Result<(bool, bool
 }
 
 #[cfg(test)]
-pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
+pub(crate) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
 -> Result<(bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let mut coordinator =
@@ -14401,7 +14404,7 @@ pub(super) fn exercise_prefix_refresh_after_predecessor_release_for_tests()
 /// Reproduce a predecessor release after the coordinator planner returned
 /// WAITING but before that WAITING publication takes the registry fence.
 #[cfg(test)]
-pub(super) fn exercise_waiting_publication_release_progress_for_tests()
+pub(crate) fn exercise_waiting_publication_release_progress_for_tests()
 -> Result<(bool, bool, bool, bool)> {
     let claim = ClaimSet::new(std::iter::empty(), [1usize], FlockMode::Exclusive);
     let mut predecessor = Ticket::register(claim.clone(), claim.clone(), None)?;
@@ -14493,7 +14496,7 @@ pub(super) fn exercise_waiting_publication_release_progress_for_tests()
 }
 
 #[cfg(test)]
-pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let mut coordinator =
         Ticket::register(coordinator_claim.clone(), coordinator_claim.clone(), None)?;
@@ -14616,7 +14619,7 @@ pub(super) fn exercise_issue_serial_race_for_tests() -> Result<(bool, bool, bool
 }
 
 #[cfg(test)]
-pub(super) fn exercise_stale_acquired_release_order_for_tests()
+pub(crate) fn exercise_stale_acquired_release_order_for_tests()
 -> Result<(bool, bool, bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let coordinator_watch =
@@ -14828,7 +14831,7 @@ fn exercise_acknowledgement_payload_notify_case(
 /// Both late acknowledgement shapes must preserve opaque destruction before
 /// targeted coordinator notification even when RESCAN was already pending.
 #[cfg(test)]
-pub(super) fn exercise_acknowledgement_payload_notify_order_for_tests()
+pub(crate) fn exercise_acknowledgement_payload_notify_order_for_tests()
 -> Result<(bool, bool, bool, bool, bool, bool)> {
     let expired = exercise_acknowledgement_payload_notify_case(true)?;
     let revoked = exercise_acknowledgement_payload_notify_case(false)?;
@@ -14838,7 +14841,7 @@ pub(super) fn exercise_acknowledgement_payload_notify_order_for_tests()
 }
 
 #[cfg(test)]
-pub(super) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool, bool, bool)> {
+pub(crate) fn exercise_stale_contention_commit_for_tests() -> Result<(bool, bool, bool, bool)> {
     let coordinator_claim = ClaimSet::new(std::iter::empty(), [0usize], FlockMode::Exclusive);
     let coordinator_next = ClaimSet::new(std::iter::empty(), [3usize], FlockMode::Exclusive);
     let coordinator_watch =
@@ -14949,7 +14952,7 @@ fn diagnostic_counter_for_tests(offset: usize) -> Result<u64> {
 }
 
 #[cfg(test)]
-pub(super) fn defer_liveness_maintenance_for_tests() -> Result<()> {
+pub(crate) fn defer_liveness_maintenance_for_tests() -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let _lock = loop {
         if let Some(lock) = try_lock_registry_existing_nonblocking(FlockMode::Exclusive)? {
@@ -14972,7 +14975,7 @@ pub(super) fn defer_liveness_maintenance_for_tests() -> Result<()> {
 }
 
 #[cfg(test)]
-pub(super) fn initializer_temp_count_for_tests() -> Result<usize> {
+pub(crate) fn initializer_temp_count_for_tests() -> Result<usize> {
     let dir = registry_data_dir();
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -14996,7 +14999,7 @@ pub(super) fn initializer_temp_count_for_tests() -> Result<usize> {
 }
 
 #[cfg(test)]
-pub(super) fn observer_preserves_uninitialized_header_for_tests() -> Result<bool> {
+pub(crate) fn observer_preserves_uninitialized_header_for_tests() -> Result<bool> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
     crate::flock::materialize(registry_writer_intent_path())?;
@@ -15027,7 +15030,7 @@ pub(super) fn observer_preserves_uninitialized_header_for_tests() -> Result<bool
 }
 
 #[cfg(test)]
-pub(super) fn prepare_zeroed_uninitialized_header_for_tests() -> Result<()> {
+pub(crate) fn prepare_zeroed_uninitialized_header_for_tests() -> Result<()> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
     crate::flock::materialize(registry_writer_intent_path())?;
@@ -15481,7 +15484,7 @@ pub(super) fn reset_generation_wait_calls_for_tests() {
 }
 
 #[cfg(test)]
-pub(super) fn generation_wait_calls_for_tests() -> usize {
+pub(crate) fn generation_wait_calls_for_tests() -> usize {
     GENERATION_WAIT_CALLS.with(std::cell::Cell::get)
 }
 
