@@ -140,12 +140,14 @@ retries = 6
 # boot is more load-sensitive than the rest of the suite: the flake has
 # been observed recovering by attempt 4, so 12 keeps a ~3x margin, and
 # the longer inter-retry delay lets concurrent VM load subside before
-# each retry. Slow-timeout
-# is generous for the nested template-build + scenario boot, especially
-# under the coverage job's llvm-cov instrumentation.
+# each retry. Every cell this filter names is a generated `ktstr/` or
+# `gauntlet/` cell inside `binary(=disk_template_e2e)`, so the full-drain
+# band above already owns their slow-timeout (180s x 12 = 2160s) by
+# first-match precedence — generous for the nested template-build +
+# scenario boot, especially under the coverage job's llvm-cov
+# instrumentation. This block therefore carries retries only.
 [[profile.ci.overrides]]
 filter = "test(disk_template_e2e)"
-slow-timeout = { period = "180s", terminate-after = 3 }
 retries = { backoff = "exponential", count = 12, delay = "3s", jitter = true, max-delay = "10s" }
 
 [[profile.ci.overrides]]
@@ -213,22 +215,21 @@ threads-required = 1
 # a host with MORE than 128 CPUs (256 vCPUs at < 2.0x; exactly 128 CPUs =
 # 2.0x SKIPS, the cap being inclusive) and SKIPS cleanly on a 96-CPU
 # runner (2.7x) instead of hard-failing, while single-VM wide-SMP boot
-# tests keep the 6x skip gate. slow-timeout 960s/terminate-after 1 covers that two-VM
-# worst running case so the per-VM framework watchdog fires FIRST (a
-# clean failure dump) rather than nextest blunt-killing a still-booting
-# second VM; single-VM wide tests fail at their ≤470s watchdog long
-# before 960s, so the larger budget is harmless for them, and on a
-# 192-CPU runner (~1.3x) every test finishes in a few hundred seconds,
-# far under 960s. The resource registry, rather than a second nextest
-# queue, admits these cells against their exact host-CPU/LLC reservations.
-# The filter is test()-scoped for snapshot_real_capture_e2e /
-# expect_auto_repro_e2e so only their wide-SMP tests get this timeout;
-# their lighter siblings keep normal budgets. retries = 2 absorbs
-# residual host-load jitter; the per-VM watchdog bounds each attempt, so
-# this is not a retry storm.
+# tests keep the 6x skip gate. Every cell these arms name is a generated
+# `ktstr/` or `gauntlet/` cell, so the full-drain band above already owns
+# their slow-timeout (180s x 12 = 2160s) by first-match precedence — well
+# clear of that ~470s two-VM worst running case, so the per-VM framework
+# watchdog still fires FIRST (a clean failure dump) rather than nextest
+# blunt-killing a still-booting second VM, and single-VM wide tests fail
+# at their ≤470s watchdog far earlier still. The resource registry, rather
+# than a second nextest queue, admits these cells against their exact
+# host-CPU/LLC reservations. The filter is test()-scoped for
+# snapshot_real_capture_e2e / expect_auto_repro_e2e so only their wide-SMP
+# tests get these retries; their lighter siblings keep normal budgets.
+# retries = 2 absorbs residual host-load jitter; the per-VM watchdog
+# bounds each attempt, so this is not a retry storm.
 [[profile.ci.overrides]]
 filter = "binary(wide_smp_boot_e2e) | binary(wide_smp_device_irq_e2e) | binary(wide_smp_net_irq_e2e) | test(multi_llc_guest_presents_fat_l3_wide_smp) | test(snapshot_real_capture_wide_smp) | test(pos_expect_auto_repro_satisfied_wide_smp)"
-slow-timeout = { period = "960s", terminate-after = 1 }
 retries = 2
 
 # Keep ordinary host-side tests CPU-bounded even though the global CI
@@ -437,15 +438,16 @@ slow-timeout = { period = "150s", terminate-after = 2 }
 retries = 0
 
 # Wide-SMP boot tests: explicit default-profile copy of the higher-priority
-# profile.ci rule. 960s/terminate-after 1 covers
-# the two-VM auto-repro test's worst running case so the per-VM framework
-# watchdog (vm_timeout_from_entry, flat dead-man boot headroom) fires
-# before nextest's kill even under a local dev box's higher overcommit
-# ratio. The ktstr registry remains the only resource scheduler.
-# See the profile.ci copy for the full rationale.
+# profile.ci rule, carrying retries only. Every cell these arms name is a
+# generated `ktstr/` or `gauntlet/` cell, so the full-drain band at the top
+# of profile.default already owns their slow-timeout (180s x 12 = 2160s) by
+# first-match precedence. That covers the two-VM auto-repro test's worst
+# running case, so the per-VM framework watchdog (vm_timeout_from_entry,
+# flat dead-man boot headroom) fires before nextest's kill even under a
+# local dev box's higher overcommit ratio. The ktstr registry remains the
+# only resource scheduler. See the profile.ci copy for the full rationale.
 [[profile.default.overrides]]
 filter = "binary(wide_smp_boot_e2e) | binary(wide_smp_device_irq_e2e) | binary(wide_smp_net_irq_e2e) | test(multi_llc_guest_presents_fat_l3_wide_smp) | test(snapshot_real_capture_wide_smp) | test(pos_expect_auto_repro_satisfied_wide_smp)"
-slow-timeout = { period = "960s", terminate-after = 1 }
 retries = 2
 
 # ── alu-vec512 ───────────────────────────────────────────────────────
