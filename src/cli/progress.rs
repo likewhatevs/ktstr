@@ -333,7 +333,13 @@ impl FetchProgress {
     ///
     /// Best-effort: a `println` error (e.g. broken pipe) is discarded
     /// — a status line must never abort a fetch.
+    ///
+    /// Both arms lay the line out through
+    /// [`crate::cli::status_line`], so a fetch status printed between
+    /// bars keeps the same status column and label color as the lines
+    /// the CLI emits outside a progress group.
     pub(crate) fn println(&self, line: &str) {
+        let line = super::util::status_line(line);
         if self.is_hidden() {
             eprintln!("{line}");
         } else {

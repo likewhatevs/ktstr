@@ -52,7 +52,7 @@ pub fn last_run_report(dir: Option<&Path>, kernel: Option<&str>) -> Option<Strin
         .map(|d| crate::test_support::analyze_sidecars(Some(d)))
         .filter(|r| !r.is_empty());
     if report.is_none() {
-        eprintln!("cargo ktstr: no sidecar data found (skipped)");
+        crate::ktstr_status!("cargo ktstr: no sidecar data found (skipped)");
     }
     report
 }

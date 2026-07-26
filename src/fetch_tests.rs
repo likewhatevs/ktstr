@@ -3566,12 +3566,18 @@ fn print_download_size_with_content_length_renders_mib() {
     let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
         print_download_size(&response, url, "ktstr", None);
     });
-    let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
+    // Strip the label's SGR wrapper: whether the line carries color
+    // depends on the test process's own stderr/`NO_COLOR`/CI
+    // environment, while the padded status column does not.
+    let captured = crate::test_support::strip_ansi_csi(
+        &String::from_utf8(bytes).expect("captured stderr must be utf-8"),
+    );
     assert_eq!(
         captured,
-        format!("ktstr: downloading {url} (1.5 MiB)\n"),
+        format!("      ktstr: downloading {url} (1.5 MiB)\n"),
         "Content-Length present must render the MiB-annotated form \
-         with the cli_label prefix and 1-decimal size",
+         with the cli_label prefix right-aligned in the status column \
+         and a 1-decimal size",
     );
 }
 
@@ -3606,7 +3612,12 @@ fn print_download_size_without_content_length_omits_mib() {
     let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
         print_download_size(&response, url, "cargo ktstr", None);
     });
-    let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
+    // See the sibling test: color is environment-dependent, the
+    // status column is not. `cargo ktstr:` fills the column exactly,
+    // so this line keeps its historical bytes.
+    let captured = crate::test_support::strip_ansi_csi(
+        &String::from_utf8(bytes).expect("captured stderr must be utf-8"),
+    );
     assert_eq!(
         captured,
         format!("cargo ktstr: downloading {url}\n"),

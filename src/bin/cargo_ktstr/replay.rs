@@ -200,7 +200,7 @@ pub(crate) fn run_replay(
     let failed_names = select_failed_names(&pool, filter);
 
     if failed_names.is_empty() {
-        eprintln!(
+        ktstr::ktstr_status!(
             "ktstr replay: no failed sidecars in pool at {} \
              (filter: {:?}) — nothing to re-run",
             root.display(),
@@ -235,7 +235,7 @@ pub(crate) fn run_replay(
         // tool tradition of "show me what you'd do before doing
         // it" (cf. `rm -i`, `git push --dry-run`).
         println!("{filter_expr}");
-        eprintln!(
+        ktstr::ktstr_status!(
             "ktstr replay: {} failed test name(s) selected. \
              Pipe the printed filter into `cargo nextest run -E` \
              or re-run with --exec to invoke nextest directly.",
@@ -452,7 +452,7 @@ fn render_outcome_diff(outcomes: &BTreeMap<&str, ReplayOutcome>) {
         }
     }
     eprintln!();
-    eprintln!(
+    ktstr::ktstr_status!(
         "ktstr replay: {fixed} FIXED, {persistent} PERSISTENT, \
          {inconclusive} INCONCLUSIVE, {mixed} MIXED, {dropped} DROPPED",
     );
@@ -674,13 +674,13 @@ fn without_heap_state(host: &HostContext) -> HostContext {
 fn render_host_diff_section(section: &HostDiffSection) {
     match section {
         HostDiffSection::NoCapture => {
-            eprintln!("ktstr replay: (no host context captured)");
+            ktstr::ktstr_status!("ktstr replay: (no host context captured)");
         }
         HostDiffSection::Unchanged => {
-            eprintln!("ktstr replay: (host context unchanged since capture)");
+            ktstr::ktstr_status!("ktstr replay: (host context unchanged since capture)");
         }
         HostDiffSection::Changed(body) => {
-            eprintln!("ktstr replay: host context drift since capture:");
+            ktstr::ktstr_status!("ktstr replay: host context drift since capture:");
             // `HostContext::diff` already terminates each line with
             // a newline AND uses two-space indentation, so a single
             // `eprint!` (NOT `eprintln!`) emits the body verbatim

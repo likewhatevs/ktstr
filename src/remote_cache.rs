@@ -348,7 +348,7 @@ pub fn remote_lookup(cache: &CacheDir, cache_key: &str, cli_label: &str) -> Opti
     let op = match create_operator() {
         Ok(op) => op,
         Err(e) => {
-            eprintln!("{cli_label}: remote cache warning: {e}");
+            crate::ktstr_status!("{cli_label}: remote cache warning: {e}");
             return None;
         }
     };
@@ -359,18 +359,18 @@ pub fn remote_lookup(cache: &CacheDir, cache_key: &str, cli_label: &str) -> Opti
             if e.kind() == opendal::ErrorKind::NotFound {
                 return None;
             }
-            eprintln!("{cli_label}: remote cache read warning: {e}");
+            crate::ktstr_status!("{cli_label}: remote cache read warning: {e}");
             return None;
         }
     };
 
     match unpack_and_store(cache, cache_key, &data) {
         Ok(entry) => {
-            eprintln!("{cli_label}: fetched from remote cache: {cache_key}");
+            crate::ktstr_status!("{cli_label}: fetched from remote cache: {cache_key}");
             Some(entry)
         }
         Err(e) => {
-            eprintln!("{cli_label}: remote cache unpack warning ({cache_key}): {e}");
+            crate::ktstr_status!("{cli_label}: remote cache unpack warning ({cache_key}): {e}");
             None
         }
     }
@@ -390,7 +390,7 @@ pub fn remote_store(entry: &CacheEntry, cli_label: &str) {
     let op = match create_operator() {
         Ok(op) => op,
         Err(e) => {
-            eprintln!("{cli_label}: remote cache warning: {e}");
+            crate::ktstr_status!("{cli_label}: remote cache warning: {e}");
             return;
         }
     };
@@ -398,17 +398,17 @@ pub fn remote_store(entry: &CacheEntry, cli_label: &str) {
     let data = match pack_entry(&entry.path, meta) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("{cli_label}: remote cache pack warning: {e}");
+            crate::ktstr_status!("{cli_label}: remote cache pack warning: {e}");
             return;
         }
     };
 
     match RUNTIME.block_on(op.write(&entry.key, data)) {
         Ok(_) => {
-            eprintln!("{cli_label}: stored to remote cache: {}", entry.key);
+            crate::ktstr_status!("{cli_label}: stored to remote cache: {}", entry.key);
         }
         Err(e) => {
-            eprintln!("{cli_label}: remote cache write warning: {e}");
+            crate::ktstr_status!("{cli_label}: remote cache write warning: {e}");
         }
     }
 }

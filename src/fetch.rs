@@ -2492,7 +2492,7 @@ fn parse_releases_body(body: &str) -> Result<Vec<Release>> {
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 pub fn fetch_latest_stable_version(client: &Client, cli_label: &str) -> Result<String> {
-    eprintln!("{cli_label}: fetching latest kernel version");
+    crate::ktstr_status!("{cli_label}: fetching latest kernel version");
     let releases = cached_releases_with(client)?;
 
     let mut best: Option<&str> = None;
@@ -2511,7 +2511,7 @@ pub fn fetch_latest_stable_version(client: &Client, cli_label: &str) -> Result<S
 
     let version =
         best.ok_or_else(|| anyhow!("no stable kernel with patch >= 8 found in releases.json"))?;
-    eprintln!("{cli_label}: latest stable kernel: {version}");
+    crate::ktstr_status!("{cli_label}: latest stable kernel: {version}");
     Ok(version.to_string())
 }
 
@@ -2569,7 +2569,7 @@ pub fn is_major_minor_prefix(s: &str) -> bool {
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
 /// `"cargo ktstr"`).
 pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) -> Result<String> {
-    eprintln!("{cli_label}: fetching latest {prefix}.x kernel version");
+    crate::ktstr_status!("{cli_label}: fetching latest {prefix}.x kernel version");
     let releases = cached_releases_with(client)?;
 
     let mut best: Option<(&str, (u32, u32, u32))> = None;
@@ -2592,11 +2592,11 @@ pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) 
     }
 
     if let Some((version, _)) = best {
-        eprintln!("{cli_label}: latest {prefix}.x kernel: {version}");
+        crate::ktstr_status!("{cli_label}: latest {prefix}.x kernel: {version}");
         return Ok(version.to_string());
     }
 
-    eprintln!(
+    crate::ktstr_status!(
         "{cli_label}: {prefix}.x not in releases.json (EOL or unreleased series); \
          resolving latest patch via the gregkh mirror tags"
     );
@@ -2610,7 +2610,7 @@ pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) 
             // fetched by the normal download path (cdn.kernel.org,
             // falling back to the gregkh mirror snapshot); torvalds is
             // the mainline authority the gregkh mirror tracks.
-            eprintln!(
+            crate::ktstr_status!(
                 "{cli_label}: no {prefix}.x stable point release; using {prefix} mainline base"
             );
             Ok(prefix.to_string())
@@ -2634,13 +2634,15 @@ pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) 
 /// others — the 404 nodes break CI runners while the tarball fetch on
 /// those same nodes still succeeds).
 fn latest_patch_from_git_tags(url: &str, prefix: &str, cli_label: &str) -> Result<Option<String>> {
-    eprintln!("{cli_label}: resolving {prefix}.x release tags via {url}");
+    crate::ktstr_status!("{cli_label}: resolving {prefix}.x release tags via {url}");
     let refs = ls_remote_refs(url, &format!("{cli_label}: {prefix}.x tags"))
         .with_context(|| format!("ls-remote {url} for {prefix}.x release tags"))?;
     match max_tag_patch(refs.iter().map(ref_full_name), prefix) {
         Some(patch) => {
             let version = format!("{prefix}.{patch}");
-            eprintln!("{cli_label}: latest {prefix}.x kernel (from git tags): {version}");
+            crate::ktstr_status!(
+                "{cli_label}: latest {prefix}.x kernel (from git tags): {version}"
+            );
             Ok(Some(version))
         }
         None => Ok(None),

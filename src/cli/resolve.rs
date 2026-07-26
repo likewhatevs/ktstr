@@ -634,7 +634,7 @@ pub fn expand_kernel_range(
 ) -> Result<Vec<String>> {
     let (start_key, end_key) = range_bounds(start, end)?;
 
-    eprintln!(
+    crate::ktstr_status!(
         "{cli_label}: expanding kernel range {start}..{end}{eol}",
         eol = if include_eol {
             " (including EOL series)"
@@ -662,7 +662,7 @@ pub fn expand_kernel_range(
     let mirror_tags = if include_eol {
         let tags = crate::fetch::cached_stable_tags();
         if tags.is_none() {
-            eprintln!(
+            crate::ktstr_status!(
                 "{cli_label}: --include-eol: could not enumerate release tags \
                  from the stable mirror (ls-remote failed); EOL series may be \
                  missing from this range"
@@ -683,7 +683,7 @@ pub fn expand_kernel_range(
         );
     }
 
-    eprintln!(
+    crate::ktstr_status!(
         "{cli_label}: range expanded to {n} kernel(s): {list}",
         n = versions.len(),
         list = versions.join(", "),

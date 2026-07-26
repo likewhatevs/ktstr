@@ -649,7 +649,7 @@ reasons.
 ## Kernel auto-download failures
 
 ```text
-ktstr: no kernel found, downloading latest stable
+      ktstr: no kernel found, downloading latest stable
 fetch https://www.kernel.org/releases.json: <error>
 ```
 

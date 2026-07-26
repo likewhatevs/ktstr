@@ -1816,7 +1816,9 @@ fn build_scheduler_workspace(
         },
     )?;
     if cached.cache_hit {
-        eprintln!("{cli_label}: reused input-addressed scheduler workspace build {identity:016x}");
+        ktstr::ktstr_status!(
+            "{cli_label}: reused input-addressed scheduler workspace build {identity:016x}"
+        );
     }
     Ok(WorkspaceSchedulerArtifacts {
         paths: cached.paths,
@@ -1987,7 +1989,7 @@ fn prepare_scheduler_artifacts_from_requirements(
     let groups = plan_workspace_scheduler_builds(&requests)?;
     let package_count: usize = groups.iter().map(|group| group.packages.len()).sum();
     if package_count > 0 {
-        eprintln!(
+        ktstr::ktstr_status!(
             "cargo ktstr: prebuilding {package_count} declared scheduler package(s) \
              in {} workspace batch(es) with profile {profile:?}",
             groups.len(),
@@ -2104,7 +2106,7 @@ fn prebuild_scheduler_manifest(
     let groups = plan_workspace_scheduler_builds(requests)?;
     let package_count: usize = groups.iter().map(|group| group.packages.len()).sum();
     if package_count > 0 {
-        eprintln!(
+        ktstr::ktstr_status!(
             "cargo ktstr verifier: prebuilding {package_count} scheduler package(s) \
              in {} workspace batch(es) with profile {profile:?}",
             groups.len(),
@@ -2614,7 +2616,7 @@ pub(crate) fn run_verifier(
 
         let kernel_count = resolved.len();
 
-        eprintln!(
+        ktstr::ktstr_status!(
             "cargo ktstr verifier: dispatching to nextest (verifier/ cells only) \
          on {kernel_count} resolved kernel(s){raw}{fwd}",
             raw = if raw { " (raw output)" } else { "" },

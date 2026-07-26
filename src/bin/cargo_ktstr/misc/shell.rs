@@ -258,13 +258,10 @@ pub(crate) fn run_shell(
         // `N` from the operator's `-i` flags. Both UNION into the
         // VM. Always emitted (even when both are 0) so the operator
         // immediately sees an accidentally-dropped include.
-        eprintln!(
-            "{}",
-            format_test_banner(name, &desc, mem, include_files.len()),
-        );
+        ktstr::cli::print_status_line(&format_test_banner(name, &desc, mem, include_files.len()));
         if desc.scheduler_kind == ktstr::test_support::SchedulerKind::KernelBuiltin {
             if desc.scheduler_enable_cmds.is_empty() {
-                eprintln!(
+                ktstr::ktstr_status!(
                     "ktstr shell: scheduler '{}' is KernelBuiltin with no enable cmds \
                      declared — drop-to-shell will run under the kernel default; \
                      refer to the test's #[ktstr_test(...)] attributes for sysctl \
@@ -272,7 +269,7 @@ pub(crate) fn run_shell(
                     desc.scheduler_name,
                 );
             } else {
-                eprintln!(
+                ktstr::ktstr_status!(
                     "ktstr shell: scheduler '{}' is KernelBuiltin — running {} enable \
                      cmd(s) before drop-to-shell and {} disable cmd(s) on shell exit. \
                      You can manually re-disable inside busybox if you want to inspect \
@@ -283,7 +280,7 @@ pub(crate) fn run_shell(
                 );
             }
         } else if desc.scheduler_kind != ktstr::test_support::SchedulerKind::Eevdf {
-            eprintln!(
+            ktstr::ktstr_status!(
                 "ktstr shell: repro the workload by invoking the scheduler binary \
                  inside the guest (e.g. /bin/{}) — its sched_args are encoded in \
                  the test source; this v1 doesn't stage the scheduler binary \

@@ -267,7 +267,7 @@ fn compute_outcome(
         if ws.is_member(pkg) {
             testable_pkgs.push(pkg.to_string());
         } else {
-            eprintln!(
+            ktstr::ktstr_status!(
                 "ktstr affected: declared scheduler package `{pkg}` (with tests) \
                  is not a workspace member; excluded from the matrix"
             );
@@ -635,7 +635,7 @@ fn map_artifacts_to_bins<R: std::io::BufRead>(
         {
             let path = PathBuf::from(exe.as_str());
             if let Some(prev) = map.insert(name.clone(), path) {
-                eprintln!(
+                ktstr::ktstr_status!(
                     "ktstr affected: scheduler package `{name}` emitted multiple \
                      [[bin]] artifacts; using the last, ignoring {} (its `.d` \
                      inputs are not considered)",

@@ -69,7 +69,7 @@ impl crate::interrupt::StdoutObserver for NextestRunProgress {
 
     fn tick(&mut self) {
         if let Some(line) = self.tick_at(Instant::now()) {
-            eprintln!("{line}");
+            ktstr::cli::print_status_line(&line);
         }
     }
 

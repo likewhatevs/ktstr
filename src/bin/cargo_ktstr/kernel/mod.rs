@@ -542,7 +542,7 @@ fn resolve_one_with_progress(
 ) -> Result<(String, PathBuf), String> {
     let result = resolve_one(id, Some(mp));
     if let Ok((label, _)) = &result {
-        eprintln!("cargo ktstr: resolved kernel {label:?}");
+        ktstr::ktstr_status!("cargo ktstr: resolved kernel {label:?}");
     }
     result
 }
@@ -717,7 +717,7 @@ pub(crate) fn kernel_build(
             let total = versions.len();
             let mut failures: Vec<(String, String)> = Vec::new();
             for (i, ver) in versions.iter().enumerate() {
-                eprintln!("cargo ktstr: [{}/{total}] kernel build {ver}", i + 1);
+                ktstr::ktstr_status!("cargo ktstr: [{}/{total}] kernel build {ver}", i + 1);
                 if let Err(e) = kernel_build_one(
                     Some(ver.clone()),
                     None,
@@ -727,7 +727,7 @@ pub(crate) fn kernel_build(
                     extra_content.as_deref(),
                     skip_sha256,
                 ) {
-                    eprintln!("cargo ktstr: {ver}: {e}");
+                    ktstr::ktstr_status!("cargo ktstr: {ver}: {e}");
                     failures.push((ver.clone(), e));
                 }
             }
@@ -800,7 +800,7 @@ pub(crate) fn kernel_build(
                 extra_content.as_deref(),
             )
             .map_err(|e| format!("build git+{url}#{git_ref}: {e:#}"))?;
-            eprintln!("cargo ktstr: kernel cached at {}", dir.display());
+            ktstr::ktstr_status!("cargo ktstr: kernel cached at {}", dir.display());
             Ok(())
         }
         Some(KernelId::CacheKey(key)) => Err(format!(
@@ -831,7 +831,7 @@ pub(crate) fn kernel_build(
                 _ => unreachable!("arm guarded to Package | Distro"),
             }
             .map_err(|e| format!("acquire --kernel {id}: {e:#}"))?;
-            eprintln!("cargo ktstr: prebuilt kernel cached at {}", dir.display());
+            ktstr::ktstr_status!("cargo ktstr: prebuilt kernel cached at {}", dir.display());
             Ok(())
         }
     }
@@ -900,8 +900,8 @@ fn kernel_build_one(
             ktstr::cache_key_suffix_with_extra(extra_kconfig),
         );
         if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
-            eprintln!("cargo ktstr: cached kernel found: {}", entry.path.display());
-            eprintln!("cargo ktstr: use --force to rebuild");
+            ktstr::ktstr_status!("cargo ktstr: cached kernel found: {}", entry.path.display());
+            ktstr::ktstr_status!("cargo ktstr: use --force to rebuild");
             return Ok(());
         }
         let result = fetch::download_tarball(
@@ -940,8 +940,8 @@ fn kernel_build_one(
         && !acquired.is_dirty
         && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {
-        eprintln!("cargo ktstr: cached kernel found: {}", entry.path.display());
-        eprintln!("cargo ktstr: use --force to rebuild");
+        ktstr::ktstr_status!("cargo ktstr: cached kernel found: {}", entry.path.display());
+        ktstr::ktstr_status!("cargo ktstr: use --force to rebuild");
         return Ok(());
     }
 

@@ -3217,7 +3217,7 @@ fn merge_profdata(
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!(
+        ktstr::ktstr_status!(
             "cargo ktstr: dropped {} of {} coverage shard(s) as unreadable; their coverage is lost: {names}",
             dropped.len(),
             inputs.len(),
@@ -4464,7 +4464,7 @@ fn run_cargo_sub(
 
         if resolved.len() > 1 {
             let encoded = encode_kernel_list(&resolved)?;
-            eprintln!(
+            ktstr::ktstr_status!(
                 "cargo ktstr: fanning gauntlet across {n} kernels",
                 n = resolved.len(),
             );
@@ -4489,7 +4489,7 @@ fn run_cargo_sub(
     let btf_anchor_inject: Option<String> =
         generate_btf_anchor(&target_dir_path, release).map(|anchor_path| {
             let existing = std::env::var("BPF_EXTRA_CFLAGS_PRE_INCL").unwrap_or_default();
-            eprintln!("cargo ktstr: BTF type anchor at {}", anchor_path.display());
+            ktstr::ktstr_status!("cargo ktstr: BTF type anchor at {}", anchor_path.display());
             format!("-include {} {existing}", anchor_path.display())
                 .trim()
                 .to_string()
@@ -4634,7 +4634,7 @@ fn run_cargo_sub(
             resolved.first().map(|(_, directory)| directory.as_path()),
             "cargo ktstr nextest artifact cache",
         )?;
-        eprintln!(
+        ktstr::ktstr_status!(
             "cargo ktstr: {} reusable nextest build",
             if materialized.cache_hit() {
                 "reused"
@@ -4657,7 +4657,7 @@ fn run_cargo_sub(
     let archive_probe = archive_reuse_path
         .as_deref()
         .map(|archive_path| {
-            eprintln!(
+            ktstr::ktstr_status!(
                 "cargo ktstr: extracting test binaries for scheduler discovery from {}",
                 archive_path.display()
             );
@@ -4899,7 +4899,7 @@ fn run_cargo_sub(
     });
     if let Some(coverage) = &cached_coverage_report {
         if !status.success() && coverage.ignore_run_fail {
-            eprintln!(
+            ktstr::ktstr_status!(
                 "cargo ktstr: coverage test run failed under --ignore-run-fail; {}",
                 if coverage.no_report {
                     "retaining coverage inputs"
@@ -4924,7 +4924,7 @@ fn run_cargo_sub(
                 })
                 .and_then(|cached| retain_cached_coverage_for_later_report(coverage, cached));
             match retention {
-                Ok(path) => eprintln!(
+                Ok(path) => ktstr::ktstr_status!(
                     "cargo ktstr: retained --no-report coverage bundle at {}; run {}/report.sh to generate the report",
                     path.display(),
                     path.display(),
@@ -4934,7 +4934,7 @@ fn run_cargo_sub(
                     let retention_failure =
                         format!("retain cached --no-report coverage inputs: {error}");
                     if final_failure.is_some() {
-                        eprintln!(
+                        ktstr::ktstr_status!(
                             "cargo ktstr: coverage retention also failed; preserving the original test failure: {retention_failure}"
                         );
                     } else {
@@ -5037,7 +5037,7 @@ fn run_cargo_sub(
             if let Some(report_failure) = report_failure {
                 final_success = false;
                 if final_failure.is_some() {
-                    eprintln!(
+                    ktstr::ktstr_status!(
                         "cargo ktstr: coverage post-run also failed; preserving the original test failure: {report_failure}"
                     );
                 } else {
@@ -5968,7 +5968,7 @@ fn acquire_cargo_build_output_lease_at_root(
             None => {
                 let now = std::time::Instant::now();
                 if now >= next_heartbeat {
-                    eprintln!(
+                    ktstr::ktstr_status!(
                         "{cli_label}: waiting to pin Cargo artifacts from {}; elapsed={:.1}s",
                         canonical_target_dir.display(),
                         now.saturating_duration_since(started).as_secs_f64(),
@@ -5998,7 +5998,7 @@ fn run_prepared_reserved_build_output(
     let output = crate::interrupt::run_output_observed(command, progress)
         .map_err(|error| format!("{cli_label}: spawn {description}: {error}"))?;
     if let Err(error) = persist_reserved_build_diagnostics(&output, cli_label, description) {
-        eprintln!("{cli_label}: could not preserve reserved-build diagnostics: {error}");
+        ktstr::ktstr_status!("{cli_label}: could not preserve reserved-build diagnostics: {error}");
     }
     Ok(output)
 }
@@ -6020,14 +6020,14 @@ fn run_prepared_reserved_build_output_pair(
         .map_err(|error| format!("{cli_label}: spawn {description}: {error}"))?;
     if let Err(error) = persist_reserved_build_diagnostics(&output.primary, cli_label, description)
     {
-        eprintln!("{cli_label}: could not preserve reserved-build diagnostics: {error}");
+        ktstr::ktstr_status!("{cli_label}: could not preserve reserved-build diagnostics: {error}");
     }
     if let Err(error) = persist_reserved_build_diagnostics(
         &output.secondary,
         cli_label,
         "concurrent Cargo metadata",
     ) {
-        eprintln!("{cli_label}: could not preserve Cargo-metadata diagnostics: {error}");
+        ktstr::ktstr_status!("{cli_label}: could not preserve Cargo-metadata diagnostics: {error}");
     }
     Ok(output)
 }
@@ -6388,7 +6388,7 @@ impl ItemProgress {
             }
         }
 
-        eprintln!("{label}: starting; total={total}");
+        ktstr::ktstr_status!("{label}: starting; total={total}");
         let reporter_state = Arc::clone(&state);
         let reporter_label = label.clone();
         let reporter = std::thread::Builder::new()
@@ -6401,22 +6401,19 @@ impl ItemProgress {
                     }
                     let now = std::time::Instant::now();
                     let snapshot = reporter_state.snapshot();
-                    eprintln!(
-                        "{}",
-                        item_progress_line(
-                            &reporter_label,
-                            total,
-                            snapshot,
-                            now.saturating_duration_since(started),
-                            "working",
-                            None,
-                        ),
-                    );
+                    ktstr::cli::print_status_line(&item_progress_line(
+                        &reporter_label,
+                        total,
+                        snapshot,
+                        now.saturating_duration_since(started),
+                        "working",
+                        None,
+                    ));
                     next_heartbeat = now + ITEM_PROGRESS_HEARTBEAT;
                 }
             })
             .map_err(|error| {
-                eprintln!(
+                ktstr::ktstr_status!(
                     "{label}: could not start progress heartbeat thread: {}",
                     escape_progress_text(&error.to_string()),
                 );
@@ -7213,7 +7210,7 @@ fn check_ktstr_version_compat(
     }
     for outcome in outcomes {
         if let VersionGuard::Warn(message) = outcome {
-            eprintln!("cargo ktstr: warning: {message}");
+            ktstr::ktstr_status!("cargo ktstr: warning: {message}");
         }
     }
     Ok(())

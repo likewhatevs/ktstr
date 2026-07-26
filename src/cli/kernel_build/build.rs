@@ -381,7 +381,7 @@ fn acquire_source_tree_lock_with_wait_hook(
             // hook while the test seam observes it without polling
             // host-global `/proc/locks`.
             on_wait();
-            eprintln!(
+            crate::ktstr_status!(
                 "{cli_label}: source tree {} is locked by a concurrent ktstr \
                  build — waiting for it to finish.",
                 canonical.display(),
@@ -433,7 +433,7 @@ enum MidWaitState {
 
 impl MidWaitState {
     /// Operator-facing diagnostic body (without the `{cli_label}: `
-    /// prefix — caller composes via `eprintln!("{cli_label}: {body}")`).
+    /// prefix — caller composes via `crate::ktstr_status!("{cli_label}: {body}")`).
     ///
     /// Returns `None` for [`Self::Clean`] (the cache-skip gate emits
     /// its own message) and [`Self::PreAcquireDirty`] (the wait was
@@ -461,7 +461,7 @@ impl MidWaitState {
 
 /// Operator-facing diagnostic body emitted when the post-mid-wait
 /// `cache_lookup` short-circuit fires (without the `{cli_label}: `
-/// prefix — caller composes via `eprintln!("{cli_label}: {body}")`,
+/// prefix — caller composes via `crate::ktstr_status!("{cli_label}: {body}")`,
 /// matching the [`MidWaitState::diagnostic`] convention).
 ///
 /// Separate from [`MidWaitState::diagnostic`] because the cache-hit
@@ -645,7 +645,7 @@ pub fn kernel_build_pipeline(
     let mid_wait_clean = mid_wait_state == MidWaitState::Clean;
 
     if let Some(body) = mid_wait_state.diagnostic() {
-        eprintln!("{cli_label}: {body}");
+        crate::ktstr_status!("{cli_label}: {body}");
     }
 
     if !force
@@ -654,7 +654,7 @@ pub fn kernel_build_pipeline(
             crate::cli::resolve::cache_lookup(cache, &acquired.cache_key, cli_label)
         && entry.image_path().exists()
     {
-        eprintln!("{cli_label}: {}", cache_hit_diagnostic(&acquired.cache_key));
+        crate::ktstr_status!("{cli_label}: {}", cache_hit_diagnostic(&acquired.cache_key));
         let image_path = entry.image_path();
         return Ok(KernelBuildResult {
             entry: Some(entry),
@@ -665,11 +665,11 @@ pub fn kernel_build_pipeline(
 
     if clean {
         if !is_local_source {
-            eprintln!(
+            crate::ktstr_status!(
                 "{cli_label}: --clean is only meaningful with a --kernel <path> source (downloaded/cloned sources start clean)"
             );
         } else {
-            eprintln!("{cli_label}: make mrproper");
+            crate::ktstr_status!("{cli_label}: make mrproper");
             run_make(source_dir, &["mrproper"])?;
         }
     }
@@ -704,14 +704,14 @@ pub fn kernel_build_pipeline(
 
     // Cache (skip for dirty local trees).
     if acquired.is_dirty {
-        eprintln!("{cli_label}: kernel built at {}", image_path.display());
+        crate::ktstr_status!("{cli_label}: kernel built at {}", image_path.display());
         // Branch the hint wording: commit/stash is only an actionable
         // remediation for an actual git repo. A non-git source tree
         // is force-marked dirty (see `acquire_local_source` in
         // `fetch.rs`) because dirty detection is impossible, and
         // telling the operator to "commit or stash" leads nowhere.
         let hint = dirty_cache_skip_hint(acquired.is_git);
-        eprintln!("{cli_label}: {hint}");
+        crate::ktstr_status!("{cli_label}: {hint}");
         return Ok(KernelBuildResult {
             entry: None,
             image_path,
@@ -950,10 +950,10 @@ fn find_built_image(
         let orig_mib = std::fs::metadata(&vmlinux_path)
             .map(|m| m.len() as f64 / (1024.0 * 1024.0))
             .unwrap_or(0.0);
-        eprintln!("{cli_label}: caching vmlinux ({orig_mib:.0} MiB, will be stripped)");
+        crate::ktstr_status!("{cli_label}: caching vmlinux ({orig_mib:.0} MiB, will be stripped)");
         Some(vmlinux_path)
     } else {
-        eprintln!("{cli_label}: warning: vmlinux not found, BTF will not be cached");
+        crate::ktstr_status!("{cli_label}: warning: vmlinux not found, BTF will not be cached");
         None
     };
     Ok((image_path, vmlinux_opt))
@@ -993,13 +993,14 @@ fn post_build_dirty_skip(
                 let (skip, hash_changed) =
                     post_build_cache_store_skip(&post, acquired.kernel_source.as_local_git_hash());
                 if skip {
-                    eprintln!(
+                    crate::ktstr_status!(
                         "{cli_label}: source tree changed during build \
                          (acquire-time dirty={}, post-build dirty={}; \
                          hash_changed={hash_changed}); skipping cache store \
                          to avoid recording a stale identity. Re-run after \
                          the working tree settles to populate the cache.",
-                        acquired.is_dirty, post.is_dirty,
+                        acquired.is_dirty,
+                        post.is_dirty,
                     );
                     return Some(KernelBuildResult {
                         entry: None,
@@ -1097,7 +1098,7 @@ fn build_metadata_and_store(
     let entry = match cache.store(&acquired.cache_key, &artifacts, &metadata) {
         Ok(entry) => {
             success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
-            eprintln!("{cli_label}: image: {}", entry.image_path().display());
+            crate::ktstr_status!("{cli_label}: image: {}", entry.image_path().display());
             if crate::remote_cache::is_enabled() {
                 crate::remote_cache::remote_store(&entry, cli_label);
             }

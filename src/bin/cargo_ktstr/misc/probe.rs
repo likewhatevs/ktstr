@@ -202,7 +202,7 @@ impl crate::interrupt::StdoutObserver for ProbeObserver {
         {
             let mut stderr = std::io::stderr().lock();
             if let Err(error) = stderr
-                .write_all(message.as_bytes())
+                .write_all(ktstr::cli::status_line(&message).as_bytes())
                 .and_then(|()| stderr.flush())
             {
                 self.forward_error = Some(format!("write probe heartbeat: {error}"));

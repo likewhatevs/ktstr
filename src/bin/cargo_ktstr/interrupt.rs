@@ -1322,7 +1322,7 @@ fn startup_launcher_fail(
         let _ = startup_wait_child_bounded(child, STARTUP_REAP_SERVICE_BACKSTOP);
     }
     let caught = signals.restore().unwrap_or(None);
-    eprintln!("cargo ktstr fatal: startup supervision failed: {error}");
+    ktstr::ktstr_status!("cargo ktstr fatal: startup supervision failed: {error}");
     if let Some(signal) = caught {
         relay_raw_wait_status(signal)
     }
@@ -1414,19 +1414,19 @@ fn startup_launcher_read_status(report: &OwnedFd, buffer: &mut Vec<u8>) -> io::R
 
 fn startup_launcher_main() -> ! {
     let token = startup_token().unwrap_or_else(|error| {
-        eprintln!("cargo ktstr fatal: create startup token: {error}");
+        ktstr::ktstr_status!("cargo ktstr fatal: create startup token: {error}");
         std::process::exit(CHILD_OWNERSHIP_FAIL_CLOSED_EXIT_CODE);
     });
     let (owner_read, owner_write) = startup_pipe().unwrap_or_else(|error| {
-        eprintln!("cargo ktstr fatal: create startup owner pipe: {error}");
+        ktstr::ktstr_status!("cargo ktstr fatal: create startup owner pipe: {error}");
         std::process::exit(CHILD_OWNERSHIP_FAIL_CLOSED_EXIT_CODE);
     });
     let (report_read, report_write) = startup_pipe().unwrap_or_else(|error| {
-        eprintln!("cargo ktstr fatal: create startup report pipe: {error}");
+        ktstr::ktstr_status!("cargo ktstr fatal: create startup report pipe: {error}");
         std::process::exit(CHILD_OWNERSHIP_FAIL_CLOSED_EXIT_CODE);
     });
     let mut signals = StartupLauncherSignals::install_for_handoff().unwrap_or_else(|error| {
-        eprintln!("cargo ktstr fatal: install startup signal relay: {error}");
+        ktstr::ktstr_status!("cargo ktstr fatal: install startup signal relay: {error}");
         std::process::exit(CHILD_OWNERSHIP_FAIL_CLOSED_EXIT_CODE);
     });
 
@@ -1545,7 +1545,7 @@ fn startup_launcher_main() -> ! {
     drop(owner_write);
     drop(report_read);
     let caught = signals.restore().unwrap_or_else(|error| {
-        eprintln!("cargo ktstr fatal: restore startup signal relay: {error}");
+        ktstr::ktstr_status!("cargo ktstr fatal: restore startup signal relay: {error}");
         std::process::exit(CHILD_OWNERSHIP_FAIL_CLOSED_EXIT_CODE);
     });
     if let Some(signal) = caught {
@@ -3216,7 +3216,7 @@ pub(crate) fn run_command_pair_coordinator_if_requested() -> bool {
             let files = match take_command_pair_files() {
                 Ok(files) => files,
                 Err(error) => {
-                    eprintln!("cargo ktstr: invalid command-pair protocol: {error}");
+                    ktstr::ktstr_status!("cargo ktstr: invalid command-pair protocol: {error}");
                     std::process::exit(125);
                 }
             };
@@ -3234,7 +3234,7 @@ pub(crate) fn run_command_pair_coordinator_if_requested() -> bool {
                 1
             };
             if let Err(error) = write_command_pair_result(&mut result_file, &result) {
-                eprintln!("cargo ktstr: write command-pair result: {error}");
+                ktstr::ktstr_status!("cargo ktstr: write command-pair result: {error}");
                 std::process::exit(125);
             }
             std::process::exit(exit_code);
@@ -4945,7 +4945,7 @@ fn drain_group_capture<O: StdoutObserver>(
             let processes = snapshot_owned_subtree(group)?;
             if !descendant_snapshot_persisted && !processes.is_empty() {
                 if let Err(error) = persist_owned_descendants_after_leader(group, &processes) {
-                    eprintln!(
+                    ktstr::ktstr_status!(
                         "cargo ktstr: could not preserve post-leader descendant diagnostics: {error}"
                     );
                 }

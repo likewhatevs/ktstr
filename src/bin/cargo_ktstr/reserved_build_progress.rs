@@ -86,7 +86,7 @@ impl ReservationWaitProgress {
             started,
             HEARTBEAT_INTERVAL,
             Box::new(|line| {
-                let _ = writeln!(std::io::stderr(), "{line}");
+                let _ = writeln!(std::io::stderr(), "{}", ktstr::cli::status_line(line));
             }),
         )
     }
@@ -243,7 +243,7 @@ impl ReservedBuildProgress {
             started,
             HEARTBEAT_INTERVAL,
             Box::new(|line| {
-                let _ = writeln!(std::io::stderr(), "{line}");
+                let _ = writeln!(std::io::stderr(), "{}", ktstr::cli::status_line(line));
             }),
             Box::new(write_stderr),
         )
