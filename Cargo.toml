@@ -481,25 +481,6 @@ jobserver = "0.1"
 insta = "1"
 predicates = "3"
 proptest = "1"
-# Rust parser for the function-size guard test
-# (`tests/src_function_size_guard.rs`). `full` enables the
-# fn/impl/expr grammar; `visit` enables the `syn::visit::Visit`
-# traverser that walks every `ItemFn` / `ImplItemFn` /
-# `TraitItemFn` to measure body line spans. Pure-AST walk: no
-# proc-macro context required, so the test runs in the standard
-# integration-test harness without a build script.
-syn = { version = "2", features = ["full", "visit"] }
-# `quote::ToTokens` + `proc_macro2::Span` for the function-size
-# guard's impl-receiver / trait-path rendering. Already in the
-# transitive dep tree via `syn` and `ktstr-macros`; pinned as
-# explicit dev-deps so the test's `use quote::ToTokens` /
-# `proc_macro2::Span` imports resolve without leaning on syn's
-# re-export surface. `span-locations` feature on proc-macro2
-# enables `Span::start()` / `Span::end()` returning
-# `LineColumn`, which the guard uses to measure brace-token
-# body spans.
-proc-macro2 = { version = "1", features = ["span-locations"] }
-quote = "1"
 # Grok-style structured log matcher. Used by the watchdog timing
 # precision test to extract the sched_ext stall duration from the
 # kernel's SCX_EXIT_ERROR_STALL message ("…failed to run for
