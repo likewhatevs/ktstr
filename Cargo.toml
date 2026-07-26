@@ -380,8 +380,26 @@ panic = "abort"
 # interactive debug session. The nextest sched_stats timeout
 # override stays as defense-in-depth — this addresses the
 # binary-size root cause; the timeout is the symptom budget.
+#
+# opt-level 1 for the same reason, one layer down. `cargo test` builds
+# the whole graph under this profile — raising `[profile.dev]` alongside
+# it was measured and moved the test binary by under 100 bytes — and that
+# binary is packed as the guest's `/init`, LZ4'd into the initrd CAS,
+# and unpacked into guest tmpfs on every cell. Measured on
+# ktstr_sched_tests: stripped 83.8 MB -> 41.1 MB, its LZ4 payload
+# 34.2 MB -> 19.7 MB, and the unit suite 219 s -> 36 s, for +28 s of
+# build wall. opt-level 2 buys 2.3 MB more stripped for another 11 s of
+# build, which does not pay for itself on a per-lane build.
+#
+# `debug-assertions` and `overflow-checks` are spelled out rather than
+# left to the dev defaults: they are the assertion coverage every test
+# and every guest runs with, and a raised opt-level must never be read
+# as license to drop them.
 [profile.test]
 debug = "line-tables-only"
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
 
 [features]
 default = ["cli-bins", "vendored"]
