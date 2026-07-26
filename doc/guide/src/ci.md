@@ -286,10 +286,10 @@ failure-output = "immediate-final"
 fail-fast = false
 
 # Heavier test classes get their own budgets. Generated cell names are
-# slash-delimited, so their filters anchor on that shape — the substring
-# form `test(verifier_)` matches none of them:
+# slash-delimited, so filters that target them anchor on that shape — the
+# substring form `test(verifier_)` matches none of them:
 [[profile.ci.overrides]]
-filter = "test(/^verifier\\//)"
+filter = "binary(compile_fail) & test(=compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 3 }
 ```
 
