@@ -1141,20 +1141,20 @@ fn coordinator_watch_filters_registry_self_closes_without_spinning() {
     );
 }
 
-// Regression for the disjoint-release wake. A release for a resource the
-// coordinator is not currently focused on must still wake its watch. The
-// classifier once filtered resource closes by a watch set handed to drain/wait
-// and DISCARDED such an edge; because a flock release is single-shot, a later
-// scan that armed a narrow watch after the edge had already fired never saw it
-// and rode the 30s COORDINATOR_WAKE_FALLBACK instead of granting the disjoint
-// waiter at once (CI: coordinator stalled with free capacity, grant_scans=1).
-// The transport now takes no watch set at all — focus belongs to the scan that
-// consumes the events, not to the wake — so this pins the property at its
-// source: every resource close reaches the waiter whatever it waits for.
+// Regression for the disjoint-release wake. The classifier once filtered
+// resource closes by a watch set handed to drain/wait and DISCARDED an edge
+// for a resource outside that set; because a flock release is single-shot, a
+// later scan that armed a narrow watch after the edge had already fired never
+// saw it and rode the 30s COORDINATOR_WAKE_FALLBACK instead of granting the
+// disjoint waiter at once (CI: coordinator stalled with free capacity,
+// grant_scans=1). The transport now takes no watch set at all — focus belongs
+// to the scan that consumes the events, not to the wake — so this pins the
+// property at its source: a resource close reaches the waiter, and the event
+// names the exact CPU that closed.
 #[test]
-fn disjoint_resource_close_wakes_coordinator_watch_regardless_of_focus() {
+fn resource_close_wakes_coordinator_watch_with_no_claim_under_wait() {
     let _prefixes = LockPrefixesGuard::new_real_wake();
-    let disjoint = 5usize; // held resource unrelated to any claim under wait
+    let disjoint = 5usize; // the only resource this test touches
     // A peer holds the disjoint CPU through a writable owner — the real-release
     // fd shape (O_RDWR, so its close is the IN_CLOSE_WRITE a holder emits).
     let holder = protocol::AdmissionFlock::from_acquired(
@@ -1179,9 +1179,9 @@ fn disjoint_resource_close_wakes_coordinator_watch_regardless_of_focus() {
         .expect("event-driven coordinator wake");
     assert!(
         woke.is_some_and(|events| events.contains_cpu_close(disjoint)),
-        "a disjoint resource release must wake the coordinator watch even though \
-         no claim under wait covers it; the old watched-set filter discarded such \
-         an edge and forced a COORDINATOR_WAKE_FALLBACK tick",
+        "a resource release must wake the coordinator watch and name the CPU that \
+         closed; the old watched-set filter discarded an edge outside the set the \
+         caller happened to pass and forced a COORDINATOR_WAKE_FALLBACK tick",
     );
 }
 
