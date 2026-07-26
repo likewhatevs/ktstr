@@ -875,8 +875,12 @@ impl AggregateSnapshot {
     }
 
     pub(super) fn conflicts(&self, candidate: &ClaimSet) -> Result<bool> {
+        Ok(self.first_conflict(candidate)?.is_some())
+    }
+
+    pub(super) fn first_conflict(&self, candidate: &ClaimSet) -> Result<Option<ContentionMarker>> {
         validate_claim(candidate)?;
-        claim_conflicts_bits(
+        claim_first_conflict_bits(
             candidate,
             &self.cpu_any,
             &self.cpu_exclusive,
@@ -884,65 +888,6 @@ impl AggregateSnapshot {
             &self.llc_exclusive,
             self.bits,
         )
-    }
-
-    pub(super) fn first_conflict(&self, candidate: &ClaimSet) -> Result<Option<ContentionMarker>> {
-        validate_claim(candidate)?;
-        let cpu_bits = if candidate.cpu_mode == ClaimMode::Exclusive {
-            &self.cpu_any
-        } else {
-            &self.cpu_exclusive
-        };
-        for &cpu in &candidate.cpus {
-            self.ensure_index(cpu, "CPU")?;
-            if cpu_bits[cpu / 64] & (1u64 << (cpu % 64)) != 0 {
-                return Ok(Some(ContentionMarker {
-                    blocker: ResourceKey::Cpu(cpu),
-                    mode: match candidate.cpu_mode {
-                        ClaimMode::Shared => FlockMode::Shared,
-                        ClaimMode::Exclusive => FlockMode::Exclusive,
-                    },
-                }));
-            }
-        }
-
-        let permit_bits = if candidate.permit_mode == ClaimMode::Exclusive {
-            &self.cpu_any
-        } else {
-            &self.cpu_exclusive
-        };
-        for &permit in &candidate.permits {
-            let index = permit_resource_index(permit)?;
-            self.ensure_index(index, "permit resource")?;
-            if permit_bits[index / 64] & (1u64 << (index % 64)) != 0 {
-                return Ok(Some(ContentionMarker {
-                    blocker: ResourceKey::Permit(permit),
-                    mode: match candidate.permit_mode {
-                        ClaimMode::Shared => FlockMode::Shared,
-                        ClaimMode::Exclusive => FlockMode::Exclusive,
-                    },
-                }));
-            }
-        }
-
-        let llc_bits = if candidate.llc_mode == ClaimMode::Exclusive {
-            &self.llc_any
-        } else {
-            &self.llc_exclusive
-        };
-        for &llc in &candidate.llcs {
-            self.ensure_index(llc, "LLC")?;
-            if llc_bits[llc / 64] & (1u64 << (llc % 64)) != 0 {
-                return Ok(Some(ContentionMarker {
-                    blocker: ResourceKey::Llc(llc),
-                    mode: match candidate.llc_mode {
-                        ClaimMode::Shared => FlockMode::Shared,
-                        ClaimMode::Exclusive => FlockMode::Exclusive,
-                    },
-                }));
-            }
-        }
-        Ok(None)
     }
 
     pub(super) fn cpu_holder_count(&self, cpu: usize) -> Result<usize> {
@@ -18715,14 +18660,15 @@ impl Table {
                 }
                 continue;
             }
-            let conflict = claim_conflicts_bits(
+            let conflict = claim_first_conflict_bits(
                 &record.claim,
                 &cpu_any,
                 &cpu_exclusive,
                 &llc_any,
                 &llc_exclusive,
                 self.layout.bits,
-            )?;
+            )?
+            .is_some();
             let flexible = record.flexible;
             let availability_compatible = self.claim_availability_compatible(&record.claim)?;
             let blocker_ready = match record.blocked_on {
@@ -19604,14 +19550,15 @@ impl Table {
                 .map(|word| read_u64(&self.header, self.layout.bitset_offset(which) + word * 8))
                 .collect::<Vec<_>>()
         };
-        claim_conflicts_bits(
+        Ok(claim_first_conflict_bits(
             claim,
             &read_words(B_CLAIM_CPUS),
             &read_words(B_CLAIM_CPU_EXCLUSIVE),
             &read_words(B_CLAIM_LLC_ANY),
             &read_words(B_CLAIM_LLC_EXCLUSIVE),
             self.layout.bits,
-        )
+        )?
+        .is_some())
     }
 
     /// Test one candidate against every live claim except one exact record
@@ -19663,10 +19610,7 @@ impl Table {
             if count_after_excluding(cpu_which, cpu, contributes)? != 0 {
                 return Ok(Some(ContentionMarker {
                     blocker: ResourceKey::Cpu(cpu),
-                    mode: match candidate.cpu_mode {
-                        ClaimMode::Shared => FlockMode::Shared,
-                        ClaimMode::Exclusive => FlockMode::Exclusive,
-                    },
+                    mode: flock_mode(candidate.cpu_mode),
                 }));
             }
         }
@@ -19683,10 +19627,7 @@ impl Table {
             if count_after_excluding(permit_which, index, contributes)? != 0 {
                 return Ok(Some(ContentionMarker {
                     blocker: ResourceKey::Permit(permit),
-                    mode: match candidate.permit_mode {
-                        ClaimMode::Shared => FlockMode::Shared,
-                        ClaimMode::Exclusive => FlockMode::Exclusive,
-                    },
+                    mode: flock_mode(candidate.permit_mode),
                 }));
             }
         }
@@ -19702,10 +19643,7 @@ impl Table {
             if count_after_excluding(llc_which, llc, contributes)? != 0 {
                 return Ok(Some(ContentionMarker {
                     blocker: ResourceKey::Llc(llc),
-                    mode: match candidate.llc_mode {
-                        ClaimMode::Shared => FlockMode::Shared,
-                        ClaimMode::Exclusive => FlockMode::Exclusive,
-                    },
+                    mode: flock_mode(candidate.llc_mode),
                 }));
             }
         }
@@ -22024,14 +21962,27 @@ fn header_bitmap_bit(header: &[u8], layout: HeaderLayout, which: usize, index: u
     read_u64(header, offset) & (1u64 << (index % 64)) != 0
 }
 
-fn claim_conflicts_bits(
+fn flock_mode(mode: ClaimMode) -> FlockMode {
+    match mode {
+        ClaimMode::Shared => FlockMode::Shared,
+        ClaimMode::Exclusive => FlockMode::Exclusive,
+    }
+}
+
+/// The first fence hit for `claim`, or `None` when nothing blocks it.
+///
+/// Single-sources the fence predicate behind both the boolean admission
+/// test and the blocked-pin marker, so the two can never drift into
+/// disagreeing about what blocks a claim.
+#[inline]
+fn claim_first_conflict_bits(
     claim: &impl ClaimView,
     cpu_any: &[u64],
     cpu_exclusive: &[u64],
     llc_any: &[u64],
     llc_exclusive: &[u64],
     bits: usize,
-) -> Result<bool> {
+) -> Result<Option<ContentionMarker>> {
     let cpu_fence = if claim.cpu_mode() == ClaimMode::Exclusive {
         cpu_any
     } else {
@@ -22042,7 +21993,10 @@ fn claim_conflicts_bits(
             anyhow::bail!("CPU index {cpu} exceeds queue registry capacity");
         }
         if cpu_fence[cpu / 64] & (1u64 << (cpu % 64)) != 0 {
-            return Ok(true);
+            return Ok(Some(ContentionMarker {
+                blocker: ResourceKey::Cpu(cpu),
+                mode: flock_mode(claim.cpu_mode()),
+            }));
         }
     }
     let permit_fence = if claim.permit_mode() == ClaimMode::Exclusive {
@@ -22053,10 +22007,17 @@ fn claim_conflicts_bits(
     for permit in claim.permits() {
         let index = permit_resource_index(permit)?;
         if index >= bits {
-            anyhow::bail!("permit index {permit} exceeds queue registry capacity");
+            anyhow::bail!(
+                "permit index {permit} maps to resource index {index}, exceeding registry capacity"
+            );
         }
         if permit_fence[index / 64] & (1u64 << (index % 64)) != 0 {
-            return Ok(true);
+            // `blocker_serial` maps the permit into CPU resource space itself,
+            // so the marker must carry the raw permit id.
+            return Ok(Some(ContentionMarker {
+                blocker: ResourceKey::Permit(permit),
+                mode: flock_mode(claim.permit_mode()),
+            }));
         }
     }
     let llc_fence = if claim.llc_mode() == ClaimMode::Exclusive {
@@ -22069,10 +22030,13 @@ fn claim_conflicts_bits(
             anyhow::bail!("LLC index {llc} exceeds queue registry capacity");
         }
         if llc_fence[llc / 64] & (1u64 << (llc % 64)) != 0 {
-            return Ok(true);
+            return Ok(Some(ContentionMarker {
+                blocker: ResourceKey::Llc(llc),
+                mode: flock_mode(claim.llc_mode()),
+            }));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn claims_conflict(a: &impl ClaimView, b: &impl ClaimView) -> bool {
