@@ -18240,6 +18240,11 @@ impl KtstrVm {
         let mut single_step_pending: bool = false;
         let mut single_step_slot: usize = 0;
         let mut armed_single_step: bool = false;
+        // Sticky aarch64 "the guest owns debug now" latch — mirrors
+        // the AP-side local in `vcpu_run_loop_unified`. See
+        // `self_arm_watchpoint`'s disarm block for why an armed
+        // watchpoint otherwise swallows the guest's own BRK forever.
+        let mut foreign_debug: bool = false;
 
         loop {
             if kill.load(Ordering::Acquire) {
@@ -18403,6 +18408,7 @@ impl KtstrVm {
                 single_step_pending,
                 single_step_slot,
                 &mut armed_single_step,
+                foreign_debug,
             );
 
             match bsp.run() {
@@ -18438,6 +18444,7 @@ impl KtstrVm {
                             &armed_slots,
                             &mut single_step_pending,
                             &mut single_step_slot,
+                            &mut foreign_debug,
                         );
                         if kill.load(Ordering::Acquire) {
                             break;

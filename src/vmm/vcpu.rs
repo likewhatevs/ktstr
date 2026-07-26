@@ -1171,6 +1171,7 @@ pub(crate) const WATCHPOINT_MAX_NON_EINTR_FAILURES: u8 = 3;
 /// rebuilds the full debugreg + DR7 (x86_64) or `dbg_wcr/dbg_wvr`
 /// arrays (aarch64) and re-issues the ioctl.
 #[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn self_arm_watchpoint(
     vcpu: &kvm_ioctls::VcpuFd,
     watchpoint: &WatchpointArm,
@@ -1179,6 +1180,7 @@ pub(crate) fn self_arm_watchpoint(
     single_step_pending: bool,
     single_step_slot: usize,
     armed_single_step: &mut bool,
+    foreign_debug: bool,
 ) -> bool {
     // Single-step bookkeeping is aarch64-only (the ARM watchpoint trap
     // fires BEFORE the store retires, so re-entering KVM_RUN replays
@@ -1187,10 +1189,17 @@ pub(crate) fn self_arm_watchpoint(
     // store (Intel SDM Vol. 3B 17.2.4) and re-entry advances normally,
     // so these inputs are unused; consume them here to keep the
     // signature shared with the aarch64 sibling.
+    //
+    // `foreign_debug` is aarch64-only for the same reason its producer
+    // is: `vmx_update_exception_bitmap` intercepts BP_VECTOR only under
+    // `KVM_GUESTDBG_USE_SW_BP`, and we arm with
+    // `KVM_GUESTDBG_USE_HW_BP`, so the guest's own `int3` never
+    // reaches userspace and no foreign debug exit can arrive.
     let _ = (
         single_step_pending,
         single_step_slot,
         &mut *armed_single_step,
+        foreign_debug,
     );
     // Fast-path gate: short-circuit when no publisher has flipped
     // `any_armed`. The freeze coordinator's err_exit publish and
@@ -1293,6 +1302,76 @@ pub(crate) fn self_arm_watchpoint(
     }
 }
 
+/// Release guest debug on this vCPU by issuing
+/// `KVM_SET_GUEST_DEBUG` with control 0. The kernel's
+/// `kvm_arch_vcpu_ioctl_set_guest_debug` treats a control word
+/// without `KVM_GUESTDBG_ENABLE` as "clear everything" — it zeroes
+/// `vcpu->guest_debug` and drops the pending-single-step flag — so
+/// the next entry runs with MDCR_EL2.TDE clear and guest debug
+/// exceptions go to the guest's own EL1 vector again.
+///
+/// Idempotent: returns immediately once `armed_slots` /
+/// `armed_single_step` show nothing is armed, so the caller can
+/// invoke it on every loop iteration. Error handling mirrors the
+/// arm path — EINTR retries on the next iteration, other errors
+/// count toward `WATCHPOINT_MAX_NON_EINTR_FAILURES` and then stamp
+/// the mirrors to stop an unbounded ioctl storm in the run loop.
+#[cfg(target_arch = "aarch64")]
+fn disarm_guest_debug(
+    vcpu: &kvm_ioctls::VcpuFd,
+    armed_slots: &mut [u64; 4],
+    failures: &mut u8,
+    armed_single_step: &mut bool,
+) -> bool {
+    if *armed_slots == [0u64; 4] && !*armed_single_step {
+        return false;
+    }
+    let debug_struct = kvm_bindings::kvm_guest_debug {
+        control: 0,
+        pad: 0,
+        arch: kvm_bindings::kvm_guest_debug_arch::default(),
+    };
+    match vcpu.set_guest_debug(&debug_struct) {
+        Ok(()) => {
+            *armed_slots = [0u64; 4];
+            *armed_single_step = false;
+            *failures = 0;
+            tracing::warn!(
+                "disarmed guest debug after a guest-owned debug exception; \
+                 this vCPU's hardware watchpoints are gone for the run — \
+                 failure-dump trigger falls back to the BPF .bss poll"
+            );
+            true
+        }
+        Err(e) => {
+            if e.errno() == libc::EINTR {
+                tracing::debug!(
+                    err = %e,
+                    "disarm_guest_debug: EINTR — will retry next iteration"
+                );
+                return false;
+            }
+            *failures = failures.saturating_add(1);
+            tracing::error!(
+                err = %e,
+                failures = *failures,
+                "disarm_guest_debug: KVM_SET_GUEST_DEBUG failed; the guest \
+                 cannot take its own debug exceptions while we hold \
+                 MDCR_EL2.TDE"
+            );
+            if *failures >= WATCHPOINT_MAX_NON_EINTR_FAILURES {
+                // Stamp the mirrors so the run loop stops re-issuing a
+                // doomed ioctl on every KVM_RUN. The vCPU stays wedged,
+                // but the watchdog surfaces that; a hot ioctl loop would
+                // only bury the evidence.
+                *armed_slots = [0u64; 4];
+                *armed_single_step = false;
+            }
+            false
+        }
+    }
+}
+
 /// aarch64 implementation. Arms ALL requested slots
 /// (`watchpoint.request_kva` for slot 0, `watchpoint.user[i]
 /// .request_kva` for slot 1..=3) by populating the
@@ -1351,15 +1430,15 @@ pub(crate) fn self_arm_watchpoint(
 ///   - On hitting `WATCHPOINT_MAX_NON_EINTR_FAILURES`, the
 ///     slot stamps to suppress further retries.
 ///
-/// There is no disarm path: once a publisher flips
-/// `any_armed`, every subsequent `set_guest_debug` carries
-/// `KVM_GUESTDBG_USE_HW` with at least one armed slot for the
-/// run lifetime. `request_kva` is not reset while vCPU
-/// threads are running (only after join at teardown), so
-/// the per-slot loop
-/// always emits at least one populated `dbg_wcr`/`dbg_wvr`
-/// pair.
+/// The only disarm path is `foreign_debug` (below). Absent
+/// that, once a publisher flips `any_armed` every subsequent
+/// `set_guest_debug` carries `KVM_GUESTDBG_USE_HW` with at
+/// least one armed slot for the run lifetime: `request_kva`
+/// is not reset while vCPU threads are running (only after
+/// join at teardown), so the per-slot loop always emits at
+/// least one populated `dbg_wcr`/`dbg_wvr` pair.
 #[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn self_arm_watchpoint(
     vcpu: &kvm_ioctls::VcpuFd,
     watchpoint: &WatchpointArm,
@@ -1368,7 +1447,41 @@ pub(crate) fn self_arm_watchpoint(
     single_step_pending: bool,
     single_step_slot: usize,
     armed_single_step: &mut bool,
+    foreign_debug: bool,
 ) -> bool {
+    // Sticky disarm. `dispatch_watchpoint_hit` sets `foreign_debug`
+    // when a KVM_EXIT_DEBUG cannot be attributed to one of our own
+    // slots — in practice a guest kprobe's `brk`, which ktstr plants
+    // as core functionality.
+    //
+    // Why the arm is what breaks the guest: on arm64 ANY non-zero
+    // `vcpu->guest_debug` makes KVM set MDCR_EL2.TDE
+    // (`arch/arm64/kvm/debug.c::kvm_arm_setup_mdcr_el2`), routing
+    // every guest debug exception to EL2. `arch/arm64/kvm/
+    // handle_exit.c` maps `ESR_ELx_EC_BRK64` to
+    // `kvm_handle_guest_debug`, which reflects the exception back
+    // into the guest ONLY when `!vcpu->guest_debug`; otherwise it
+    // returns KVM_EXIT_DEBUG to userspace. So while we hold guest
+    // debug, the guest's own BRK never reaches its EL1 debug vector,
+    // the PC never advances, and the vCPU re-executes the BRK on
+    // every KVM_RUN. x86_64 has no equivalent: KVM intercepts a
+    // guest #BP only under `KVM_GUESTDBG_USE_SW_BP`.
+    //
+    // Handing debug back is therefore the only recovery. Control 0
+    // (no `KVM_GUESTDBG_ENABLE`) makes
+    // `kvm_arch_vcpu_ioctl_set_guest_debug` zero `vcpu->guest_debug`
+    // outright, clearing TDE on the next entry so the re-executed
+    // BRK traps to the guest.
+    //
+    // Sticky because the alternative re-wedges instantly: the slot
+    // KVAs stay published for the run lifetime, so any later
+    // iteration would re-arm and swallow the next kprobe. The
+    // failure-dump trigger falls back to the BPF `.bss` poll, which
+    // is the documented degraded path. Peer vCPUs keep their arms —
+    // this is per-vCPU degradation, not a global kill switch.
+    if foreign_debug {
+        return disarm_guest_debug(vcpu, armed_slots, failures, armed_single_step);
+    }
     // Fast-path gate: short-circuit when no publisher has flipped
     // `any_armed`. The freeze coordinator's err_exit publish and
     // `arm_user_watchpoint` set the gate (via
