@@ -1734,6 +1734,65 @@ fn zero_width_permit_request_names_no_permits() {
     );
 }
 
+/// A claim-fenced attempt selects no CPUs, and permit selection is skipped
+/// for that zero-width plan. Both acquisition arms already refuse an empty
+/// selection, so the skip changes no outcome — its only observable effect is
+/// the registry snapshot the permit watch would otherwise take. Pin that:
+/// `discover_registered_placement_states` takes the single aggregate snapshot
+/// a fenced no-wait attempt is allowed, so the delta is exactly 1 (2 without
+/// the short-circuit). Uses `acquire_llc_plan_interruptible` because it is
+/// the entry point supplying `PermitAdmission::Cooperative`;
+/// `acquire_llc_plan_with_acquire_fn` hardcodes `PermitAdmission::None` and
+/// takes a different arm that never selected permits.
+#[test]
+fn claim_fenced_plan_takes_only_the_discover_registry_snapshot() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0]);
+    let topo = synth_host_topo(&[(vec![0], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    let claim =
+        admission_protocol::ClaimSet::new([0usize], std::iter::empty(), FlockMode::Exclusive);
+    let watch = admission_protocol::ClaimSet::with_modes(
+        [0usize],
+        [0usize],
+        FlockMode::Exclusive,
+        FlockMode::Shared,
+    );
+    let coordinator =
+        match admission_protocol::register_ticket_or_acquire(claim, watch, None, |_| {
+            Ok::<Option<()>, anyhow::Error>(None)
+        })
+        .expect("register exclusive LLC claim")
+        {
+            admission_protocol::TicketWork::Coordinator(coordinator) => coordinator,
+            admission_protocol::TicketWork::Acquired(_) => {
+                panic!("fresh registry must elect a coordinator")
+            }
+        };
+    let registry_reads_before =
+        crate::vmm::host_topology::protocol::aggregate_snapshot_read_count_for_tests();
+    let error = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        Some(CpuCap::new(1).expect("cap=1 valid")),
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("a covering registered claim must fail fast");
+    assert!(error.downcast_ref::<ResourceContention>().is_some());
+    assert_eq!(
+        crate::vmm::host_topology::protocol::aggregate_snapshot_read_count_for_tests()
+            - registry_reads_before,
+        1,
+        "a claim-fenced attempt must read the aggregate exactly once (DISCOVER); \
+         selecting permits for a plan that funds no CPUs costs a second read",
+    );
+    drop(coordinator);
+}
+
 #[test]
 fn preparation_private_working_set_uses_two_chunks_and_preserves_conversion_headroom() {
     assert_eq!(MEMORY_PERMIT_CHUNK_MIB, 256);
