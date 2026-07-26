@@ -805,20 +805,10 @@ pub struct GuestMemProgAccessorOwned {
 }
 
 impl GuestMemProgAccessorOwned {
-    pub fn finish(
-        kernel: super::guest::GuestKernel,
-        elf: &goblin::elf::Elf<'_>,
-        data: &[u8],
-        vmlinux: &std::path::Path,
-    ) -> anyhow::Result<Self> {
-        let offsets = BpfProgOffsets::from_elf(elf, data, vmlinux)?;
-        Self::finish_with_offsets(kernel, offsets)
-    }
-
     /// Complete an owned program accessor with BTF offsets derived before
-    /// live-VM helper startup. Keeps offset semantics identical to `finish`
-    /// while removing BTF parsing and sidecar I/O from teardown-sensitive
-    /// worker lifetimes.
+    /// live-VM helper startup. Keeping BTF parsing and sidecar I/O out of
+    /// teardown-sensitive worker lifetimes is why the caller supplies the
+    /// offsets rather than an ELF.
     pub(crate) fn finish_with_offsets(
         kernel: super::guest::GuestKernel,
         offsets: BpfProgOffsets,
@@ -835,7 +825,7 @@ impl GuestMemProgAccessorOwned {
 
     /// Borrow as a [`GuestMemProgAccessor`] for program operations.
     ///
-    /// Infallible — `finish` already resolved `prog_idr_kva` and the
+    /// Infallible — `finish_with_offsets` already resolved `prog_idr_kva` and the
     /// borrow returns the cached KVA directly. Mirrors
     /// [`super::bpf_map::GuestMemMapAccessorOwned::as_accessor`].
     pub fn as_accessor(&self) -> GuestMemProgAccessor<'_> {

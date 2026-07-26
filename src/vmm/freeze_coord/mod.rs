@@ -98,11 +98,7 @@ mod early_snapshot_guard_tests;
 
 use self::attach_watchdog::{AttachAttemptTracker, AttachWatchdogDecision};
 use self::dispatch::{BulkDispatchSinks, dispatch_bulk_message};
-#[allow(unused_imports)]
-use self::lazy_init::{
-    try_init_owned_accessor_with_hint, try_init_owned_prog_accessor_with_hint,
-    try_init_prog_per_cpu_offsets,
-};
+use self::lazy_init::try_init_prog_per_cpu_offsets;
 #[allow(unused_imports)]
 use self::snapshot::{
     VmlinuxSymbolCache, arm_user_watchpoint, decode_snapshot_request, frame_kernel_op_reply,
@@ -1579,11 +1575,11 @@ pub(super) const SNAPSHOT_SUMMARY_PREFIX: &str = "freeze-coord: STDERR-PRESERVED
 /// Degraded) so the 7 sites share one atomic-publish + stderr
 /// fallback contract.
 ///
-/// Atomic-publish mirrors the [`KtstrVm`]-scope emit_json /
-/// emit_degraded_json cascade in steps 1-4 but DIVERGES from them on
-/// step-4 (parent-fsync) failure handling: this tagged-sibling helper
-/// rolls back the rename and returns `Err`, whereas the canonical-path
-/// closures log the durability gap and return `Ok` per user direction
+/// Atomic-publish mirrors [`publish_canonical_dump`] in steps 1-4 but
+/// DIVERGES from it on step-4 (parent-fsync) failure handling: this
+/// tagged-sibling helper rolls back the rename and returns `Err`,
+/// whereas the canonical-path publisher logs the durability gap and
+/// returns `Ok` per user direction
 /// ("operator-has-the-data" discipline on the operator-facing main
 /// dump). The split is intentional and documented at both call sites
 /// (search "operator-has-the-data discipline" in this file).
@@ -1757,6 +1753,74 @@ pub(super) fn write_to_tagged_path(
             Err(e)
         }
     }
+}
+
+/// Atomic-publish for the CANONICAL failure-dump path.
+///
+/// Atomic-publish pattern: write to a sibling `.tmp` file, fsync the file,
+/// then rename into place, then fsync the parent directory. Guarantees a
+/// reader of `p` either sees the previous file (if any) or the complete new
+/// dump — never a truncated / mid-write JSON file. The fsync on the tmp file
+/// holds the bytes against a host crash between rename() and writeback; the
+/// parent-dir fsync (CF3) holds the directory-entry update against a host
+/// crash post-rename so the operator post-reboot sees the new file at `p`
+/// rather than an empty parent. POSIX rename(2) atomicity covers ordering
+/// visible to other processes, NOT durability — directory-entry durability
+/// requires fsync on the parent dir, matching what database engines (SQLite,
+/// RocksDB) do for journal commits.
+///
+/// If the parent fsync fails (ENOSPC / EROFS / EIO), do NOT roll back the
+/// rename — per user direction, the operator-facing dump on disk is more
+/// valuable than bridge/FS contract symmetry. The file IS visible (rename
+/// succeeded); only the directory-entry durability across a host crash is in
+/// doubt. Log the durability gap and continue — operators inspecting the dump
+/// dir post-test see the file, with a warn flagging the missed fsync. The
+/// tagged-sibling helper [`write_to_tagged_path`] takes the opposite stance
+/// (it rolls back) because per-trigger sibling dumps don't have the same
+/// operator-signal preservation concern.
+///
+/// On write failure the leftover tmp file is removed best-effort so a future
+/// operator doesn't see a stale `.json.tmp` alongside the previous dump.
+///
+/// `kind` is the operator-facing label ("failure-dump" / "degraded-dump")
+/// interpolated into the two warn messages, same convention as
+/// [`write_to_tagged_path`]'s `warn_msg` param.
+pub(super) fn publish_canonical_dump(
+    p: &std::path::Path,
+    json: &str,
+    kind: &'static str,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = p.with_extension("json.tmp");
+    let write_atomic = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp_path, p)?;
+        if let Some(dir) = p.parent()
+            && let Err(parent_fsync_err) = std::fs::File::open(dir).and_then(|d| d.sync_all())
+        {
+            tracing::warn!(
+                path = %p.display(),
+                parent_fsync_error = %parent_fsync_err,
+                "freeze-coord: {kind} parent-dir fsync failed after rename; file IS visible on disk but directory-entry durability across a host crash is not guaranteed — operator-facing dump preserved per operator-has-the-data discipline"
+            );
+        }
+        Ok(())
+    };
+    write_atomic().inspect_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        tracing::warn!(
+            path = %p.display(),
+            tmp_path = %tmp_path.display(),
+            error = %e,
+            "freeze-coord: {kind} atomic write failed; stderr fallback below"
+        );
+    })
 }
 
 /// Outcome of one freeze-and-capture cycle. Replaces the prior
@@ -2131,19 +2195,7 @@ fn read_cpu_clock_ns(clock_id: libc::clockid_t) -> Option<u64> {
 }
 
 fn ap_teardown_service_clock(vt: &VcpuThread) -> Option<ApTeardownServiceClock> {
-    let mut clock_id: libc::clockid_t = 0;
-    // SAFETY: the JoinHandle owns a still-unjoined pthread, so its pthread_t
-    // remains valid for pthread_getcpuclockid throughout teardown.
-    let ret = unsafe {
-        libc::pthread_getcpuclockid(vt.handle.as_pthread_t() as libc::pthread_t, &mut clock_id)
-    };
-    if ret != 0 {
-        return None;
-    }
-    Some(ApTeardownServiceClock {
-        clock_id,
-        anchor_ns: read_cpu_clock_ns(clock_id)?,
-    })
+    vm_worker_service_clock(&vt.handle)
 }
 
 fn ap_teardown_service_exhausted(
@@ -2188,11 +2240,24 @@ fn wake_ap_for_teardown(vt: &VcpuThread) {
 /// formatting the diagnostic could itself recreate the teardown hang.
 #[cold]
 fn fail_closed_ap_teardown(cause: ApTeardownFailCause) -> ! {
+    let diagnostic = match cause {
+        ApTeardownFailCause::ServiceBudget => AP_TEARDOWN_SERVICE_FAIL_DIAGNOSTIC,
+        ApTeardownFailCause::WallBackstop => AP_TEARDOWN_WALL_FAIL_DIAGNOSTIC,
+    };
+    fail_closed_exit(diagnostic, AP_TEARDOWN_FAIL_CLOSED_EXIT_CODE)
+}
+
+/// Terminate the process without running destructors after a bounded teardown
+/// proof fails. Callers pass a static diagnostic because a wedged worker may
+/// own the allocator, the tracing subscriber, or stderr's Rust lock, so
+/// formatting here could recreate the very hang being escaped.
+#[cold]
+fn fail_closed_exit(diagnostic: &'static [u8], exit_code: i32) -> ! {
     // SAFETY: these libc calls are async-signal-safe. Best-effort O_NONBLOCK
     // prevents a full captured-stderr pipe from turning the diagnostic itself
     // into another teardown wait. `write` receives a valid static byte slice,
     // and libc `_exit` terminates the whole process on Linux without running
-    // destructors which could touch the live AP's guest-memory references.
+    // destructors which could touch live guest-memory references.
     unsafe {
         let stderr_flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
         if stderr_flags >= 0 {
@@ -2202,16 +2267,12 @@ fn fail_closed_ap_teardown(cause: ApTeardownFailCause) -> ! {
                 stderr_flags | libc::O_NONBLOCK,
             );
         }
-        let diagnostic = match cause {
-            ApTeardownFailCause::ServiceBudget => AP_TEARDOWN_SERVICE_FAIL_DIAGNOSTIC,
-            ApTeardownFailCause::WallBackstop => AP_TEARDOWN_WALL_FAIL_DIAGNOSTIC,
-        };
         let _ = libc::write(
             libc::STDERR_FILENO,
             diagnostic.as_ptr().cast(),
             diagnostic.len(),
         );
-        libc::_exit(AP_TEARDOWN_FAIL_CLOSED_EXIT_CODE);
+        libc::_exit(exit_code);
     }
 }
 
@@ -3334,23 +3395,7 @@ mod ap_boot_gate_tests {
     }
 }
 
-/// Delivered pthread CPU service an accessor-init worker may consume after
-/// coordinator shutdown is published. The worker checks `kill` around every
-/// retry and performs no intentionally long operation after that edge; two
-/// seconds is generous while remaining independent of host descheduling.
-const ACCESSOR_INIT_TEARDOWN_SERVICE_BUDGET_NS: u64 = 2_000_000_000;
 const ACCESSOR_INIT_TEARDOWN_WALL_BACKSTOP: Duration = FREEZE_RENDEZVOUS_TIMEOUT;
-const ACCESSOR_INIT_TEARDOWN_FAIL_CLOSED_EXIT_CODE: i32 = 77;
-const ACCESSOR_INIT_TEARDOWN_SERVICE_DIAGNOSTIC: &[u8] =
-    b"ktstr fatal: accessor-init teardown delivered-service budget exhausted; terminating the test process to preserve guest-memory lifetime\n";
-const ACCESSOR_INIT_TEARDOWN_WALL_DIAGNOSTIC: &[u8] =
-    b"ktstr fatal: accessor-init teardown wall backstop exhausted; terminating the test process to preserve guest-memory lifetime\n";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AccessorInitTeardownFailCause {
-    ServiceBudget,
-    WallBackstop,
-}
 
 /// Own the coordinator's nested accessor-init worker across every exit path.
 ///
@@ -3375,50 +3420,26 @@ impl AccessorInitThreadGuard {
     }
 
     fn shutdown(&mut self) {
+        // The wait core skips its wake entirely once the worker has finished,
+        // so publish the VM-wide stop edge here regardless: other consumers
+        // (`freeze_coord_kill`) depend on it being set by this point.
         trigger_freeze_coord_kill(&self.kill, &self.kill_evt);
         let Some(handle) = self.handle.as_ref() else {
             return;
         };
-
-        let mut clock_id: libc::clockid_t = 0;
-        // SAFETY: the guard owns this still-unjoined pthread for the whole
-        // wait. A failed clock lookup simply leaves the wall backstop as the
-        // sole fail-safe.
-        let service_clock = if unsafe {
-            libc::pthread_getcpuclockid(handle.as_pthread_t() as libc::pthread_t, &mut clock_id)
-        } == 0
-        {
-            read_cpu_clock_ns(clock_id).map(|anchor_ns| ApTeardownServiceClock {
-                clock_id,
-                anchor_ns,
-            })
-        } else {
-            None
+        let wake = VmWorkerWake {
+            kill: Some((self.kill.as_ref(), self.kill_evt.as_ref())),
+            bsp_done: None,
         };
-        let wall_deadline = Instant::now() + ACCESSOR_INIT_TEARDOWN_WALL_BACKSTOP;
-
-        while !handle.is_finished() {
-            if service_clock.is_some_and(|clock| {
-                read_cpu_clock_ns(clock.clock_id).is_some_and(|now_ns| {
-                    now_ns.saturating_sub(clock.anchor_ns)
-                        > ACCESSOR_INIT_TEARDOWN_SERVICE_BUDGET_NS
-                })
-            }) {
-                fail_closed_accessor_init_teardown(AccessorInitTeardownFailCause::ServiceBudget);
-            }
-            if Instant::now() >= wall_deadline {
-                fail_closed_accessor_init_teardown(AccessorInitTeardownFailCause::WallBackstop);
-            }
-
-            // Re-publish both halves in case another eventfd consumer drained
-            // the prior counter, and wake a worker currently parked outside
-            // poll. Its 100/200 ms bounded polls remain the independent
-            // lost-edge backstop.
-            trigger_freeze_coord_kill(&self.kill, &self.kill_evt);
-            handle.thread().unpark();
-            std::thread::park_timeout(Duration::from_millis(10));
+        if let Err(cause) = wait_vm_worker_shutdown(
+            handle,
+            &wake,
+            Instant::now() + ACCESSOR_INIT_TEARDOWN_WALL_BACKSTOP,
+            VM_WORKER_TEARDOWN_SERVICE_BUDGET_NS,
+            VM_WORKER_TEARDOWN_POLL,
+        ) {
+            fail_closed_vm_worker_teardown(VmWorkerFamily::AccessorInit, cause);
         }
-
         let handle = self
             .handle
             .take()
@@ -3444,9 +3465,12 @@ const VM_WORKER_TEARDOWN_SERVICE_BUDGET_NS: u64 = 2_000_000_000;
 // One event-loop quantum beyond the longest intentional 30-second coordinator
 // grace lets that grace publish its terminal edge instead of racing the owner
 // to the exact same deadline. This remains one run-wide deadline shared by all
-// four joins, never four serial per-worker allowances.
+// four `RunVmThreadGuard` joins, never four serial per-worker allowances.
+// `VmWorkerFamily::AccessorInit` is not one of those joins: it is bounded by
+// the coordinator's own per-call `ACCESSOR_INIT_TEARDOWN_WALL_BACKSTOP`.
 const VM_WORKER_TEARDOWN_WALL_BACKSTOP: Duration = Duration::from_secs(31);
 const VM_WORKER_TEARDOWN_FAIL_CLOSED_EXIT_CODE: i32 = 78;
+const ACCESSOR_INIT_TEARDOWN_FAIL_CLOSED_EXIT_CODE: i32 = 77;
 const VM_WORKER_TEARDOWN_POLL: Duration = Duration::from_millis(10);
 const DEFERRED_DRAIN_GRACE: Duration = Duration::from_secs(30);
 const DEFERRED_DRAIN_IDLE_GRACE: Duration = Duration::from_secs(1);
@@ -3486,6 +3510,13 @@ enum VmWorkerFamily {
     FreezeCoordinator,
     Monitor,
     BpfMapWriter,
+    /// The coordinator's nested accessor-init worker. It checks `kill` around
+    /// every retry and performs no intentionally long operation after that
+    /// edge, so the shared 2 s delivered-service budget is generous while
+    /// remaining independent of host descheduling. Unlike the four
+    /// `RunVmThreadGuard` joins it is bounded by the coordinator's own
+    /// per-call wall backstop, not the run-wide one.
+    AccessorInit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3603,6 +3634,10 @@ fn fail_closed_vm_worker_teardown(family: VmWorkerFamily, cause: VmWorkerTeardow
         b"ktstr fatal: BPF-map-writer teardown delivered-service budget exhausted; terminating to preserve guest-memory ownership\n";
     const BPF_WALL: &[u8] =
         b"ktstr fatal: BPF-map-writer teardown wall backstop exhausted; terminating to preserve guest-memory ownership\n";
+    const ACCESSOR_SERVICE: &[u8] =
+        b"ktstr fatal: accessor-init teardown delivered-service budget exhausted; terminating the test process to preserve guest-memory lifetime\n";
+    const ACCESSOR_WALL: &[u8] =
+        b"ktstr fatal: accessor-init teardown wall backstop exhausted; terminating the test process to preserve guest-memory lifetime\n";
     let diagnostic = match (family, cause) {
         (VmWorkerFamily::Watchdog, VmWorkerTeardownFailCause::ServiceBudget) => WD_SERVICE,
         (VmWorkerFamily::Watchdog, VmWorkerTeardownFailCause::WallBackstop) => WD_WALL,
@@ -3614,24 +3649,20 @@ fn fail_closed_vm_worker_teardown(family: VmWorkerFamily, cause: VmWorkerTeardow
         (VmWorkerFamily::Monitor, VmWorkerTeardownFailCause::WallBackstop) => MONITOR_WALL,
         (VmWorkerFamily::BpfMapWriter, VmWorkerTeardownFailCause::ServiceBudget) => BPF_SERVICE,
         (VmWorkerFamily::BpfMapWriter, VmWorkerTeardownFailCause::WallBackstop) => BPF_WALL,
-    };
-    // SAFETY: allocation-free fail-closed boundary. A wedged worker may own
-    // arbitrary Rust locks, so diagnostics use only static bytes and libc.
-    unsafe {
-        let stderr_flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
-        if stderr_flags >= 0 {
-            let _ = libc::fcntl(
-                libc::STDERR_FILENO,
-                libc::F_SETFL,
-                stderr_flags | libc::O_NONBLOCK,
-            );
+        (VmWorkerFamily::AccessorInit, VmWorkerTeardownFailCause::ServiceBudget) => {
+            ACCESSOR_SERVICE
         }
-        let _ = libc::write(
-            libc::STDERR_FILENO,
-            diagnostic.as_ptr().cast(),
-            diagnostic.len(),
-        );
-        libc::_exit(VM_WORKER_TEARDOWN_FAIL_CLOSED_EXIT_CODE);
+        (VmWorkerFamily::AccessorInit, VmWorkerTeardownFailCause::WallBackstop) => ACCESSOR_WALL,
+    };
+    fail_closed_exit(diagnostic, family_exit_code(family))
+}
+
+/// Fail-closed exits stay distinguishable per site (70-78); accessor-init
+/// keeps 77 so existing triage does not have to read stderr.
+fn family_exit_code(family: VmWorkerFamily) -> i32 {
+    match family {
+        VmWorkerFamily::AccessorInit => ACCESSOR_INIT_TEARDOWN_FAIL_CLOSED_EXIT_CODE,
+        _ => VM_WORKER_TEARDOWN_FAIL_CLOSED_EXIT_CODE,
     }
 }
 
@@ -3640,11 +3671,12 @@ mod vm_worker_shutdown_tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    const FAMILIES: [VmWorkerFamily; 4] = [
+    const FAMILIES: [VmWorkerFamily; 5] = [
         VmWorkerFamily::Watchdog,
         VmWorkerFamily::FreezeCoordinator,
         VmWorkerFamily::Monitor,
         VmWorkerFamily::BpfMapWriter,
+        VmWorkerFamily::AccessorInit,
     ];
 
     fn evt() -> Arc<EventFd> {
@@ -3832,36 +3864,6 @@ mod vm_worker_shutdown_tests {
             continuously_advancing.expired(start + DEFERRED_DRAIN_GRACE),
             "progress cannot extend the run-wide absolute ceiling"
         );
-    }
-}
-
-#[cold]
-fn fail_closed_accessor_init_teardown(cause: AccessorInitTeardownFailCause) -> ! {
-    // SAFETY: same fail-closed contract as AP teardown. A wedged worker may
-    // own allocator or logging locks, so use only static bytes and
-    // async-signal-safe libc calls, make stderr nonblocking best-effort, and
-    // terminate without running destructors.
-    unsafe {
-        let stderr_flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
-        if stderr_flags >= 0 {
-            let _ = libc::fcntl(
-                libc::STDERR_FILENO,
-                libc::F_SETFL,
-                stderr_flags | libc::O_NONBLOCK,
-            );
-        }
-        let diagnostic = match cause {
-            AccessorInitTeardownFailCause::ServiceBudget => {
-                ACCESSOR_INIT_TEARDOWN_SERVICE_DIAGNOSTIC
-            }
-            AccessorInitTeardownFailCause::WallBackstop => ACCESSOR_INIT_TEARDOWN_WALL_DIAGNOSTIC,
-        };
-        let _ = libc::write(
-            libc::STDERR_FILENO,
-            diagnostic.as_ptr().cast(),
-            diagnostic.len(),
-        );
-        libc::_exit(ACCESSOR_INIT_TEARDOWN_FAIL_CLOSED_EXIT_CODE);
     }
 }
 
@@ -6971,9 +6973,10 @@ impl KtstrVm {
                 };
                 // Spawn the accessor-init worker before entering the
                 // coordinator's epoll loop. The worker:
-                //   1. Loops `try_init_owned_accessor` +
-                //      `try_init_owned_prog_accessor` against the
-                //      shared `Arc<GuestMem>` until both succeed.
+                //   1. Loops `GuestMemMapAccessorOwned::from_elf_with_hint`
+                //      + `GuestMemProgAccessorOwned::finish_with_offsets`
+                //      against the shared `Arc<GuestMem>` until both
+                //      succeed.
                 //   2. On success: stores `phys_base + 1` (biased) in
                 //      `kern_phys_base` via `compare_exchange(0, ..)`
                 //      so the monitor thread observes the value
@@ -7658,8 +7661,8 @@ impl KtstrVm {
                 let mut scan_ctx_warned: bool = false;
                 const SCAN_CTX_WARN_AFTER_ITERS: u32 = 12;
                 // The accessor-init worker spawned above owns the
-                // retry/warn discipline for its two `try_init_*`
-                // helpers; the coordinator no longer tracks
+                // retry/warn discipline for its two accessor
+                // constructions; the coordinator no longer tracks
                 // `accessor_retries` / `accessor_warned` /
                 // `accessor_last_err` fields here. The constant below
                 // is reused by the `prog_per_cpu_offsets` /
@@ -11766,82 +11769,10 @@ impl KtstrVm {
                         let mut write_failed = false;
                         let path_str: Option<String> =
                             freeze_coord_dump_path.as_ref().and_then(|p| {
-                                if let Some(parent) = p.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                // Atomic-publish pattern: write to a sibling
-                                // .tmp file, fsync the file, then rename into
-                                // place, then fsync the parent directory.
-                                // Guarantees a reader of `p` either sees the
-                                // previous file (if any) or the complete new
-                                // dump — never a truncated / mid-write JSON
-                                // file. The fsync on the tmp file holds the
-                                // bytes against a host crash between rename()
-                                // and writeback; the parent-dir fsync (CF3)
-                                // holds the directory-entry update against a
-                                // host crash post-rename so the operator
-                                // post-reboot sees the new file at `p`
-                                // rather than an empty parent. POSIX rename(2)
-                                // atomicity covers ordering visible to other
-                                // processes, NOT durability — directory-entry
-                                // durability requires fsync on the parent dir,
-                                // matching what database engines (SQLite,
-                                // RocksDB) do for journal commits.
-                                let tmp_path = p.with_extension("json.tmp");
-                                let write_atomic = || -> std::io::Result<()> {
-                                    use std::io::Write as _;
-                                    let mut f =
-                                        std::fs::File::create(&tmp_path)?;
-                                    f.write_all(json.as_bytes())?;
-                                    f.sync_all()?;
-                                    drop(f);
-                                    std::fs::rename(&tmp_path, p)?;
-                                    // Canonical-path parent-dir fsync (CF3):
-                                    // best-effort durability. If the parent
-                                    // fsync fails (ENOSPC / EROFS / EIO), do
-                                    // NOT roll back the rename — per user
-                                    // direction, the operator-facing
-                                    // failure-dump.json on disk is more
-                                    // valuable than bridge/FS contract
-                                    // symmetry. The file IS visible (rename
-                                    // succeeded); only the directory-entry
-                                    // durability across a host crash is in
-                                    // doubt. Log the durability gap and
-                                    // continue — operators inspecting the
-                                    // dump dir post-test see the file, with
-                                    // a warn flagging the missed fsync. The
-                                    // tagged-sibling helper write_to_tagged_path
-                                    // takes the opposite stance (it rolls
-                                    // back) because per-trigger sibling
-                                    // dumps don't have the same operator-
-                                    // signal preservation concern.
-                                    if let Some(dir) = p.parent()
-                                        && let Err(parent_fsync_err) =
-                                            std::fs::File::open(dir).and_then(|d| d.sync_all())
-                                    {
-                                        tracing::warn!(
-                                            path = %p.display(),
-                                            parent_fsync_error = %parent_fsync_err,
-                                            "freeze-coord: failure-dump parent-dir fsync failed after rename; file IS visible on disk but directory-entry durability across a host crash is not guaranteed — operator-facing dump preserved per operator-has-the-data discipline"
-                                        );
-                                    }
-                                    Ok(())
-                                };
-                                match write_atomic() {
+                                match publish_canonical_dump(p, json, "failure-dump") {
                                     Ok(()) => Some(p.display().to_string()),
-                                    Err(e) => {
+                                    Err(_) => {
                                         write_failed = true;
-                                        // Best-effort cleanup of the leftover
-                                        // tmp file so a future operator
-                                        // doesn't see a stale `.json.tmp`
-                                        // alongside the previous dump.
-                                        let _ = std::fs::remove_file(&tmp_path);
-                                        tracing::warn!(
-                                            path = %p.display(),
-                                            tmp_path = %tmp_path.display(),
-                                            error = %e,
-                                            "freeze-coord: failure-dump atomic write failed; stderr fallback below"
-                                        );
                                         None
                                     }
                                 }
@@ -11932,57 +11863,10 @@ impl KtstrVm {
                         let mut write_failed = false;
                         let path_str: Option<String> =
                             freeze_coord_dump_path.as_ref().and_then(|p| {
-                                if let Some(parent) = p.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                let tmp_path = p.with_extension("json.tmp");
-                                let write_atomic = || -> std::io::Result<()> {
-                                    use std::io::Write as _;
-                                    let mut f =
-                                        std::fs::File::create(&tmp_path)?;
-                                    f.write_all(json.as_bytes())?;
-                                    f.sync_all()?;
-                                    drop(f);
-                                    std::fs::rename(&tmp_path, p)?;
-                                    // Canonical-path parent-dir fsync (CF3):
-                                    // best-effort durability — symmetric with
-                                    // emit_json above. On parent-fsync failure
-                                    // after a successful rename, do NOT roll
-                                    // back the renamed file: the operator-
-                                    // facing degraded dump on disk is more
-                                    // valuable than bridge/FS contract
-                                    // symmetry. Log the durability gap and
-                                    // continue; operators reading the dump
-                                    // dir post-test see the file with a warn
-                                    // flagging the missed fsync. The tagged-
-                                    // sibling helper write_to_tagged_path
-                                    // takes the opposite stance (rollback)
-                                    // because per-trigger siblings don't
-                                    // carry the same operator-signal
-                                    // preservation concern.
-                                    if let Some(dir) = p.parent()
-                                        && let Err(parent_fsync_err) =
-                                            std::fs::File::open(dir).and_then(|d| d.sync_all())
-                                    {
-                                        tracing::warn!(
-                                            path = %p.display(),
-                                            parent_fsync_error = %parent_fsync_err,
-                                            "freeze-coord: degraded-dump parent-dir fsync failed after rename; file IS visible on disk but directory-entry durability across a host crash is not guaranteed — operator-facing dump preserved per operator-has-the-data discipline"
-                                        );
-                                    }
-                                    Ok(())
-                                };
-                                match write_atomic() {
+                                match publish_canonical_dump(p, json, "degraded-dump") {
                                     Ok(()) => Some(p.display().to_string()),
-                                    Err(e) => {
+                                    Err(_) => {
                                         write_failed = true;
-                                        let _ = std::fs::remove_file(&tmp_path);
-                                        tracing::warn!(
-                                            path = %p.display(),
-                                            tmp_path = %tmp_path.display(),
-                                            error = %e,
-                                            "freeze-coord: degraded-dump atomic write failed; stderr fallback below"
-                                        );
                                         None
                                     }
                                 }
@@ -14953,7 +14837,7 @@ impl KtstrVm {
                 // (`freeze_coord_handle.join()` in run_vm), so any
                 // worker still running past this join would dereference
                 // freed memory through stale `Arc<GuestMem>` on its
-                // next `try_init_*` retry.
+                // next accessor-init retry.
                 trigger_freeze_coord_kill(&freeze_coord_kill, &freeze_coord_kill_evt);
                 if let Some(mut worker_guard) = accessor_init_guard.take() {
                     let jt = std::time::Instant::now();
@@ -15168,107 +15052,86 @@ impl KtstrVm {
                     let _ = attach_tick.snapshot;
                     let monitor_live = attach_tick.monitor_live;
                     let attach_step = attach_tick.attach;
-                    match attach_step.decision {
-                        AttachWatchdogDecision::RequestCancel {
-                            generation,
-                            kind,
-                            cause,
-                            service_ns,
-                            trigger_elapsed_ns,
-                            trigger_budget_ns,
-                        } => {
-                            eprintln!(
-                                "ktstr-watchdog: scheduler attach cancellation requested: \
-                                 generation={generation}, kind={kind:?}, cause={cause:?}, \
-                                 max_vcpu_service={:?}, trigger_elapsed={:?}, \
-                                 trigger_budget={:?}",
-                                Duration::from_nanos(service_ns),
-                                Duration::from_nanos(trigger_elapsed_ns),
-                                Duration::from_nanos(trigger_budget_ns),
-                            );
-                        }
-                        AttachWatchdogDecision::None
-                        | AttachWatchdogDecision::FailClosed { .. }
-                        | AttachWatchdogDecision::FinishUnsettled { .. }
-                        | AttachWatchdogDecision::SensorTerminal { .. } => {}
-                    }
-                    let attach_failure = match attach_step.decision {
-                        AttachWatchdogDecision::FailClosed {
-                            generation,
-                            kind,
-                            cause,
-                            service_after_cancel_ns,
-                            grace_budget_ns,
-                        } => {
-                            eprintln!(
-                                "ktstr-watchdog: scheduler attach cancellation was not \
-                                 acknowledged; failing closed: generation={generation}, \
-                                 kind={kind:?}, cause={cause:?}, \
-                                 max_vcpu_service_since_cancel={:?}, grace_budget={:?}",
-                                Duration::from_nanos(service_after_cancel_ns),
-                                Duration::from_nanos(grace_budget_ns),
-                            );
-                            Some((
+                    let (attach_failure, attach_finish_failure, attach_monitor_failure) =
+                        match attach_step.decision {
+                            AttachWatchdogDecision::RequestCancel {
+                                generation,
+                                kind,
+                                cause,
+                                service_ns,
+                                trigger_elapsed_ns,
+                                trigger_budget_ns,
+                            } => {
+                                eprintln!(
+                                    "ktstr-watchdog: scheduler attach cancellation requested: \
+                                     generation={generation}, kind={kind:?}, cause={cause:?}, \
+                                     max_vcpu_service={:?}, trigger_elapsed={:?}, \
+                                     trigger_budget={:?}",
+                                    Duration::from_nanos(service_ns),
+                                    Duration::from_nanos(trigger_elapsed_ns),
+                                    Duration::from_nanos(trigger_budget_ns),
+                                );
+                                (None, None, None)
+                            }
+                            AttachWatchdogDecision::FailClosed {
                                 generation,
                                 kind,
                                 cause,
                                 service_after_cancel_ns,
                                 grace_budget_ns,
-                            ))
-                        }
-                        AttachWatchdogDecision::None
-                        | AttachWatchdogDecision::RequestCancel { .. }
-                        | AttachWatchdogDecision::FinishUnsettled { .. }
-                        | AttachWatchdogDecision::SensorTerminal { .. } => None,
-                    };
-                    let attach_finish_failure = match attach_step.decision {
-                        AttachWatchdogDecision::FinishUnsettled {
-                            generation,
-                            kind,
-                            service_after_finished_ns,
-                            grace_budget_ns,
-                        } => {
-                            eprintln!(
-                                "ktstr-watchdog: scheduler attach finish rendezvous did not \
-                                 settle; failing closed: generation={generation}, \
-                                 kind={kind:?}, max_vcpu_service_since_finished={:?}, \
-                                 grace_budget={:?}",
-                                Duration::from_nanos(service_after_finished_ns),
-                                Duration::from_nanos(grace_budget_ns),
-                            );
-                            Some((
+                            } => {
+                                eprintln!(
+                                    "ktstr-watchdog: scheduler attach cancellation was not \
+                                     acknowledged; failing closed: generation={generation}, \
+                                     kind={kind:?}, cause={cause:?}, \
+                                     max_vcpu_service_since_cancel={:?}, grace_budget={:?}",
+                                    Duration::from_nanos(service_after_cancel_ns),
+                                    Duration::from_nanos(grace_budget_ns),
+                                );
+                                let failure = (
+                                    generation,
+                                    kind,
+                                    cause,
+                                    service_after_cancel_ns,
+                                    grace_budget_ns,
+                                );
+                                (Some(failure), None, None)
+                            }
+                            AttachWatchdogDecision::FinishUnsettled {
                                 generation,
                                 kind,
                                 service_after_finished_ns,
                                 grace_budget_ns,
-                            ))
-                        }
-                        AttachWatchdogDecision::None
-                        | AttachWatchdogDecision::RequestCancel { .. }
-                        | AttachWatchdogDecision::FailClosed { .. }
-                        | AttachWatchdogDecision::SensorTerminal { .. } => None,
-                    };
+                            } => {
+                                eprintln!(
+                                    "ktstr-watchdog: scheduler attach finish rendezvous did not \
+                                     settle; failing closed: generation={generation}, \
+                                     kind={kind:?}, max_vcpu_service_since_finished={:?}, \
+                                     grace_budget={:?}",
+                                    Duration::from_nanos(service_after_finished_ns),
+                                    Duration::from_nanos(grace_budget_ns),
+                                );
+                                let failure =
+                                    (generation, kind, service_after_finished_ns, grace_budget_ns);
+                                (None, Some(failure), None)
+                            }
+                            AttachWatchdogDecision::SensorTerminal {
+                                generation,
+                                kind,
+                                finishing,
+                            } => {
+                                let attach_phase = if finishing { "finishing" } else { "active" };
+                                eprintln!(
+                                    "ktstr-watchdog: scheduler attach monitor unavailable; \
+                                     failing immediately: generation={generation}, kind={kind:?}, \
+                                     attach_phase={attach_phase}"
+                                );
+                                (None, None, Some((generation, kind, attach_phase)))
+                            }
+                            AttachWatchdogDecision::None => (None, None, None),
+                        };
                     let attach_fail_closed =
                         attach_failure.is_some() || attach_finish_failure.is_some();
-                    let attach_monitor_failure = match attach_step.decision {
-                        AttachWatchdogDecision::SensorTerminal {
-                            generation,
-                            kind,
-                            finishing,
-                        } => {
-                            let attach_phase = if finishing { "finishing" } else { "active" };
-                            eprintln!(
-                                "ktstr-watchdog: scheduler attach monitor unavailable; \
-                                 failing immediately: generation={generation}, kind={kind:?}, \
-                                 attach_phase={attach_phase}"
-                            );
-                            Some((generation, kind, attach_phase))
-                        }
-                        AttachWatchdogDecision::None
-                        | AttachWatchdogDecision::RequestCancel { .. }
-                        | AttachWatchdogDecision::FailClosed { .. }
-                        | AttachWatchdogDecision::FinishUnsettled { .. } => None,
-                    };
                     let attach_monitor_unavailable = attach_monitor_failure.is_some();
                     let readiness_host_samples = readiness_wait_for_wd
                         .active()
@@ -19939,8 +19802,46 @@ mod write_to_tagged_path_tests {
     //! the FS write succeeds — same contract emit_json + the drain
     //! enforce. Coverage here pins the no-sink, success, and
     //! write-failure branches.
-    use super::write_to_tagged_path;
+    use super::{publish_canonical_dump, write_to_tagged_path};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Canonical-path happy path — payload lands at the configured path
+    /// byte-for-byte with no `.json.tmp` residue. The canonical publisher is
+    /// what an operator's `failure_dump_path` actually receives, so its
+    /// atomic-publish contract needs the same pinning the tagged sibling has.
+    #[test]
+    fn canonical_publish_writes_payload_without_tmp_residue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("failure-dump.json");
+        let payload = "{\"schema\":\"single\",\"k\":\"v\"}";
+        publish_canonical_dump(&path, payload, "failure-dump").expect("publish succeeds");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read published dump"),
+            payload
+        );
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "tmp sibling must not linger after rename"
+        );
+    }
+
+    /// Canonical-path write failure — a regular file blocks the parent
+    /// directory, so `File::create` on the tmp returns ENOTDIR. The publisher
+    /// must return `Err` (the caller's `write_failed` gate for the stderr
+    /// fallback) and leave no stale `.json.tmp` behind.
+    #[test]
+    fn canonical_publish_write_failure_returns_err_without_tmp_residue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_in_the_way = dir.path().join("not_a_dir");
+        std::fs::write(&file_in_the_way, b"").expect("create blocker file");
+        let path = file_in_the_way.join("sub").join("failure-dump.json");
+        let result = publish_canonical_dump(&path, "{\"k\":\"v\"}", "failure-dump");
+        assert!(result.is_err(), "expected Err on write failure");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "tmp sibling must be cleaned up after write failure"
+        );
+    }
 
     /// `dump_path: None` — verifier / shell / template iteration.
     /// Helper returns `Ok(None)` without touching the stderr_summary
