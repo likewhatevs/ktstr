@@ -3000,18 +3000,18 @@ pub(crate) fn exercise_candidate_ready_matrix_for_tests() -> Result<()> {
     let (predecessors, availability) = registry::probe_snapshots_for_tests(
         &[predecessor],
         &[
-            (1, Some(registry::CpuAvailability::Free)),
-            (2, Some(registry::CpuAvailability::SharedHeld)),
-            (3, Some(registry::CpuAvailability::ExclusiveHeld)),
+            (1, Some(registry::ResourceAvailability::Free)),
+            (2, Some(registry::ResourceAvailability::SharedHeld)),
+            (3, Some(registry::ResourceAvailability::ExclusiveHeld)),
             (4, None),
-            (5, Some(registry::CpuAvailability::Free)),
+            (5, Some(registry::ResourceAvailability::Free)),
         ],
         &[
-            (1, Some(registry::LlcAvailability::Free)),
-            (2, Some(registry::LlcAvailability::SharedHeld)),
-            (3, Some(registry::LlcAvailability::ExclusiveHeld)),
+            (1, Some(registry::ResourceAvailability::Free)),
+            (2, Some(registry::ResourceAvailability::SharedHeld)),
+            (3, Some(registry::ResourceAvailability::ExclusiveHeld)),
             (4, None),
-            (5, Some(registry::LlcAvailability::Free)),
+            (5, Some(registry::ResourceAvailability::Free)),
         ],
     )?;
     let watch = ClaimSet::with_modes(
@@ -3927,83 +3927,50 @@ impl HolderObserver {
         }
     }
 
+    /// Classify one resource by the strongest lock its proof file still
+    /// grants. Only valid where a holder may take the lock shared — see the
+    /// permit loop in `observe_with_proofs` for the exclusive-only case.
+    fn classify_proof(&mut self, key: ResourceKey) -> Result<registry::ResourceObservation> {
+        let availability = if self.try_proof(key, FlockMode::Exclusive)? {
+            registry::ResourceAvailability::Free
+        } else if self.try_proof(key, FlockMode::Shared)? {
+            registry::ResourceAvailability::SharedHeld
+        } else {
+            registry::ResourceAvailability::ExclusiveHeld
+        };
+        Ok(registry::ResourceObservation {
+            availability,
+            sh_resolved: true,
+            ex_resolved: true,
+        })
+    }
+
     fn observe_with_proofs(
         &mut self,
         request: &registry::ObservationRequest,
     ) -> Result<registry::AvailabilityObservation> {
         let mut observation = registry::AvailabilityObservation::default();
         for &cpu in request.cpus.keys() {
-            let key = ResourceKey::Cpu(cpu);
-            if self.try_proof(key, FlockMode::Exclusive)? {
-                observation.cpus.insert(
-                    cpu,
-                    registry::CpuObservation {
-                        availability: registry::CpuAvailability::Free,
-                        sh_resolved: true,
-                        ex_resolved: true,
-                    },
-                );
-            } else if self.try_proof(key, FlockMode::Shared)? {
-                observation.cpus.insert(
-                    cpu,
-                    registry::CpuObservation {
-                        availability: registry::CpuAvailability::SharedHeld,
-                        sh_resolved: true,
-                        ex_resolved: true,
-                    },
-                );
-            } else {
-                observation.cpus.insert(
-                    cpu,
-                    registry::CpuObservation {
-                        availability: registry::CpuAvailability::ExclusiveHeld,
-                        sh_resolved: true,
-                        ex_resolved: true,
-                    },
-                );
-            }
+            let observed = self.classify_proof(ResourceKey::Cpu(cpu))?;
+            observation.cpus.insert(cpu, observed);
         }
         for &llc in request.llcs.keys() {
-            let key = ResourceKey::Llc(llc);
-            if self.try_proof(key, FlockMode::Exclusive)? {
-                observation.llcs.insert(
-                    llc,
-                    registry::LlcObservation {
-                        availability: registry::LlcAvailability::Free,
-                        sh_resolved: true,
-                        ex_resolved: true,
-                    },
-                );
-            } else if self.try_proof(key, FlockMode::Shared)? {
-                observation.llcs.insert(
-                    llc,
-                    registry::LlcObservation {
-                        availability: registry::LlcAvailability::SharedHeld,
-                        sh_resolved: true,
-                        ex_resolved: true,
-                    },
-                );
-            } else {
-                observation.llcs.insert(
-                    llc,
-                    registry::LlcObservation {
-                        availability: registry::LlcAvailability::ExclusiveHeld,
-                        sh_resolved: true,
-                        ex_resolved: true,
-                    },
-                );
-            }
+            let observed = self.classify_proof(ResourceKey::Llc(llc))?;
+            observation.llcs.insert(llc, observed);
         }
+        // Permits are only ever flocked exclusive, so a failed exclusive probe
+        // means held, not shared-held; routing them through `classify_proof`
+        // would report SharedHeld and make a held permit look available.
         for &permit in request.permits.keys() {
             let key = ResourceKey::Permit(permit);
             let availability = if self.try_proof(key, FlockMode::Exclusive)? {
-                registry::CpuAvailability::Free
+                registry::ResourceAvailability::Free
             } else {
-                registry::CpuAvailability::ExclusiveHeld
+                registry::ResourceAvailability::ExclusiveHeld
             };
             observation.permits.insert(
                 permit,
-                registry::CpuObservation {
+                registry::ResourceObservation {
                     availability,
                     sh_resolved: true,
                     ex_resolved: true,

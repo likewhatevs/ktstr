@@ -755,38 +755,24 @@ pub(super) struct ObservationRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CpuAvailability {
+pub(super) enum ResourceAvailability {
     ExclusiveHeld,
     SharedHeld,
     Free,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct CpuObservation {
-    pub availability: CpuAvailability,
-    pub sh_resolved: bool,
-    pub ex_resolved: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LlcAvailability {
-    ExclusiveHeld,
-    SharedHeld,
-    Free,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct LlcObservation {
-    pub availability: LlcAvailability,
+pub(super) struct ResourceObservation {
+    pub availability: ResourceAvailability,
     pub sh_resolved: bool,
     pub ex_resolved: bool,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct AvailabilityObservation {
-    pub cpus: BTreeMap<usize, CpuObservation>,
-    pub llcs: BTreeMap<usize, LlcObservation>,
-    pub permits: BTreeMap<usize, CpuObservation>,
+    pub cpus: BTreeMap<usize, ResourceObservation>,
+    pub llcs: BTreeMap<usize, ResourceObservation>,
+    pub permits: BTreeMap<usize, ResourceObservation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4545,8 +4531,8 @@ pub(super) fn exercise_shared_watch_held_metadata_for_tests() -> Result<bool> {
 #[cfg(test)]
 pub(super) fn probe_snapshots_for_tests(
     predecessors: &[ClaimSet],
-    cpu_availability: &[(usize, Option<CpuAvailability>)],
-    llc_availability: &[(usize, Option<LlcAvailability>)],
+    cpu_availability: &[(usize, Option<ResourceAvailability>)],
+    llc_availability: &[(usize, Option<ResourceAvailability>)],
 ) -> Result<(AggregateSnapshot, AvailabilitySnapshot)> {
     let max_resource = predecessors
         .iter()
@@ -4588,13 +4574,13 @@ pub(super) fn probe_snapshots_for_tests(
         set_snapshot_bit(
             &mut availability.cpu_sh_available,
             cpu,
-            state.is_some_and(|state| state != CpuAvailability::ExclusiveHeld),
+            state.is_some_and(|state| state != ResourceAvailability::ExclusiveHeld),
             layout.bits,
         )?;
         set_snapshot_bit(
             &mut availability.cpu_ex_available,
             cpu,
-            state == Some(CpuAvailability::Free),
+            state == Some(ResourceAvailability::Free),
             layout.bits,
         )?;
     }
@@ -4608,13 +4594,13 @@ pub(super) fn probe_snapshots_for_tests(
         set_snapshot_bit(
             &mut availability.llc_sh_available,
             llc,
-            state.is_some_and(|state| state != LlcAvailability::ExclusiveHeld),
+            state.is_some_and(|state| state != ResourceAvailability::ExclusiveHeld),
             layout.bits,
         )?;
         set_snapshot_bit(
             &mut availability.llc_ex_available,
             llc,
-            state == Some(LlcAvailability::Free),
+            state == Some(ResourceAvailability::Free),
             layout.bits,
         )?;
     }
@@ -6597,18 +6583,18 @@ pub(super) fn cancel_coordinator_after_commit_for_tests() {
 fn set_cpu_availability_for_tests(
     table: &mut Table,
     cpu: usize,
-    availability: CpuAvailability,
+    availability: ResourceAvailability,
 ) -> Result<()> {
     table.set_bitmap_bit(B_CPU_KNOWN, cpu, true)?;
     table.set_bitmap_bit(
         B_CPU_SH_AVAILABLE,
         cpu,
-        availability != CpuAvailability::ExclusiveHeld,
+        availability != ResourceAvailability::ExclusiveHeld,
     )?;
     table.set_bitmap_bit(
         B_CPU_EX_AVAILABLE,
         cpu,
-        availability == CpuAvailability::Free,
+        availability == ResourceAvailability::Free,
     )?;
     table.set_bitmap_bit(B_PENDING_CPU_SH, cpu, false)?;
     table.set_bitmap_bit(B_PENDING_CPU_EX, cpu, false)?;
@@ -6624,9 +6610,9 @@ fn set_cpu_free_for_tests(table: &mut Table, cpu: usize, free: bool) -> Result<(
         table,
         cpu,
         if free {
-            CpuAvailability::Free
+            ResourceAvailability::Free
         } else {
-            CpuAvailability::ExclusiveHeld
+            ResourceAvailability::ExclusiveHeld
         },
     )
 }
@@ -7198,7 +7184,7 @@ pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConser
     let refilled_after_completion = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
-        set_cpu_availability_for_tests(&mut table, 0, CpuAvailability::SharedHeld)?;
+        set_cpu_availability_for_tests(&mut table, 0, ResourceAvailability::SharedHeld)?;
         set_cpu_free_for_tests(&mut table, 1, false)?;
         table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible_at(backfill_started_ns.saturating_add(1), None)?;
@@ -7221,7 +7207,7 @@ pub(super) fn exercise_work_conserving_backfill_for_tests() -> Result<WorkConser
     let expired_head_stops_refill = {
         let _lock = lock_registry_existing(FlockMode::Exclusive)?;
         let mut table = Table::open_existing()?;
-        set_cpu_availability_for_tests(&mut table, 0, CpuAvailability::SharedHeld)?;
+        set_cpu_availability_for_tests(&mut table, 0, ResourceAvailability::SharedHeld)?;
         set_cpu_free_for_tests(&mut table, 1, false)?;
         table.set_pending_flag(PENDING_RESCAN);
         table.grant_compatible_at(expired_now_ns, None)?;
@@ -7380,8 +7366,8 @@ fn exercise_known_free_close_storm_impl(
     let mut observation = AvailabilityObservation::default();
     observation.cpus.insert(
         1,
-        CpuObservation {
-            availability: CpuAvailability::Free,
+        ResourceObservation {
+            availability: ResourceAvailability::Free,
             sh_resolved: true,
             ex_resolved: true,
         },
@@ -7470,8 +7456,8 @@ pub(super) fn exercise_llc_sh_only_shared_to_free_close_for_tests() -> Result<(b
     let mut shared = AvailabilityObservation::default();
     shared.llcs.insert(
         1,
-        LlcObservation {
-            availability: LlcAvailability::SharedHeld,
+        ResourceObservation {
+            availability: ResourceAvailability::SharedHeld,
             sh_resolved: true,
             ex_resolved: true,
         },
@@ -7534,8 +7520,8 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
     let mut busy = AvailabilityObservation::default();
     busy.cpus.insert(
         1,
-        CpuObservation {
-            availability: CpuAvailability::ExclusiveHeld,
+        ResourceObservation {
+            availability: ResourceAvailability::ExclusiveHeld,
             sh_resolved: true,
             ex_resolved: true,
         },
@@ -7567,8 +7553,8 @@ pub(super) fn exercise_busy_to_free_close_for_tests() -> Result<(usize, u64, usi
     let mut free = AvailabilityObservation::default();
     free.cpus.insert(
         1,
-        CpuObservation {
-            availability: CpuAvailability::Free,
+        ResourceObservation {
+            availability: ResourceAvailability::Free,
             sh_resolved: true,
             ex_resolved: true,
         },
@@ -7643,8 +7629,8 @@ pub(super) fn exercise_llc_ex_contention_shared_wake_for_tests() -> Result<(u64,
     let mut observation = AvailabilityObservation::default();
     observation.llcs.insert(
         1,
-        LlcObservation {
-            availability: LlcAvailability::SharedHeld,
+        ResourceObservation {
+            availability: ResourceAvailability::SharedHeld,
             sh_resolved: true,
             ex_resolved: true,
         },
@@ -7704,7 +7690,7 @@ pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests() -> Result<CpuEx
     table.clear_record_blocked(shared.slot)?;
     table.set_record_state(exclusive.slot, STATE_WAITING)?;
     table.clear_record_blocked(exclusive.slot)?;
-    set_cpu_availability_for_tests(&mut table, 1, CpuAvailability::SharedHeld)?;
+    set_cpu_availability_for_tests(&mut table, 1, ResourceAvailability::SharedHeld)?;
     write_u64(&mut table.header, H_PENDING_FLAGS, 0);
 
     table.begin_transaction()?;
@@ -7748,8 +7734,8 @@ pub(super) fn exercise_cpu_ex_contention_shared_wake_for_tests() -> Result<CpuEx
     let mut observation = AvailabilityObservation::default();
     observation.cpus.insert(
         1,
-        CpuObservation {
-            availability: CpuAvailability::SharedHeld,
+        ResourceObservation {
+            availability: ResourceAvailability::SharedHeld,
             sh_resolved: true,
             ex_resolved: true,
         },
@@ -8215,7 +8201,7 @@ pub(super) fn exercise_cpu_shared_commit_improvement_for_tests() -> Result<(u64,
         let mut table = Table::open_existing()?;
         table.set_record_state(middle.slot, STATE_WAITING)?;
         table.set_record_state(later.slot, STATE_WAITING)?;
-        set_cpu_availability_for_tests(&mut table, 1, CpuAvailability::ExclusiveHeld)?;
+        set_cpu_availability_for_tests(&mut table, 1, ResourceAvailability::ExclusiveHeld)?;
         set_cpu_free_for_tests(&mut table, 3, false)?;
         write_u64(&mut table.header, H_PENDING_FLAGS, 0);
         table.finish_claim_scan();
@@ -14001,8 +13987,8 @@ pub(super) fn exercise_waiting_release_wake_for_tests() -> Result<(bool, bool, b
         let mut observation = AvailabilityObservation::default();
         observation.cpus.insert(
             41,
-            CpuObservation {
-                availability: CpuAvailability::Free,
+            ResourceObservation {
+                availability: ResourceAvailability::Free,
                 sh_resolved: true,
                 ex_resolved: true,
             },
@@ -20289,8 +20275,8 @@ impl Table {
                 continue;
             }
             let availability = observed.availability;
-            let sh_available = availability != CpuAvailability::ExclusiveHeld;
-            let ex_available = availability == CpuAvailability::Free;
+            let sh_available = availability != ResourceAvailability::ExclusiveHeld;
+            let ex_available = availability == ResourceAvailability::Free;
             let sh_candidate = self.bitmap_bit(B_CANDIDATE_CPU_SH, cpu)?;
             let ex_candidate = self.bitmap_bit(B_CANDIDATE_CPU_EX, cpu)?;
             self.set_bitmap_bit(B_CPU_KNOWN, cpu, true)?;
@@ -20336,8 +20322,8 @@ impl Table {
                 continue;
             }
             let availability = observed.availability;
-            let sh_available = availability != CpuAvailability::ExclusiveHeld;
-            let ex_available = availability == CpuAvailability::Free;
+            let sh_available = availability != ResourceAvailability::ExclusiveHeld;
+            let ex_available = availability == ResourceAvailability::Free;
             let sh_candidate = self.bitmap_bit(B_CANDIDATE_CPU_SH, index)?;
             let ex_candidate = self.bitmap_bit(B_CANDIDATE_CPU_EX, index)?;
             self.set_bitmap_bit(B_CPU_KNOWN, index, true)?;
@@ -20382,8 +20368,8 @@ impl Table {
                 continue;
             }
             let availability = observed.availability;
-            let sh_available = availability != LlcAvailability::ExclusiveHeld;
-            let ex_available = availability == LlcAvailability::Free;
+            let sh_available = availability != ResourceAvailability::ExclusiveHeld;
+            let ex_available = availability == ResourceAvailability::Free;
             let sh_candidate = self.bitmap_bit(B_CANDIDATE_LLC_SH, llc)?;
             let ex_candidate = self.bitmap_bit(B_CANDIDATE_LLC_EX, llc)?;
             self.set_bitmap_bit(B_LLC_KNOWN, llc, true)?;
