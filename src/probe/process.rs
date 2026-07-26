@@ -1044,16 +1044,21 @@ fn set_rodata_slot(
 /// On a heavily contended host the fexit `BPF_PROG_LOAD` can be
 /// rejected with a transient error even for a privileged loader whose
 /// same targets load cleanly on a quiet host — observed as an
-/// intermittent `EPERM (os error 13)` on the busiest arm64 CI lanes,
-/// which dropped the exit-side counters and left the failure dump a
-/// placeholder. Retrying the open+load a few times with a short
-/// backoff — a cost bounded well inside the probe's boot budget —
-/// recovers the real counters. `set_attach_target` is deterministic,
-/// so a chunk with no valid target is never retried.
+/// intermittent "Permission denied (os error 13)" on the busiest
+/// arm64 CI lanes, which dropped the exit-side counters and left the
+/// failure dump a placeholder. os error 13 is EACCES (not EPERM):
+/// the errno `BPF_PROG_LOAD` uses for a verifier rejection, so the
+/// failure can also be deterministic for a given kernel/arch — on the
+/// arm64 7.1 CI kernel the `enqueue_task_scx` fexit load fails all
+/// three attempts in every observed run. Retrying the open+load a few
+/// times with a short backoff — a cost bounded well inside the
+/// probe's boot budget — recovers the transient case and costs ~200ms
+/// in the deterministic one. `set_attach_target` is deterministic, so
+/// a chunk with no valid target is never retried.
 const KERNEL_FEXIT_LOAD_ATTEMPTS: u32 = 3;
 
 // More than one attempt is the whole point: it turns a transient load
-// EPERM into a recovered load rather than an immediate placeholder dump.
+// EACCES into a recovered load rather than an immediate placeholder dump.
 const _: () = assert!(
     KERNEL_FEXIT_LOAD_ATTEMPTS >= 2,
     "the kernel-fexit batch load must retry at least once"
