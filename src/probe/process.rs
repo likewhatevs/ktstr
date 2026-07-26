@@ -36,6 +36,7 @@
 //! 5. Caller waits on `done` and proceeds to the test scenario with
 //!    full instrumentation in place.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -1575,17 +1576,39 @@ pub fn run_probe_skeleton(
     // functions. Worker pool runs them concurrently; results land
     // back in the original input order so the post-attach
     // `kprobe_attach_failed` / `links` shape matches the prior loop.
+    //
+    // At most one kprobe per address, tracked in `probed_ips` and carried
+    // into Phase B. A second kprobe on an address is pure redundancy: the
+    // kernel folds both into an aggrprobe whose members run the same
+    // `ktstr_probe` program and resolve the same IP-keyed `func_meta`, so
+    // the duplicate costs an extra trap and yields no extra data. Phase B
+    // derives kernel bridge callers from the scheduler's BPF ops and
+    // readily re-names a function Phase A already probed.
     let mut links: Vec<(Link, String)> = Vec::new();
-    let attach_input: Vec<String> = func_ips
-        .iter()
-        .map(|(idx, _, _)| functions[*idx as usize].raw_name.clone())
-        .collect();
-    for (raw, result) in parallel_attach_kprobes(&skel.progs.ktstr_probe, &attach_input) {
+    let mut probed_ips: HashSet<u64> = HashSet::new();
+    let mut attach_input: Vec<String> = Vec::new();
+    let mut attach_ips: Vec<u64> = Vec::new();
+    for (idx, ip, _) in &func_ips {
+        let raw = &functions[*idx as usize].raw_name;
+        if !probed_ips.insert(*ip) {
+            tracing::debug!(func = %raw, ip, "kprobe already planned for ip, skipping");
+            continue;
+        }
+        attach_input.push(raw.clone());
+        attach_ips.push(*ip);
+    }
+    for ((raw, result), ip) in parallel_attach_kprobes(&skel.progs.ktstr_probe, &attach_input)
+        .into_iter()
+        .zip(attach_ips)
+    {
         match result {
             Ok(link) => {
                 links.push((link, raw));
             }
             Err(e) => {
+                // Nothing is planted at this address, so leave it open
+                // for Phase B to try again.
+                probed_ips.remove(&ip);
                 tracing::warn!(%e, func = %raw, "kprobe attach failed");
                 diag.kprobe_attach_failed.push((raw, e.to_string()));
             }
@@ -2153,6 +2176,7 @@ pub fn run_probe_skeleton(
                         &mut fentry_links,
                         &mut fexit_links,
                         &mut links,
+                        &mut probed_ips,
                         &mut diag,
                     );
                     pb.done.set();
@@ -2639,6 +2663,11 @@ pub fn run_probe_skeleton(
 /// which stays alive throughout. BPF fentry/fexit use separate
 /// skeleton loads that share `probe_data` and `func_meta_map` via
 /// `reuse_fd`.
+///
+/// `probed_ips` carries the addresses Phase A already planted a kprobe
+/// on; targets landing on one of them get their `func_meta` but no
+/// second kprobe.
+#[allow(clippy::too_many_arguments)]
 fn attach_phase_b_fentry(
     skel: &crate::bpf_skel::ProbeSkel<'_>,
     pb: &PhaseBInput,
@@ -2646,6 +2675,7 @@ fn attach_phase_b_fentry(
     fentry_links: &mut Vec<libbpf_rs::Link>,
     fexit_links: &mut Vec<libbpf_rs::Link>,
     links: &mut Vec<(libbpf_rs::Link, String)>,
+    probed_ips: &mut HashSet<u64>,
     diag: &mut ProbeDiagnostics,
 ) {
     use libbpf_rs::MapCore;
@@ -2748,7 +2778,25 @@ fn attach_phase_b_fentry(
         });
     }
 
-    let attach_input: Vec<String> = kprobe_targets.iter().map(|t| t.raw_name.clone()).collect();
+    // Skip any target Phase A already has a kprobe on: that kprobe runs
+    // the same `ktstr_probe` program and keys off the `func_meta` written
+    // above, so the Phase B entry capture is unaffected, while a second
+    // kprobe on the address would only aggregate them in the kernel. See
+    // the Phase A attach loop.
+    let mut attach_slots: Vec<usize> = Vec::new();
+    let mut attach_input: Vec<String> = Vec::new();
+    for (slot, target) in kprobe_targets.iter().enumerate() {
+        if !probed_ips.insert(target.ip) {
+            tracing::debug!(
+                func = %target.raw_name,
+                ip = target.ip,
+                "phase_b: kprobe already attached at ip, skipping",
+            );
+            continue;
+        }
+        attach_slots.push(slot);
+        attach_input.push(target.raw_name.clone());
+    }
     // Kernel fexit must mirror the set that resolved and received func_meta,
     // not the raw Phase-B plan. Feeding an absent generation-specific alias to
     // set_attach_target can poison the whole batch even though the matching
@@ -2765,22 +2813,31 @@ fn attach_phase_b_fentry(
         })
         .collect();
     let attach_results = parallel_attach_kprobes(&skel.progs.ktstr_probe, &attach_input);
-    // Pair the attach result with its target metadata. `attach_results`
-    // is in the same order as `attach_input` is in the same order as
-    // `kprobe_targets`, so a zip-and-iterate replays the original
-    // sequential post-attach bookkeeping (links push, func_ips push,
-    // counter bumps) without reordering.
-    for (target, (raw_name, result)) in kprobe_targets.into_iter().zip(attach_results.into_iter()) {
-        debug_assert_eq!(target.raw_name, raw_name);
+    // Scatter the results back onto their targets. `attach_results` is in
+    // the same order as `attach_input`, which `attach_slots` maps onto
+    // `kprobe_targets`, so the post-attach bookkeeping (links push,
+    // func_ips push, counter bumps) still runs in target order. A `None`
+    // slot is a target skipped by the dedupe above.
+    let mut results_by_slot: Vec<Option<libbpf_rs::Result<libbpf_rs::Link>>> =
+        (0..kprobe_targets.len()).map(|_| None).collect();
+    for (slot, (raw_name, result)) in attach_slots.into_iter().zip(attach_results.into_iter()) {
+        debug_assert_eq!(kprobe_targets[slot].raw_name, raw_name);
+        results_by_slot[slot] = Some(result);
+    }
+    for (target, result) in kprobe_targets.into_iter().zip(results_by_slot.into_iter()) {
         match result {
-            Ok(link) => {
-                links.push((link, raw_name));
+            Some(Ok(link)) => {
+                links.push((link, target.raw_name));
                 diag.kprobe_attached += 1;
             }
-            Err(e) => {
-                tracing::warn!(%e, func = %raw_name, "phase_b kprobe attach failed");
-                diag.kprobe_attach_failed.push((raw_name, e.to_string()));
+            Some(Err(e)) => {
+                // Nothing planted here after all — release the address.
+                probed_ips.remove(&target.ip);
+                tracing::warn!(%e, func = %target.raw_name, "phase_b kprobe attach failed");
+                diag.kprobe_attach_failed
+                    .push((target.raw_name, e.to_string()));
             }
+            None => {}
         }
         diag.kprobe_resolved += 1;
         func_ips.push((target.idx, target.ip, target.display_name));
