@@ -274,7 +274,7 @@ fn load_btf_from_bytes_inner(
 
     if sidecar_allowed {
         if sidecar_fresh(&sidecar, &canon_path) {
-            match std::fs::read(&sidecar) {
+            match map_sidecar(&sidecar) {
                 Ok(cached) if is_raw_btf(&cached) => {
                     match Btf::from_bytes(&cached) {
                         Ok(btf) => return Ok(btf),
@@ -301,7 +301,7 @@ fn load_btf_from_bytes_inner(
                     tracing::warn!(
                         path = %sidecar.display(),
                         err = %e,
-                        "btf sidecar read failed; falling back to ELF extraction",
+                        "btf sidecar map failed; falling back to ELF extraction",
                     );
                 }
             }
@@ -374,6 +374,26 @@ fn btf_sidecar_path(path: &Path) -> std::path::PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".btf");
     std::path::PathBuf::from(name)
+}
+
+/// Map a published sidecar read-only instead of copying it into an owned
+/// `Vec`.
+///
+/// Both sidecars are multi-MB and every nextest cell rehydrates them in a
+/// fresh process, so `std::fs::read` charged each cell a private copy of the
+/// whole file on top of the page cache that already held it. The decoders
+/// above copy out whatever they retain, so a mapping serves them identically
+/// while the pages stay shared between concurrent cells.
+///
+/// Errors (including the empty file `mmap` rejects) are reported like the
+/// read failures they replace; every caller treats one as a sidecar miss.
+pub(crate) fn map_sidecar(path: &Path) -> std::io::Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: sidecars are published by atomic rename and never rewritten in
+    // place, so the inode behind an open mapping is immutable for the
+    // mapping's lifetime — a sibling process replacing the pathname leaves
+    // this mapping on the bytes it was created from.
+    unsafe { memmap2::Mmap::map(&file) }
 }
 
 /// True iff `data` begins with the little-endian raw-BTF magic
@@ -455,7 +475,7 @@ pub(crate) fn load_btf_from_sidecar(path: &Path) -> Option<Btf> {
     if !sidecar_fresh(&sidecar, &canon) {
         return None;
     }
-    let cached = std::fs::read(&sidecar).ok()?;
+    let cached = map_sidecar(&sidecar).ok()?;
     if !is_raw_btf(&cached) {
         return None;
     }

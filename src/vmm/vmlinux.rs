@@ -292,7 +292,10 @@ struct ArtifactsSidecar {
     /// Sorted mirror of [`VmlinuxArtifacts::all_symbols`]. A Vec gives the
     /// sidecar deterministic bytes; serializing a HashMap directly would
     /// reshuffle entries after every decode because its RandomState changes.
-    /// The live artifact rebuilds the O(1) lookup map once on load.
+    /// The live artifact rebuilds the O(1) lookup map once on load — decoding
+    /// straight into a map instead is slower, not faster: the Vec's exact
+    /// length lets the `collect` size the table once, where a map decode
+    /// grows and rehashes from serde's capped capacity hint.
     all_symbols: Vec<(String, u64)>,
     /// `Some` iff the original parse produced a [`MonitorArtifacts`]
     /// (BTF loaded and `KernelOffsets` resolved).
@@ -389,7 +392,7 @@ fn load_artifacts_sidecar(canon: &Path) -> Option<VmlinuxArtifacts> {
     if !crate::monitor::btf_offsets::sidecar_fresh(&sidecar, canon) {
         return None;
     }
-    let bytes = std::fs::read(&sidecar).ok()?;
+    let bytes = crate::monitor::btf_offsets::map_sidecar(&sidecar).ok()?;
     let decoded: ArtifactsSidecar = postcard::from_bytes(&bytes).ok()?;
     // Version gate: a tag mismatch means the sidecar was written by a
     // ktstr build with a different offset-struct layout (or is a
