@@ -719,7 +719,7 @@ impl KtstrKvm {
         // range can exceed the vCPU count; KVM_CREATE_VCPU requires the id be
         // < KVM_CAP_MAX_VCPU_ID. Skip cleanly if the host's cap is too low,
         // same class as the max_vcpus check above.
-        // `max_apic_id` is passed in from `new_inner`, the same u32 it
+        // `max_apic_id` is passed in from `KtstrKvm::new`, the same u32 it
         // computed for the split-irqchip decision.
         let max_vcpu_id = kvm.get_max_vcpu_id();
         if (max_apic_id as usize) >= max_vcpu_id {
