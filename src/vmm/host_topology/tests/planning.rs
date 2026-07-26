@@ -3473,7 +3473,7 @@ fn bin_matching_displaces_flexible_requests_instead_of_getting_stuck_greedily() 
         (1usize, vec![0]),
         (2usize, vec![1, 2]),
     ]);
-    let matched = match_distinct_bins(&edges, &[0, 1, 2])
+    let matched = match_distinct(&edges, &[0, 1, 2])
         .expect("augmenting paths must find the complete 0→1, 1→0, 2→2 match");
     assert_eq!(
         matched,

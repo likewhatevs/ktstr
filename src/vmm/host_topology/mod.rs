@@ -75,18 +75,11 @@ fn reservation_wait_progress_poll() -> Option<std::time::Duration> {
 /// Resource contention error — LLC slots or CPUs unavailable.
 /// Downcast via `anyhow::Error::downcast_ref::<ResourceContention>()`
 /// to distinguish from fatal errors.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
 pub struct ResourceContention {
     pub reason: String,
 }
-
-impl std::fmt::Display for ResourceContention {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.reason)
-    }
-}
-
-impl std::error::Error for ResourceContention {}
 
 /// The requested topology cannot be realized on this host, and no retry
 /// changes that. Surfaced as a SKIP by the x86_64 VM-creation caps (guest
@@ -112,18 +105,11 @@ impl std::error::Error for ResourceContention {}
 /// still recognised). This typed error replaced a fragile message
 /// string-match (`"need"` + `"LLC"`/`"CPU"`) that would misclassify any
 /// unrelated error happening to contain those words.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
 pub struct TopologyInsufficient {
     pub reason: String,
 }
-
-impl std::fmt::Display for TopologyInsufficient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.reason)
-    }
-}
-
-impl std::error::Error for TopologyInsufficient {}
 
 /// The host cannot honor the `performance_mode` guarantee (an exclusive
 /// host LLC for the test's virtual LLC topology + a service CPU), and no
@@ -140,18 +126,11 @@ impl std::error::Error for TopologyInsufficient {}
 /// Downcast via `anyhow::Error::downcast_ref::<PerfModeUnavailable>()`
 /// (chain-aware: the dispatch + macro predicates walk the full error
 /// chain, so a `.context(...)`-wrapped instance is still recognised).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
 pub struct PerfModeUnavailable {
     pub reason: String,
 }
-
-impl std::fmt::Display for PerfModeUnavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.reason)
-    }
-}
-
-impl std::error::Error for PerfModeUnavailable {}
 
 /// An operator `--cpu-cap N` (or `KTSTR_CPU_CAP`) the host cannot satisfy: N
 /// exceeds the CPUs this process is allowed on. A HARD ERROR, not a skip —
@@ -164,18 +143,11 @@ impl std::error::Error for PerfModeUnavailable {}
 ///
 /// Downcast via `anyhow::Error::downcast_ref::<CpuBudgetUnsatisfiable>()`
 /// (chain-aware).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
 pub struct CpuBudgetUnsatisfiable {
     pub reason: String,
 }
-
-impl std::fmt::Display for CpuBudgetUnsatisfiable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.reason)
-    }
-}
-
-impl std::error::Error for CpuBudgetUnsatisfiable {}
 
 /// The requested topology cannot be represented by this VMM's static
 /// device layout, and the limit is host-INDEPENDENT, so no retry and no
@@ -211,18 +183,11 @@ impl std::error::Error for CpuBudgetUnsatisfiable {}
 // aarch64 (where the bail MUST construct it — a real regression if it
 // stops) and allow it only off-arch.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
 pub struct TopologyUnrepresentable {
     pub reason: String,
 }
-
-impl std::fmt::Display for TopologyUnrepresentable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.reason)
-    }
-}
-
-impl std::error::Error for TopologyUnrepresentable {}
 
 /// A physical LLC group on the host, identified by its cache ID.
 #[derive(Debug, Clone)]
@@ -1370,7 +1335,7 @@ fn grain_mapping_possible(
             }
             let mut order = (0..demands.len()).collect::<Vec<_>>();
             order.sort_by_key(|request| edges[request].len());
-            match_distinct_bins(&edges, &order).is_some()
+            match_distinct(&edges, &order).is_some()
         };
 
     // The one service CPU may share any guest-mapped LLC...
@@ -1458,43 +1423,39 @@ fn host_bins_preferred_fit(
     }
     let mut order = request_indices.to_vec();
     order.sort_by_key(|request| edges[request].len());
-    match_distinct_bins(&edges, &order).is_some()
+    match_distinct(&edges, &order).is_some()
 }
 
-/// Maximum-cardinality bipartite matching for strict guest-NUMA placement.
-fn match_distinct_nodes(
-    edges: &std::collections::BTreeMap<u32, Vec<usize>>,
-) -> Option<std::collections::BTreeMap<u32, usize>> {
-    fn augment(
-        guest: u32,
-        edges: &std::collections::BTreeMap<u32, Vec<usize>>,
-        owner: &mut std::collections::BTreeMap<usize, u32>,
+/// Maximum-cardinality bipartite matching over `order`. Unlike a greedy
+/// "first bin that fits" walk, augmenting paths can displace an earlier
+/// flexible request when a later request has only that bin available.
+fn match_distinct<K: Ord + Copy>(
+    edges: &std::collections::BTreeMap<K, Vec<usize>>,
+    order: &[K],
+) -> Option<std::collections::BTreeMap<K, usize>> {
+    fn augment<K: Ord + Copy>(
+        left: K,
+        edges: &std::collections::BTreeMap<K, Vec<usize>>,
+        owner: &mut std::collections::BTreeMap<usize, K>,
         seen: &mut std::collections::BTreeSet<usize>,
     ) -> bool {
-        for &host in edges.get(&guest).into_iter().flatten() {
-            if !seen.insert(host) {
+        for &right in edges.get(&left).into_iter().flatten() {
+            if !seen.insert(right) {
                 continue;
             }
-            let displaced = owner.get(&host).copied();
+            let displaced = owner.get(&right).copied();
             if displaced.is_none_or(|other| augment(other, edges, owner, seen)) {
-                owner.insert(host, guest);
+                owner.insert(right, left);
                 return true;
             }
         }
         false
     }
 
-    let mut guests = edges.keys().copied().collect::<Vec<_>>();
-    guests.sort_by_key(|guest| {
-        edges
-            .get(guest)
-            .expect("guest came from this edge map")
-            .len()
-    });
     let mut owner = std::collections::BTreeMap::new();
-    for guest in guests {
+    for &left in order {
         if !augment(
-            guest,
+            left,
             edges,
             &mut owner,
             &mut std::collections::BTreeSet::new(),
@@ -1505,9 +1466,18 @@ fn match_distinct_nodes(
     Some(
         owner
             .into_iter()
-            .map(|(host, guest)| (guest, host))
+            .map(|(right, left)| (left, right))
             .collect(),
     )
+}
+
+/// Maximum-cardinality bipartite matching for strict guest-NUMA placement.
+fn match_distinct_nodes(
+    edges: &std::collections::BTreeMap<u32, Vec<usize>>,
+) -> Option<std::collections::BTreeMap<u32, usize>> {
+    let mut guests = edges.keys().copied().collect::<Vec<_>>();
+    guests.sort_by_key(|guest| edges[guest].len());
+    match_distinct(edges, &guests)
 }
 
 fn assign_distinct_bins(
@@ -1615,7 +1585,7 @@ fn assign_distinct_bins(
             ),
         )
     });
-    let Some(assignment) = match_distinct_bins(&edges, &requests) else {
+    let Some(assignment) = match_distinct(&edges, &requests) else {
         return false;
     };
     for (&request, &llc) in &assignment {
@@ -1623,51 +1593,6 @@ fn assign_distinct_bins(
         mapped[request] = llc;
     }
     true
-}
-
-/// Maximum-cardinality request-to-LLC matching. Unlike a greedy "first bin
-/// that fits" walk, augmenting paths can displace an earlier flexible request
-/// when a later request has only that bin available.
-fn match_distinct_bins(
-    edges: &std::collections::BTreeMap<usize, Vec<usize>>,
-    request_order: &[usize],
-) -> Option<std::collections::BTreeMap<usize, usize>> {
-    fn augment(
-        request: usize,
-        edges: &std::collections::BTreeMap<usize, Vec<usize>>,
-        owner: &mut std::collections::BTreeMap<usize, usize>,
-        seen: &mut std::collections::BTreeSet<usize>,
-    ) -> bool {
-        for &bin in edges.get(&request).into_iter().flatten() {
-            if !seen.insert(bin) {
-                continue;
-            }
-            let displaced = owner.get(&bin).copied();
-            if displaced.is_none_or(|other| augment(other, edges, owner, seen)) {
-                owner.insert(bin, request);
-                return true;
-            }
-        }
-        false
-    }
-
-    let mut owner = std::collections::BTreeMap::new();
-    for &request in request_order {
-        if !augment(
-            request,
-            edges,
-            &mut owner,
-            &mut std::collections::BTreeSet::new(),
-        ) {
-            return None;
-        }
-    }
-    Some(
-        owner
-            .into_iter()
-            .map(|(bin, request)| (request, bin))
-            .collect(),
-    )
 }
 
 /// Lock mode for LLC reservation.
@@ -2117,26 +2042,12 @@ enum RawAcquireAll {
     },
 }
 
-#[cfg(test)]
-thread_local! {
-    static AUTHORITATIVE_REGISTRY_PROBES: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn authoritative_registry_probe_count_for_tests() -> usize {
-    AUTHORITATIVE_REGISTRY_PROBES.with(std::cell::Cell::get)
-}
-
 pub(crate) fn try_acquire_resources(
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
     cpus: &[usize],
     cpu_mode: FlockMode,
 ) -> Result<TryAcquireAll> {
-    #[cfg(test)]
-    AUTHORITATIVE_REGISTRY_PROBES.with(|probes| probes.set(probes.get() + 1));
     let request = resource_claim_with_modes(llc_indices, llc_mode, cpus, cpu_mode);
     if request.is_empty() {
         return Ok(TryAcquireAll::Acquired(protocol::Acquired::untracked(
@@ -3230,6 +3141,23 @@ impl IntoLlcLockAttempt for Option<Vec<protocol::AdmissionFlock>> {
     }
 }
 
+impl IntoLlcLockAttempt for protocol::ProbeOutcome<Vec<protocol::AdmissionFlock>> {
+    fn into_llc_lock_attempt(self) -> LlcLockAttempt {
+        match self {
+            protocol::ProbeOutcome::Acquired(locks) => LlcLockAttempt::Acquired(locks),
+            protocol::ProbeOutcome::Contended(evidence) => LlcLockAttempt::Contended(evidence),
+            protocol::ProbeOutcome::Unavailable => {
+                #[cfg(test)]
+                {
+                    LlcLockAttempt::Unavailable
+                }
+                #[cfg(not(test))]
+                unreachable!("physical permit probe cannot return unavailable")
+            }
+        }
+    }
+}
+
 fn try_acquire_llc_plan_locks_with_evidence(
     selected: &[usize],
     cpus: &[usize],
@@ -3265,6 +3193,20 @@ fn try_acquire_llc_plan_locks_with_evidence(
         }
     }
     Ok(LlcLockAttempt::Acquired(locks))
+}
+
+/// `on_acquired` stays a closure so the Acquired-only payload clones never
+/// run on a contended probe.
+fn llc_attempt_into_probe<T>(
+    attempt: LlcLockAttempt,
+    on_acquired: impl FnOnce(Vec<protocol::AdmissionFlock>) -> T,
+) -> protocol::ProbeOutcome<T> {
+    match attempt {
+        LlcLockAttempt::Acquired(locks) => protocol::ProbeOutcome::Acquired(on_acquired(locks)),
+        LlcLockAttempt::Contended(evidence) => protocol::ProbeOutcome::Contended(evidence),
+        #[cfg(test)]
+        LlcLockAttempt::Unavailable => protocol::ProbeOutcome::Unavailable,
+    }
 }
 
 /// Exact LLC-SH/CPU-SH planner used for cooperative VM admission.
@@ -5615,20 +5557,11 @@ where
                 let reusable = probe.clone_reusable_permits()?;
                 let locks = probe.try_acquire(&exact, || {
                     if permit_admission == PermitAdmission::None {
-                        Ok(
-                            match acquire_fn(&selected, &selected_cpus, &snapshots)?
-                                .into_llc_lock_attempt()
-                            {
-                                LlcLockAttempt::Acquired(locks) => {
-                                    protocol::ProbeOutcome::Acquired(locks)
-                                }
-                                LlcLockAttempt::Contended(evidence) => {
-                                    protocol::ProbeOutcome::Contended(evidence)
-                                }
-                                #[cfg(test)]
-                                LlcLockAttempt::Unavailable => protocol::ProbeOutcome::Unavailable,
-                            },
-                        )
+                        Ok(llc_attempt_into_probe(
+                            acquire_fn(&selected, &selected_cpus, &snapshots)?
+                                .into_llc_lock_attempt(),
+                            |locks| locks,
+                        ))
                     } else {
                         acquire_resources_with_permits_granted_reusing(
                             &selected,
@@ -5701,30 +5634,14 @@ where
                 if permit_admission == PermitAdmission::None {
                     Ok(acquire_fn(&selected, &selected_cpus, &snapshots)?.into_llc_lock_attempt())
                 } else {
-                    Ok(
-                        match acquire_resources_with_permits_granted(
-                            &selected,
-                            LlcLockMode::Shared,
-                            &selected_cpus,
-                            FlockMode::Shared,
-                            &all_permits,
-                        )? {
-                            protocol::ProbeOutcome::Acquired(locks) => {
-                                LlcLockAttempt::Acquired(locks)
-                            }
-                            protocol::ProbeOutcome::Contended(evidence) => {
-                                LlcLockAttempt::Contended(evidence)
-                            }
-                            protocol::ProbeOutcome::Unavailable => {
-                                #[cfg(test)]
-                                {
-                                    LlcLockAttempt::Unavailable
-                                }
-                                #[cfg(not(test))]
-                                unreachable!("physical permit probe cannot return unavailable")
-                            }
-                        },
-                    )
+                    Ok(acquire_resources_with_permits_granted(
+                        &selected,
+                        LlcLockMode::Shared,
+                        &selected_cpus,
+                        FlockMode::Shared,
+                        &all_permits,
+                    )?
+                    .into_llc_lock_attempt())
                 }
             })
             .map_err(|e| ResourceContention {
@@ -6035,47 +5952,22 @@ where
         if sizing == LlcPlanSizing::Exact
             && designated_is_live
             && let Some(acquired) = probe.try_acquire(&designated, || {
-                Ok(
-                    match if permit_admission == PermitAdmission::None {
+                Ok(llc_attempt_into_probe(
+                    if permit_admission == PermitAdmission::None {
                         try_acquire_llc_plan_locks_with_evidence(&selected, &cpus, &snapshots)?
                     } else {
-                        match acquire_resources_with_permits_granted_reusing(
+                        acquire_resources_with_permits_granted_reusing(
                             &selected,
                             LlcLockMode::Shared,
                             &cpus,
                             FlockMode::Shared,
                             &permits,
                             &reusable_permits,
-                        )? {
-                            protocol::ProbeOutcome::Acquired(locks) => {
-                                LlcLockAttempt::Acquired(locks)
-                            }
-                            protocol::ProbeOutcome::Contended(evidence) => {
-                                LlcLockAttempt::Contended(evidence)
-                            }
-                            protocol::ProbeOutcome::Unavailable => {
-                                #[cfg(test)]
-                                {
-                                    LlcLockAttempt::Unavailable
-                                }
-                                #[cfg(not(test))]
-                                unreachable!()
-                            }
-                        }
-                    } {
-                        LlcLockAttempt::Acquired(locks) => protocol::ProbeOutcome::Acquired((
-                            selected.clone(),
-                            locks,
-                            cpus.clone(),
-                            cpu_permits.clone(),
-                        )),
-                        LlcLockAttempt::Contended(evidence) => {
-                            protocol::ProbeOutcome::Contended(evidence)
-                        }
-                        #[cfg(test)]
-                        LlcLockAttempt::Unavailable => protocol::ProbeOutcome::Unavailable,
+                        )?
+                        .into_llc_lock_attempt()
                     },
-                )
+                    |locks| (selected.clone(), locks, cpus.clone(), cpu_permits.clone()),
+                ))
             })?
         {
             return Ok(Some(acquired));
@@ -6203,51 +6095,33 @@ where
             && next_claim == designated
             && designated_is_live
             && let Some(acquired) = probe.try_acquire(&designated, || {
-                Ok(
-                    match if permit_admission == PermitAdmission::None {
+                Ok(llc_attempt_into_probe(
+                    if permit_admission == PermitAdmission::None {
                         try_acquire_llc_plan_locks_with_evidence(
                             &next_selected,
                             &next_cpus,
                             &snapshots,
                         )?
                     } else {
-                        match acquire_resources_with_permits_granted_reusing(
+                        acquire_resources_with_permits_granted_reusing(
                             &next_selected,
                             LlcLockMode::Shared,
                             &next_cpus,
                             FlockMode::Shared,
                             &next_all_permits,
                             &reusable_permits,
-                        )? {
-                            protocol::ProbeOutcome::Acquired(locks) => {
-                                LlcLockAttempt::Acquired(locks)
-                            }
-                            protocol::ProbeOutcome::Contended(evidence) => {
-                                LlcLockAttempt::Contended(evidence)
-                            }
-                            protocol::ProbeOutcome::Unavailable => {
-                                #[cfg(test)]
-                                {
-                                    LlcLockAttempt::Unavailable
-                                }
-                                #[cfg(not(test))]
-                                unreachable!()
-                            }
-                        }
-                    } {
-                        LlcLockAttempt::Acquired(locks) => protocol::ProbeOutcome::Acquired((
+                        )?
+                        .into_llc_lock_attempt()
+                    },
+                    |locks| {
+                        (
                             next_selected.clone(),
                             locks,
                             next_cpus.clone(),
                             next_permits.cpu_permits.clone(),
-                        )),
-                        LlcLockAttempt::Contended(evidence) => {
-                            protocol::ProbeOutcome::Contended(evidence)
-                        }
-                        #[cfg(test)]
-                        LlcLockAttempt::Unavailable => protocol::ProbeOutcome::Unavailable,
+                        )
                     },
-                )
+                ))
             })?
         {
             return Ok(Some(acquired));
