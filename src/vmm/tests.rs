@@ -1603,10 +1603,16 @@ fn bench_boot_time() {
 /// once a clean boot arrives.
 ///
 /// Named `boot_kernel_*` so the lock-taking-VM-cell override's
-/// `vmm::tests::boot_kernel_.*` arm covers its two cold boots — that block
-/// is first in `.config/nextest.toml` and overrides are first-match per
-/// setting, so it, not the later `test(boot_kernel) | test(bench_boot)`
-/// block, is what sets this test's slow-timeout.
+/// `vmm::tests::boot_kernel_.*` arm covers its two cold boots. That block
+/// heads the override list of both `profile.ci` and `profile.default` in
+/// `.config/nextest.toml`, and overrides are first-match per setting, so it
+/// sets this test's slow-timeout (180s x 12) under the profiles CI and local
+/// runs select. Precedence is per profile, not per file position: nextest
+/// consults the selected profile's own overrides before falling back to
+/// `profile.default`. The `test(boot_kernel) | test(bench_boot)` filter is a
+/// `[[profile.quick.overrides]]` entry, so it is inert under ci/default and
+/// is what deliberately short-circuits this test to 60s with no retry under
+/// `--profile quick`.
 /// Follows the sibling boot tests' `skip_on_contention!` convention for
 /// the /dev/kvm + host-resource gate.
 #[test]
