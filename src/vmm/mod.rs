@@ -1131,12 +1131,8 @@ fn admission_intent_plan_for(
         !candidates.is_empty(),
         "admission intent has no host placement"
     );
-    let permit_pool = host_topology::VmPermitPool::new_with_preparation(
-        allowed.len(),
-        cpu_required,
-        memory_min_mib,
-        None,
-    )?;
+    let permit_pool =
+        host_topology::VmPermitPool::new_with_preparation(cpu_required, memory_min_mib, None)?;
     Ok(Some(AdmissionIntentPlan {
         candidates,
         permit_pool,
@@ -2449,7 +2445,7 @@ impl KtstrVm {
                 reason: "non-waiting performance admission is unsupported".into(),
             }));
         }
-        Self::acquire_performance_with_permits(&allowed, candidates, pending, memory_mib, None)
+        Self::acquire_performance_with_permits(candidates, pending, memory_mib, None)
     }
 
     /// Enumerate the exact placements which satisfy one performance-mode
@@ -2479,7 +2475,6 @@ impl KtstrVm {
     }
 
     fn acquire_performance_with_permits(
-        allowed: &[usize],
         candidates: Vec<FlexibleRunCandidate>,
         pending: Option<host_topology::protocol::PendingAdmission>,
         memory_mib: u32,
@@ -2490,7 +2485,6 @@ impl KtstrVm {
         let cpu_required = candidates[0].plan.assignments.len()
             + usize::from(candidates[0].plan.service_cpu.is_some());
         let permit_pool = host_topology::VmPermitPool::new_performance_with_preparation(
-            allowed.len(),
             cpu_required,
             memory_mib,
             pending.as_ref(),
@@ -2707,7 +2701,6 @@ impl KtstrVm {
             );
         }
         let permit_pool = host_topology::VmPermitPool::new_with_preparation(
-            allowed.len(),
             shared_target,
             memory_mib,
             pending.as_ref(),
@@ -3191,7 +3184,6 @@ impl KtstrVm {
             "CPU-only admission requires a sorted, unique allowed mask"
         );
         let permit_pool = host_topology::VmPermitPool::new_with_preparation(
-            allowed.len(),
             target,
             memory_mib,
             pending.as_ref(),

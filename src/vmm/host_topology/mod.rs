@@ -3386,7 +3386,7 @@ pub(crate) fn acquire_build_llc_plan(
     })
 }
 
-/// Cooperative work may oversubscribe each allowed host CPU by this factor.
+/// Cooperative work may oversubscribe each possible host CPU by this factor.
 /// A full-width VM therefore consumes one of four host-width lanes, while the
 /// physical CPU/LLC SH locks continue to describe the topology it may share.
 const COOPERATIVE_OVERSUBSCRIPTION: usize = 4;
@@ -3419,6 +3419,13 @@ struct AdmissionPermitPool {
 }
 
 impl AdmissionPermitPool {
+    /// `cpu_count` is the host's possible CPU width, never the caller's
+    /// cpuset: permit identities are lockfiles in one host-wide namespace, so
+    /// every participant sharing a lock directory has to derive the same
+    /// indices and the same general/reserved boundary. A cpuset-derived width
+    /// would also truncate the pool below the identities a preparation permit
+    /// (always possible-width) already holds, dropping the inherited OFD from
+    /// the run selection that is meant to reuse it.
     fn for_host(cpu_count: usize) -> Self {
         let total_count = cpu_count.saturating_mul(COOPERATIVE_OVERSUBSCRIPTION);
         let reserved_count = total_count
@@ -4748,22 +4755,20 @@ impl VmPermitReservation {
 
 impl VmPermitPool {
     pub(crate) fn new_with_preparation(
-        allowed_cpu_count: usize,
         cpu_required: usize,
         memory_mib: u32,
         pending: Option<&protocol::PendingAdmission>,
     ) -> Result<Self> {
-        let cpu = AdmissionPermitPool::for_host(allowed_cpu_count);
+        let cpu = AdmissionPermitPool::for_host(possible_cpu_width());
         Self::with_cpu_pool(cpu, cpu_required, memory_mib, pending)
     }
 
     pub(crate) fn new_performance_with_preparation(
-        allowed_cpu_count: usize,
         cpu_required: usize,
         memory_mib: u32,
         pending: Option<&protocol::PendingAdmission>,
     ) -> Result<Self> {
-        let cpu = AdmissionPermitPool::for_performance_host(allowed_cpu_count);
+        let cpu = AdmissionPermitPool::for_performance_host(possible_cpu_width());
         Self::with_cpu_pool(cpu, cpu_required, memory_mib, pending)
     }
 
@@ -5326,9 +5331,9 @@ where
         pending.preparation_memory_permits().to_vec()
     });
     let permit_pool = match permit_admission {
-        PermitAdmission::Build => AdmissionPermitPool::for_build_host(allowed_cpus)?,
+        PermitAdmission::Build => AdmissionPermitPool::for_build_host(possible_cpu_width())?,
         PermitAdmission::Cooperative | PermitAdmission::None => {
-            AdmissionPermitPool::for_host(allowed_cpus)
+            AdmissionPermitPool::for_host(possible_cpu_width())
         }
     };
     let permit_rotation = pid_window_offset(std::process::id(), permit_pool.len().max(1));

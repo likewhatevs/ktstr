@@ -854,7 +854,7 @@ fn default_early_intent_preserves_exact_preference_inside_shared_fallback() {
 
     let plan = AdmissionIntentPlan {
         candidates,
-        permit_pool: host_topology::VmPermitPool::new_with_preparation(4, 2, 256, None)
+        permit_pool: host_topology::VmPermitPool::new_with_preparation(2, 256, None)
             .expect("construct test permit pool"),
     };
     let watch = plan.watch();
@@ -875,7 +875,7 @@ fn early_intent_selects_weighted_permits_once_for_all_topology_candidates() {
     let count_permit_probes = |candidates| {
         let plan = AdmissionIntentPlan {
             candidates,
-            permit_pool: host_topology::VmPermitPool::new_with_preparation(4, 2, 256, None)
+            permit_pool: host_topology::VmPermitPool::new_with_preparation(2, 256, None)
                 .expect("construct test permit pool"),
         };
         let permit_only_probes = std::cell::Cell::new(0usize);

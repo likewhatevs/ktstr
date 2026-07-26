@@ -1763,6 +1763,24 @@ fn preparation_private_working_set_uses_two_chunks_and_preserves_conversion_head
     );
 }
 
+/// Preparation and run must derive the CPU-permit pool from the same host
+/// width. Permit identities are one host-wide lockfile namespace, so a run
+/// pool sized from the caller's (cgroup-narrowed) cpuset would stop short of
+/// the identities this process's own preparation phase already holds.
+#[test]
+fn run_permit_pool_covers_the_preparation_pool_under_a_narrow_cpuset() {
+    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
+    let preparation = AdmissionPermitPool::for_host(possible_cpu_width());
+    let run = VmPermitPool::new_with_preparation(1, 256, None).expect("construct run permit pool");
+    assert_eq!(
+        run.cpu.all().collect::<Vec<_>>(),
+        preparation.all().collect::<Vec<_>>(),
+        "the run CPU-permit pool must be the preparation pool",
+    );
+    assert_eq!(run.cpu.general, preparation.general);
+    assert_eq!(run.cpu.reserved, preparation.reserved);
+}
+
 #[test]
 fn required_chunks_charges_touch_ceiling_not_sized_ram_on_wide_cells() {
     // The run claim charges `required_chunks(permit_memory)` where
@@ -2033,8 +2051,10 @@ fn elastic_build_acquires_serial_shared_plan_while_build_permits_are_saturated()
     let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
     let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let build_pool =
-        AdmissionPermitPool::for_build_host(4).expect("construct build-only namespace");
+    // Saturate the namespace the planner itself derives: build permits are
+    // sized from the host possible width, not this test's allowed cpuset.
+    let build_pool = AdmissionPermitPool::for_build_host(possible_cpu_width())
+        .expect("construct build-only namespace");
     let busy_permits = build_pool.all().collect::<Vec<_>>();
     let busy_claim = resource_claim_with_permits(
         &[],
