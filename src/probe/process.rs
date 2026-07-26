@@ -1581,9 +1581,13 @@ pub fn run_probe_skeleton(
     // into Phase B. A second kprobe on an address is pure redundancy: the
     // kernel folds both into an aggrprobe whose members run the same
     // `ktstr_probe` program and resolve the same IP-keyed `func_meta`, so
-    // the duplicate costs an extra trap and yields no extra data. Phase B
-    // derives kernel bridge callers from the scheduler's BPF ops and
-    // readily re-names a function Phase A already probed.
+    // the duplicate yields no extra data. Folding is also what keeps the
+    // address at a single probepoint, so the cost is a second run of that
+    // one handler: the argument and field reads and the `probe_data`
+    // update repeat, and the per-CPU counters behind `bpf_kprobe_fires` /
+    // `bpf_kprobe_returns` are bumped twice per hit. Phase B derives
+    // kernel bridge callers from the scheduler's BPF ops and readily
+    // re-names a function Phase A already probed.
     let mut links: Vec<(Link, String)> = Vec::new();
     let mut probed_ips: HashSet<u64> = HashSet::new();
     let mut attach_input: Vec<String> = Vec::new();
