@@ -2009,9 +2009,18 @@ impl KtstrVm {
         // sequester CPU/LLC claims, resident guest memory, and already-spawned
         // AP threads while no guest can run. It would also place the wait
         // after `run_start`, falsely charging it to the guest watchdog.
+        // Stage-local timing as well as the cumulative mark: this stage
+        // rehydrates the per-cell symbol/BTF products, and its own cost is
+        // what a cache/laziness change moves — the cumulative figure hides it
+        // behind the initramfs stage above.
+        let vmlinux_started = Instant::now();
         let prepared_vmlinux = prepare_vmlinux(&self.kernel);
         if dbg {
-            eprintln!("  vmlinux artifacts prepared: {:?}", start.elapsed());
+            eprintln!(
+                "  vmlinux artifacts prepared: {:?} (stage {:?})",
+                start.elapsed(),
+                vmlinux_started.elapsed()
+            );
         }
 
         // Acquire the run-scoped host reservation before KVM VM creation,

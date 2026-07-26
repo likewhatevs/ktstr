@@ -95,8 +95,12 @@ _with-host-sampler +cmd:
             'print(held)' > "$probe_script"
         (
             lock_dir="${KTSTR_LOCK_DIR:-}"
+            echo "host-sample-format: v2 t idle iowait cpu_total permit_locks io_sectors io_ms"
             while true; do
-                busy_idle=$(awk '/^cpu /{print $5+$6, $2+$3+$4+$5+$6+$7+$8+$9}' /proc/stat)
+                # idle and iowait stay separate columns: folded together they
+                # cannot distinguish an idle host from one blocked on IO,
+                # which is the whole question the series exists to answer.
+                cpu=$(awk '/^cpu /{print "idle="$5, "iowait="$6, "cpu_total="$2+$3+$4+$5+$6+$7+$8+$9}' /proc/stat)
                 permits=0
                 if [ -n "$lock_dir" ] && command -v python3 >/dev/null 2>&1; then
                     # Permit files persist after release; a permit is HELD
@@ -110,8 +114,8 @@ _with-host-sampler +cmd:
                 # sectors read+written and ms spent in IO, cumulative like
                 # /proc/stat, so deltas give the IO rate and utilization the
                 # CPU columns cannot see.
-                io=$(awk '$3 !~ /^(loop|ram)/ {r+=$6; w+=$10; t+=$13} END {print r+w, t}' /proc/diskstats 2>/dev/null)
-                echo "host-sample: t=$(date +%s) idle_total=${busy_idle} permit_locks=${permits} io_sectors_ms=${io}"
+                io=$(awk '$3 !~ /^(loop|ram)/ {r+=$6; w+=$10; t+=$13} END {print "io_sectors="r+w, "io_ms="t}' /proc/diskstats 2>/dev/null)
+                echo "host-sample: t=$(date +%s) ${cpu} permit_locks=${permits} ${io}"
                 sleep 5
             done > "${KTSTR_BUILD_DIAGNOSTICS_DIR}/host-saturation.log" 2>/dev/null
         ) &
