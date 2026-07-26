@@ -632,9 +632,11 @@ fn watchpoint_dispatch_ignores_non_watchpt_ec() {
     );
     assert!(
         foreign_debug,
-        "a soft-step exit we never requested belongs to the guest — \
-         it must set foreign_debug so self_arm_watchpoint releases \
-         guest debug instead of swallowing the exception"
+        "an unrequested soft-step exit cannot be guest-owned (KVM \
+         masks the guest's MDSCR_EL1.SS while we hold debug), so it \
+         signals a bookkeeping desync — it must set foreign_debug so \
+         self_arm_watchpoint releases guest debug instead of \
+         swallowing the exception"
     );
 }
 
@@ -705,13 +707,14 @@ fn watchpoint_dispatch_brk_ec_requests_guest_debug_release() {
 }
 
 /// `EC = WATCHPT_LOW` whose FAR falls outside every armed slot's
-/// 4-byte window is either a watchpoint the GUEST armed (routed to
-/// EL2 by our MDCR_EL2.TDE) or one of ours reported with an
-/// imprecise FAR (ARM ARM D2.10.5). Either way there is no slot to
-/// single-step past and the aarch64 trap fires BEFORE the store
-/// retires, so returning without action replays the store forever.
-/// Pin that this path releases guest debug rather than latching or
-/// silently continuing.
+/// 4-byte window is one of OURS reported with an imprecise FAR (ARM
+/// ARM D2.10.5) — it cannot be a watchpoint the GUEST armed, because
+/// while we hold guest debug the vCPU is VCPU_DEBUG_HOST_OWNED and
+/// the hyp debug save/restore loads our `external_debug_state`, not
+/// the guest's. Either way there is no slot to single-step past and
+/// the aarch64 trap fires BEFORE the store retires, so returning
+/// without action replays the store forever. Pin that this path
+/// releases guest debug rather than latching or silently continuing.
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn watchpoint_far_no_slot_match_requests_guest_debug_release() {
@@ -749,6 +752,138 @@ fn watchpoint_far_no_slot_match_requests_guest_debug_release() {
     assert!(
         !single_step_pending,
         "no slot matched, so there is nothing to step past"
+    );
+}
+
+/// The request mirror (`armed_slots`) is NOT a proxy for
+/// `vcpu->guest_debug`, and conflating the two makes the
+/// foreign-debug release a no-op in the one state it is most needed.
+///
+/// Reachability: `WatchpointArm::disarm` zeroes `request_kva` on
+/// scheduler detach / A→B rebind / sched-swap notify, and the freeze
+/// coordinator zeroes a user slot after every `Op::WatchSnapshot`
+/// capture — all while vCPU threads run. `any_armed` is never reset,
+/// so the arm path falls through to a re-issue with an all-zero
+/// request set.
+///
+/// Two invariants are pinned here:
+///
+///   1. That re-issue must carry control 0, so the kernel drops
+///      `vcpu->guest_debug` and with it MDCR_EL2.TDE. An
+///      `ENABLE | USE_HW` with no DBGWCR.E bits is accepted by
+///      `kvm_arch_vcpu_ioctl_set_guest_debug` and keeps routing the
+///      guest's own BRKs to EL2 while watching nothing.
+///
+///   2. When that ioctl FAILS and the retry cap stamps
+///      `armed_slots = [0; 4]`, the state must stay `Engaged`. This
+///      is the residual case invariant 1 cannot cover: the kernel
+///      still holds guest debug, so a later `foreign_debug` release
+///      still owes a control-0 ioctl. The pre-fix guard
+///      (`armed_slots == [0; 4] && !armed_single_step`) returned
+///      without issuing one, and the vCPU re-executed its guest BRK
+///      forever.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn zeroed_request_mirror_does_not_imply_guest_debug_released() {
+    use crate::vmm::vcpu::{GuestDebugState, WatchpointArm, watchpoint_control_word};
+    use std::sync::atomic::Ordering;
+
+    // Publish slot 0 the way the freeze coordinator does, then read
+    // the request set back the way `self_arm_watchpoint` does.
+    let watchpoint = WatchpointArm::new().expect("WatchpointArm::new");
+    let kva = 0xffff_ffff_8100_1000u64;
+    watchpoint.request_kva.store(kva, Ordering::Release);
+    watchpoint.mark_armed();
+    let mut requests = [0u64; 4];
+    requests[0] = watchpoint.request_kva.load(Ordering::Acquire);
+    for i in 0..3 {
+        requests[i + 1] = watchpoint.user[i].request_kva.load(Ordering::Acquire);
+    }
+    let armed_control = watchpoint_control_word(&requests, false);
+    assert_ne!(
+        armed_control & kvm_bindings::KVM_GUESTDBG_ENABLE,
+        0,
+        "a published slot must arm with KVM_GUESTDBG_ENABLE"
+    );
+    let mut state = GuestDebugState::after_ok(armed_control);
+    assert_eq!(
+        state,
+        GuestDebugState::Engaged,
+        "an accepted ENABLE ioctl means the kernel holds guest debug"
+    );
+
+    // Scheduler detach / rebind / post-capture slot release.
+    watchpoint.disarm();
+    let mut requests = [0u64; 4];
+    requests[0] = watchpoint.request_kva.load(Ordering::Acquire);
+    for i in 0..3 {
+        requests[i + 1] = watchpoint.user[i].request_kva.load(Ordering::Acquire);
+    }
+    assert_eq!(
+        requests, [0u64; 4],
+        "WatchpointArm::disarm clears request_kva while vCPUs run"
+    );
+    assert_eq!(
+        watchpoint.any_armed.load(Ordering::Relaxed),
+        1,
+        "the arm fast-path gate is never reset, so the release \
+         re-issue is actually reached"
+    );
+
+    // Invariant 1: the release re-issue hands debug back.
+    let release_control = watchpoint_control_word(&requests, false);
+    assert_eq!(
+        release_control, 0,
+        "an all-zero request set must issue control 0 — \
+         KVM_GUESTDBG_ENABLE with no DBGWCR.E bits keeps MDCR_EL2.TDE \
+         set and swallows the guest's own BRKs"
+    );
+    assert_eq!(
+        GuestDebugState::after_ok(release_control),
+        GuestDebugState::Released,
+        "a successful control-0 ioctl is the only thing that releases"
+    );
+
+    // A pending single-step must NOT take the release branch even
+    // with every request zeroed: dropping KVM_GUESTDBG_SINGLESTEP
+    // mid-dance clears the kernel's pending-step state, so the
+    // SOFTSTP_LOW exit that clears `single_step_pending` never
+    // arrives.
+    assert_ne!(
+        watchpoint_control_word(&requests, true) & kvm_bindings::KVM_GUESTDBG_SINGLESTEP,
+        0,
+        "a pending single-step must keep SINGLESTEP asserted"
+    );
+
+    // Invariant 2: the release ioctl failed and the retry cap
+    // stamped the mirror. The mirror now reads "nothing armed" while
+    // the kernel still holds guest debug.
+    let armed_slots = [0u64; 4];
+    let armed_single_step = false;
+    assert!(
+        armed_slots == [0u64; 4] && !armed_single_step,
+        "the pre-fix guard's condition holds in this state — that is \
+         the whole point"
+    );
+    assert!(
+        state.needs_release(),
+        "a failed arm ioctl must leave the state Engaged, so a later \
+         foreign_debug release still issues its control-0 ioctl \
+         despite the all-zero mirror"
+    );
+
+    // Giving up on the release is distinct from having released:
+    // it stops the ioctl storm without claiming TDE is clear.
+    state = GuestDebugState::ReleaseFailed;
+    assert!(
+        !state.needs_release(),
+        "ReleaseFailed must stop the retry loop"
+    );
+    assert_ne!(
+        state,
+        GuestDebugState::Released,
+        "'we gave up retrying' must stay distinguishable from \
+         'nothing is programmed in the CPU'"
     );
 }
 
@@ -947,9 +1082,8 @@ fn watchpoint_dispatch_x86_dr6_b2_latches_user_slot_1() {
     );
     assert!(
         !foreign_debug,
-        "x86 dispatch must never set foreign_debug — KVM only \
-         intercepts a guest #BP under KVM_GUESTDBG_USE_SW_BP, which \
-         ktstr never sets, so no foreign debug exit can arrive"
+        "the x86 arm never writes foreign_debug — sticky disarm is \
+         aarch64-only, where a swallowed guest BRK wedges the vCPU"
     );
 }
 

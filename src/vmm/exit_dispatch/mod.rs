@@ -13,7 +13,8 @@ use crate::sync::MutexExt;
 use crate::vmm::IoapicHandle;
 use crate::vmm::PiMutex;
 use crate::vmm::vcpu::{
-    ImmediateExitVcpu, SCX_EXIT_ERROR_THRESHOLD, WatchpointArm, self_arm_watchpoint,
+    GuestDebugState, ImmediateExitVcpu, SCX_EXIT_ERROR_THRESHOLD, WatchpointArm,
+    self_arm_watchpoint,
 };
 use crate::vmm::{console, kvm, pci, virtio_blk, virtio_console, virtio_net};
 use kvm_ioctls::VcpuExit;
@@ -599,8 +600,16 @@ pub(crate) fn dispatch_watchpoint_hit(
         // the BP_VECTOR intercept bit only when guest_debug carries
         // `KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP`; we arm with
         // `KVM_GUESTDBG_USE_HW_BP`, so a guest kprobe's `int3` is
-        // never intercepted and goes straight to the guest IDT. The
-        // aarch64 MDCR_EL2.TDE blanket has no x86 equivalent.
+        // never intercepted and goes straight to the guest IDT —
+        // there is no x86 analogue of arm64's BRK swallowed under
+        // MDCR_EL2.TDE. That is NOT a blanket exemption: DB_VECTOR is
+        // in the exception bitmap unconditionally, and under
+        // `KVM_GUESTDBG_USE_HW_BP` `handle_exception_nmi` reflects
+        // every guest #DB to userspace instead of reinjecting it. The
+        // reason ktstr sees none is narrower — x86 kprobes no longer
+        // single-step with EFLAGS.TF
+        // (`arch/x86/kernel/kprobes/core.c::setup_singlestep`) and
+        // guest DR writes are shadowed while we hold guest debug.
         let _ = armed_slots;
         let _ = (
             &mut *single_step_pending,
@@ -611,14 +620,25 @@ pub(crate) fn dispatch_watchpoint_hit(
         let trap_bits = (dr6 & 0xF) as u8;
         if trap_bits == 0 {
             // KVM exited via KVM_EXIT_DEBUG with no DR0..3 trap
-            // bits set — possible when a single-step (BS, bit 14)
-            // or task-switch (BT, bit 15) fired without a data/
-            // code breakpoint match. ktstr never arms BS/BT, so
-            // this is either a host-side debug stub leaking
-            // through or a synthetic exit — log and ignore.
-            // Mirrors the aarch64 "no FAR match" debug log so
-            // both arches surface unexpected debug exits the
-            // same way.
+            // bits set — a single-step (BS, bit 14) or task-switch
+            // (BT, bit 15) fired without a data/code breakpoint
+            // match. ktstr never arms BS/BT, so the source is
+            // outside our slots: a host-side debug stub, a
+            // synthetic exit, or a GUEST-originated #DB, which
+            // reaches us because DB_VECTOR is intercepted
+            // unconditionally and `handle_exception_nmi` reflects
+            // it to userspace under `KVM_GUESTDBG_USE_HW_BP`
+            // instead of reinjecting. The guest sources are a known
+            // accepted gap: EFLAGS.TF single-stepping (uprobe XOL,
+            // `ptrace(PTRACE_SINGLESTEP)`) and ICEBP. Swallowing
+            // one cannot wedge the vCPU the way an arm64 BRK does
+            // (#DB is trap-class, so the instruction retired), and
+            // routing it into the aarch64 `foreign_debug` release
+            // would be the worse trade: that latch is sticky, so one
+            // spurious #DB would forfeit the failure-dump watchpoint
+            // for the rest of the run. Log and ignore. `debug!`
+            // rather than `warn!` because a guest that does step
+            // would emit one of these per stepped instruction.
             tracing::debug!(
                 dr6,
                 "KVM_EXIT_DEBUG fired with no DR0..DR3 trap bit set \
@@ -657,13 +677,25 @@ pub(crate) fn dispatch_watchpoint_hit(
             // trigger; this exit only signals "one instruction
             // executed cleanly past the watched store".
             //
-            // If the flag is NOT set we got a soft-step exit
-            // we did not request, so it belongs to whatever
-            // enabled MDSCR_EL1.SS inside the guest (kgdb, the
-            // guest's own `hw_breakpoint.c` step-past-a-
-            // watchpoint dance). We cannot service it and we
-            // must not keep swallowing it — flag it foreign and
-            // let `self_arm_watchpoint` hand debug back.
+            // If the flag is NOT set, this exit should be
+            // unreachable. A software-step exception requires
+            // MDSCR_EL1.SS == 1, and while `vcpu->guest_debug`
+            // is non-zero the guest never sees its own
+            // MDSCR_EL1: `arch/arm64/kvm/debug.c::
+            // setup_external_mdscr` builds `external_mdscr_el1`
+            // as the guest value with SS/MDE/KDE cleared,
+            // re-adding SS only under
+            // `KVM_GUESTDBG_SINGLESTEP`, and `hyp/include/hyp/
+            // sysreg-sr.h::ctxt_mdscr_el1` loads that value on
+            // entry whenever the host owns the debug regs. So
+            // no in-guest agent can raise a soft-step while we
+            // are attached — unlike the BRK/breakpoint ECs
+            // below, which are genuinely guest-owned. Reaching
+            // here means our own `single_step_pending`
+            // bookkeeping desynced. Treat it as a blunt safety
+            // valve: we cannot service the exit and must not
+            // keep swallowing it, so flag it foreign and let
+            // `self_arm_watchpoint` hand debug back.
             if *single_step_pending {
                 *single_step_pending = false;
                 // Zero `single_step_slot` defensively. The
@@ -683,8 +715,10 @@ pub(crate) fn dispatch_watchpoint_hit(
                 tracing::warn!(
                     hsr = debug_arch.hsr,
                     "KVM_EXIT_DEBUG soft-step EC with no \
-                     single-step pending; guest owns this \
-                     exception — disarming guest debug on this vCPU"
+                     single-step pending; MDSCR_EL1.SS is \
+                     host-masked while we hold guest debug, so this \
+                     is an internal single-step bookkeeping desync \
+                     — disarming guest debug on this vCPU"
                 );
             }
             return;
@@ -749,14 +783,24 @@ pub(crate) fn dispatch_watchpoint_hit(
             }
         }
         if matched_mask == 0 {
-            // Either a guest-armed watchpoint routed to EL2 by our
-            // MDCR_EL2.TDE, or one of ours whose FAR landed outside
-            // the watched window (ARM ARM D2.10.5 permits an
-            // imprecise FAR). Both readings demand the same action:
-            // there is no slot to single-step past, so re-entering
-            // KVM_RUN replays the same store and re-traps forever
-            // (the aarch64 watchpoint trap is taken BEFORE the
-            // access retires). Give debug back to the guest.
+            // Not a guest-armed watchpoint: while `vcpu->guest_debug`
+            // is non-zero `arch/arm64/kvm/debug.c` marks the vCPU
+            // VCPU_DEBUG_HOST_OWNED, and
+            // `hyp/include/hyp/debug-sr.h::__vcpu_debug_regs` then
+            // loads `external_debug_state` — our own
+            // KVM_SET_GUEST_DEBUG payload — so the guest's
+            // DBGWCR/DBGWVR are not in hardware at all. This is one
+            // of OURS whose FAR landed outside the watched window;
+            // ARM ARM D2.10.5 permits an imprecise FAR, and
+            // `arch/arm64/kernel/hw_breakpoint.c` documents the same
+            // ("hardware does not always report a watchpoint hit
+            // address that matches one of the watchpoints set"),
+            // which is why Linux attributes by closest match rather
+            // than an exact range test like the one above. There is
+            // no slot to single-step past, so re-entering KVM_RUN
+            // replays the same store and re-traps forever (the
+            // aarch64 watchpoint trap is taken BEFORE the access
+            // retires). Give debug back to the guest.
             *foreign_debug = true;
             tracing::warn!(
                 hsr = debug_arch.hsr,
@@ -984,6 +1028,12 @@ pub(crate) fn vcpu_run_loop_unified(
     // on by `self_arm_watchpoint`, which disarms guest debug so the
     // guest can take the exception itself.
     let mut foreign_debug: bool = false;
+    // What the KERNEL holds, as opposed to what `armed_slots`
+    // requests. The two diverge whenever the coordinator releases
+    // every slot while this thread runs; only this local can tell
+    // `self_arm_watchpoint`'s disarm path whether a control-0 ioctl
+    // is still owed. Inert on x86_64.
+    let mut guest_debug_state = GuestDebugState::Released;
     loop {
         if kill.load(Ordering::Acquire) {
             break;
@@ -1026,6 +1076,7 @@ pub(crate) fn vcpu_run_loop_unified(
             single_step_slot,
             &mut armed_single_step,
             foreign_debug,
+            &mut guest_debug_state,
         );
 
         match vcpu.run() {

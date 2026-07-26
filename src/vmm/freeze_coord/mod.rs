@@ -35,8 +35,8 @@ use super::host_comms::BulkDrainResult;
 use super::pi_mutex::PiMutex;
 use super::result::{HostVcpuSchedstat, VmResult, VmRunState};
 use super::vcpu::{
-    ApFreezeHandles, BpfMapWriteParams, ImmediateExitHandle, ImmediateExitVcpu, VcpuThread,
-    WatchpointArm, duration_to_jiffies, load_probe_bss_offset, open_vcpu_perf_capture,
+    ApFreezeHandles, BpfMapWriteParams, GuestDebugState, ImmediateExitHandle, ImmediateExitVcpu,
+    VcpuThread, WatchpointArm, duration_to_jiffies, load_probe_bss_offset, open_vcpu_perf_capture,
     pin_current_thread, register_vcpu_signal_handler, self_arm_watchpoint, set_rt_priority,
     set_thread_cpumask, vcpu_signal,
 };
@@ -18245,6 +18245,12 @@ impl KtstrVm {
         // `self_arm_watchpoint`'s disarm block for why an armed
         // watchpoint otherwise swallows the guest's own BRK forever.
         let mut foreign_debug: bool = false;
+        // What the KERNEL holds, as opposed to what `armed_slots`
+        // requests — mirrors the AP-side local. The two diverge
+        // whenever the coordinator releases every slot while this
+        // loop runs; only this local can tell the disarm path
+        // whether a control-0 ioctl is still owed. Inert on x86_64.
+        let mut guest_debug_state = GuestDebugState::Released;
 
         loop {
             if kill.load(Ordering::Acquire) {
@@ -18409,6 +18415,7 @@ impl KtstrVm {
                 single_step_slot,
                 &mut armed_single_step,
                 foreign_debug,
+                &mut guest_debug_state,
             );
 
             match bsp.run() {
