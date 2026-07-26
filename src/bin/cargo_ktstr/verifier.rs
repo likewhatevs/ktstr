@@ -75,10 +75,7 @@ use crate::feature_discovery::{
     selected_activations_for_context, selected_workspace_packages,
 };
 #[cfg(test)]
-use crate::feature_discovery::{
-    explicit_package_exclusions, explicit_package_selection, infer_ktstr_feature_roots,
-    selected_activations,
-};
+use crate::feature_discovery::{infer_ktstr_feature_roots, selected_activations};
 use crate::kernel::{
     encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
 };
@@ -542,12 +539,7 @@ fn query_verifier_package_plan(
             .into_iter()
             .map(|package| package.name.to_string())
             .collect::<HashSet<_>>();
-        plan.compatible
-            .retain(|package| selected.contains(&package.name));
-        plan.older
-            .retain(|package| selected.contains(&package.name));
-        plan.newer
-            .retain(|package| selected.contains(&package.name));
+        restrict_plan_to_selected(&mut plan, &selected);
     }
     Ok((plan, Some(metadata)))
 }
@@ -575,29 +567,13 @@ fn format_older_package_skip(package: &OlderVerifierPackage) -> String {
     )
 }
 
-#[cfg(test)]
-fn restrict_plan_to_explicit_selection(
-    mut plan: VerifierPackagePlan,
-    args: &[String],
-) -> VerifierPackagePlan {
-    let excluded = explicit_package_exclusions(args);
-    plan.compatible
-        .retain(|package| !excluded.contains(&package.name));
-    plan.older
-        .retain(|package| !excluded.contains(&package.name));
-    plan.newer
-        .retain(|package| !excluded.contains(&package.name));
-
-    let Some(selected) = explicit_package_selection(args) else {
-        return plan;
-    };
+fn restrict_plan_to_selected(plan: &mut VerifierPackagePlan, selected: &HashSet<String>) {
     plan.compatible
         .retain(|package| selected.contains(&package.name));
     plan.older
         .retain(|package| selected.contains(&package.name));
     plan.newer
         .retain(|package| selected.contains(&package.name));
-    plan
 }
 
 /// Remove exact `-p` selectors for packages already classified as old.
@@ -2696,6 +2672,18 @@ mod tests {
         values.iter().map(|value| (*value).to_string()).collect()
     }
 
+    /// The plan `query_verifier_package_plan` produces once
+    /// `selected_workspace_packages` has resolved an operator's package
+    /// selection down to `selected`.
+    fn plan_restricted_to(mut plan: VerifierPackagePlan, selected: &[&str]) -> VerifierPackagePlan {
+        let selected = selected
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<HashSet<_>>();
+        restrict_plan_to_selected(&mut plan, &selected);
+        plan
+    }
+
     #[test]
     fn recursive_verifier_cached_reuse_strips_build_surface_and_keeps_cell_filter() {
         let command = strings(&[
@@ -4032,7 +4020,7 @@ mod tests {
     #[test]
     fn explicit_package_selection_is_not_widened() {
         let forward = strings(&["-p", "scx_layered"]);
-        let plan = restrict_plan_to_explicit_selection(scoped_plan(), &forward);
+        let plan = plan_restricted_to(scoped_plan(), &["scx_layered"]);
         let args = build_scoped_nextest_args(None, &forward, &plan);
         let selected = args
             .windows(2)
@@ -4049,8 +4037,7 @@ mod tests {
 
     #[test]
     fn explicit_old_package_becomes_non_error_empty_plan() {
-        let selected =
-            restrict_plan_to_explicit_selection(scoped_plan(), &strings(&["-p", "scx_mitosis"]));
+        let selected = plan_restricted_to(scoped_plan(), &["scx_mitosis"]);
         assert!(selected.compatible.is_empty());
         assert_eq!(selected.older[0].name, "scx_mitosis");
         assert!(selected.newer.is_empty());
@@ -4065,7 +4052,7 @@ mod tests {
             "--features",
             "ktstr-tests",
         ]);
-        let selected = restrict_plan_to_explicit_selection(scoped_plan(), &args);
+        let selected = plan_restricted_to(scoped_plan(), &["scx_layered", "scx_mitosis"]);
         let rewritten = drop_older_package_selectors(&args, &selected.older);
         assert_eq!(
             rewritten,
@@ -4119,7 +4106,7 @@ mod tests {
             "--package=scx_mitosis",
             "payload",
         ]);
-        let selected = restrict_plan_to_explicit_selection(scoped_plan(), &args);
+        let selected = plan_restricted_to(scoped_plan(), &["scx_layered", "scx_mitosis"]);
         assert_eq!(
             drop_older_package_selectors(&args, &selected.older),
             strings(&[
@@ -4154,7 +4141,7 @@ mod tests {
             name: "future_tests".to_string(),
             versions: vec![Version::parse("0.42.0").unwrap()],
         });
-        let selected = restrict_plan_to_explicit_selection(plan, &strings(&["-p", "scx_layered"]));
+        let selected = plan_restricted_to(plan, &["scx_layered"]);
         assert_eq!(
             selected.compatible,
             vec![CompatibleVerifierPackage {
@@ -4173,15 +4160,9 @@ mod tests {
             name: "future_tests".to_string(),
             versions: vec![Version::parse("0.42.0").unwrap()],
         });
-        let selected = restrict_plan_to_explicit_selection(
-            plan,
-            &strings(&[
-                "--workspace",
-                "--exclude",
-                "scx_mitosis",
-                "--exclude=future_tests@1.0.0",
-            ]),
-        );
+        // `--workspace --exclude scx_mitosis --exclude future_tests` leaves
+        // exactly the three compatible members selected.
+        let selected = plan_restricted_to(plan, &["scx_cosmos", "scx_lavd", "scx_layered"]);
         assert!(selected.older.is_empty());
         assert!(selected.newer.is_empty());
         assert_eq!(selected.compatible.len(), 3);
@@ -4212,7 +4193,8 @@ mod tests {
     #[test]
     fn lone_exclude_gets_required_workspace_scope() {
         let forward = strings(&["--exclude", "scx_cosmos"]);
-        let plan = restrict_plan_to_explicit_selection(scoped_plan(), &forward);
+        // A lone `--exclude` widens to the whole workspace minus that package.
+        let plan = plan_restricted_to(scoped_plan(), &["scx_lavd", "scx_layered", "scx_mitosis"]);
         let args = build_scoped_nextest_args(None, &forward, &plan);
         assert!(args.iter().any(|argument| argument == "--workspace"));
         assert!(

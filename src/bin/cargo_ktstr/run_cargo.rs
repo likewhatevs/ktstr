@@ -2653,6 +2653,18 @@ impl StagedProfraw {
     }
 }
 
+/// Render the operator-facing suffix describing what a failed coverage report
+/// managed to retain. `retained` names the profile in the success wording; the
+/// exact text is diagnostic-only and has no test asserting it, so keep the
+/// wording stable when editing.
+fn coverage_recovery_suffix(recovery: Result<Option<PathBuf>, String>, retained: &str) -> String {
+    match recovery {
+        Ok(Some(path)) => format!("; raw shards and {retained} retained at {}", path.display()),
+        Ok(None) => String::new(),
+        Err(error) => format!("; additionally failed to retain coverage inputs: {error}"),
+    }
+}
+
 fn coverage_recovery_parent() -> Result<PathBuf, String> {
     let cache_root = ktstr::cache::cargo_artifact_tree_cache_root()
         .map_err(|error| format!("resolve coverage recovery cache root: {error:#}"))?;
@@ -4976,17 +4988,10 @@ fn run_cargo_sub(
                     match crate::interrupt::run_status(report) {
                         Ok(report_status) if report_status.success() => staged.discard().err(),
                         Ok(report_status) => {
-                            let recovery = staged.persist(&coverage.merged_profdata);
-                            let recovery = match recovery {
-                                Ok(Some(path)) => format!(
-                                    "; raw shards and merged profile retained at {}",
-                                    path.display(),
-                                ),
-                                Ok(None) => String::new(),
-                                Err(error) => format!(
-                                    "; additionally failed to retain coverage inputs: {error}"
-                                ),
-                            };
+                            let recovery = coverage_recovery_suffix(
+                                staged.persist(&coverage.merged_profdata),
+                                "merged profile",
+                            );
                             Some(format!(
                                 "cargo llvm-cov report exited with {}{recovery}",
                                 report_status
@@ -4995,17 +5000,10 @@ fn run_cargo_sub(
                             ))
                         }
                         Err(error) => {
-                            let recovery = staged.persist(&coverage.merged_profdata);
-                            let recovery = match recovery {
-                                Ok(Some(path)) => format!(
-                                    "; raw shards and merged profile retained at {}",
-                                    path.display(),
-                                ),
-                                Ok(None) => String::new(),
-                                Err(error) => format!(
-                                    "; additionally failed to retain coverage inputs: {error}"
-                                ),
-                            };
+                            let recovery = coverage_recovery_suffix(
+                                staged.persist(&coverage.merged_profdata),
+                                "merged profile",
+                            );
                             Some(format!("spawn cargo llvm-cov report: {error}{recovery}"))
                         }
                     }
@@ -5019,18 +5017,7 @@ fn run_cargo_sub(
                                 .unwrap_or(&coverage.merged_profdata);
                             staged.persist(retained_profile)
                         });
-                    let recovery = match recovery {
-                        Ok(Some(path)) => format!(
-                            "; raw shards and available merged profile retained at {}",
-                            path.display(),
-                        ),
-                        Ok(None) => String::new(),
-                        Err(recovery_error) => {
-                            format!(
-                                "; additionally failed to retain coverage inputs: {recovery_error}"
-                            )
-                        }
-                    };
+                    let recovery = coverage_recovery_suffix(recovery, "available merged profile");
                     Some(format!("prepare cargo llvm-cov report: {error}{recovery}"))
                 }
             };
@@ -5638,20 +5625,44 @@ fn remove_shared_build_scratch_bucket(bucket: &std::path::Path) -> std::io::Resu
 /// runs before that lease is taken, so the non-blocking lock below would
 /// otherwise succeed against the caller's own bucket and delete the very
 /// directory it is about to build in or reuse at runtime.
+/// Roots both shared build-scratch reclamation sweeps scan: the parent holding
+/// every bucket, and the build-output lock root whose leases gate removal.
+struct SweepRoots {
+    parent: std::path::PathBuf,
+    lock_root: std::path::PathBuf,
+}
+
+fn shared_build_scratch_sweep_roots() -> Option<SweepRoots> {
+    let bucket_zero = crate::nextest_artifact_cache::shared_build_scratch_dir(0).ok()?;
+    let parent = bucket_zero.parent()?.to_path_buf();
+    let lock_root = ktstr::cache::cargo_build_output_lock_root().ok()?;
+    Some(SweepRoots { parent, lock_root })
+}
+
+/// Buckets under `parent` a sweep may consider: real directories with a
+/// parseable bucket id, minus the bucket the calling run is about to lease.
+fn reclaimable_bucket_candidates(
+    parent: &std::path::Path,
+    exempt_bucket: Option<u64>,
+) -> Vec<(u64, std::path::PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter_map(|entry| {
+            let bucket_id = shared_build_scratch_bucket_id(&entry.file_name())?;
+            (exempt_bucket != Some(bucket_id)).then(|| (bucket_id, entry.path()))
+        })
+        .collect()
+}
+
 pub(crate) fn gc_stale_shared_build_scratch(now: std::time::SystemTime, exempt_bucket: u64) {
-    let Ok(parent) = crate::nextest_artifact_cache::shared_build_scratch_dir(0)
-        .map(|bucket_zero| bucket_zero.parent().map(std::path::Path::to_path_buf))
-    else {
+    let Some(roots) = shared_build_scratch_sweep_roots() else {
         return;
     };
-    let Some(parent) = parent else {
-        return;
-    };
-    let lock_root = match ktstr::cache::cargo_build_output_lock_root() {
-        Ok(root) => root,
-        Err(_) => return,
-    };
-    gc_stale_shared_build_scratch_in(&parent, &lock_root, now, Some(exempt_bucket));
+    gc_stale_shared_build_scratch_in(&roots.parent, &roots.lock_root, now, Some(exempt_bucket));
 }
 
 fn gc_stale_shared_build_scratch_in(
@@ -5660,21 +5671,7 @@ fn gc_stale_shared_build_scratch_in(
     now: std::time::SystemTime,
     exempt_bucket: Option<u64>,
 ) {
-    let entries = match std::fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Some(bucket_id) = shared_build_scratch_bucket_id(&entry.file_name()) else {
-            continue;
-        };
-        if exempt_bucket == Some(bucket_id) {
-            continue;
-        }
-        let bucket = entry.path();
+    for (_bucket_id, bucket) in reclaimable_bucket_candidates(parent, exempt_bucket) {
         if !shared_build_scratch_bucket_is_idle(&bucket, now) {
             continue;
         }
@@ -5792,21 +5789,12 @@ pub(crate) fn reclaim_shared_build_scratch_under_pressure(
     shortfall_bytes: u64,
     exempt_bucket: u64,
 ) -> u64 {
-    let Ok(parent) = crate::nextest_artifact_cache::shared_build_scratch_dir(0)
-        .map(|bucket_zero| bucket_zero.parent().map(std::path::Path::to_path_buf))
-    else {
+    let Some(roots) = shared_build_scratch_sweep_roots() else {
         return 0;
-    };
-    let Some(parent) = parent else {
-        return 0;
-    };
-    let lock_root = match ktstr::cache::cargo_build_output_lock_root() {
-        Ok(root) => root,
-        Err(_) => return 0,
     };
     reclaim_shared_build_scratch_under_pressure_in(
-        &parent,
-        &lock_root,
+        &roots.parent,
+        &roots.lock_root,
         shortfall_bytes,
         Some(exempt_bucket),
     )
@@ -5821,28 +5809,18 @@ fn reclaim_shared_build_scratch_under_pressure_in(
     if shortfall_bytes == 0 {
         return 0;
     }
-    let entries = match std::fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(_) => return 0,
-    };
     // (last_used, path, bucket_id) for every reclaimable bucket except the one
     // the pending build will use. Ordered oldest-idle first so the
     // least-recently-built configurations go before hotter ones.
-    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, u64)> = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Some(bucket_id) = shared_build_scratch_bucket_id(&entry.file_name()) else {
-            continue;
-        };
-        if exempt_bucket == Some(bucket_id) {
-            continue;
-        }
-        let path = entry.path();
-        let last_used = bucket_last_used(&path).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        candidates.push((last_used, path, bucket_id));
-    }
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, u64)> =
+        reclaimable_bucket_candidates(parent, exempt_bucket)
+            .into_iter()
+            .map(|(id, path)| {
+                let last_used =
+                    bucket_last_used(&path).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                (last_used, path, id)
+            })
+            .collect();
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2)));
 
     let mut reclaimed = 0u64;
@@ -6359,7 +6337,7 @@ impl ItemProgress {
         use std::io::IsTerminal as _;
         use std::sync::Arc;
 
-        let label = escape_progress_text(label);
+        let label = crate::reserved_build_progress::escape_free(label);
         let started = std::time::Instant::now();
         let state = Arc::new(ItemProgressState::new());
         if std::io::stderr().is_terminal() {
@@ -6415,7 +6393,7 @@ impl ItemProgress {
             .map_err(|error| {
                 ktstr::ktstr_status!(
                     "{label}: could not start progress heartbeat thread: {}",
-                    escape_progress_text(&error.to_string()),
+                    crate::reserved_build_progress::escape_free(&error.to_string()),
                 );
             })
             .ok();
@@ -6499,35 +6477,13 @@ fn item_progress_line(
         snapshot.completed,
         total,
         snapshot.failed,
-        format_progress_elapsed(elapsed),
+        crate::reserved_build_progress::format_elapsed(elapsed),
     );
     if let Some(detail) = detail {
         line.push_str("; error=");
-        line.push_str(&escape_progress_text(detail));
+        line.push_str(&crate::reserved_build_progress::escape_free(detail));
     }
     line
-}
-
-fn format_progress_elapsed(elapsed: std::time::Duration) -> String {
-    let seconds = elapsed.as_secs();
-    if seconds >= 60 {
-        format!("{}m {:02}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{:.1}s", elapsed.as_secs_f64())
-    }
-}
-
-fn escape_progress_text(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect()
 }
 
 /// Precompute cast analysis for exact declaration-derived scheduler

@@ -580,7 +580,8 @@ impl Drop for ReservedBuildProgress {
     }
 }
 
-fn format_elapsed(elapsed: Duration) -> String {
+/// Render a duration as `Xm SSs` past a minute, `X.Ys` below it.
+pub(crate) fn format_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     if seconds >= 60 {
         format!("{}m {:02}s", seconds / 60, seconds % 60)
@@ -598,7 +599,9 @@ fn exit_label(status: &ExitStatus) -> String {
     }
 }
 
-fn escape_free(value: &str) -> String {
+/// Replace control characters with spaces so progress lines cannot emit
+/// terminal escapes.
+pub(crate) fn escape_free(value: &str) -> String {
     value
         .chars()
         .map(|character| {

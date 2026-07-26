@@ -83,13 +83,10 @@ impl crate::interrupt::StdoutObserver for NextestRunProgress {
 }
 
 fn nextest_heartbeat_line(elapsed: Duration) -> String {
-    let seconds = elapsed.as_secs();
-    let elapsed = if seconds >= 60 {
-        format!("{}m {:02}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{:.1}s", elapsed.as_secs_f64())
-    };
-    format!("cargo ktstr: nextest run still active; elapsed={elapsed}")
+    format!(
+        "cargo ktstr: nextest run still active; elapsed={}",
+        crate::reserved_build_progress::format_elapsed(elapsed)
+    )
 }
 
 /// Whether one inherited variable describes nextest's current test process.

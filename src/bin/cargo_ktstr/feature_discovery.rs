@@ -1239,19 +1239,6 @@ fn explicit_package_specs(args: &[String]) -> Option<Vec<String>> {
     (!specs.is_empty()).then_some(specs)
 }
 
-/// Exact package names requested by `-p` / `--package`, or `None` for
-/// unscoped/workspace/unsupported package-spec cases.
-#[cfg(test)]
-pub(crate) fn explicit_package_selection(args: &[String]) -> Option<HashSet<String>> {
-    if has_workspace_selector(args) {
-        return None;
-    }
-    explicit_package_specs(args)?
-        .into_iter()
-        .map(|spec| package_spec_name(&spec).map(ToString::to_string))
-        .collect()
-}
-
 fn explicit_package_exclusion_specs(args: &[String]) -> Option<Vec<String>> {
     let args = cargo_args(args);
     let mut excluded = Vec::new();
@@ -1274,15 +1261,6 @@ fn explicit_package_exclusion_specs(args: &[String]) -> Option<Vec<String>> {
         index += 1;
     }
     Some(excluded)
-}
-
-#[cfg(test)]
-pub(crate) fn explicit_package_exclusions(args: &[String]) -> HashSet<String> {
-    explicit_package_exclusion_specs(args)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|spec| package_spec_name(&spec).map(ToString::to_string))
-        .collect()
 }
 
 pub(crate) fn has_package_selector(args: &[String]) -> bool {
