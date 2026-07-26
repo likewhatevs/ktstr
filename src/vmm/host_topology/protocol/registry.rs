@@ -2924,11 +2924,7 @@ impl Ticket {
                     .as_ref()
                     .unwrap_or(&acquired_designation);
                 table.begin_transaction()?;
-                table.mark_unknown(
-                    &released_claim.cpus,
-                    &released_claim.llcs,
-                    &released_claim.permits,
-                )?;
+                table.mark_claim_unknown(released_claim)?;
                 table.finish_transaction()?;
                 drop(table);
                 drop(lock);
@@ -2984,11 +2980,7 @@ impl Ticket {
                     .preparation_claim
                     .as_ref()
                     .unwrap_or(&acquired_designation);
-                table.mark_unknown(
-                    &released_claim.cpus,
-                    &released_claim.llcs,
-                    &released_claim.permits,
-                )?;
+                table.mark_claim_unknown(released_claim)?;
             } else if let Some((marker, serial, consumed_serial)) = blocked {
                 table.set_record_blocked(self.slot, marker, serial)?;
                 table.set_record_issue_serial(self.slot, consumed_serial)?;
@@ -3032,11 +3024,7 @@ impl Ticket {
             // REPLAN -> WAITING drains this ring slot through set_record_state.
             table.set_record_state(self.slot, STATE_WAITING)?;
             table.clear_record_blocked(self.slot)?;
-            table.mark_unknown(
-                &result.next_claim.cpus,
-                &result.next_claim.llcs,
-                &result.next_claim.permits,
-            )?;
+            table.mark_claim_unknown(&result.next_claim)?;
             let _edge = table.schedule_replan_completion_edge_in_transaction()?;
             table.finish_transaction()?;
             drop(table);
@@ -3069,11 +3057,7 @@ impl Ticket {
                     .as_ref()
                     .unwrap_or(&acquired_designation);
                 table.begin_transaction()?;
-                table.mark_unknown(
-                    &released_claim.cpus,
-                    &released_claim.llcs,
-                    &released_claim.permits,
-                )?;
+                table.mark_claim_unknown(released_claim)?;
                 table.finish_transaction()?;
             }
             drop(table);
@@ -3183,11 +3167,7 @@ impl Ticket {
                     .preparation_claim
                     .as_ref()
                     .unwrap_or(&acquired_designation);
-                table.mark_unknown(
-                    &released_claim.cpus,
-                    &released_claim.llcs,
-                    &released_claim.permits,
-                )?;
+                table.mark_claim_unknown(released_claim)?;
                 notify_now = table.schedule_grant_completion_edge_in_transaction()?;
                 table.finish_transaction()?;
             }
@@ -3254,11 +3234,7 @@ impl Ticket {
                             self.slot,
                             callback_snapshot_serial.max(blocked_at),
                         )?;
-                        table.mark_unknown(
-                            &preparation_claim.cpus,
-                            &preparation_claim.llcs,
-                            &preparation_claim.permits,
-                        )?;
+                        table.mark_claim_unknown(&preparation_claim)?;
                         table.schedule_grant_completion_edge_in_transaction()?;
                         table.finish_transaction()?;
                         drop(table);
@@ -17171,8 +17147,13 @@ impl Table {
         Ok(())
     }
 
-    fn record(&mut self, slot: u64) -> Result<Option<Record>> {
-        let layout = self.layout;
+    /// Bytes of a slot that holds a record in a valid active state.
+    ///
+    /// Single-sources the state whitelist for both decode paths; every
+    /// non-FREE state must appear here or that decode silently rejects
+    /// live records.
+    #[inline]
+    fn active_record_bytes(&mut self, slot: u64) -> Result<Option<&[u8]>> {
         let Some(bytes) = self.record_bytes(slot)? else {
             return Ok(None);
         };
@@ -17194,6 +17175,14 @@ impl Table {
         ) {
             anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid state {state}");
         }
+        Ok(Some(bytes))
+    }
+
+    fn record(&mut self, slot: u64) -> Result<Option<Record>> {
+        let layout = self.layout;
+        let Some(bytes) = self.active_record_bytes(slot)? else {
+            return Ok(None);
+        };
         let record = decode_record(bytes, layout, slot)?;
         if record.ticket == 0
             || record.claim.is_empty()
@@ -17214,27 +17203,9 @@ impl Table {
 
     fn scan_record(&mut self, slot: u64) -> Result<Option<ScanRecord>> {
         let layout = self.layout;
-        let Some(bytes) = self.record_bytes(slot)? else {
+        let Some(bytes) = self.active_record_bytes(slot)? else {
             return Ok(None);
         };
-        let state = read_u32(bytes, R_STATE);
-        if state == STATE_FREE {
-            return Ok(None);
-        }
-        if !matches!(
-            state,
-            STATE_WAITING
-                | STATE_GRANTED
-                | STATE_REPLAN
-                | STATE_COORDINATOR
-                | STATE_HELD
-                | STATE_COORDINATOR_STANDBY
-                | STATE_PENDING
-                | STATE_REVOKED
-                | STATE_REPLAN_EXPIRED
-        ) {
-            anyhow::bail!("queue registry v{VERSION} slot {slot} has invalid state {state}");
-        }
         let record = decode_scan_record(bytes, layout, slot)?;
         if record.ticket == 0 || record.claim.is_empty() {
             anyhow::bail!(
@@ -17302,9 +17273,9 @@ impl Table {
         Ok(read_u64(bytes, R_TICKET) == ticket && read_u32(bytes, R_STATE) == state)
     }
 
+    /// Strict ticket order proves uniqueness, so no ticket set is needed here.
     fn records(&mut self) -> Result<Vec<Record>> {
         let mut records = Vec::new();
-        let mut tickets = BTreeSet::new();
         let next_slot = self.next_slot()?;
         let head = read_u64(&self.header, H_ACTIVE_HEAD);
         let tail = read_u64(&self.header, H_ACTIVE_TAIL);
@@ -17334,12 +17305,6 @@ impl Table {
             if record.ticket <= previous_ticket {
                 anyhow::bail!(
                     "queue registry v{VERSION} active tickets are not strictly increasing at {}",
-                    record.ticket
-                );
-            }
-            if !tickets.insert(record.ticket) {
-                anyhow::bail!(
-                    "queue registry v{VERSION} contains duplicate active ticket {}",
                     record.ticket
                 );
             }
@@ -19965,6 +19930,10 @@ impl Table {
         self.mark_observation_modes(&plan)
     }
 
+    fn mark_claim_unknown(&mut self, claim: &ClaimSet) -> Result<bool> {
+        self.mark_unknown(&claim.cpus, &claim.llcs, &claim.permits)
+    }
+
     fn mark_observation_modes(&mut self, plan: &PossibleReleasePlan) -> Result<bool> {
         if plan.is_empty() {
             return Ok(false);
@@ -20198,7 +20167,7 @@ impl Table {
         contention: &[ContentionMarker],
     ) -> Result<()> {
         self.begin_transaction()?;
-        self.mark_unknown(&footprint.cpus, &footprint.llcs, &footprint.permits)?;
+        self.mark_claim_unknown(footprint)?;
         self.mark_blockers_unknown(contention)?;
         self.advance_generation()?;
         self.finish_transaction()
