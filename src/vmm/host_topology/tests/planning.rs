@@ -1668,6 +1668,7 @@ fn cooperative_permits_admit_four_host_width_claims_and_reject_a_fifth() {
             lane * host_width,
             &[],
             |candidate| Ok(candidate.permits.is_disjoint(&held)),
+            |_| Ok(false),
         )
         .unwrap()
         .expect("each of four host-width cooperative lanes must fit");
@@ -1685,6 +1686,7 @@ fn cooperative_permits_admit_four_host_width_claims_and_reject_a_fifth() {
             0,
             &[],
             |candidate| Ok(candidate.permits.is_disjoint(&held)),
+            |_| Ok(false),
         )
         .unwrap()
         .is_none(),
@@ -1703,13 +1705,21 @@ fn zero_width_permit_request_names_no_permits() {
     assert_eq!(pool.len(), host_width * COOPERATIVE_OVERSUBSCRIPTION);
 
     let mut probes = 0usize;
-    let selection =
-        select_admission_permits(PermitAdmission::Cooperative, &pool, 0, 0, 0, &[], |_| {
+    let selection = select_admission_permits(
+        PermitAdmission::Cooperative,
+        &pool,
+        0,
+        0,
+        0,
+        &[],
+        |_| {
             probes += 1;
             Ok(true)
-        })
-        .expect("select a zero-width shape")
-        .expect("a zero-width request with no floor is met by an empty selection");
+        },
+        |_| Ok(false),
+    )
+    .expect("select a zero-width shape")
+    .expect("a zero-width request with no floor is met by an empty selection");
     assert!(
         selection.permits.is_empty(),
         "zero-width selection must name no permits, got {:?}",
@@ -1725,9 +1735,16 @@ fn zero_width_permit_request_names_no_permits() {
     );
 
     assert!(
-        select_admission_permits(PermitAdmission::Cooperative, &pool, 0, 1, 0, &[], |_| Ok(
-            true
-        ))
+        select_admission_permits(
+            PermitAdmission::Cooperative,
+            &pool,
+            0,
+            1,
+            0,
+            &[],
+            |_| Ok(true),
+            |_| Ok(false),
+        )
         .expect("select a zero-width shape under a one-permit floor")
         .is_none(),
         "an empty selection cannot clear a one-permit floor",
@@ -2031,12 +2048,18 @@ fn build_permits_are_bounded_but_never_blocked_by_live_default_borrowers() {
                 && !cooperative.reserved.contains(&permit)),
         "build permits must be disjoint from both general and borrowed default capacity",
     );
-    let selection =
-        select_admission_permits(PermitAdmission::Build, &build, 1, 1, 0, &[], |candidate| {
-            Ok(candidate.permits.is_disjoint(&borrowed))
-        })
-        .expect("select one build permit")
-        .expect("a live default borrower must not delay build admission");
+    let selection = select_admission_permits(
+        PermitAdmission::Build,
+        &build,
+        1,
+        1,
+        0,
+        &[],
+        |candidate| Ok(candidate.permits.is_disjoint(&borrowed)),
+        |_| Ok(false),
+    )
+    .expect("select one build permit")
+    .expect("a live default borrower must not delay build admission");
     assert_eq!(
         selection.admission_class,
         admission_protocol::AdmissionClass::Build
@@ -2169,6 +2192,7 @@ fn cooperative_selection_borrows_reserved_capacity_when_general_capacity_is_exha
         0,
         &[],
         |candidate| Ok(candidate.permits.is_disjoint(&exhausted_general)),
+        |_| Ok(false),
     )
     .expect("select cooperative fallback capacity")
     .expect("reserved capacity must remain a soft default fallback");
@@ -3981,6 +4005,7 @@ fn performance_permit_pool_cannot_select_the_reserved_suffix() {
         0,
         &ordinary.reserved,
         |_| Ok(true),
+        |_| Ok(false),
     )
     .unwrap()
     .expect("general performance permits remain selectable");
@@ -4215,4 +4240,81 @@ fn permit_selection_prefers_grant_free_and_falls_back() {
         2,
         "under total charge the fallback must restore today's selection",
     );
+}
+
+/// Width preservation: grant avoidance is a preference, never a filter
+/// that shrinks the request. `LlcPlanSizing::Elastic` floors a permit
+/// request at one, so a charge covering all but one permit lets a
+/// filtering tier answer a multi-permit request from that single permit
+/// — and an elastic selection's permit count *is* the CPU width
+/// `apply_plan_permit_width` truncates the plan to. The grant charge
+/// would then be deciding how many CPUs the plan funds, which is a
+/// capacity decision a subordinate bias must never make. Avoidance has
+/// to fill the requested width from the charged permits instead.
+#[test]
+fn grant_aware_permit_selection_preserves_elastic_plan_width() {
+    let pool = AdmissionPermitPool::for_host(2);
+    let all: Vec<usize> = pool.all().collect();
+    assert!(all.len() >= 3, "fixture needs at least 3 permits");
+    let grant_free = all[2];
+    let charged: std::collections::BTreeSet<usize> = all
+        .iter()
+        .copied()
+        .filter(|permit| *permit != grant_free)
+        .collect();
+    let selection = select_plan_permits_grant_aware(
+        PermitAdmission::Cooperative,
+        LlcPlanSizing::Elastic,
+        &pool,
+        None,
+        2,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |_| Ok(true),
+        |candidate: &admission_protocol::ClaimSet| {
+            Ok(candidate
+                .permits
+                .iter()
+                .any(|permit| charged.contains(permit)))
+        },
+    )
+    .expect("grant-aware permit selection")
+    .expect("a fully available pool must satisfy the request");
+    assert_eq!(
+        selection.permits.cpu_permits.len(),
+        2,
+        "grant avoidance must fill the requested width from charged \
+         permits rather than return a short set: {:?}",
+        selection.permits.cpu_permits,
+    );
+    assert_eq!(
+        selection.cpu_width, 2,
+        "the funded CPU width must still be the requested width",
+    );
+    assert!(
+        selection.permits.cpu_permits.contains(&grant_free),
+        "the one grant-free permit must still be preferred: {:?}",
+        selection.permits.cpu_permits,
+    );
+    // The consequence the width guards: the plan keeps every CPU the
+    // selection was asked to fund.
+    let topo = HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
+    let mut selected_llcs = vec![0];
+    let mut selected_cpus = vec![0, 1];
+    apply_plan_permit_width(
+        LlcPlanSizing::Elastic,
+        &selection,
+        &topo,
+        &mut selected_llcs,
+        &mut selected_cpus,
+    );
+    assert_eq!(
+        selected_cpus,
+        vec![0, 1],
+        "a short permit selection truncates the CPU plan",
+    );
+    assert_eq!(selected_llcs, vec![0]);
 }

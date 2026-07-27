@@ -4467,6 +4467,21 @@ fn claim_without_owned_permits(
     (!external.is_empty()).then_some(external)
 }
 
+/// `grant_charged` reports whether an in-flight grant is already counting on
+/// a candidate permit. It orders permits *inside* one admission class and
+/// never promotes a class: a charged permit stays a candidate and is taken as
+/// soon as the grant-free permits of its own class run out. The selected
+/// width and the class each permit comes from therefore match a grant-blind
+/// walk of the same pool exactly, which is what keeps the charge a bias
+/// rather than a fence — treating it as a fence would both livelock the
+/// permit axis (a senior that never publishes an overlapping claim never
+/// triggers the scan's ticket-order revoke) and, under
+/// [`LlcPlanSizing::Elastic`], hand back a short selection that
+/// [`apply_plan_permit_width`] would then truncate the CPU plan to.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one complete permit request, plus the grant-charge bias over it"
+)]
 fn select_admission_permits(
     kind: PermitAdmission,
     pool: &AdmissionPermitPool,
@@ -4475,6 +4490,7 @@ fn select_admission_permits(
     rotation: usize,
     preferred: &[usize],
     mut ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+    mut grant_charged: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
 ) -> Result<Option<PermitSelection>> {
     if kind == PermitAdmission::None {
         return Ok(Some(PermitSelection {
@@ -4501,15 +4517,17 @@ fn select_admission_permits(
         PermitAdmission::Build => (&pool.reserved, &pool.general),
         PermitAdmission::None => unreachable!(),
     };
-    let mut ordered = Vec::with_capacity(first.len() + second.len());
+    let mut permits = Vec::with_capacity(maximum);
+    let mut seen = std::collections::BTreeSet::new();
     for group in [first, second] {
-        if group.is_empty() {
+        if group.is_empty() || permits.len() == maximum {
             continue;
         }
         // Preserve the admission class preference before OFD reuse. In
         // particular, cooperative/default work first tries general capacity;
         // inherited preparation owners in the reserved suffix are reused only
         // after the general class is exhausted.
+        let mut ordered = Vec::with_capacity(preferred.len() + group.len());
         ordered.extend(
             preferred
                 .iter()
@@ -4518,28 +4536,45 @@ fn select_admission_permits(
         );
         let start = rotation % group.len();
         ordered.extend((0..group.len()).map(|offset| group[(start + offset) % group.len()]));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    ordered.retain(|permit| seen.insert(*permit));
-    let mut permits = Vec::with_capacity(maximum);
-    for permit in ordered {
-        let admission_class = match kind {
-            PermitAdmission::Cooperative if pool.reserved.contains(&permit) => {
-                protocol::AdmissionClass::DefaultBorrow
-            }
-            PermitAdmission::Cooperative => protocol::AdmissionClass::Ordinary,
-            PermitAdmission::Build => protocol::AdmissionClass::Build,
-            PermitAdmission::None => unreachable!(),
-        };
-        let candidate = PermitSelection {
-            permits: vec![permit],
-            admission_class,
-        };
-        if ready(&permit_only_claim(&candidate))? {
-            permits.push(permit);
+        ordered.retain(|permit| seen.insert(*permit));
+        // Ready permits this class would give up only to a grant-free peer of
+        // the same class. They are appended below in discovery order, so a
+        // class whose ready permits are all charged selects exactly what a
+        // grant-blind walk of it would.
+        let mut charged = Vec::new();
+        for permit in ordered {
             if permits.len() == maximum {
                 break;
             }
+            let admission_class = match kind {
+                PermitAdmission::Cooperative if pool.reserved.contains(&permit) => {
+                    protocol::AdmissionClass::DefaultBorrow
+                }
+                PermitAdmission::Cooperative => protocol::AdmissionClass::Ordinary,
+                PermitAdmission::Build => protocol::AdmissionClass::Build,
+                PermitAdmission::None => unreachable!(),
+            };
+            let candidate = PermitSelection {
+                permits: vec![permit],
+                admission_class,
+            };
+            let claim = permit_only_claim(&candidate);
+            if !ready(&claim)? {
+                continue;
+            }
+            if grant_charged(&claim)? {
+                if charged.len() < maximum {
+                    charged.push(permit);
+                }
+            } else {
+                permits.push(permit);
+            }
+        }
+        for permit in charged {
+            if permits.len() == maximum {
+                break;
+            }
+            permits.push(permit);
         }
     }
     if permits.len() < minimum {
@@ -4567,6 +4602,10 @@ fn select_admission_permits(
     }
 }
 
+/// `grant_charged` carries the same within-tier bias contract as
+/// [`select_admission_permits`]: the memory pool is one tier, so
+/// a charged chunk is taken as soon as the grant-free chunks run out and the
+/// selected count never falls below a grant-blind walk's.
 fn select_memory_permits(
     pool: &MemoryPermitPool,
     required: usize,
@@ -4574,6 +4613,7 @@ fn select_memory_permits(
     rotation: usize,
     preferred: &[usize],
     mut ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+    mut grant_charged: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
 ) -> Result<Option<Vec<usize>>> {
     if required == 0 {
         return Ok(Some(Vec::new()));
@@ -4590,17 +4630,32 @@ fn select_memory_permits(
     );
     let mut seen = std::collections::BTreeSet::new();
     ordered.retain(|permit| seen.insert(*permit));
+    let mut charged = Vec::new();
     for permit in ordered {
+        if selected.len() == required {
+            break;
+        }
         let candidate = PermitSelection {
             permits: vec![permit],
             admission_class,
         };
-        if ready(&permit_only_claim(&candidate))? {
-            selected.push(permit);
-            if selected.len() == required {
-                break;
-            }
+        let claim = permit_only_claim(&candidate);
+        if !ready(&claim)? {
+            continue;
         }
+        if grant_charged(&claim)? {
+            if charged.len() < required {
+                charged.push(permit);
+            }
+        } else {
+            selected.push(permit);
+        }
+    }
+    for permit in charged {
+        if selected.len() == required {
+            break;
+        }
+        selected.push(permit);
     }
     if selected.len() < required {
         return Ok(None);
@@ -4625,7 +4680,46 @@ fn select_vm_permits(
     memory_rotation: usize,
     preferred_cpu: &[usize],
     preferred_memory: &[usize],
+    ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+) -> Result<Option<VmPermitSelection>> {
+    select_vm_permits_grant_aware(
+        kind,
+        cpu_pool,
+        memory_pool,
+        maximum_cpus,
+        minimum_cpus,
+        required_memory,
+        cpu_rotation,
+        memory_rotation,
+        preferred_cpu,
+        preferred_memory,
+        ready,
+        |_| Ok(false),
+    )
+}
+
+/// `grant_charged` is the within-class bias documented on
+/// [`select_admission_permits`]. It is deliberately absent from
+/// the whole-selection readiness check below: that check is validity, not
+/// selection, and folding the charge into it would turn the bias back into an
+/// all-or-nothing filter.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors select_vm_permits, which carries one complete permit request"
+)]
+fn select_vm_permits_grant_aware(
+    kind: PermitAdmission,
+    cpu_pool: &AdmissionPermitPool,
+    memory_pool: Option<&MemoryPermitPool>,
+    maximum_cpus: usize,
+    minimum_cpus: usize,
+    required_memory: usize,
+    cpu_rotation: usize,
+    memory_rotation: usize,
+    preferred_cpu: &[usize],
+    preferred_memory: &[usize],
     mut ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+    mut grant_charged: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
 ) -> Result<Option<VmPermitSelection>> {
     let Some(cpu) = select_admission_permits(
         kind,
@@ -4635,6 +4729,7 @@ fn select_vm_permits(
         cpu_rotation,
         preferred_cpu,
         &mut ready,
+        &mut grant_charged,
     )?
     else {
         return Ok(None);
@@ -4647,6 +4742,7 @@ fn select_vm_permits(
             memory_rotation,
             preferred_memory,
             &mut ready,
+            &mut grant_charged,
         )?,
         None => Some(Vec::new()),
     };
@@ -4860,11 +4956,60 @@ fn select_plan_permits(
     preferred_memory: &[usize],
     ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
 ) -> Result<Option<PlanPermitSelection>> {
+    select_plan_permits_grant_aware(
+        kind,
+        sizing,
+        cpu_pool,
+        memory_pool,
+        maximum_cpus,
+        required_memory,
+        cpu_rotation,
+        memory_rotation,
+        preferred_cpu,
+        preferred_memory,
+        ready,
+        |_| Ok(false),
+    )
+}
+
+/// Grant-aware permit planning: `grant_conflicts` reports whether an
+/// in-flight grant already counts on a candidate permit, and the selection
+/// prefers the permits it does not cover.
+///
+/// The preference lives inside one admission class and inside one selection
+/// pass (see [`select_admission_permits`]), never as a filter
+/// over the whole request. That is what makes it safe on the elastic sizing,
+/// whose permit floor is one: a filtering tier can satisfy an elastic request
+/// from a single grant-free permit, and because an elastic selection's permit
+/// count *is* the CPU width [`apply_plan_permit_width`] truncates the plan
+/// to, a two-CPU cell would then be planned onto one CPU. Biasing within the
+/// pass instead keeps the selected width — and the class each permit is drawn
+/// from — identical to a grant-blind walk, so a saturated or fully charged
+/// pool selects exactly what it selects today and a senior still publishes
+/// the overlapping claim the scan's ticket-order revoke needs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors select_plan_permits, which carries one complete permit request"
+)]
+fn select_plan_permits_grant_aware(
+    kind: PermitAdmission,
+    sizing: LlcPlanSizing,
+    cpu_pool: &AdmissionPermitPool,
+    memory_pool: Option<&MemoryPermitPool>,
+    maximum_cpus: usize,
+    required_memory: usize,
+    cpu_rotation: usize,
+    memory_rotation: usize,
+    preferred_cpu: &[usize],
+    preferred_memory: &[usize],
+    ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+    grant_conflicts: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+) -> Result<Option<PlanPermitSelection>> {
     let minimum_cpus = match sizing {
         LlcPlanSizing::Exact => maximum_cpus,
         LlcPlanSizing::Elastic => 1,
     };
-    if let Some(permits) = select_vm_permits(
+    if let Some(permits) = select_vm_permits_grant_aware(
         kind,
         cpu_pool,
         memory_pool,
@@ -4876,6 +5021,7 @@ fn select_plan_permits(
         preferred_cpu,
         preferred_memory,
         ready,
+        grant_conflicts,
     )? {
         let cpu_width = match (sizing, kind) {
             (LlcPlanSizing::Elastic, PermitAdmission::Cooperative | PermitAdmission::Build) => {
@@ -4904,62 +5050,6 @@ fn select_plan_permits(
     }
 
     Ok(None)
-}
-
-/// Two-tier grant-aware permit selection: prefer permits no in-flight grant
-/// is counting on, then rerun grant-blind when the grant-free tier cannot
-/// satisfy the request. The fallback is mandatory — treating a grant charge
-/// as a hard `candidate_ready` failure livelocks the permit axis (a senior
-/// that never publishes an overlapping claim never triggers the scan's
-/// ticket-order revoke, while fast-path juniors re-grab freed permits), and
-/// under genuine scarcity the fallback restores today's behavior exactly, so
-/// the senior's reserved overlapping claim still wins via scan revocation.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors select_plan_permits, which carries one complete permit request"
-)]
-fn select_plan_permits_grant_aware(
-    kind: PermitAdmission,
-    sizing: LlcPlanSizing,
-    cpu_pool: &AdmissionPermitPool,
-    memory_pool: Option<&MemoryPermitPool>,
-    maximum_cpus: usize,
-    required_memory: usize,
-    cpu_rotation: usize,
-    memory_rotation: usize,
-    preferred_cpu: &[usize],
-    preferred_memory: &[usize],
-    mut ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
-    mut grant_conflicts: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
-) -> Result<Option<PlanPermitSelection>> {
-    if let Some(selection) = select_plan_permits(
-        kind,
-        sizing,
-        cpu_pool,
-        memory_pool,
-        maximum_cpus,
-        required_memory,
-        cpu_rotation,
-        memory_rotation,
-        preferred_cpu,
-        preferred_memory,
-        |candidate| Ok(ready(candidate)? && !grant_conflicts(candidate)?),
-    )? {
-        return Ok(Some(selection));
-    }
-    select_plan_permits(
-        kind,
-        sizing,
-        cpu_pool,
-        memory_pool,
-        maximum_cpus,
-        required_memory,
-        cpu_rotation,
-        memory_rotation,
-        preferred_cpu,
-        preferred_memory,
-        ready,
-    )
 }
 
 fn apply_plan_permit_width(
