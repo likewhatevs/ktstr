@@ -1,28 +1,16 @@
 //! Failure-dump timeline support.
 //!
-//! Two related primitives live here:
+//! Host-side consumer for the `timeline_events` BPF ringbuf
+//! populated by the `ktstr_tl_*` handlers in
+//! `src/bpf/probe.bpf.c`: [`parse_timeline_buf`] parses drained
+//! records into [`TimelineEvent`] values for the failure dump.
 //!
-//! 1. **Sched-event timeline** ([`TimelineEvent`], [`parse_timeline_buf`],
-//!    [`TimelineCapture`]) — host-side consumer for the
-//!    `timeline_events` BPF ringbuf populated by `tp_btf/sched_switch`,
-//!    `sched_migrate_task`, and `sched_wakeup` handlers (see
-//!    `src/bpf/probe.bpf.c::ktstr_tl_*`). The freeze coordinator
-//!    drains the ringbuf at failure time, parses the records into
-//!    [`TimelineEvent`] values, and stitches them into the failure
-//!    dump.
-//!
-//! 2. **Incremental snapshot ring** ([`SnapshotRing`],
-//!    [`IncrementalCapture`]) — periodic VM-freeze capture of raw
-//!    BPF state bytes for deferred render at trigger time. Cadence,
-//!    ring depth, and rendering policy are tuned per consumer; the
-//!    [`DEFAULT_SNAPSHOT_RING_DEPTH`] constant pins the storage
-//!    budget at 60 entries.
-//!
-//! Both surfaces are defined and re-exported from the crate root
-//! (see `crate::prelude`) but not yet wired into the dump pipeline:
-//! [`super::dump::DumpContext`] has no field for either capture, and
-//! every item here carries `#[allow(dead_code)]`. Consuming them is
-//! a follow-up.
+//! The parser and [`TimelineCapture`] are re-exported from
+//! [`crate::live_host`] but no host-side drain consumes them yet —
+//! the BPF producer is live (its per-CPU counters surface as
+//! `bpf_timeline_count` / `bpf_timeline_drops` in the probe diag),
+//! the dump-pipeline consumer is the follow-up, which is why the
+//! parse path carries `#[allow(dead_code)]`.
 //!
 //! # Layout pinning
 //!
@@ -272,146 +260,6 @@ pub struct TimelineCapture<'a> {
     pub drops: u64,
 }
 
-// ---------------------------------------------------------------
-// Incremental capture: periodic VM-freeze ring of raw bytes.
-// ---------------------------------------------------------------
-
-/// Default snapshot-ring depth: 60 entries at 1 Hz steady-state
-/// covers 60 seconds of pre-trigger context — long enough for the
-/// dual-snapshot delta to detect slow drift, short enough that the
-/// storage cost stays within the 60-300 MiB envelope of the per-VM
-/// budget for incremental capture.
-pub const DEFAULT_SNAPSHOT_RING_DEPTH: usize = 60;
-
-/// One incremental snapshot — opaque raw bytes captured at a
-/// particular freeze instant + the wall-clock ts of capture.
-///
-/// "Opaque bytes" because the producer captures BPF state without
-/// rendering it. Render is deferred until trigger fires; the
-/// failure dump's renderer parses the buffer through the same
-/// pipeline as a regular failure dump.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
-#[allow(dead_code)]
-pub struct IncrementalSnapshot {
-    /// Wall-clock timestamp at freeze instant (CLOCK_REALTIME ns).
-    /// `0` when the producer didn't stamp it (test fixtures only).
-    pub captured_ns: u64,
-    /// Boot-time (CLOCK_MONOTONIC_RAW) ns at freeze instant.
-    /// Co-axial with `captured_ns`; the dump renderer pairs the
-    /// two so the timeline is anchored against both wall-clock
-    /// (operator readability) and monotonic (delta math).
-    pub monotonic_ns: u64,
-    /// Raw captured bytes. Shape is producer-defined: typically
-    /// the `.bss` value buffer of the scheduler's BPF object,
-    /// concatenated with a serialized `super::scx_walker`
-    /// snapshot. The renderer treats it as opaque until
-    /// trigger time.
-    pub bytes: Vec<u8>,
-}
-
-/// Bounded ring of [`IncrementalSnapshot`] values.
-///
-/// Newest snapshot at the back; the oldest is dropped when the ring
-/// fills (single-producer-single-consumer pattern — the freeze
-/// coordinator pushes, the failure-dump renderer drains).
-///
-/// Cheap to clone for sidecar persistence: `Vec` of `Vec<u8>`
-/// shares no internal state, so the capture-mode binary can
-/// snapshot the ring at trigger time without blocking the
-/// coordinator's continued sampling.
-#[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
-pub struct SnapshotRing {
-    capacity: usize,
-    snapshots: std::collections::VecDeque<IncrementalSnapshot>,
-}
-
-impl SnapshotRing {
-    /// New ring with the requested capacity. Pass
-    /// [`DEFAULT_SNAPSHOT_RING_DEPTH`] for the storage-budget-tuned
-    /// default (60 entries).
-    #[allow(dead_code)]
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-            snapshots: std::collections::VecDeque::with_capacity(capacity.max(1)),
-        }
-    }
-
-    /// Push a new snapshot. When the ring is full, the oldest
-    /// entry is dropped (FIFO eviction).
-    #[allow(dead_code)]
-    pub fn push(&mut self, snap: IncrementalSnapshot) {
-        if self.snapshots.len() == self.capacity {
-            self.snapshots.pop_front();
-        }
-        self.snapshots.push_back(snap);
-    }
-
-    /// Number of snapshots currently held.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.snapshots.len()
-    }
-
-    /// True when the ring holds no snapshots.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.snapshots.is_empty()
-    }
-
-    /// Capacity (the depth this ring was constructed with).
-    #[allow(dead_code)]
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Drain every held snapshot into a vec, oldest-first. Used by
-    /// the failure-dump renderer at trigger time to consume the
-    /// pre-trigger window.
-    #[allow(dead_code)]
-    pub fn drain(&mut self) -> Vec<IncrementalSnapshot> {
-        self.snapshots.drain(..).collect()
-    }
-
-    /// Borrow the held snapshots for read-only inspection (e.g.
-    /// the capture-mode binary's "show me what's in the ring
-    /// right now" diagnostic).
-    #[allow(dead_code)]
-    pub fn snapshots(&self) -> impl Iterator<Item = &IncrementalSnapshot> {
-        self.snapshots.iter()
-    }
-}
-
-/// Capture handle the freeze coordinator passes into the dump
-/// pipeline when periodic incremental snapshots are enabled.
-///
-/// Defined for a future dump-pipeline integration; not yet consumed
-/// by any renderer ([`super::dump::FailureDumpReport`] has no
-/// incremental-snapshot field, and this type carries
-/// `#[allow(dead_code)]`).
-/// `None` capture means the freeze coordinator wasn't running the
-/// periodic loop — typical for one-shot dumps where the
-/// dual-snapshot delta is enough.
-#[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
-pub struct IncrementalCapture {
-    /// Pre-trigger ring of raw snapshots. Producer drains the
-    /// ring into this vec at trigger time; the dump renderer
-    /// parses each snapshot's bytes via the same path as a
-    /// regular failure dump.
-    pub snapshots: Vec<IncrementalSnapshot>,
-    /// Steady-state sampling frequency (Hz) — typically 1.
-    /// Surfaced so the operator can correlate snapshot timing
-    /// against the failure window.
-    pub steady_hz: f64,
-    /// Escalation frequency (Hz) used during stuck detection —
-    /// typically 10. Reflects the actual frequency at trigger
-    /// time, not the configured ceiling.
-    pub trigger_hz: f64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,56 +487,6 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert!(matches!(evs[0], TimelineEvent::Switch { .. }));
         assert!(matches!(evs[1], TimelineEvent::Wakeup { .. }));
-    }
-
-    /// Snapshot ring bounds at capacity and evicts oldest first.
-    #[test]
-    fn snapshot_ring_evicts_oldest() {
-        let mut ring = SnapshotRing::new(3);
-        for i in 0..5 {
-            ring.push(IncrementalSnapshot {
-                captured_ns: i,
-                monotonic_ns: i,
-                bytes: vec![i as u8],
-            });
-        }
-        assert_eq!(ring.len(), 3);
-        assert_eq!(ring.capacity(), 3);
-        let drained = ring.drain();
-        assert_eq!(drained.len(), 3);
-        // After eviction we should have ts=2,3,4 (oldest 0,1 dropped).
-        assert_eq!(drained[0].captured_ns, 2);
-        assert_eq!(drained[2].captured_ns, 4);
-    }
-
-    /// Default ring depth matches the documented 60-entry budget.
-    #[test]
-    fn default_ring_depth_pinned() {
-        assert_eq!(DEFAULT_SNAPSHOT_RING_DEPTH, 60);
-    }
-
-    /// New ring is empty and matches its capacity.
-    #[test]
-    fn snapshot_ring_starts_empty() {
-        let ring = SnapshotRing::new(8);
-        assert!(ring.is_empty());
-        assert_eq!(ring.len(), 0);
-        assert_eq!(ring.capacity(), 8);
-    }
-
-    /// `IncrementalSnapshot` round-trips through serde so off-disk
-    /// captures parse on reload.
-    #[test]
-    fn incremental_snapshot_serde_roundtrip() {
-        let snap = IncrementalSnapshot {
-            captured_ns: 1234567890,
-            monotonic_ns: 9876543210,
-            bytes: vec![1, 2, 3, 4],
-        };
-        let json = serde_json::to_string(&snap).unwrap();
-        let parsed: IncrementalSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.captured_ns, 1234567890);
-        assert_eq!(parsed.bytes, vec![1, 2, 3, 4]);
     }
 
     /// `TimelineEvent` round-trips through serde — every variant

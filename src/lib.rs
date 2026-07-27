@@ -511,7 +511,6 @@ pub mod live_host {
     };
     pub use crate::monitor::live_host_kernel::{KallsymsTable, LiveHostKernelEnv, uname_release};
     pub use crate::monitor::timeline::{
-        DEFAULT_SNAPSHOT_RING_DEPTH, IncrementalCapture, IncrementalSnapshot, SnapshotRing,
         TimelineCapture, TimelineEvent, TimelineEventRaw, parse_timeline_buf,
         parse_timeline_record, tl_evt,
     };
