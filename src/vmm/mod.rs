@@ -1412,6 +1412,7 @@ impl AdmissionIntentPlan {
         mut pressure: impl FnMut(&AdmissionIntentCandidate) -> Result<(usize, usize)>,
     ) -> Result<Option<host_topology::protocol::ClaimSet>> {
         let Some(permits) = self.permit_pool.select(&mut ready)? else {
+            grant_flow::note_block(grant_flow::GrantBlock::Permits);
             return Ok(None);
         };
         let mut best = None;
@@ -1431,6 +1432,7 @@ impl AdmissionIntentPlan {
         if let Some((_, claim)) = best {
             return Ok(Some(claim));
         }
+        grant_flow::note_block(grant_flow::GrantBlock::NoCandidate);
         Ok(None)
     }
 }

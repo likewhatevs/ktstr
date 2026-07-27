@@ -23,6 +23,11 @@
 //! module once carried answered their questions (the watermark-park and
 //! EX-pin-rotation churn producers are fixed) and were removed with them.
 //!
+//! [`GrantBlock`] is the current breakdown: why a wake failed to convert.
+//! `grants_issued` says a grant was licensed and `grants_reached_held` says it
+//! converted; the gap between them is unattributable without naming the fence
+//! that rejected each candidate.
+//!
 //! Entirely inert unless `KTSTR_BUILD_DIAGNOSTICS_DIR` is set (CI only): the
 //! `note_*` calls are relaxed atomic updates and the expensive inputs
 //! (distinct-CPU popcount, discover timing) are computed only behind
@@ -50,6 +55,80 @@ static DISCOVER_COUNT: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_NS_SUM: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
+static BLOCKS: [AtomicU64; GrantBlock::COUNT] = [const { AtomicU64::new(0) }; GrantBlock::COUNT];
+
+/// Why a wake failed to convert into a HELD run claim.
+///
+/// The first four name the fence a single candidate placement hit; a wake
+/// evaluates many candidates, so these count candidate rejections, not wakes.
+/// [`GrantBlock::Permits`] and [`GrantBlock::NoCandidate`] are per-wake
+/// outcomes of the selection as a whole, and [`GrantBlock::Unlicensed`] counts
+/// wakes that never carried a grant to lose. Read the two groups separately —
+/// like the headline totals above they are independent rates, not a
+/// conserved flow.
+#[derive(Clone, Copy)]
+pub(crate) enum GrantBlock {
+    /// The wake carried no grant license (a REPLAN re-designation), so no
+    /// candidate could convert however free the host was.
+    Unlicensed,
+    /// The weighted permit pool offered no acceptable set, so the selection
+    /// never reached a topology candidate.
+    Permits,
+    /// Permits resolved but every topology candidate was rejected below.
+    NoCandidate,
+    /// A candidate resource is the blocker this wake's own probe just met.
+    Contended,
+    /// An older ticket's reservation covers a candidate resource.
+    Predecessors,
+    /// A candidate resource is observed held by someone else.
+    Busy,
+    /// A candidate resource has never been observed. The availability fence
+    /// rejects unobserved and held identically, so on a mostly-idle host this
+    /// is the cause that looks like contention but is not.
+    Unobserved,
+}
+
+impl GrantBlock {
+    const COUNT: usize = 7;
+
+    const ALL: [Self; Self::COUNT] = [
+        Self::Unlicensed,
+        Self::Permits,
+        Self::NoCandidate,
+        Self::Contended,
+        Self::Predecessors,
+        Self::Busy,
+        Self::Unobserved,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Unlicensed => "unlicensed",
+            Self::Permits => "permits",
+            Self::NoCandidate => "no_candidate",
+            Self::Contended => "contended",
+            Self::Predecessors => "predecessors",
+            Self::Busy => "busy",
+            Self::Unobserved => "unobserved",
+        }
+    }
+}
+
+/// One conversion fence hit. Unlike the `note_*` totals above this fires per
+/// CANDIDATE per scan, so it checks [`enabled`] before touching anything —
+/// including the `atexit` registration, which a diagnostics-off process has no
+/// image to write.
+pub(crate) fn note_block(block: GrantBlock) {
+    if !enabled() {
+        return;
+    }
+    BLOCKS[block.index()].fetch_add(1, Ordering::Relaxed);
+    ensure_atexit();
+}
 
 fn dir() -> Option<&'static PathBuf> {
     DIR.get_or_init(|| {
@@ -136,10 +215,20 @@ fn format_line(pid: u32) -> String {
         .load(Ordering::Relaxed)
         .checked_div(discover_count)
         .unwrap_or(0);
+    let blocks = GrantBlock::ALL
+        .iter()
+        .map(|block| {
+            format!(
+                " block_{}={}",
+                block.label(),
+                BLOCKS[block.index()].load(Ordering::Relaxed),
+            )
+        })
+        .collect::<String>();
     format!(
         "grant-flow: pid={pid} grants_issued={} grants_reached_held={} grants_lost={} \
          held_in_flight_max={} distinct_held_cpus_max={} discover_count={} \
-         discover_ns_mean={discover_ns_mean} discover_ns_max={}\n",
+         discover_ns_mean={discover_ns_mean} discover_ns_max={}{blocks}\n",
         GRANTS_ISSUED.load(Ordering::Relaxed),
         GRANTS_REACHED_HELD.load(Ordering::Relaxed),
         GRANTS_LOST.load(Ordering::Relaxed),
@@ -194,10 +283,43 @@ mod tests {
             "discover_count=",
             "discover_ns_mean=",
             "discover_ns_max=",
+            "block_unlicensed=",
+            "block_permits=",
+            "block_no_candidate=",
+            "block_contended=",
+            "block_predecessors=",
+            "block_busy=",
+            "block_unobserved=",
         ] {
             assert!(line.contains(field), "missing {field} in {line}");
         }
         assert!(line.ends_with('\n'));
+    }
+
+    /// Every variant owns a distinct slot, so no two causes alias in the line.
+    #[test]
+    fn block_variants_index_distinct_slots() {
+        let mut indices = GrantBlock::ALL.map(GrantBlock::index);
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            std::array::from_fn::<_, { GrantBlock::COUNT }, _>(|index| index)
+        );
+    }
+
+    /// The counters stay untouched with the sink off — the whole breakdown is
+    /// as inert on a production run as the totals it sits beside.
+    #[test]
+    fn blocks_are_inert_without_a_diagnostics_dir() {
+        if enabled() {
+            return;
+        }
+        let before = BLOCKS[GrantBlock::Unobserved.index()].load(Ordering::Relaxed);
+        note_block(GrantBlock::Unobserved);
+        assert_eq!(
+            BLOCKS[GrantBlock::Unobserved.index()].load(Ordering::Relaxed),
+            before,
+        );
     }
 
     #[test]

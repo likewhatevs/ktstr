@@ -1252,9 +1252,32 @@ impl GrantedProbe {
                                 || candidate.permit_mode == ClaimMode::Exclusive)
                     }
                 });
-        Ok(!just_contended
-            && !self.predecessors.conflicts(candidate)?
-            && self.availability.allows(candidate)?)
+        // Evaluated as the original short-circuit chain, so a candidate pays
+        // for exactly the fences it reaches; the first one that rejects it is
+        // the one attributed.
+        use crate::vmm::grant_flow::{GrantBlock, note_block};
+        if just_contended {
+            note_block(GrantBlock::Contended);
+            return Ok(false);
+        }
+        if self.predecessors.conflicts(candidate)? {
+            note_block(GrantBlock::Predecessors);
+            return Ok(false);
+        }
+        if !self.availability.allows(candidate)? {
+            // `allows` rejects an unobserved resource exactly like a held one.
+            // Splitting them is the whole point of the breakdown, and the
+            // extra pass runs only for the diagnostics sink.
+            if crate::vmm::grant_flow::enabled() {
+                note_block(if self.availability.unobserved(candidate)? {
+                    GrantBlock::Unobserved
+                } else {
+                    GrantBlock::Busy
+                });
+            }
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     pub(crate) fn candidate_holder_pressure(&self, candidate: &ClaimSet) -> Result<usize> {
@@ -1740,6 +1763,9 @@ pub(crate) fn register_intent_for_preparation(
                         };
                         let selected = granted_candidate(&probe)?;
                         if !acquisition_allowed {
+                            crate::vmm::grant_flow::note_block(
+                                crate::vmm::grant_flow::GrantBlock::Unlicensed,
+                            );
                             if let Some(candidate) = selected {
                                 probe.reserve(&candidate)?;
                             }
@@ -2621,6 +2647,14 @@ pub(crate) fn exercise_candidate_ready_matrix_for_tests() -> Result<()> {
             && !probe.candidate_ready(&cpu(4, FlockMode::Shared))?
             && !probe.candidate_ready(&llc(4, FlockMode::Shared))?,
         "exclusive-held and unknown resources must reject every candidate mode"
+    );
+    anyhow::ensure!(
+        !probe.availability.unobserved(&cpu(3, FlockMode::Shared))?
+            && probe.availability.unobserved(&cpu(4, FlockMode::Shared))?
+            && !probe.availability.unobserved(&llc(3, FlockMode::Shared))?
+            && probe.availability.unobserved(&llc(4, FlockMode::Shared))?,
+        "the grant-flow split must separate a genuinely held resource from an unobserved one \
+         that `allows` rejects identically"
     );
     anyhow::ensure!(
         probe

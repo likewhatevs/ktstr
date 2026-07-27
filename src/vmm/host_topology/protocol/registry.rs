@@ -1020,6 +1020,43 @@ impl AvailabilitySnapshot {
         }
         Ok(true)
     }
+
+    /// Whether any resource in `candidate` has never been observed.
+    ///
+    /// [`Self::allows`] rejects unobserved and held resources identically, so
+    /// this is the only way to tell a candidate blocked by a real holder from
+    /// one blocked by a gap in the observation coverage. Diagnostic-only: it
+    /// is never a fence, and answers nothing about availability on its own.
+    pub(super) fn unobserved(&self, candidate: &ClaimSet) -> Result<bool> {
+        validate_claim(candidate)?;
+        let known = |words: &[u64], index: usize| words[index / 64] & (1u64 << (index % 64)) != 0;
+        for &cpu in &candidate.cpus {
+            if cpu >= self.bits {
+                anyhow::bail!("CPU index {cpu} exceeds queue registry capacity");
+            }
+            if !known(&self.cpu_known, cpu) {
+                return Ok(true);
+            }
+        }
+        for &permit in &candidate.permits {
+            let index = permit_resource_index(permit)?;
+            if index >= self.bits {
+                anyhow::bail!("permit index {permit} exceeds queue registry capacity");
+            }
+            if !known(&self.cpu_known, index) {
+                return Ok(true);
+            }
+        }
+        for &llc in &candidate.llcs {
+            if llc >= self.bits {
+                anyhow::bail!("LLC index {llc} exceeds queue registry capacity");
+            }
+            if !known(&self.llc_known, llc) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone)]
