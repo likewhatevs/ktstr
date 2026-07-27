@@ -2071,7 +2071,7 @@ fn build_permits_are_bounded_but_never_blocked_by_live_default_borrowers() {
 fn elastic_build_falls_back_to_one_cpu_when_every_build_permit_is_busy() {
     let pool = AdmissionPermitPool::for_build_host(4).expect("construct build-only namespace");
     let busy = pool.all().collect::<std::collections::BTreeSet<_>>();
-    let selection = select_plan_permits(
+    let selection = select_plan_permits_grant_aware(
         PermitAdmission::Build,
         LlcPlanSizing::Elastic,
         &pool,
@@ -2083,6 +2083,7 @@ fn elastic_build_falls_back_to_one_cpu_when_every_build_permit_is_busy() {
         &[],
         &[],
         |candidate| Ok(candidate.permits.is_disjoint(&busy)),
+        |_| Ok(false),
     )
     .expect("select an elastic build shape")
     .expect("busy build permits must retain serial forward progress");
@@ -2106,7 +2107,7 @@ fn elastic_build_uses_the_one_free_build_permit_before_serial_fallback() {
         .all()
         .filter(|permit| *permit != free)
         .collect::<std::collections::BTreeSet<_>>();
-    let selection = select_plan_permits(
+    let selection = select_plan_permits_grant_aware(
         PermitAdmission::Build,
         LlcPlanSizing::Elastic,
         &pool,
@@ -2118,6 +2119,7 @@ fn elastic_build_uses_the_one_free_build_permit_before_serial_fallback() {
         &[],
         &[],
         |candidate| Ok(candidate.permits.is_disjoint(&busy)),
+        |_| Ok(false),
     )
     .expect("select an elastic build shape")
     .expect("one free build permit must remain usable");

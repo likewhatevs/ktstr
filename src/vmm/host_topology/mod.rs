@@ -4942,54 +4942,24 @@ struct PlanPermitSelection {
     cpu_width: usize,
 }
 
-#[allow(clippy::too_many_arguments)] // Preserve every admission axis at the shared planning seam.
-fn select_plan_permits(
-    kind: PermitAdmission,
-    sizing: LlcPlanSizing,
-    cpu_pool: &AdmissionPermitPool,
-    memory_pool: Option<&MemoryPermitPool>,
-    maximum_cpus: usize,
-    required_memory: usize,
-    cpu_rotation: usize,
-    memory_rotation: usize,
-    preferred_cpu: &[usize],
-    preferred_memory: &[usize],
-    ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
-) -> Result<Option<PlanPermitSelection>> {
-    select_plan_permits_grant_aware(
-        kind,
-        sizing,
-        cpu_pool,
-        memory_pool,
-        maximum_cpus,
-        required_memory,
-        cpu_rotation,
-        memory_rotation,
-        preferred_cpu,
-        preferred_memory,
-        ready,
-        |_| Ok(false),
-    )
-}
-
 /// Grant-aware permit planning: `grant_conflicts` reports whether an
 /// in-flight grant already counts on a candidate permit, and the selection
 /// prefers the permits it does not cover.
 ///
 /// The preference lives inside one admission class and inside one selection
-/// pass (see [`select_admission_permits`]), never as a filter
-/// over the whole request. That is what makes it safe on the elastic sizing,
-/// whose permit floor is one: a filtering tier can satisfy an elastic request
-/// from a single grant-free permit, and because an elastic selection's permit
-/// count *is* the CPU width [`apply_plan_permit_width`] truncates the plan
-/// to, a two-CPU cell would then be planned onto one CPU. Biasing within the
-/// pass instead keeps the selected width — and the class each permit is drawn
-/// from — identical to a grant-blind walk, so a saturated or fully charged
-/// pool selects exactly what it selects today and a senior still publishes
-/// the overlapping claim the scan's ticket-order revoke needs.
+/// pass (see [`select_admission_permits`]), never as a filter over the whole
+/// request. That is what makes it safe on the elastic sizing, whose permit
+/// floor is one: a filtering tier can satisfy an elastic request from a
+/// single grant-free permit, and because an elastic selection's permit count
+/// *is* the CPU width [`apply_plan_permit_width`] truncates the plan to, the
+/// charge would end up deciding how many CPUs the plan funds. Biasing within
+/// the pass instead keeps the selected width — and the class each permit is
+/// drawn from — identical to a grant-blind walk, so a saturated or fully
+/// charged pool selects exactly what it selects today and a senior still
+/// publishes the overlapping claim the scan's ticket-order revoke needs.
 #[expect(
     clippy::too_many_arguments,
-    reason = "mirrors select_plan_permits, which carries one complete permit request"
+    reason = "one complete permit request, plus the grant-charge bias over it"
 )]
 fn select_plan_permits_grant_aware(
     kind: PermitAdmission,
@@ -5404,6 +5374,7 @@ where
     let mut queue_seed_snapshots = None;
     let mut queue_seed_cpu_states = None;
     let mut queue_seed_universe = None;
+    let mut queue_seed_permit_snapshot = None;
     let mut contention = protocol::ContentionSet::default();
     loop {
         check_acquire_cancelled(cancelled)?;
@@ -5556,6 +5527,11 @@ where
             .into());
         }
         let (mut selected_cpus, mut selected_mems) = selected_materialized.unwrap_or_default();
+        // Kept past the selection so a queued designation can reuse this
+        // attempt's permit-scoped snapshot for its grant bias instead of
+        // taking a second registry read. `None` whenever this attempt named
+        // no permits at all.
+        let mut attempt_permit_snapshot = None;
         let plan_permit_selection = if selected_cpus.is_empty() {
             // Claim-blocked: there is no plan to fund. Every acquisition arm
             // below requires a non-empty selection, so selecting permits for a
@@ -5592,13 +5568,14 @@ where
                 &watch_permits,
                 watch_class,
             );
-            let permit_snapshot = protocol::registered_claim_snapshot(&watch)?;
+            let permit_snapshot =
+                attempt_permit_snapshot.insert(protocol::registered_claim_snapshot(&watch)?);
             let preparation_owned = preferred_cpu_permits
                 .iter()
                 .chain(&preferred_memory_permits)
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>();
-            select_plan_permits(
+            select_plan_permits_grant_aware(
                 permit_admission,
                 sizing,
                 &permit_pool,
@@ -5619,6 +5596,18 @@ where
                         return Ok(true);
                     };
                     permit_snapshot.conflicts(&external).map(|busy| !busy)
+                },
+                |candidate| {
+                    // A fast-path acquirer takes its permits outright, so
+                    // taking one an in-flight grant is counting on kills that
+                    // grant in the next scan. This snapshot's watch names
+                    // every pool permit, which is what makes the folded permit
+                    // indices readable from it.
+                    let Some(external) = claim_without_owned_permits(candidate, &preparation_owned)
+                    else {
+                        return Ok(false);
+                    };
+                    permit_snapshot.grant_conflicts(&external)
                 },
             )?
         };
@@ -5705,6 +5694,7 @@ where
             queue_seed_snapshots = Some(snapshots);
             queue_seed_cpu_states = Some(cpu_states);
             queue_seed_universe = Some(allowed.clone());
+            queue_seed_permit_snapshot = attempt_permit_snapshot;
             break;
         }
         let mut registry_fenced = false;
@@ -5798,6 +5788,7 @@ where
             // exclusions are transient contention; seeding from them could
             // create an empty/short claim precisely when waiting is needed.
             queue_seed_universe = Some(allowed.clone());
+            queue_seed_permit_snapshot = attempt_permit_snapshot;
             break;
         }
         if attempt >= ACQUIRE_MAX_TOCTOU_RETRIES {
@@ -5942,7 +5933,15 @@ where
         .chain(&preferred_memory_permits)
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
-    let queued_plan_permits = select_plan_permits(
+    // This designation is the exact claim the authoritative scan later hands
+    // this ticket as its grant, and the fence every junior behind it must
+    // clear once that grant lands. Naming a permit some junior's in-flight
+    // grant is already counting on therefore resolves as a ticket-order
+    // revocation of that junior. Bias away from the charged permits, reading
+    // the charge from the failed fast attempt's permit-scoped snapshot: no
+    // extra registry read, and a stale bias cannot make a designation
+    // invalid because the width and admission class do not depend on it.
+    let queued_plan_permits = select_plan_permits_grant_aware(
         permit_admission,
         sizing,
         &permit_pool,
@@ -5961,6 +5960,15 @@ where
                 return Ok(true);
             };
             snapshot.conflicts(&external).map(|busy| !busy)
+        },
+        |candidate| {
+            let Some(snapshot) = queue_seed_permit_snapshot.as_ref() else {
+                return Ok(false);
+            };
+            let Some(external) = claim_without_owned_permits(candidate, &preparation_owned) else {
+                return Ok(false);
+            };
+            snapshot.grant_conflicts(&external)
         },
     )?
     .expect("a non-empty host permit pool must seed a queued designation");
