@@ -2461,7 +2461,16 @@ impl Ticket {
             .filter(|record| record.ticket == self.ticket)
             .ok_or_else(|| anyhow::anyhow!("live queue ticket {} disappeared", self.ticket))?;
         let acknowledgement = match record.state {
-            STATE_REVOKED => table.acknowledge_revoked(self.slot, self.ticket, None)?,
+            STATE_REVOKED => {
+                // Reaching an ordinary state read in REVOKED means the scan
+                // destroyed this grant before the owner's wake ever observed
+                // GRANTED, so no `run_granted` entry — and therefore no
+                // `grants_lost` — accounts for it.
+                crate::vmm::grant_flow::note_block(
+                    crate::vmm::grant_flow::GrantBlock::RevokedUnwoken,
+                );
+                table.acknowledge_revoked(self.slot, self.ticket, None)?
+            }
             STATE_REPLAN_EXPIRED => {
                 table.acknowledge_expired_replan(self.slot, self.ticket, None)?
             }
@@ -2756,6 +2765,13 @@ impl Ticket {
                 // accumulator is the complete admission fence. Park this
                 // unentered token and publish one coalesced edge; the
                 // coordinator consumes it in its normal scan turn.
+                if crate::vmm::grant_flow::enabled() {
+                    use crate::vmm::grant_flow::{GrantBlock, note_block};
+                    note_block(GrantBlock::ParkEntry);
+                    if table.changed_claims_saturated() {
+                        note_block(GrantBlock::ParkSaturated);
+                    }
+                }
                 table.begin_transaction()?;
                 table.set_record_state(self.slot, STATE_WAITING)?;
                 table.clear_record_blocked(self.slot)?;
@@ -2930,6 +2946,13 @@ impl Ticket {
             && (table.changed_claims_saturated()
                 || table.changed_claims_conflict(&record.claim)?);
         if dirty_grant && record.state == STATE_GRANTED && record.claim == designated {
+            if crate::vmm::grant_flow::enabled() {
+                use crate::vmm::grant_flow::{GrantBlock, note_block};
+                note_block(GrantBlock::ParkCommit);
+                if table.changed_claims_saturated() {
+                    note_block(GrantBlock::ParkSaturated);
+                }
+            }
             let released_acquired = result.acquired.is_some();
             let blocked = if released_acquired {
                 None
@@ -3182,6 +3205,13 @@ impl Ticket {
                     &[],
                 )? {
                     PendingTransition::Committed(pending_claim) => {
+                        // Only a licensed grant reaches here (the ensure above
+                        // rejects a preparation claim from an unlicensed wake),
+                        // so this is a grant spent on a PENDING preparation
+                        // rather than on a HELD run claim.
+                        crate::vmm::grant_flow::note_block(
+                            crate::vmm::grant_flow::GrantBlock::Prepared,
+                        );
                         drop(table);
                         drop(lock);
                         notify_coordinator();
@@ -12174,6 +12204,52 @@ pub(crate) fn exercise_disjoint_entrant_proceeds_for_tests()
 }
 
 #[cfg(test)]
+pub(crate) struct ChangedClaimCoverageOutcome {
+    pub(crate) cpu_bits: u64,
+    pub(crate) permit_bits: u64,
+    pub(crate) llc_bits: u64,
+    pub(crate) cleared: bool,
+}
+
+/// The changed-claims coverage sampler reads back exactly what
+/// `mark_changed_claim` folded: CPUs and folded permits are counted apart
+/// even though they share one bitset, LLCs come from their own, and a
+/// finished scan leaves all three at zero. The sampler is the instrument the
+/// accumulator-saturation question is answered with, so a miscount would
+/// misdirect that answer rather than fail loudly.
+#[cfg(test)]
+pub(crate) fn exercise_changed_claim_coverage_for_tests() -> Result<ChangedClaimCoverageOutcome> {
+    let anchor_cpu = 3_200usize;
+    let anchor = ClaimSet::new(std::iter::empty(), [anchor_cpu], FlockMode::Exclusive);
+    let mut ticket = Ticket::register(anchor.clone(), anchor, None)?;
+    let outcome = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        // Start from the state a completed scan leaves behind, so the counts
+        // below are exactly what this fixture folds.
+        table.finish_claim_scan();
+        // Real host CPUs only: an index above the CPU/permit boundary is
+        // folded permit space by construction.
+        let mut folded = ClaimSet::new([9usize, 11], [0usize, 1, 2], FlockMode::Exclusive);
+        folded.permits.insert(5);
+        table.mark_changed_claim(&folded)?;
+        let (cpu_bits, permit_bits) = table.changed_cpu_permit_bit_counts(B_CHANGED_CPU_ANY);
+        let llc_bits = table.changed_bit_count(B_CHANGED_LLC_ANY);
+        table.finish_claim_scan();
+        let cleared = table.changed_cpu_permit_bit_counts(B_CHANGED_CPU_ANY) == (0, 0)
+            && table.changed_bit_count(B_CHANGED_LLC_ANY) == 0;
+        ChangedClaimCoverageOutcome {
+            cpu_bits,
+            permit_bits,
+            llc_bits,
+            cleared,
+        }
+    };
+    ticket.finish(None)?;
+    Ok(outcome)
+}
+
+#[cfg(test)]
 fn exercise_pending_replan_grant_race_case(
     offset: usize,
     complete_during_callback: bool,
@@ -18637,8 +18713,12 @@ impl Table {
         } else {
             Vec::new()
         };
+        let mut max_scanned_ticket = 0u64;
 
         for record in records {
+            if diagnostics_enabled {
+                max_scanned_ticket = max_scanned_ticket.max(record.ticket);
+            }
             // An expired planner callback is quarantined until its own owner
             // acknowledges it. It contributes neither a predecessor fence
             // nor coordinator/progress ownership and cannot be republished by
@@ -18877,6 +18957,22 @@ impl Table {
                 // or committed a newly-busy resource after this grant was
                 // issued. Revoke the stale grant before it can race into the
                 // real flock probe.
+                if diagnostics_enabled {
+                    use crate::vmm::grant_flow::{GrantBlock, note_block};
+                    note_block(GrantBlock::ScanRevoke);
+                    if let Some(marker) = first_conflict {
+                        note_block(GrantBlock::ScanRevokeConflict);
+                        match marker.blocker {
+                            ResourceKey::Permit(_) => {
+                                note_block(GrantBlock::ScanRevokeConflictPermit);
+                            }
+                            ResourceKey::Llc(_) => note_block(GrantBlock::ScanRevokeConflictLlc),
+                            ResourceKey::Cpu(_) => {}
+                        }
+                    } else {
+                        note_block(GrantBlock::ScanRevokeUnavailable);
+                    }
+                }
                 self.set_record_state(record.slot, STATE_REVOKED)?;
                 self.clear_record_blocked_known(record.slot, record.external_blocker)?;
                 crash_at_for_tests("revoke_state_before_wake");
@@ -19145,6 +19241,21 @@ impl Table {
                 distinct_cpus,
             );
             crate::vmm::grant_flow::note_backfill_scan(backfill_head_sample);
+            // Sample the accumulator as this scan found it, before the reset
+            // below clears it: this is the largest coverage a granted entrant
+            // waking since the previous scan had to be disjoint from to avoid
+            // parking.
+            let watermark = self.min_changed_ticket();
+            let (changed_cpu_bits, changed_permit_bits) =
+                self.changed_cpu_permit_bit_counts(B_CHANGED_CPU_ANY);
+            let changed_llc_bits = self.changed_bit_count(B_CHANGED_LLC_ANY);
+            crate::vmm::grant_flow::note_changed_claims(
+                self.changed_claims_saturated(),
+                changed_cpu_bits,
+                changed_permit_bits,
+                changed_llc_bits,
+                (watermark != u64::MAX).then(|| max_scanned_ticket.saturating_sub(watermark)),
+            );
         }
         self.finish_claim_scan();
         self.clear_pending_flag(PENDING_RESCAN | PENDING_REPLAN_RESCAN);
@@ -19521,6 +19632,39 @@ impl Table {
         }
         atomic_u64(&self.header, H_AGGREGATE_DIRTY).store(0, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Diagnostics-only: how many bits of a changed-claims accumulator bitset
+    /// are set. O(words) header reads, sampled once per authoritative scan
+    /// behind `grant_flow::enabled`.
+    fn changed_bit_count(&self, which: usize) -> u64 {
+        let offset = self.layout.bitset_offset(which);
+        (0..self.layout.words)
+            .map(|word| u64::from(read_u64(&self.header, offset + word * 8).count_ones()))
+            .sum()
+    }
+
+    /// [`Self::changed_bit_count`] split at the CPU/folded-permit boundary, so
+    /// a saturated permit pool is not read as host-wide CPU coverage.
+    fn changed_cpu_permit_bit_counts(&self, which: usize) -> (u64, u64) {
+        let base = host_cpu_resource_bits();
+        let offset = self.layout.bitset_offset(which);
+        let mut cpus = 0u64;
+        let mut permits = 0u64;
+        for word in 0..self.layout.words {
+            let bits = read_u64(&self.header, offset + word * 8);
+            let start = word * 64;
+            let cpu_mask = if start >= base {
+                0
+            } else if start + 64 <= base {
+                u64::MAX
+            } else {
+                (1u64 << (base - start)) - 1
+            };
+            cpus += u64::from((bits & cpu_mask).count_ones());
+            permits += u64::from((bits & !cpu_mask).count_ones());
+        }
+        (cpus, permits)
     }
 
     fn bitmap_bit(&self, which: usize, index: usize) -> Result<bool> {

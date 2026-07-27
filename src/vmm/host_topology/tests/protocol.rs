@@ -5534,6 +5534,32 @@ fn disjoint_entrant_proceeds_past_dirty_watermark() {
     );
 }
 
+/// The changed-claims coverage sampler counts the accumulator the way the
+/// saturation question needs it read: CPUs apart from folded permits, LLCs
+/// from their own bitset, and zero once a scan has reset it.
+#[test]
+fn changed_claim_coverage_counts_each_accumulator_axis() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_changed_claim_coverage_for_tests()
+        .expect("exercise changed-claims coverage sampler");
+    assert_eq!(
+        outcome.cpu_bits, 3,
+        "the three folded host CPUs must count on the CPU axis",
+    );
+    assert_eq!(
+        outcome.permit_bits, 1,
+        "the folded permit must count apart from the CPUs sharing its bitset",
+    );
+    assert_eq!(
+        outcome.llc_bits, 2,
+        "both folded LLCs must count on the LLC axis",
+    );
+    assert!(
+        outcome.cleared,
+        "a finished claim scan must leave every accumulator axis at zero",
+    );
+}
+
 #[test]
 fn pending_replan_edge_suppresses_conflicting_later_grant_at_entry_and_commit() {
     let _prefixes = LockPrefixesGuard::new();

@@ -35,6 +35,15 @@
 //! converted; the gap between them is unattributable without naming the fence
 //! that rejected each candidate.
 //!
+//! - `changed_*`: one sample per authoritative grant scan of the changed-claims
+//!   accumulator as the scan found it, taken immediately before the scan resets
+//!   it. `changed_dirty_scans` against `changed_scans` says how often the suffix
+//!   watermark was armed at all, `changed_saturated_scans` how often the
+//!   accumulator lost claim precision outright, and the bit counts how much of
+//!   the host the accumulator covered when the scan cleared it. Read them
+//!   against `block_park_entry` / `block_park_commit`: a large accumulated
+//!   footprint only matters if granted entrants actually park on it.
+//!
 //! Entirely inert unless `KTSTR_BUILD_DIAGNOSTICS_DIR` is set (CI only): the
 //! `note_*` calls are relaxed atomic updates and the expensive inputs
 //! (distinct-CPU popcount, discover timing) are computed only behind
@@ -66,6 +75,16 @@ static BACKFILL_HEAD_CAPACITY_MAX: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_COUNT: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_NS_SUM: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static CHANGED_SCANS: AtomicU64 = AtomicU64::new(0);
+static CHANGED_DIRTY_SCANS: AtomicU64 = AtomicU64::new(0);
+static CHANGED_SATURATED_SCANS: AtomicU64 = AtomicU64::new(0);
+static CHANGED_CPU_BITS_SUM: AtomicU64 = AtomicU64::new(0);
+static CHANGED_CPU_BITS_MAX: AtomicU64 = AtomicU64::new(0);
+static CHANGED_PERMIT_BITS_SUM: AtomicU64 = AtomicU64::new(0);
+static CHANGED_PERMIT_BITS_MAX: AtomicU64 = AtomicU64::new(0);
+static CHANGED_LLC_BITS_SUM: AtomicU64 = AtomicU64::new(0);
+static CHANGED_LLC_BITS_MAX: AtomicU64 = AtomicU64::new(0);
+static CHANGED_WATERMARK_SPAN_MAX: AtomicU64 = AtomicU64::new(0);
 static ATEXIT_REGISTERED: AtomicBool = AtomicBool::new(false);
 static BLOCKS: [AtomicU64; GrantBlock::COUNT] = [const { AtomicU64::new(0) }; GrantBlock::COUNT];
 
@@ -90,6 +109,18 @@ static BLOCKS: [AtomicU64; GrantBlock::COUNT] = [const { AtomicU64::new(0) }; Gr
 /// see why admission itself stalled. `scan_conflict_*` partition
 /// [`GrantBlock::ScanConflict`] and `scan_fairness_*` partition
 /// [`GrantBlock::ScanFairness`], the same way the `predecessors_*` pair does.
+///
+/// The last group — `scan_revoke_*`, `revoked_unwoken`, `park_*` and
+/// `prepared` — accounts for what became of an ISSUED grant, one per grant
+/// rather than per candidate. Every other outcome of a licensed grant already
+/// lands in `grants_reached_held` or `grants_lost`, so these are the terms that
+/// close the `grants_issued` books: a grant the scan revoked, a revocation the
+/// owner's wake never even observed as GRANTED (which therefore fires no
+/// `grants_lost`), a grant the changed-claims fence sent back to WAITING, and a
+/// grant that legitimately became a parked PENDING preparation instead of a
+/// HELD run claim. `scan_revoke_conflict` and `scan_revoke_unavailable`
+/// partition [`GrantBlock::ScanRevoke`]; the permit/LLC pair partitions
+/// `scan_revoke_conflict` by axis with the CPU axis as the remainder.
 #[derive(Clone, Copy)]
 pub(crate) enum GrantBlock {
     /// The wake carried no grant license (a REPLAN re-designation), so no
@@ -145,10 +176,51 @@ pub(crate) enum GrantBlock {
     /// Scan side: a preparation intent found no free slot in the preparation
     /// token pool.
     ScanPreparationPool,
+    /// Scan side: an authoritative scan revoked an in-flight GRANTED record.
+    /// The grant is destroyed before its callback can commit, and whether that
+    /// costs a `grants_lost` depends only on whether the owner had already
+    /// woken.
+    ScanRevoke,
+    /// Sub-count of [`GrantBlock::ScanRevoke`]: the revoked grant's claim
+    /// conflicts the live predecessor prefix. Only an earlier ticket's
+    /// fence-preserving claim enters that prefix, so this names senior work
+    /// covering a footprint a junior grant already held.
+    ScanRevokeConflict,
+    /// Sub-count of [`GrantBlock::ScanRevokeConflict`] on the permit axis.
+    ScanRevokeConflictPermit,
+    /// Sub-count of [`GrantBlock::ScanRevokeConflict`] on the LLC axis.
+    ScanRevokeConflictLlc,
+    /// Sub-count of [`GrantBlock::ScanRevoke`]: a resource the grant names is
+    /// not observed available. Publishing a blocker witness and releasing a
+    /// claim whose callback lost its race both drop the named resources out of
+    /// availability until the next observation, so this can fire with no queue
+    /// conflict at all.
+    ScanRevokeUnavailable,
+    /// Owner side: the revocation landed before this ticket's wake read
+    /// GRANTED, so it acknowledged REVOKED from an ordinary state read and
+    /// never entered the grant callback. This is the silent term — the grant
+    /// was issued and destroyed without ever reaching `grants_lost`.
+    RevokedUnwoken,
+    /// Owner side: the changed-claims fence parked the granted entrant before
+    /// its probe ran.
+    ParkEntry,
+    /// Owner side: the changed-claims fence parked the granted entrant after
+    /// its probe ran, discarding that work.
+    ParkCommit,
+    /// Sub-count of [`GrantBlock::ParkEntry`] and [`GrantBlock::ParkCommit`]:
+    /// the accumulator was saturated, so the park is the fail-closed blanket
+    /// one rather than a proven claim overlap.
+    ParkSaturated,
+    /// Owner side: a licensed grant converted into a parked PENDING
+    /// preparation. By design it never reaches HELD under this grant — the
+    /// later one-shot activation publishes HELD without one — so it is neither
+    /// conversion nor loss. The coordinator's own preparation finish carries no
+    /// grant and is deliberately not counted.
+    Prepared,
 }
 
 impl GrantBlock {
-    const COUNT: usize = 18;
+    const COUNT: usize = 28;
 
     const ALL: [Self; Self::COUNT] = [
         Self::Unlicensed,
@@ -169,6 +241,16 @@ impl GrantBlock {
         Self::ScanFairnessWindow,
         Self::ScanFairnessCapacity,
         Self::ScanPreparationPool,
+        Self::ScanRevoke,
+        Self::ScanRevokeConflict,
+        Self::ScanRevokeConflictPermit,
+        Self::ScanRevokeConflictLlc,
+        Self::ScanRevokeUnavailable,
+        Self::RevokedUnwoken,
+        Self::ParkEntry,
+        Self::ParkCommit,
+        Self::ParkSaturated,
+        Self::Prepared,
     ];
 
     const fn index(self) -> usize {
@@ -195,6 +277,16 @@ impl GrantBlock {
             Self::ScanFairnessWindow => "scan_fairness_window",
             Self::ScanFairnessCapacity => "scan_fairness_capacity",
             Self::ScanPreparationPool => "scan_preparation_pool",
+            Self::ScanRevoke => "scan_revoke",
+            Self::ScanRevokeConflict => "scan_revoke_conflict",
+            Self::ScanRevokeConflictPermit => "scan_revoke_conflict_permit",
+            Self::ScanRevokeConflictLlc => "scan_revoke_conflict_llc",
+            Self::ScanRevokeUnavailable => "scan_revoke_unavailable",
+            Self::RevokedUnwoken => "revoked_unwoken",
+            Self::ParkEntry => "park_entry",
+            Self::ParkCommit => "park_commit",
+            Self::ParkSaturated => "park_saturated",
+            Self::Prepared => "prepared",
         }
     }
 }
@@ -309,12 +401,52 @@ pub(crate) fn note_discover(elapsed_ns: u64) {
     ensure_atexit();
 }
 
+/// One authoritative scan's view of the changed-claims accumulator, sampled
+/// immediately before the scan resets it and only behind [`enabled`]. The bit
+/// counts are the accumulated coverage on the CPU, folded-permit and LLC axes;
+/// `watermark_span` is how far below the highest live ticket the suffix
+/// watermark sits, and is `None` when no dirty event armed it at all. Together
+/// they say whether the accumulator narrows the granted-entrant park in
+/// practice or has grown to cover the host by the time a scan clears it.
+pub(crate) fn note_changed_claims(
+    saturated: bool,
+    cpu_bits: u64,
+    permit_bits: u64,
+    llc_bits: u64,
+    watermark_span: Option<u64>,
+) {
+    CHANGED_SCANS.fetch_add(1, Ordering::Relaxed);
+    if saturated {
+        CHANGED_SATURATED_SCANS.fetch_add(1, Ordering::Relaxed);
+    }
+    CHANGED_CPU_BITS_SUM.fetch_add(cpu_bits, Ordering::Relaxed);
+    bump_max(&CHANGED_CPU_BITS_MAX, cpu_bits);
+    CHANGED_PERMIT_BITS_SUM.fetch_add(permit_bits, Ordering::Relaxed);
+    bump_max(&CHANGED_PERMIT_BITS_MAX, permit_bits);
+    CHANGED_LLC_BITS_SUM.fetch_add(llc_bits, Ordering::Relaxed);
+    bump_max(&CHANGED_LLC_BITS_MAX, llc_bits);
+    if let Some(span) = watermark_span {
+        CHANGED_DIRTY_SCANS.fetch_add(1, Ordering::Relaxed);
+        bump_max(&CHANGED_WATERMARK_SPAN_MAX, span);
+    }
+    ensure_atexit();
+}
+
 fn format_line(pid: u32) -> String {
     let discover_count = DISCOVER_COUNT.load(Ordering::Relaxed);
     let discover_ns_mean = DISCOVER_NS_SUM
         .load(Ordering::Relaxed)
         .checked_div(discover_count)
         .unwrap_or(0);
+    let changed_scans = CHANGED_SCANS.load(Ordering::Relaxed);
+    let changed_mean = |cell: &AtomicU64| {
+        cell.load(Ordering::Relaxed)
+            .checked_div(changed_scans)
+            .unwrap_or(0)
+    };
+    let changed_cpu_bits_mean = changed_mean(&CHANGED_CPU_BITS_SUM);
+    let changed_permit_bits_mean = changed_mean(&CHANGED_PERMIT_BITS_SUM);
+    let changed_llc_bits_mean = changed_mean(&CHANGED_LLC_BITS_SUM);
     let blocks = GrantBlock::ALL
         .iter()
         .map(|block| {
@@ -330,7 +462,12 @@ fn format_line(pid: u32) -> String {
          held_in_flight_max={} granted_in_flight_max={} distinct_held_cpus_max={} \
          backfill_scans={} backfill_head_scans={} backfill_head_age_ns_max={} \
          backfill_head_capacity_max={} discover_count={} \
-         discover_ns_mean={discover_ns_mean} discover_ns_max={}{blocks}\n",
+         discover_ns_mean={discover_ns_mean} discover_ns_max={} \
+         changed_scans={changed_scans} changed_dirty_scans={} \
+         changed_saturated_scans={} changed_cpu_bits_mean={changed_cpu_bits_mean} \
+         changed_cpu_bits_max={} changed_permit_bits_mean={changed_permit_bits_mean} \
+         changed_permit_bits_max={} changed_llc_bits_mean={changed_llc_bits_mean} \
+         changed_llc_bits_max={} changed_watermark_span_max={}{blocks}\n",
         GRANTS_ISSUED.load(Ordering::Relaxed),
         GRANTS_REACHED_HELD.load(Ordering::Relaxed),
         GRANTS_LOST.load(Ordering::Relaxed),
@@ -343,6 +480,12 @@ fn format_line(pid: u32) -> String {
         BACKFILL_HEAD_CAPACITY_MAX.load(Ordering::Relaxed),
         discover_count,
         DISCOVER_NS_MAX.load(Ordering::Relaxed),
+        CHANGED_DIRTY_SCANS.load(Ordering::Relaxed),
+        CHANGED_SATURATED_SCANS.load(Ordering::Relaxed),
+        CHANGED_CPU_BITS_MAX.load(Ordering::Relaxed),
+        CHANGED_PERMIT_BITS_MAX.load(Ordering::Relaxed),
+        CHANGED_LLC_BITS_MAX.load(Ordering::Relaxed),
+        CHANGED_WATERMARK_SPAN_MAX.load(Ordering::Relaxed),
     )
 }
 
@@ -395,6 +538,16 @@ mod tests {
             "discover_count=",
             "discover_ns_mean=",
             "discover_ns_max=",
+            "changed_scans=",
+            "changed_dirty_scans=",
+            "changed_saturated_scans=",
+            "changed_cpu_bits_mean=",
+            "changed_cpu_bits_max=",
+            "changed_permit_bits_mean=",
+            "changed_permit_bits_max=",
+            "changed_llc_bits_mean=",
+            "changed_llc_bits_max=",
+            "changed_watermark_span_max=",
             "block_unlicensed=",
             "block_permits=",
             "block_no_candidate=",
@@ -413,6 +566,16 @@ mod tests {
             "block_scan_fairness_window=",
             "block_scan_fairness_capacity=",
             "block_scan_preparation_pool=",
+            "block_scan_revoke=",
+            "block_scan_revoke_conflict=",
+            "block_scan_revoke_conflict_permit=",
+            "block_scan_revoke_conflict_llc=",
+            "block_scan_revoke_unavailable=",
+            "block_revoked_unwoken=",
+            "block_park_entry=",
+            "block_park_commit=",
+            "block_park_saturated=",
+            "block_prepared=",
         ] {
             assert!(line.contains(field), "missing {field} in {line}");
         }

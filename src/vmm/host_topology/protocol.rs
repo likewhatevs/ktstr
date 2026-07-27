@@ -55,7 +55,7 @@ pub(crate) use registry::{
     diagnostics_for_tests as ticket_registry_diagnostics_for_tests,
     exercise_acknowledgement_payload_notify_order_for_tests,
     exercise_bounded_replan_window_for_tests, exercise_busy_to_free_close_for_tests,
-    exercise_changed_replan_wave_completions_for_tests,
+    exercise_changed_claim_coverage_for_tests, exercise_changed_replan_wave_completions_for_tests,
     exercise_clean_coordinator_mismatch_recovery_for_tests,
     exercise_coordinator_heartbeat_deadline_for_tests,
     exercise_coordinator_pending_replan_for_tests, exercise_coordinator_turnover_for_tests,
