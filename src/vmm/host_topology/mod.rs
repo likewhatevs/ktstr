@@ -5314,6 +5314,11 @@ where
     let mut queue_seed_snapshots = None;
     let mut queue_seed_cpu_states = None;
     let mut queue_seed_universe = None;
+    // The same aggregate the failed fast attempt already read. The queued
+    // designation consumes only its in-flight grant charge, as a selection
+    // bias, so reusing it costs no extra registry read and a stale bias can
+    // never make a designation invalid.
+    let mut queue_seed_aggregate = None;
     let mut contention = protocol::ContentionSet::default();
     loop {
         check_acquire_cancelled(cancelled)?;
@@ -5508,7 +5513,7 @@ where
                 .chain(&preferred_memory_permits)
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>();
-            select_plan_permits(
+            select_plan_permits_grant_aware(
                 permit_admission,
                 sizing,
                 &permit_pool,
@@ -5529,6 +5534,18 @@ where
                         return Ok(true);
                     };
                     permit_snapshot.conflicts(&external).map(|busy| !busy)
+                },
+                |candidate| {
+                    // A fast-path acquirer takes its permits outright. Taking
+                    // one an in-flight grant is counting on kills that grant
+                    // in the next scan, so prefer a permit no grant charge
+                    // covers; the grant-blind fallback keeps a saturated pool
+                    // exactly as work-conserving as before.
+                    let Some(external) = claim_without_owned_permits(candidate, &preparation_owned)
+                    else {
+                        return Ok(false);
+                    };
+                    permit_snapshot.grant_conflicts(&external)
                 },
             )?
         };
@@ -5615,6 +5632,7 @@ where
             queue_seed_snapshots = Some(snapshots);
             queue_seed_cpu_states = Some(cpu_states);
             queue_seed_universe = Some(allowed.clone());
+            queue_seed_aggregate = Some(aggregate);
             break;
         }
         let mut registry_fenced = false;
@@ -5708,6 +5726,7 @@ where
             // exclusions are transient contention; seeding from them could
             // create an empty/short claim precisely when waiting is needed.
             queue_seed_universe = Some(allowed.clone());
+            queue_seed_aggregate = Some(aggregate);
             break;
         }
         if attempt >= ACQUIRE_MAX_TOCTOU_RETRIES {
@@ -5786,6 +5805,8 @@ where
         .expect("waiting acquisition must preserve its failed fast-phase CPU snapshot");
     let queued_allowed = queue_seed_universe
         .expect("waiting acquisition must preserve its full static CPU universe");
+    let queued_aggregate = queue_seed_aggregate
+        .expect("waiting acquisition must preserve its failed fast-phase registry aggregate");
     let queued_target_cpus = sizing.queued_target(target_cpus);
     let queued_capacity = live_cpu_capacity(
         sizing,
@@ -5852,7 +5873,16 @@ where
         .chain(&preferred_memory_permits)
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
-    let queued_plan_permits = select_plan_permits(
+    // The exact designation published here is what the authoritative scan
+    // later hands this ticket as a grant, and what fences every junior behind
+    // it once that grant lands. A designation naming a permit some junior's
+    // in-flight grant is already counting on therefore resolves as a
+    // ticket-order revocation of that junior — the dominant grant-churn term.
+    // Bias away from the charged permits, with the mandatory grant-blind
+    // fallback: a queued designation must still name a complete canonical
+    // permit set when every permit is charged, or a saturated pool would have
+    // nothing to queue for.
+    let queued_plan_permits = select_plan_permits_grant_aware(
         permit_admission,
         sizing,
         &permit_pool,
@@ -5871,6 +5901,12 @@ where
                 return Ok(true);
             };
             snapshot.conflicts(&external).map(|busy| !busy)
+        },
+        |candidate| {
+            let Some(external) = claim_without_owned_permits(candidate, &preparation_owned) else {
+                return Ok(false);
+            };
+            queued_aggregate.grant_conflicts(&external)
         },
     )?
     .expect("a non-empty host permit pool must seed a queued designation");

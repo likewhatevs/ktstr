@@ -731,6 +731,14 @@ impl RegisteredClaimSnapshot {
     pub(crate) fn llc_grant_count(&self, llc: usize) -> Result<usize> {
         self.inner.llc_grant_count(llc)
     }
+
+    /// Whether `candidate` overlaps any in-flight grant charge, permits
+    /// included (they are charged at their folded CPU-space indices). Same
+    /// soft-avoid-only contract as [`GrantedProbe::grant_conflicts`]: callers
+    /// MUST rerun grant-blind when no grant-free candidate exists.
+    pub(crate) fn grant_conflicts(&self, candidate: &ClaimSet) -> Result<bool> {
+        self.inner.grant_conflicts(candidate)
+    }
 }
 
 /// Copy the aggregate reservation bitsets once for a whole planning pass.
