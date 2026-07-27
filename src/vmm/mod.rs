@@ -839,6 +839,14 @@ fn topology_from_admission_descriptor(
 pub struct AdmissionExecGuard {
     pending: Option<host_topology::protocol::PendingAdmission>,
     descriptor: crate::test_support::AdmissionCellDescriptor,
+    /// Pre-exec admission clock: when this wrapper entered
+    /// [`pre_admit_test_cell`], and the elapsed at the moment the cell was
+    /// published into the cross-process queue. Deliberately a private instant
+    /// rather than [`record_process_start`]: the wrapper is also an
+    /// acquisition-phase coordinator, whose `exit_timing` lines are ordered on
+    /// the UNIX-epoch clock precisely because it has no process-start anchor.
+    admission_start: std::time::Instant,
+    registered: Option<Duration>,
 }
 
 impl AdmissionExecGuard {
@@ -863,6 +871,14 @@ impl AdmissionExecGuard {
         .context("encode pending pre-exec admission")?;
         let handoff = host_topology::protocol::prepare_pending_exec_handoff(pending, &metadata)?;
         handoff.configure_exec(&mut command);
+        command.env(
+            PRE_EXEC_ADMISSION_ENV,
+            format_pre_exec_admission_stamp(
+                std::process::id(),
+                self.admission_start.elapsed(),
+                self.registered.unwrap_or_default(),
+            ),
+        );
         let description = format!("{command:?}");
         Err(anyhow::Error::new(command.exec()))
             .with_context(|| format!("exec pre-admitted test cell via {description}"))
@@ -1145,9 +1161,12 @@ fn admission_intent_plan_for(
 pub fn pre_admit_test_cell(
     mut descriptor: crate::test_support::AdmissionCellDescriptor,
 ) -> Result<AdmissionExecGuard> {
+    let admission_start = std::time::Instant::now();
     let unreserved = |descriptor| AdmissionExecGuard {
         pending: None,
         descriptor,
+        admission_start,
+        registered: None,
     };
     let nonempty_env = |name| {
         std::env::var(name)
@@ -1181,10 +1200,13 @@ pub fn pre_admit_test_cell(
     let Some(plan) = admission_intent_plan(&descriptor)? else {
         return Ok(unreserved(descriptor));
     };
+    let registered = admission_start.elapsed();
     let pending = register_admission_intent(&plan)?;
     Ok(AdmissionExecGuard {
         pending: Some(pending),
         descriptor,
+        admission_start,
+        registered: Some(registered),
     })
 }
 
@@ -1786,8 +1808,59 @@ static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceL
 /// Record the process/admission-start anchor for [`process_start_elapsed`].
 /// Idempotent (first call wins); call as early as possible in a `#[ktstr_test]`
 /// run, before any admission wait, so the anchor precedes the queue.
+///
+/// A cell admitted by the pre-exec target runner spent most of its queue in
+/// the wrapper, before this process image existed. The wrapper's stamp
+/// ([`PRE_EXEC_ADMISSION_ENV`]) back-dates the anchor across that same-PID
+/// exec so the clock covers the whole span nextest charges the test.
 pub(crate) fn record_process_start() {
-    let _ = PROCESS_START.get_or_init(std::time::Instant::now);
+    let _ = PROCESS_START.get_or_init(|| {
+        let now = std::time::Instant::now();
+        pre_exec_admission_stamp()
+            .and_then(|(elapsed, _)| now.checked_sub(elapsed))
+            .unwrap_or(now)
+    });
+}
+
+/// Pre-exec admission clock carried across the sealed same-PID exec as
+/// `{pid}:{elapsed_ns}:{registered_ns}`. Both are nanoseconds on the
+/// wrapper's [`AdmissionExecGuard::admission_start`] clock: `elapsed_ns` at
+/// the exec itself, `registered_ns` at the moment the cell was published into
+/// the cross-process queue. The PID prefix is the same one-shot guard the
+/// descriptor handoff uses — exec preserves the PID, so a grandchild that
+/// inherits this variable sees a mismatch and ignores it.
+///
+/// Empty-string policy: absent, empty, or malformed all fail closed to no
+/// back-dating, leaving this process's own start as the anchor.
+const PRE_EXEC_ADMISSION_ENV: &str = "KTSTR_PRE_EXEC_ADMISSION_V1";
+
+fn format_pre_exec_admission_stamp(pid: u32, elapsed: Duration, registered: Duration) -> String {
+    format!("{pid}:{}:{}", elapsed.as_nanos(), registered.as_nanos())
+}
+
+fn parse_pre_exec_admission_stamp(value: &str, pid: u32) -> Option<(Duration, Duration)> {
+    let mut fields = value.split(':');
+    if fields.next()?.parse::<u32>().ok()? != pid {
+        return None;
+    }
+    let elapsed = Duration::from_nanos(fields.next()?.parse().ok()?);
+    let registered = Duration::from_nanos(fields.next()?.parse().ok()?);
+    if fields.next().is_some() || registered > elapsed {
+        return None;
+    }
+    Some((elapsed, registered))
+}
+
+/// This process's pre-exec admission stamp, or `None` when it was not admitted
+/// through the target runner. Memoized: the value is fixed for the process
+/// lifetime and is read from paths that run after libtest may have started
+/// threads.
+fn pre_exec_admission_stamp() -> Option<(Duration, Duration)> {
+    static STAMP: std::sync::OnceLock<Option<(Duration, Duration)>> = std::sync::OnceLock::new();
+    *STAMP.get_or_init(|| {
+        let raw = std::env::var(PRE_EXEC_ADMISSION_ENV).ok()?;
+        parse_pre_exec_admission_stamp(&raw, std::process::id())
+    })
 }
 
 /// Elapsed wall since [`record_process_start`], or `None` if it was never
@@ -1807,7 +1880,10 @@ const ADMISSION_TIMING_FILE: &str = "admission-timing.log";
 /// (registration, grant, release) decomposing a cell's charged wall into
 /// admission queue-wait vs granted service. All instants use
 /// [`process_start_elapsed`] so the series aligns with the wall-net telemetry
-/// and nextest's process-relative rail.
+/// and nextest's process-relative rail. For a cell admitted by the pre-exec
+/// target runner that clock is back-dated to the wrapper (see
+/// [`PRE_EXEC_ADMISSION_ENV`]), so `wait_ns` covers the whole queue rather
+/// than only the post-exec remainder.
 ///
 /// Constructed at registration and moved into the run's teardown guard, it
 /// emits exactly one line on `drop` — at run-locks release on the normal path,
@@ -1827,7 +1903,13 @@ struct AdmissionTiming {
 impl AdmissionTiming {
     /// Record the registration instant, or `None` when the diagnostics sink is
     /// unset (the local-run default: no allocation, no clock read, no write).
-    fn new(identity: String, vcpus: u32, permits: u32) -> Option<Self> {
+    ///
+    /// `imported_pre_exec` marks a run that adopted the target runner's
+    /// pending admission: its queue started in the wrapper, so the wrapper's
+    /// stamp supplies the registration instant. Without it the registration
+    /// instant would land after the pre-exec wait AND after this process's
+    /// artifact preparation, charging neither to any field.
+    fn new(identity: String, vcpus: u32, permits: u32, imported_pre_exec: bool) -> Option<Self> {
         let dir = std::env::var_os(ADMISSION_TIMING_DIR_ENV)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)?;
@@ -1836,7 +1918,12 @@ impl AdmissionTiming {
             identity,
             vcpus,
             permits,
-            registered: process_start_elapsed().unwrap_or_default(),
+            registered: imported_pre_exec
+                .then(pre_exec_admission_stamp)
+                .flatten()
+                .map(|(_, registered)| registered)
+                .or_else(process_start_elapsed)
+                .unwrap_or_default(),
             granted: None,
         })
     }
@@ -2043,9 +2130,9 @@ impl KtstrVm {
         // full advertised size. See `permit_memory_mib`.
         let permit_memory_mib = self.permit_memory_mib(prepared_initrd.as_ref(), memory_mib)?;
         pending_admission.finish_preparation()?;
-        // Registration instant: the pending admission is created (direct path)
-        // or imported from the pre-exec parent (handoff path); either way the
-        // cell is now queued for the physical run claim. A never-granted cell
+        // Registration instant: for a direct run the pending admission is
+        // created here; for a handoff run it was created pre-exec and the
+        // wrapper's stamp supplies the earlier instant. A never-granted cell
         // emits `outcome=pending-killed` when `admission_timing` drops on unwind.
         let mut admission_timing = AdmissionTiming::new(
             imported_descriptor
@@ -2055,6 +2142,7 @@ impl KtstrVm {
                 .unwrap_or_else(|| "<unknown>".to_string()),
             self.topology.total_cpus(),
             pending_admission.preparation_cpu_permits().len() as u32,
+            imported_descriptor.is_some(),
         );
         let run_locks = self.acquire_run_locks(true, Some(pending_admission), permit_memory_mib)?;
         // Grant instant: the physical run claim is held (PENDING→HELD).

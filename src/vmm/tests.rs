@@ -2693,10 +2693,10 @@ fn admission_timing_emits_on_drop_when_dir_set() {
 
     {
         let mut granted =
-            AdmissionTiming::new("ktstr::granted".into(), 4, 2).expect("dir set -> Some");
+            AdmissionTiming::new("ktstr::granted".into(), 4, 2, false).expect("dir set -> Some");
         granted.mark_granted();
     }
-    AdmissionTiming::new("ktstr::killed".into(), 1, 0).expect("dir set -> Some");
+    AdmissionTiming::new("ktstr::killed".into(), 1, 0, false).expect("dir set -> Some");
 
     let log = std::fs::read_to_string(dir.path().join(ADMISSION_TIMING_FILE))
         .expect("admission-timing.log written");
@@ -2727,7 +2727,36 @@ fn admission_timing_silent_without_dir() {
     let _lock = crate::test_support::test_helpers::lock_env();
     let _guard = crate::test_support::test_helpers::EnvVarGuard::remove(ADMISSION_TIMING_DIR_ENV);
     assert!(
-        AdmissionTiming::new("ktstr::none".into(), 4, 2).is_none(),
+        AdmissionTiming::new("ktstr::none".into(), 4, 2, false).is_none(),
         "no diagnostics dir -> no telemetry"
     );
+}
+
+/// The pre-exec admission stamp survives its own encoding, and every way it
+/// can be wrong fails closed to `None` — the caller then falls back to this
+/// process's own clock instead of back-dating on a bogus value.
+#[test]
+fn pre_exec_admission_stamp_round_trips_and_fails_closed() {
+    let encoded = format_pre_exec_admission_stamp(
+        4242,
+        Duration::from_nanos(9_000),
+        Duration::from_nanos(1_500),
+    );
+    assert_eq!(encoded, "4242:9000:1500");
+    assert_eq!(
+        parse_pre_exec_admission_stamp(&encoded, 4242),
+        Some((Duration::from_nanos(9_000), Duration::from_nanos(1_500))),
+    );
+
+    // A grandchild inheriting the variable sees a different PID.
+    assert_eq!(parse_pre_exec_admission_stamp(&encoded, 4243), None);
+    // Registration cannot postdate the exec that carried it.
+    assert_eq!(parse_pre_exec_admission_stamp("7:1500:9000", 7), None);
+    for malformed in ["", "7", "7:9000", "7:9000:1500:0", "7:x:1", "x:9000:1500"] {
+        assert_eq!(
+            parse_pre_exec_admission_stamp(malformed, 7),
+            None,
+            "{malformed:?} must fail closed",
+        );
+    }
 }
