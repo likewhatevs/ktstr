@@ -882,9 +882,10 @@ fn find_scheduler_bss_map<'a>(
 ///     BTF; only `ktstr_arena_ctx` matches all three offsets with the
 ///     declared widths, so the resulting cast finding is
 ///     `(ktstr_bss_arena_holder, 0) -> (ktstr_arena_ctx, AddrSpace::Arena)`.
-///   - `ktstr_init_task` writes the freshly-allocated `taskc` user-side
+///   - `ktstr_init_task` publishes the first-allocated `taskc` user-side
 ///     arena VA into `ktstr_bss_arena_holder.arena_target` so the
-///     captured `.bss` page carries a non-zero pointer at dump time.
+///     captured `.bss` page carries a non-zero pointer, into a slot that
+///     is still live, at dump time.
 ///   - The dump renderer walks the `.bss` Datasec, descends into the
 ///     `ktstr_bss_arena_holder` struct, and for the `arena_target`
 ///     member calls `MemReader::cast_lookup`. The hit fires
@@ -1002,12 +1003,13 @@ fn check_cast_analysis_chases_bss_to_arena(result: &VmResult) -> Result<()> {
         );
     }
 
-    // The pointer value MUST be non-zero -- `ktstr_init_task` writes
-    // the live arena VA every time it runs, so by the time the
-    // freeze fires there must be at least one task that ran through
-    // init_task and stamped the global. A zero value would mean the
-    // write never happened OR the captured page predates every
-    // init_task invocation.
+    // The pointer value MUST be non-zero -- `ktstr_init_task` publishes
+    // the FIRST task's live arena VA (see the holder's declaration in
+    // main.bpf.c: a most-recent stamp dangles when that task exits
+    // before the dump), so by the time the freeze fires at least one
+    // task has run through init_task and stamped the global. A zero
+    // value would mean the write never happened OR the captured page
+    // predates every init_task invocation.
     let arena_value = arena_target
         .get("value")
         .and_then(|v| v.as_u64())
@@ -1238,7 +1240,7 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_BSS_TO_ARENA: ktstr::test_support::KtstrTestE
         // fires the freeze coordinator's dump_state path. The .bss-side
         // fixture is exercised inside ktstr_init_task on every task
         // ktstr scheduler initializes, so by the time the watchdog
-        // fires the .bss global has been written and the trainer has
+        // fires the .bss global has been published and the trainer has
         // been called.
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
