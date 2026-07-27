@@ -18622,12 +18622,17 @@ impl Table {
         let mut encoded_watch_serial_memo = BTreeMap::<EncodedWatchSerialMemoKey, u64>::new();
         self.bump_grant_scans();
         note_grant_scan(records.len());
-        // Grant-flow ramp gauge (diagnostics-only): count in-flight HELD/GRANTED
-        // run claims and the distinct host CPUs they cover this scan. Gated so a
-        // disabled sink pays no per-record accounting.
-        let sample_held_in_flight = crate::vmm::grant_flow::enabled();
+        // Grant-flow gauges (diagnostics-only): the in-flight HELD/GRANTED ramp
+        // and the distinct host CPUs it covers, plus the per-record reason this
+        // scan declined to grant a queued waiter. One hoisted probe of the sink,
+        // so a disabled sink pays no per-record accounting; every attributed
+        // input is already computed for the decision itself, so the attribution
+        // reads nothing extra from a record.
+        let diagnostics_enabled = crate::vmm::grant_flow::enabled();
         let mut held_in_flight = 0u64;
-        let mut held_cpu_bits = if sample_held_in_flight {
+        let mut granted_in_flight = 0u64;
+        let mut backfill_head_sample = None;
+        let mut held_cpu_bits = if diagnostics_enabled {
             vec![0u64; self.layout.words]
         } else {
             Vec::new()
@@ -18686,15 +18691,17 @@ impl Table {
                 }
                 continue;
             }
-            let conflict = claim_first_conflict_bits(
+            // The marker the conflict search already produces names the fenced
+            // resource; retaining it keeps the diagnostics axis split free.
+            let first_conflict = claim_first_conflict_bits(
                 &record.claim,
                 &cpu_any,
                 &cpu_exclusive,
                 &llc_any,
                 &llc_exclusive,
                 self.layout.bits,
-            )?
-            .is_some();
+            )?;
+            let conflict = first_conflict.is_some();
             let flexible = record.flexible;
             let availability_compatible = self.claim_availability_compatible(&record.claim)?;
             let blocker_ready = match record.blocked_on {
@@ -18783,6 +18790,40 @@ impl Table {
                 && preparation_tokens.is_some()
                 && prep_pending_tokens + prep_granted_tokens + coordinator_reserve
                     >= preparation_pool;
+            // Diagnostics-only admission attribution, in the same order the
+            // grant branch below evaluates its terms, so the cause recorded is
+            // the one that actually withheld the grant. Pure branching on
+            // values already computed above.
+            if diagnostics_enabled
+                && record.state == STATE_WAITING
+                && record.ticket != coordinator_ticket
+                && (!acquisition_viable || preparation_pool_blocked)
+            {
+                use crate::vmm::grant_flow::{GrantBlock, note_block};
+                if let Some(marker) = first_conflict {
+                    note_block(GrantBlock::ScanConflict);
+                    match marker.blocker {
+                        ResourceKey::Permit(_) => note_block(GrantBlock::ScanConflictPermit),
+                        ResourceKey::Llc(_) => note_block(GrantBlock::ScanConflictLlc),
+                        ResourceKey::Cpu(_) => {}
+                    }
+                } else if !availability_compatible {
+                    note_block(GrantBlock::ScanUnavailable);
+                } else if !blocker_ready {
+                    note_block(GrantBlock::ScanBlocker);
+                } else if fairness_blocked {
+                    note_block(GrantBlock::ScanFairness);
+                    if let Some(head) = backfill_head.as_ref() {
+                        note_block(if head.admission_open {
+                            GrantBlock::ScanFairnessCapacity
+                        } else {
+                            GrantBlock::ScanFairnessWindow
+                        });
+                    }
+                } else {
+                    note_block(GrantBlock::ScanPreparationPool);
+                }
+            }
             let mut scan_state = record.state;
             if record.state == STATE_COORDINATOR {
                 // A coordinator can now sit behind live GRANTED/REPLAN
@@ -18978,8 +19019,11 @@ impl Table {
 
             let preserves_fence = matches!(scan_state, STATE_GRANTED | STATE_REVOKED | STATE_HELD)
                 || (scan_state == STATE_COORDINATOR && acquisition_viable);
-            if sample_held_in_flight && matches!(scan_state, STATE_GRANTED | STATE_HELD) {
+            if diagnostics_enabled && matches!(scan_state, STATE_GRANTED | STATE_HELD) {
                 held_in_flight += 1;
+                if scan_state == STATE_GRANTED {
+                    granted_in_flight += 1;
+                }
                 for cpu in record.claim.cpus() {
                     if cpu < self.layout.bits {
                         held_cpu_bits[cpu / 64] |= 1u64 << (cpu % 64);
@@ -19036,6 +19080,10 @@ impl Table {
                     admission_open: backfill_now_ns - started_ns < BACKFILL_MAX_AGE_NS,
                 });
                 selected_backfill_head = true;
+                if diagnostics_enabled {
+                    backfill_head_sample =
+                        Some((backfill_now_ns - started_ns, record.backfill_capacity));
+                }
             }
             if !selected_backfill_head && record.backfill_started_ns != 0 {
                 self.set_record_backfill_started_ns(record.slot, 0)?;
@@ -19086,12 +19134,17 @@ impl Table {
             self.advance_generation()?;
             self.note_queue_progress()?;
         }
-        if sample_held_in_flight {
+        if diagnostics_enabled {
             let distinct_cpus = held_cpu_bits
                 .iter()
                 .map(|word| word.count_ones() as u64)
                 .sum();
-            crate::vmm::grant_flow::note_held_in_flight(held_in_flight, distinct_cpus);
+            crate::vmm::grant_flow::note_held_in_flight(
+                held_in_flight,
+                granted_in_flight,
+                distinct_cpus,
+            );
+            crate::vmm::grant_flow::note_backfill_scan(backfill_head_sample);
         }
         self.finish_claim_scan();
         self.clear_pending_flag(PENDING_RESCAN | PENDING_REPLAN_RESCAN);

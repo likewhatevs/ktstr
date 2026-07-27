@@ -4,9 +4,16 @@
 //! - `grants_issued`: WAITING→GRANTED transitions the coordinator scan makes.
 //! - `grants_reached_held`: records published as a live HELD run claim.
 //! - `grants_lost`: licensed grants a cell was told about but did not convert.
-//! - `held_in_flight` / `distinct_held_cpus`: peak count of in-flight
-//!   GRANTED+HELD claims and the distinct host CPUs they cover — the ramp
-//!   indicator.
+//! - `held_in_flight` / `granted_in_flight` / `distinct_held_cpus`: peak count
+//!   of in-flight GRANTED+HELD claims, of the GRANTED subset alone, and the
+//!   distinct host CPUs they cover — the ramp indicator. Both fence later
+//!   tickets identically, so the gap between the two is the fenced footprint
+//!   that is not running anything.
+//! - `backfill_scans` / `backfill_head_scans` / `backfill_head_age_ns_max` /
+//!   `backfill_head_capacity_max`: how often an authoritative scan found a
+//!   physically blocked exact head to protect at all, and how much bounded
+//!   admission that head had left. The bounded-admission fence can only
+//!   withhold a grant on a scan that selected a head.
 //! - `discover` count and wall-time: how often the placement contention-bail
 //!   holder diagnostic runs and how long it takes. The bail probes only the
 //!   contended LLC lock files with a non-blocking flock (no host-global
@@ -50,7 +57,12 @@ static GRANTS_ISSUED: AtomicU64 = AtomicU64::new(0);
 static GRANTS_REACHED_HELD: AtomicU64 = AtomicU64::new(0);
 static GRANTS_LOST: AtomicU64 = AtomicU64::new(0);
 static HELD_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
+static GRANTED_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 static DISTINCT_HELD_CPUS_MAX: AtomicU64 = AtomicU64::new(0);
+static BACKFILL_SCANS: AtomicU64 = AtomicU64::new(0);
+static BACKFILL_HEAD_SCANS: AtomicU64 = AtomicU64::new(0);
+static BACKFILL_HEAD_AGE_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static BACKFILL_HEAD_CAPACITY_MAX: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_COUNT: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_NS_SUM: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_NS_MAX: AtomicU64 = AtomicU64::new(0);
@@ -70,6 +82,14 @@ static BLOCKS: [AtomicU64; GrantBlock::COUNT] = [const { AtomicU64::new(0) }; Gr
 /// The `predecessors_*` variants are sub-counts: each also increments
 /// [`GrantBlock::Predecessors`], so they partition it by the resource axis the
 /// reservation fenced rather than adding to it.
+///
+/// The `scan_*` group is a third, independent group counted on the other side
+/// of the protocol: one per queued waiter per authoritative grant scan that
+/// declined to grant it. Everything above is wake-side, and a waiter the scan
+/// never grants is never woken to reject a candidate, so only this group can
+/// see why admission itself stalled. `scan_conflict_*` partition
+/// [`GrantBlock::ScanConflict`] and `scan_fairness_*` partition
+/// [`GrantBlock::ScanFairness`], the same way the `predecessors_*` pair does.
 #[derive(Clone, Copy)]
 pub(crate) enum GrantBlock {
     /// The wake carried no grant license (a REPLAN re-designation), so no
@@ -98,10 +118,37 @@ pub(crate) enum GrantBlock {
     /// Sub-count of [`GrantBlock::Predecessors`]: the reserved resource is an
     /// LLC. The CPU-axis remainder is `predecessors` minus these two.
     PredecessorsLlc,
+    /// Scan side: the waiter's exact claim overlaps the live predecessor
+    /// prefix. Bounded admission (backfill) is a separate term of the same
+    /// decision and cannot lift this one: a real conflict withholds the grant
+    /// whether or not a backfill head exists.
+    ScanConflict,
+    /// Sub-count of [`GrantBlock::ScanConflict`] on the permit axis.
+    ScanConflictPermit,
+    /// Sub-count of [`GrantBlock::ScanConflict`] on the LLC axis.
+    ScanConflictLlc,
+    /// Scan side: the waiter's claim is free of predecessors but a resource it
+    /// names is observed held, or has never been observed at all.
+    ScanUnavailable,
+    /// Scan side: the waiter is pinned to a blocker whose serial has not moved.
+    ScanBlocker,
+    /// Scan side: the bounded-admission (backfill) fence withheld the grant to
+    /// keep a physically blocked exact head from starving. This is the only
+    /// cause that backfill itself produces.
+    ScanFairness,
+    /// Sub-count of [`GrantBlock::ScanFairness`]: the head's bounded admission
+    /// window has expired, so no replacement bypass work is issued.
+    ScanFairnessWindow,
+    /// Sub-count of [`GrantBlock::ScanFairness`]: the window is open but the
+    /// head's bypass capacity is fully spent by outstanding conflicting work.
+    ScanFairnessCapacity,
+    /// Scan side: a preparation intent found no free slot in the preparation
+    /// token pool.
+    ScanPreparationPool,
 }
 
 impl GrantBlock {
-    const COUNT: usize = 9;
+    const COUNT: usize = 18;
 
     const ALL: [Self; Self::COUNT] = [
         Self::Unlicensed,
@@ -113,6 +160,15 @@ impl GrantBlock {
         Self::Unobserved,
         Self::PredecessorsPermit,
         Self::PredecessorsLlc,
+        Self::ScanConflict,
+        Self::ScanConflictPermit,
+        Self::ScanConflictLlc,
+        Self::ScanUnavailable,
+        Self::ScanBlocker,
+        Self::ScanFairness,
+        Self::ScanFairnessWindow,
+        Self::ScanFairnessCapacity,
+        Self::ScanPreparationPool,
     ];
 
     const fn index(self) -> usize {
@@ -130,6 +186,15 @@ impl GrantBlock {
             Self::Unobserved => "unobserved",
             Self::PredecessorsPermit => "predecessors_permit",
             Self::PredecessorsLlc => "predecessors_llc",
+            Self::ScanConflict => "scan_conflict",
+            Self::ScanConflictPermit => "scan_conflict_permit",
+            Self::ScanConflictLlc => "scan_conflict_llc",
+            Self::ScanUnavailable => "scan_unavailable",
+            Self::ScanBlocker => "scan_blocker",
+            Self::ScanFairness => "scan_fairness",
+            Self::ScanFairnessWindow => "scan_fairness_window",
+            Self::ScanFairnessCapacity => "scan_fairness_capacity",
+            Self::ScanPreparationPool => "scan_preparation_pool",
         }
     }
 }
@@ -206,10 +271,29 @@ pub(crate) fn note_grant_lost() {
 /// Deliberately no file IO here — this runs under the registry EX flock; the
 /// coordinator loop persists the image periodically outside the lock (the
 /// atexit line alone is lost when the scan-running orchestrator is killed).
-pub(crate) fn note_held_in_flight(held_records: u64, distinct_cpus: u64) {
+pub(crate) fn note_held_in_flight(held_records: u64, granted_records: u64, distinct_cpus: u64) {
     bump_max(&HELD_IN_FLIGHT_MAX, held_records);
+    bump_max(&GRANTED_IN_FLIGHT_MAX, granted_records);
     bump_max(&DISTINCT_HELD_CPUS_MAX, distinct_cpus);
     ensure_atexit();
+}
+
+/// One authoritative grant scan's bounded-admission (backfill) outcome,
+/// sampled once per scan behind [`enabled`]. `head` is `None` when the scan
+/// found no physically blocked exact head to protect; the fence is then inert
+/// for that scan and withholds nothing. Otherwise it carries the head's age
+/// inside its bounded admission window and the bypass capacity that window
+/// opens. Read `backfill_head_scans` against `backfill_scans` before reading
+/// anything into `block_scan_fairness`.
+pub(crate) fn note_backfill_scan(head: Option<(u64, u32)>) {
+    BACKFILL_SCANS.fetch_add(1, Ordering::Relaxed);
+    ensure_atexit();
+    let Some((age_ns, capacity)) = head else {
+        return;
+    };
+    BACKFILL_HEAD_SCANS.fetch_add(1, Ordering::Relaxed);
+    bump_max(&BACKFILL_HEAD_AGE_NS_MAX, age_ns);
+    bump_max(&BACKFILL_HEAD_CAPACITY_MAX, u64::from(capacity));
 }
 
 /// One placement contention-bail holder diagnostic, and its wall-time. Since
@@ -243,13 +327,20 @@ fn format_line(pid: u32) -> String {
         .collect::<String>();
     format!(
         "grant-flow: pid={pid} grants_issued={} grants_reached_held={} grants_lost={} \
-         held_in_flight_max={} distinct_held_cpus_max={} discover_count={} \
+         held_in_flight_max={} granted_in_flight_max={} distinct_held_cpus_max={} \
+         backfill_scans={} backfill_head_scans={} backfill_head_age_ns_max={} \
+         backfill_head_capacity_max={} discover_count={} \
          discover_ns_mean={discover_ns_mean} discover_ns_max={}{blocks}\n",
         GRANTS_ISSUED.load(Ordering::Relaxed),
         GRANTS_REACHED_HELD.load(Ordering::Relaxed),
         GRANTS_LOST.load(Ordering::Relaxed),
         HELD_IN_FLIGHT_MAX.load(Ordering::Relaxed),
+        GRANTED_IN_FLIGHT_MAX.load(Ordering::Relaxed),
         DISTINCT_HELD_CPUS_MAX.load(Ordering::Relaxed),
+        BACKFILL_SCANS.load(Ordering::Relaxed),
+        BACKFILL_HEAD_SCANS.load(Ordering::Relaxed),
+        BACKFILL_HEAD_AGE_NS_MAX.load(Ordering::Relaxed),
+        BACKFILL_HEAD_CAPACITY_MAX.load(Ordering::Relaxed),
         discover_count,
         DISCOVER_NS_MAX.load(Ordering::Relaxed),
     )
@@ -295,7 +386,12 @@ mod tests {
             "grants_reached_held=",
             "grants_lost=",
             "held_in_flight_max=",
+            "granted_in_flight_max=",
             "distinct_held_cpus_max=",
+            "backfill_scans=",
+            "backfill_head_scans=",
+            "backfill_head_age_ns_max=",
+            "backfill_head_capacity_max=",
             "discover_count=",
             "discover_ns_mean=",
             "discover_ns_max=",
@@ -308,6 +404,15 @@ mod tests {
             "block_unobserved=",
             "block_predecessors_permit=",
             "block_predecessors_llc=",
+            "block_scan_conflict=",
+            "block_scan_conflict_permit=",
+            "block_scan_conflict_llc=",
+            "block_scan_unavailable=",
+            "block_scan_blocker=",
+            "block_scan_fairness=",
+            "block_scan_fairness_window=",
+            "block_scan_fairness_capacity=",
+            "block_scan_preparation_pool=",
         ] {
             assert!(line.contains(field), "missing {field} in {line}");
         }
