@@ -50,7 +50,7 @@ use super::{
 /// reorders `bpf_local_storage_elem` would silently misread without
 /// the assertion. A fail-fast resolver lets the caller surface
 /// "walker disabled on this kernel" instead of corrupted data.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct TaskStorageOffsets {
     /// Offset of `buckets` pointer (`struct bpf_local_storage_map_bucket *`)

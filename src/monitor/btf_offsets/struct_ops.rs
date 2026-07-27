@@ -34,7 +34,7 @@ use super::{
 /// Resolution is optional — `resolve_struct_ops_offsets()` returns
 /// `Err` when `bpf_struct_ops_map` or `bpf_struct_ops_value` is
 /// missing from BTF (kernels built without struct_ops support).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct StructOpsOffsets {
     /// Offset of the embedded `kvalue` (`struct bpf_struct_ops_value`)

@@ -97,7 +97,7 @@ pub const NUMA_EVENT_NAMES: [&str; NR_VM_NUMA_EVENT_ITEMS] = [
 /// stripped vmlinux. `vm_numa_event` is gated on `CONFIG_NUMA`;
 /// when missing the resolver returns Err so the caller skips the
 /// capture.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct NumaStatsOffsets {
     /// Offset of `node_zones[]` within `struct pglist_data`.
     pub pglist_data_node_zones: usize,

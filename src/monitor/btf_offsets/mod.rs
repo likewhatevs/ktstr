@@ -1348,7 +1348,7 @@ impl IdrOffsets {
 
 /// Byte offsets within kernel BPF structures needed for host-side
 /// BPF map discovery and value access.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct BpfMapOffsets {
     /// Offset of `name` (char\[BPF_OBJ_NAME_LEN\]) within `struct bpf_map`.
@@ -1703,7 +1703,7 @@ impl BpfProgOffsets {
 /// Captures the two fields the host-side scx walker dereferences off a
 /// `struct rq` pointer: `scx` (the embedded `struct scx_rq`) and
 /// `curr` (the currently-running `struct task_struct *`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)] // wired via ScxWalkerOffsets; stays alive once the
 // freeze coordinator populates ScxWalkerCapture.
 pub struct RqStructOffsets {
@@ -1747,7 +1747,7 @@ impl RqStructOffsets {
 ///   debug dump omits it. `clock` is similar — read by
 ///   in-kernel scheduling paths but not by `scx_dump_state`;
 ///   ktstr surfaces it for cross-CPU clock-skew analysis.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxRqOffsets {
     /// Offset of `local_dsq` (struct scx_dispatch_q). Read by
@@ -1855,7 +1855,7 @@ impl ScxRqOffsets {
 ///
 /// Walkers that need additional task_struct fields (priority, signal,
 /// stack...) compose [`TaskStructEnrichmentOffsets`] alongside this.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct TaskStructCoreOffsets {
     /// Offset of `comm` (`char[16]`).
@@ -1947,7 +1947,7 @@ impl TaskStructEnrichmentOffsets {
 /// Offsets here are relative to the `sched_ext_entity` base; the full
 /// offset within `task_struct` is
 /// `TaskStructCoreOffsets::scx + <field>`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct SchedExtEntityOffsets {
     pub runnable_node: usize,
@@ -1991,7 +1991,7 @@ impl SchedExtEntityOffsets {
 }
 
 /// Field offsets within `struct scx_dsq_list_node`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxDsqListNodeOffsets {
     /// Offset of `node` (struct list_head). Fixed at 0 in current
@@ -2013,7 +2013,7 @@ impl ScxDsqListNodeOffsets {
 }
 
 /// Field offsets within `struct scx_dispatch_q`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxDispatchQOffsets {
     /// Offset of `list` (struct list_head). Head of the FIFO task list.
@@ -2052,7 +2052,7 @@ impl ScxDispatchQOffsets {
 /// `Option<ScxSchedOffsets>` (`ScxWalkerOffsets::sched`) before
 /// constructing this; once the struct exists, several internal fields
 /// are also kernel-version-gated, so each is `Option<usize>`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxSchedOffsets {
     /// Offset of `dsq_hash` (struct rhashtable). User-allocated DSQs.
@@ -2104,7 +2104,7 @@ impl ScxSchedOffsets {
 /// is development-only (no released tag in our supported range), so
 /// the parent `ScxWalkerOffsets::sched_pnode` is `Option<…>`. Within
 /// the struct, the single `global_dsq` field is also dev-only.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxSchedPnodeOffsets {
     /// Offset of `global_dsq` (struct scx_dispatch_q). Per-NUMA-node
@@ -2130,7 +2130,7 @@ impl ScxSchedPnodeOffsets {
 /// `ScxWalkerOffsets::sched_pcpu` is `Option<…>` so kernels < v6.18
 /// don't fail BTF resolution. Inside the struct, the single
 /// `bypass_dsq` field is dev-only.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxSchedPcpuOffsets {
     /// Offset of `bypass_dsq` (struct scx_dispatch_q). Per-CPU
@@ -2153,7 +2153,7 @@ impl ScxSchedPcpuOffsets {
 /// Field offsets within `struct rhashtable`, `struct bucket_table`,
 /// and `struct rhash_head`. Bundled together since the user DSQ walk
 /// needs all three to traverse a single rhashtable.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct RhashtableOffsets {
     /// `rhashtable.tbl` — `struct bucket_table __rcu *`.
@@ -2303,7 +2303,7 @@ impl UpidStructOffsets {
 /// the BTF's anonymous-struct-walking `member_byte_offset`, so the
 /// path works even if the kernel later wraps the field in an
 /// anonymous union.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RunnableScanOffsets {
     /// Offset of `scx` (struct sched_ext_entity) within
     /// `struct task_struct`. Used by the container_of step to
@@ -2401,7 +2401,7 @@ impl RunnableScanOffsets {
 /// `TASK_COMM_LEN` is fixed at 16 by the kernel uapi
 /// (`include/linux/sched.h::TASK_COMM_LEN`); the walker reads a
 /// fixed-size 16-byte buffer at `task_struct_comm`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct TaskEnrichmentOffsets {
     // -- struct task_struct fields --
@@ -2632,7 +2632,7 @@ pub mod pid_type {
 /// - `struct scx_dsq_list_node`: include/linux/sched/ext.h
 /// - `struct sched_ext_entity`: include/linux/sched/ext.h
 /// - `struct rhashtable` / `struct bucket_table`: include/linux/rhashtable.h
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)] // wired into ScxWalkerCapture; freeze coordinator
 // populates the capture once the producer-side
 // wiring lands.

@@ -47,7 +47,7 @@ use super::{find_struct, member_byte_offset};
 /// axis reads loud-absent. `cgroup.psi` is an unconditional pointer member
 /// (always BTF-resolvable); it reads NULL at runtime, not `Err`, when
 /// per-cgroup PSI is off.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct CgroupWalkOffsets {
     /// `offsetof(struct cgroup, self)` — the embedded `cgroup_subsys_state`.
     /// 0 on every current kernel (`self` is the first member), but resolved

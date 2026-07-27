@@ -23,7 +23,7 @@ use super::{find_struct, member_byte_offset};
 ///
 /// Resolution is optional — `resolve_htab_offsets()` returns `Err`
 /// when the required types are missing from BTF.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct HtabOffsets {
     /// Offset of `buckets` pointer within `struct bpf_htab`.
