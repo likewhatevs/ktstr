@@ -5,6 +5,26 @@
 
 use super::*;
 
+/// Build a base archive through the production preparation path, mirroring
+/// what `PreparedBaseInputs::build` does for a real run. Tests assert on
+/// archive shape, so they must not bypass preparation and repeat a large
+/// binary transform in every nextest process.
+fn base_archive(
+    payload: &Path,
+    extras: &[(&str, &Path)],
+    includes: &[(&str, &Path)],
+    busybox: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let owned: Vec<(String, PathBuf)> = includes
+        .iter()
+        .map(|(name, path)| ((*name).to_owned(), (*path).to_path_buf()))
+        .collect();
+    let inputs =
+        crate::vmm::initramfs_cache::prepare_base_inputs(payload, extras, &owned, busybox)?;
+    crate::vmm::initramfs_cache::get_or_prepare_base(inputs, InitrdCompression::Uncompressed)?
+        .read_uncompressed_for_test()
+}
+
 /// Thin test wrapper over [`build_suffix`] that takes only the
 /// args tests commonly vary. The remaining [`SuffixParams`] fields
 /// default to empty, so assertions stay focused on the args- and
@@ -21,7 +41,7 @@ fn build_suffix_args(base_len: usize, args: &[String], sched_args: &[String]) ->
 }
 
 /// Thin test wrapper that produces a complete cpio newc archive by
-/// concatenating [`build_initramfs_base`] and [`build_suffix`] output.
+/// concatenating the prepared base archive and [`build_suffix`] output.
 /// Passes `payload` to the suffix so the assembled archive carries
 /// `/init` (the base no longer does). Production callers build base and
 /// suffix separately so they can stream the parts into guest memory
@@ -32,7 +52,7 @@ fn build_initramfs(
     extra_binaries: &[(&str, &Path)],
     args: &[String],
 ) -> Result<Vec<u8>> {
-    let base = build_initramfs_base(payload, extra_binaries, &[], None)?;
+    let base = base_archive(payload, extra_binaries, &[], None)?;
     let suffix = build_suffix(
         base.len(),
         &SuffixParams {
@@ -125,7 +145,7 @@ fn build_initramfs_has_init() {
 #[test]
 fn build_initramfs_base_is_valid_cpio() {
     let exe = crate::resolve_current_exe().unwrap();
-    let initrd = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let initrd = base_archive(&exe, &[], &[], None).unwrap();
     assert_eq!(&initrd[..6], b"070701");
     // Base is NOT 512-aligned on its own; only base+suffix is.
     let full = build_initramfs(&exe, &[], &[]).unwrap();
@@ -173,7 +193,7 @@ fn initramfs_empty_args() {
 #[test]
 fn suffix_adds_args_and_trailer() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let args = vec!["run".into(), "--json".into()];
     let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
     let s = String::from_utf8_lossy(&suffix);
@@ -191,7 +211,7 @@ fn split_matches_monolithic() {
     let exe = crate::resolve_current_exe().unwrap();
     let args = vec!["run".into(), "--json".into(), "scenario".into()];
     let monolithic = build_initramfs(&exe, &[], &args).unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let suffix = build_suffix(
         base.len(),
         &SuffixParams {
@@ -213,7 +233,7 @@ fn split_matches_monolithic() {
 #[test]
 fn suffix_different_args_differ() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let a = build_suffix_args(base.len(), &["a".into()], &[]).unwrap();
     let b = build_suffix_args(base.len(), &["b".into()], &[]).unwrap();
     assert_ne!(a, b, "different args should produce different suffixes");
@@ -222,7 +242,7 @@ fn suffix_different_args_differ() {
 #[test]
 fn suffix_empty_args() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let suffix = build_suffix_args(base.len(), &[], &[]).unwrap();
     assert_eq!((base.len() + suffix.len()) % 512, 0);
     let s = String::from_utf8_lossy(&suffix);
@@ -232,7 +252,7 @@ fn suffix_empty_args() {
 #[test]
 fn suffix_with_sched_enable() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let sched_enable = vec!["echo 1 > /sys/kernel/sched_ext/enable".to_string()];
     let suffix = build_suffix(
         base.len(),
@@ -262,7 +282,7 @@ fn suffix_with_sched_enable() {
 #[test]
 fn suffix_with_sched_disable() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let sched_disable = vec!["echo 0 > /sys/kernel/sched_ext/enable".to_string()];
     let suffix = build_suffix(
         base.len(),
@@ -287,7 +307,7 @@ fn suffix_with_sched_disable() {
 #[test]
 fn suffix_with_exec_cmd() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let cmd = "/usr/bin/stress-ng --cpu 1 --timeout 5s";
     let suffix = build_suffix(
         base.len(),
@@ -316,7 +336,7 @@ fn suffix_omits_empty_optional_entries() {
     // empty sched_enable, empty sched_disable, and None exec_cmd must
     // not leave zero-length cpio entries in the archive.
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let suffix = build_suffix(base.len(), &SuffixParams::default()).unwrap();
     let mut archive = Vec::with_capacity(base.len() + suffix.len());
     archive.extend_from_slice(&base);
@@ -340,7 +360,7 @@ fn suffix_omits_empty_optional_entries() {
 #[test]
 fn suffix_emits_per_staged_scheduler_args_entries() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let staged = vec![
         (
             "mitosis_args_a".to_string(),
@@ -391,7 +411,7 @@ fn suffix_emits_per_staged_scheduler_args_entries() {
 #[test]
 fn suffix_skips_staged_entries_with_empty_args() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let staged = vec![
         ("populated".to_string(), vec!["--flag".to_string()]),
         ("empty".to_string(), vec![]),
@@ -429,7 +449,7 @@ fn suffix_skips_staged_entries_with_empty_args() {
 #[test]
 fn suffix_omits_module_entries_when_empty() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
 
     let with_empty = build_suffix(
         base.len(),
@@ -465,7 +485,7 @@ fn suffix_omits_module_entries_when_empty() {
 #[test]
 fn suffix_emits_kernel_modules_in_order() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
 
     let dir = tempfile::Builder::new()
         .prefix("ktstr-kmod-suffix-test-")
@@ -842,7 +862,7 @@ fn resolve_soname_rpath_only_wins_when_runpath_empty() {
 #[test]
 fn suffix_with_sched_args() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let sched_args = vec!["--enable-borrow".into(), "--llc".into()];
     let suffix = build_suffix_args(base.len(), &[], &sched_args).unwrap();
     let s = String::from_utf8_lossy(&suffix);
@@ -857,7 +877,7 @@ fn suffix_with_sched_args() {
 #[test]
 fn suffix_without_sched_args_omits_entry() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let suffix = build_suffix_args(base.len(), &[], &[]).unwrap();
     let s = String::from_utf8_lossy(&suffix);
     assert!(
@@ -896,7 +916,7 @@ fn strip_debug_nonexistent_fails() {
 #[test]
 fn init_lives_in_suffix_not_base() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
 
     // The base must NOT carry /init or the sentinel — keeping the
     // payload's bytes out of the base is what makes it cacheable across
@@ -1035,7 +1055,7 @@ fn busybox_with_include_files() {
     let tmp = tmp_dir.path().join("included");
     std::fs::write(&tmp, b"hello").unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/test.txt", tmp.as_path())];
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &includes,
@@ -1056,7 +1076,7 @@ fn busybox_with_include_files() {
 #[test]
 fn include_files_no_busybox_when_empty() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let names = cpio_entry_names(&base);
     assert!(
         !names.iter().any(|n| n == "bin/busybox"),
@@ -1075,7 +1095,7 @@ fn include_files_preserves_mode() {
 
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/run.sh", tmp.as_path())];
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &includes,
@@ -1114,7 +1134,7 @@ fn include_files_elf_gets_shared_libs() {
     }
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &includes,
@@ -1144,7 +1164,7 @@ fn include_files_non_elf_no_shared_libs() {
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/hello.sh", tmp.as_path())];
     // Should not fail (ELF parsing skipped for non-ELF).
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &includes,
@@ -1166,7 +1186,7 @@ fn include_files_adds_directory_entries() {
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> =
         vec![("include-files/subdir/nested/file.txt", tmp.as_path())];
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &includes,
@@ -1223,7 +1243,7 @@ fn include_files_rejects_path_traversal() {
     std::fs::write(&tmp, b"data").unwrap();
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/../etc/passwd", tmp.as_path())];
-    let result = build_initramfs_base(
+    let result = base_archive(
         &exe,
         &[],
         &includes,
@@ -1255,7 +1275,7 @@ fn include_files_rejects_fifo() {
     );
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/pipe", fifo_path.as_path())];
-    let result = build_initramfs_base(
+    let result = base_archive(
         &exe,
         &[],
         &includes,
@@ -1265,7 +1285,10 @@ fn include_files_rejects_fifo() {
         ),
     );
     assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    // The regular-file gate now fires inside `pin_input`'s
+    // `StableFileIdentity::from_file`, so the reason sits below the
+    // preparation context: match the whole chain.
+    let err = format!("{:#}", result.unwrap_err());
     assert!(
         err.contains("not a regular file"),
         "error should reject FIFO: {err}"
@@ -1279,7 +1302,7 @@ fn include_files_rejects_directory() {
     std::fs::create_dir(&dir_path).unwrap();
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/mydir", dir_path.as_path())];
-    let result = build_initramfs_base(
+    let result = base_archive(
         &exe,
         &[],
         &includes,
@@ -1289,7 +1312,10 @@ fn include_files_rejects_directory() {
         ),
     );
     assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    // The regular-file gate now fires inside `pin_input`'s
+    // `StableFileIdentity::from_file`, so the reason sits below the
+    // preparation context: match the whole chain.
+    let err = format!("{:#}", result.unwrap_err());
     assert!(
         err.contains("not a regular file"),
         "error should reject directory: {err}"
@@ -1300,7 +1326,7 @@ fn include_files_rejects_directory() {
 fn busybox_independent_of_include_files() {
     let exe = crate::resolve_current_exe().unwrap();
     // busybox=true but no include_files.
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &[],
@@ -1378,7 +1404,7 @@ fn ld_so_cache_consistent_with_resolve_soname() {
 #[test]
 fn no_duplicate_cpio_entries() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let entries = cpio_entries(&base);
     let mut seen = std::collections::HashSet::new();
     let mut duplicates = Vec::new();
@@ -1415,7 +1441,7 @@ fn no_duplicate_entries_with_include_files() {
         ("usr/local/custom/platform/lib/libcustom3.so", f3.as_path()),
     ];
 
-    let base = build_initramfs_base(&exe, &[], &includes, None).unwrap();
+    let base = base_archive(&exe, &[], &includes, None).unwrap();
     let entries = cpio_entries(&base);
     let entry_names: Vec<&str> = entries.iter().map(|(n, _, _, _)| n.as_str()).collect();
 
@@ -1505,7 +1531,7 @@ fn include_elf_shared_libs_all_present_in_archive() {
     }
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
-    let base = build_initramfs_base(&exe, &[], &includes, None).unwrap();
+    let base = base_archive(&exe, &[], &includes, None).unwrap();
     let entries = cpio_entries(&base);
     let entry_map: std::collections::HashMap<&str, (u32, u32, u32)> = entries
         .iter()
@@ -1543,7 +1569,7 @@ fn all_inode_zero_entries_have_nlink_one() {
     // Check that all entries use ino=0 and nlink=1, so the kernel
     // initramfs unpacker never enters the hardlink path.
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let mut remaining: &[u8] = base.as_slice();
     while let Ok(reader) = cpio::newc::Reader::new(remaining) {
         if reader.entry().is_trailer() {
@@ -2253,7 +2279,7 @@ fn is_standard_interpreter_matches_known_and_rejects_custom() {
 #[test]
 fn suffix_emits_workload_root_cgroup_and_scheduler_cgroup_parent() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let suffix = build_suffix(
         base.len(),
         &SuffixParams {

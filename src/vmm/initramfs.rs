@@ -284,7 +284,7 @@ fn resolve_shared_libs_with_extra_interp_hints(
 /// A standard system linker (glibc/musl `ld.so`) is statically linked with no
 /// deps, so this returns an empty set for it (`is_standard_interpreter`). A
 /// custom-toolchain linker can instead be dynamically linked with its own
-/// `libA -> libB` chain alongside it; `build_initramfs_base` packs that chain
+/// `libA -> libB` chain alongside it; the base archive packs that chain
 /// into the base and `prepared_base_semantic_key` hashes it, so both go
 /// through this one helper and the cache key covers exactly the set the base
 /// packs.
@@ -985,101 +985,6 @@ fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
     }
 }
 
-/// Build the base cpio archive: directories, `bin/busybox` (shell mode),
-/// extra binaries, include files, and shared libraries. Does NOT include
-/// `/init`, `/args`, the sentinel, trailer, or 512-byte padding — those
-/// are the per-run suffix ([`build_suffix`]). The returned bytes are a
-/// valid cpio prefix `build_suffix` completes. `/init` is deliberately
-/// NOT here: keeping the payload's bytes out of the base means a payload
-/// recompile that leaves the shared-lib set unchanged hits the base cache
-/// (the base depends only on the lib SET, resolved from `payload`, not
-/// its content).
-///
-/// When `busybox_bytes` is `Some`, embeds the provided bytes at
-/// `bin/busybox` for shell mode. Bytes are sourced from
-/// [`crate::vmm::blobs::load_busybox_bytes`] (which reads the
-/// `KTSTR_BUSYBOX_PATH` env var that `cargo-ktstr` sets at startup);
-/// the library does not embed busybox itself.
-///
-/// `include_files` adds files verbatim to the archive (no strip_debug).
-/// Each entry is `(archive_path, host_path)`. ELF files get shared library
-/// resolution; non-ELF files are copied as-is. Symlinks are followed to
-/// their target; the target must be a regular file (FIFOs, device nodes,
-/// and sockets are rejected). Archive paths must not contain `..`
-/// components. Callers expand directories into individual file entries
-/// before calling this function (see `cli::resolve_include_files`).
-///
-/// Extra binaries are `strip_debug`'d before being written. `payload` is
-/// read only for shared-lib resolution (its `/init` bytes are written by
-/// [`build_suffix`]).
-#[tracing::instrument(skip_all, fields(payload = %payload.display(), includes = include_files.len()))]
-#[cfg(test)]
-pub fn build_initramfs_base(
-    payload: &Path,
-    extra_binaries: &[(&str, &Path)],
-    include_files: &[(&str, &Path)],
-    busybox_bytes: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let validated_includes = validate_include_files(include_files)?;
-
-    let mut archive = Vec::new();
-
-    // Collect directory entries needed for shared libraries and includes.
-    let mut dirs = BTreeSet::new();
-
-    // `count` mirrors the moved `all_binaries.len()`: 1 (payload) + extras +
-    // include_files that are ELF (the set resolve_all_shared_libs walks).
-    let _s_resolve = tracing::debug_span!(
-        "resolve_all_libs",
-        count = 1 + extra_binaries.len() + include_files.iter().filter(|(_, p)| is_elf(p)).count()
-    )
-    .entered();
-    let shared_libs = resolve_all_shared_libs(payload, extra_binaries, include_files, &mut dirs)?;
-
-    // Busybox goes under bin/. wprof, when set, rides
-    // include_files (which registers its own parent dirs).
-    if busybox_bytes.is_some() {
-        dirs.insert("bin".to_string());
-    }
-    // Include files need their parent directories in the cpio archive.
-    // The component walk produces all ancestors (e.g. "include-files/sub/f"
-    // yields "include-files" and "include-files/sub").
-    for (archive_path, _, _) in &validated_includes {
-        register_parent_dirs(&mut dirs, archive_path);
-    }
-    // Extras with a path component (e.g. "bin/ktstr-jemalloc-probe")
-    // need their parent directory registered too, otherwise the
-    // kernel's cpio extractor sees the file before the directory
-    // entry exists and silently drops it. The `("scheduler",
-    // path)` case writes to archive root and has no parent to
-    // register, so `register_parent_dirs` no-ops on it.
-    for (name, _) in extra_binaries {
-        register_parent_dirs(&mut dirs, name);
-    }
-
-    drop(_s_resolve);
-
-    tracing::debug!(
-        shared_libs_count = shared_libs.len(),
-        dirs_count = dirs.len(),
-        dirs = ?dirs,
-        shared_libs_guests = ?shared_libs.iter().map(|(g, _)| g.as_str()).collect::<Vec<_>>(),
-        "pre-write archive contents"
-    );
-
-    write_archive_entries(
-        &mut archive,
-        &dirs,
-        busybox_bytes,
-        extra_binaries,
-        &validated_includes,
-        &shared_libs,
-        None,
-    )?;
-
-    Ok(archive)
-}
-
 /// Build a base archive from an already-resolved, caller-pinned dependency
 /// closure.
 ///
@@ -1133,48 +1038,6 @@ pub(crate) fn build_initramfs_base_from_resolved(
     Ok(archive)
 }
 
-/// Validate `include_files` entries and capture each file's mode.
-///
-/// Rejects archive paths with `..` components or the `.ktstr_` sentinel
-/// prefix, stats each host path (following symlinks), and rejects
-/// non-regular files. The returned `(archive_path, host_path, mode)`
-/// triples reuse the stat result so the write loop avoids a second
-/// stat syscall per file.
-#[cfg(test)]
-fn validate_include_files<'a>(
-    include_files: &'a [(&'a str, &'a Path)],
-) -> Result<Vec<(&'a str, &'a Path, u32)>> {
-    // Validate include_files and collect metadata (reused in the write
-    // loop to avoid a second stat syscall per file).
-    let mut validated_includes: Vec<(&str, &Path, u32)> = Vec::with_capacity(include_files.len());
-    for (archive_path, host_path) in include_files {
-        validate_include_archive_path(archive_path)?;
-        // Follow symlinks: include_files entries are explicitly
-        // specified by the test author, so a symlink to a regular
-        // file is intentional (e.g. package-manager symlinks in
-        // /usr/local/bin). The is_file() check below catches
-        // non-regular targets (directories, FIFOs, devices).
-        let meta = std::fs::metadata(host_path).with_context(|| {
-            format!(
-                "stat include file '{}': {}",
-                archive_path,
-                host_path.display()
-            )
-        })?;
-        // Reject non-regular files (FIFOs, device nodes, sockets block or
-        // produce garbage).
-        if !meta.file_type().is_file() {
-            anyhow::bail!(
-                "include_files entry '{}' is not a regular file: {}",
-                archive_path,
-                host_path.display()
-            );
-        }
-        validated_includes.push((archive_path, host_path, meta.permissions().mode()));
-    }
-    Ok(validated_includes)
-}
-
 fn validate_include_archive_path(archive_path: &str) -> Result<()> {
     if Path::new(archive_path)
         .components()
@@ -1186,138 +1049,6 @@ fn validate_include_archive_path(archive_path: &str) -> Result<()> {
         anyhow::bail!("include_files archive path must not start with '.ktstr_': {archive_path}");
     }
     Ok(())
-}
-
-/// Resolve the shared-library closure for the init payload, extra
-/// binaries, and ELF include files.
-///
-/// Walks each binary's `DT_NEEDED` chain plus its `PT_INTERP` (and the
-/// interpreter's own deps for non-standard linkers), registering every
-/// resolved guest path's parent directories into `dirs`. Returns the
-/// sorted, deduplicated `(guest_path, host_path)` pairs. The
-/// `resolve_all_libs` span (and its dir-registration phase) is held
-/// entered by the caller; the per-binary `resolve_shared_libs` span is
-/// created here.
-#[cfg(test)]
-fn resolve_all_shared_libs(
-    payload: &Path,
-    extra_binaries: &[(&str, &Path)],
-    include_files: &[(&str, &Path)],
-    dirs: &mut BTreeSet<String>,
-) -> Result<Vec<(String, PathBuf)>> {
-    // Resolve shared library dependencies for init binary and extras.
-    let mut shared_libs: Vec<(String, PathBuf)> = Vec::new();
-    let mut all_binaries: Vec<&Path> = std::iter::once(payload)
-        .chain(extra_binaries.iter().map(|(_, p)| *p))
-        .collect();
-
-    // ELF files from include_files join the shared lib resolution chain.
-    let mut include_elf_paths: Vec<&Path> = Vec::new();
-    for (_, host_path) in include_files {
-        if is_elf(host_path) {
-            include_elf_paths.push(host_path);
-            all_binaries.push(host_path);
-        }
-    }
-
-    for path in &all_binaries {
-        let _s_one =
-            tracing::debug_span!("resolve_shared_libs", binary = %path.display()).entered();
-        let result = resolve_shared_libs(path)
-            .with_context(|| format!("resolve libs for {}", path.display()))?;
-        drop(_s_one);
-
-        // Include-file ELFs must have all shared libs resolvable.
-        if !result.missing.is_empty() && include_elf_paths.contains(path) {
-            let names: Vec<&str> = result.missing.iter().map(|m| m.soname.as_str()).collect();
-            anyhow::bail!(
-                "{}: missing shared libraries: {}",
-                path.display(),
-                names.join(", ")
-            );
-        }
-
-        // Pack PT_INTERP (dynamic linker) into the initramfs. The
-        // interpreter is not a DT_NEEDED entry and won't appear in the
-        // resolved shared libs, so it must be added explicitly.
-        // For non-standard interpreters, also resolve their own deps.
-        tracing::debug!(
-            binary = %path.display(),
-            interpreter = ?result.interpreter,
-            is_include = include_elf_paths.contains(path),
-            "resolved interpreter for binary"
-        );
-        if let Some(ref interp) = result.interpreter {
-            let interp_path = Path::new(interp);
-            let is_standard = is_standard_interpreter(interp);
-            tracing::debug!(
-                interp = %interp_path.display(),
-                exists = interp_path.is_file(),
-                is_standard,
-                "interpreter details"
-            );
-            if interp_path.is_file() {
-                let canonical = std::fs::canonicalize(interp_path)
-                    .unwrap_or_else(|_| interp_path.to_path_buf());
-                let canon_str = canonical.to_string_lossy();
-                let guest = canon_str
-                    .strip_prefix('/')
-                    .unwrap_or(&canon_str)
-                    .to_string();
-                register_parent_dirs(dirs, &guest);
-                tracing::debug!(
-                    canonical_guest = %guest,
-                    canonical_host = %canonical.display(),
-                    "packing interpreter canonical path"
-                );
-                shared_libs.push((guest.clone(), canonical.clone()));
-
-                // Also add the non-canonical path if it differs.
-                let orig_guest = interp.strip_prefix('/').unwrap_or(interp).to_string();
-                if orig_guest != guest {
-                    tracing::debug!(
-                        orig_guest = %orig_guest,
-                        canonical_guest = %guest,
-                        "packing interpreter original (non-canonical) path"
-                    );
-                    register_parent_dirs(dirs, &orig_guest);
-                    shared_libs.push((orig_guest, canonical));
-                } else {
-                    tracing::debug!("interpreter original path matches canonical, no alias needed");
-                }
-
-                // A non-standard interpreter (custom toolchain linker) can
-                // itself be dynamically linked with its own libA->libB chain
-                // alongside it; resolve_interpreter_deps walks that chain
-                // (seeding the linker's parent + sibling lib dirs, since the
-                // linker has no PT_INTERP of its own) and returns empty for a
-                // standard, statically-linked ld.so. The cache key hashes the
-                // same set (prepared_base_semantic_key) so an interp-dep
-                // change invalidates the base.
-                if let Ok(interp_result) = resolve_interpreter_deps(interp) {
-                    for (g, h) in interp_result.found {
-                        register_parent_dirs(dirs, &g);
-                        shared_libs.push((g, h));
-                    }
-                }
-            }
-        }
-
-        for (guest_path, host_path) in result.found {
-            register_parent_dirs(dirs, &guest_path);
-            shared_libs.push((guest_path, host_path));
-        }
-    }
-    let pre_dedup_count = shared_libs.len();
-    shared_libs.sort_by(|a, b| a.0.cmp(&b.0));
-    shared_libs.dedup_by(|a, b| a.0 == b.0);
-    tracing::debug!(
-        pre_dedup = pre_dedup_count,
-        post_dedup = shared_libs.len(),
-        removed = pre_dedup_count - shared_libs.len(),
-        "shared_libs dedup"
-    );
-    Ok(shared_libs)
 }
 
 /// Write all cpio entries for the base archive in extractor-safe order:
@@ -1631,7 +1362,8 @@ pub(crate) fn build_dynamic_tail(prefix_len: usize, params: &SuffixParams<'_>) -
     }
 
     // Per-staged-scheduler args files. The staged binary itself is
-    // packed into the base archive by `build_initramfs_base` as an
+    // packed into the base archive by
+    // `build_initramfs_base_from_resolved` as an
     // extras entry under `staging/schedulers/<name>/scheduler`;
     // its `register_parent_dirs` loop populates the directory
     // chain so this suffix entry lands inside a pre-existing tree.

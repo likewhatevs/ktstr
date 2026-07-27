@@ -1531,7 +1531,7 @@ impl KtstrVm {
         let compression = self.initrd_compression;
         #[cfg(feature = "wprof")]
         let wprof_host_path: Option<PathBuf> = self.wprof.as_ref().map(|w| w.host_path.clone());
-        // Extras are stripped by `build_initramfs_base` before write. The
+        // Extras are stripped by the base builder before write. The
         // scheduler and probe can lose their DWARF without functional impact
         // — the probe resolves `tsd_s.thread_allocated` offsets against the
         // TARGET process's `/proc/<pid>/exe`, not against its own binary, so
@@ -1545,7 +1545,7 @@ impl KtstrVm {
         // Staged schedulers ride the same `extras` path, packed under
         // `staging/schedulers/<name>/scheduler` so the cpio extractor's silent
         // parent-dir requirement gets satisfied via the auto-registered
-        // ancestor entries (see `build_initramfs_base`'s
+        // ancestor entries (see `build_initramfs_base_from_resolved`'s
         // `register_parent_dirs` loop). Each staged binary contributes its own
         // DT_NEEDED set to the shared-lib resolution chain.
         let staged_extras_names: Vec<String> = staged_schedulers
