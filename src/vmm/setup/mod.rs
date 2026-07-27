@@ -1792,6 +1792,29 @@ impl KtstrVm {
         })
     }
 
+    /// Enforce the initramfs memory floor already applied at admission.
+    ///
+    /// Defense in depth: a builder with too-small `memory_mib` fails fast
+    /// here instead of OOMing during boot. Arch-neutral — both the x86_64
+    /// and aarch64 loaders gate on this before mapping the stream.
+    fn ensure_initramfs_memory(&self, prepared: &PreparedInitrd, memory_mib: u32) -> Result<()> {
+        let budget = self.memory_budget(prepared)?;
+        let min_mib = initramfs_min_memory_mib(&budget);
+        if memory_mib < min_mib {
+            anyhow::bail!(
+                "VM memory {}MiB insufficient for initramfs \
+                 (uncompressed={}MiB, compressed={}MiB, \
+                 init_size={}MiB): need {}MiB",
+                memory_mib,
+                prepared.uncompressed_len() >> 20,
+                prepared.compressed_len() >> 20,
+                budget.kernel_init_size >> 20,
+                min_mib,
+            );
+        }
+        Ok(())
+    }
+
     /// Resolve the exact guest-memory allocation from immutable prepared
     /// inputs. This runs before host admission so the queue claim and the KVM
     /// allocation use the same value.
@@ -1873,26 +1896,7 @@ impl KtstrVm {
         mbind_node_map: &[Vec<usize>],
         memory_mib: u32,
     ) -> Result<(Option<u64>, Option<u32>)> {
-        let uncompressed_size = prepared.uncompressed_len();
-        let compressed_size = prepared.compressed_len();
-
-        // Enforce the same minimum used before admission.
-        let budget = self.memory_budget(&prepared)?;
-        let kernel_init_size = budget.kernel_init_size;
-        let min_mib = initramfs_min_memory_mib(&budget);
-        if memory_mib < min_mib {
-            anyhow::bail!(
-                "VM memory {}MiB insufficient for initramfs \
-                 (uncompressed={}MiB, compressed={}MiB, \
-                 init_size={}MiB): need {}MiB",
-                memory_mib,
-                uncompressed_size >> 20,
-                compressed_size >> 20,
-                kernel_init_size >> 20,
-                min_mib,
-            );
-        }
-
+        self.ensure_initramfs_memory(&prepared, memory_mib)?;
         let size = self.load_prepared_initrd(vm, prepared, load_addr, mbind_node_map)?;
         Ok((Some(load_addr), Some(size)))
     }
@@ -1979,6 +1983,75 @@ impl KtstrVm {
         Ok(kernel_result)
     }
 
+    /// Dynamic cmdline tail shared by both arches. Companion to
+    /// [`base_guest_cmdline`]: that pins the static common flags, this pins
+    /// the config-derived ones (verbose/loglevel, rdinit, disk auto-mount,
+    /// numa balancing, wprof, bpf-map-write gate, cmdline_extra). Centralized
+    /// for the same reason — a per-arch drift here previously left
+    /// `sysctl.vm.overcommit_memory=1` on x86 only, OOM-ing the aarch64 guest
+    /// /init.
+    ///
+    /// `verbose_extra` is the per-arch verbose-only prefix (x86_64:
+    /// `" earlyprintk=serial"`; aarch64: `""` — it already has earlycon
+    /// unconditionally). `cmdline_extra` stays LAST so an operator
+    /// `.cmdline("loglevel=7")` still wins the kernel's last-duplicate-wins
+    /// parse.
+    fn append_dynamic_cmdline_tail(&self, cmdline: &mut String, verbose_extra: &str) {
+        let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
+        if verbose {
+            cmdline.push_str(verbose_extra);
+            cmdline.push_str(" loglevel=7");
+        } else {
+            cmdline.push_str(" loglevel=0");
+        }
+        if self.init_binary.is_some() {
+            cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
+        }
+        // Auto-mount handshake. Emit a `KTSTR_DISK0_FS=<tag>` token whenever
+        // the first disk has been pre-formatted so the guest init at
+        // [`crate::vmm::rust_init::auto_mount_data_disks`] can mount
+        // `/dev/vda` at `/mnt/disk0` before the test dispatch runs.
+        // `Filesystem::Raw` skips the emission because there is no on-disk fs
+        // to mount; the guest sees only the absent token and short-circuits
+        // the mount path.
+        //
+        // `KTSTR_DISK0_RO=1` is emitted when the disk is configured
+        // `read_only`. The virtio_blk device advertises `VIRTIO_BLK_F_RO` for
+        // that case so the guest's gendisk is RO; mounting RW would fail with
+        // `-EROFS` (kernel `do_mount` path: `__btrfs_open_devices` probes the
+        // bdev's `bdev_read_only` and returns EROFS when the RW mount tries to
+        // write). The token lets the guest set `MS_RDONLY` proactively,
+        // surfacing the intent in the cmdline and avoiding the kernel-side
+        // EROFS path.
+        //
+        // The cache_tag() value is reused as the fstype string because it is
+        // already kebab-free, <=8 chars, and matches the on-disk-format
+        // identifier the host selected — using the same value for both keeps
+        // the guest mount and host cache key in lockstep, so a future
+        // `Filesystem` variant rename only has to update one place (the
+        // `cache_tag` match in disk_config.rs) and the cmdline / mount
+        // automatically follow.
+        if let Some(disk) = self.disk.as_ref() {
+            cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
+        }
+        cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
+        #[cfg(feature = "wprof")]
+        if let Some(wprof) = self.wprof.as_ref() {
+            cmdline.push_str(" KTSTR_WPROF_ARGS=");
+            cmdline.push_str(&wprof.args_cmdline());
+        }
+        if !self.bpf_map_writes.is_empty() {
+            cmdline.push_str(" KTSTR_AWAIT_BPF_MAP_WRITE_READY=1");
+        }
+        if !self.cmdline_extra.is_empty() {
+            cmdline.push(' ');
+            cmdline.push_str(&self.cmdline_extra);
+        }
+    }
+
     /// Build the guest kernel cmdline (base flags + per-device `virtio_mmio.device=` tokens).
     #[cfg(target_arch = "x86_64")]
     fn build_guest_cmdline(&self) -> String {
@@ -2034,18 +2107,6 @@ impl KtstrVm {
             "no_timer_check clocksource=kvm-clock i8042.noaux i8042.nomux \
              i8042.nopnp i8042.dumbkbd {pci_flag}reboot=k"
         ));
-        let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
-            .map(|v| v == "1")
-            .unwrap_or(false)
-            || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
-        if verbose {
-            cmdline.push_str(" earlyprintk=serial loglevel=7");
-        } else {
-            cmdline.push_str(" loglevel=0");
-        }
-        if self.init_binary.is_some() {
-            cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
-        }
         // Virtio-console MMIO device on the kernel cmdline. The kernel's
         // virtio_mmio_cmdline_devices driver parses this to register the
         // MMIO transport at the given base address and IRQ.
@@ -2060,58 +2121,16 @@ impl KtstrVm {
         // the virtio-pci driver — it needs NO `virtio_mmio.device=` token (the
         // same reason the NIC emits none; aarch64 keeps blk on virtio-MMIO and
         // emits the token in `finish_aarch64_setup`). The single PCI block
-        // function becomes `/dev/vda`. The auto-mount handshake tokens below are
-        // transport-independent and still emitted whenever a disk is attached.
-        if let Some(disk) = self.disk.as_ref() {
-            // Auto-mount handshake. Emit a `KTSTR_DISK0_FS=<tag>`
-            // token whenever the first disk has been pre-formatted so
-            // the guest init at
-            // [`crate::vmm::rust_init::auto_mount_data_disks`]
-            // can mount `/dev/vda` at `/mnt/disk0` before the test
-            // dispatch runs. `Filesystem::Raw` skips the emission
-            // because there is no on-disk fs to mount; the guest
-            // sees only the absent token and short-circuits the
-            // mount path.
-            //
-            // `KTSTR_DISK0_RO=1` is emitted when the disk is
-            // configured `read_only`. The virtio_blk device
-            // advertises `VIRTIO_BLK_F_RO` for that case so the
-            // guest's gendisk is RO; mounting RW would fail with
-            // `-EROFS` (kernel `do_mount` path: `__btrfs_open_devices`
-            // probes the bdev's `bdev_read_only` and returns EROFS
-            // when the RW mount tries to write). The token lets the
-            // guest set `MS_RDONLY` proactively, surfacing the
-            // intent in the cmdline and avoiding the kernel-side
-            // EROFS path.
-            //
-            // The cache_tag() value is reused as the fstype string
-            // because it is already kebab-free, ≤8 chars, and
-            // matches the on-disk-format identifier the host
-            // selected — using the same value for both keeps the
-            // guest mount and host cache key in lockstep, so a
-            // future `Filesystem` variant rename only has to update
-            // one place (the `cache_tag` match in disk_config.rs)
-            // and the cmdline / mount automatically follow.
-            cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
-        }
-        // No virtio-net cmdline token on x86_64: the NIC is a virtio-pci
-        // function (builder `.network()` sets `pci_enabled`), enumerated
-        // by the guest over ECAM and bound by the virtio-pci driver — it
-        // needs no `virtio_mmio.device=` token. (aarch64 keeps its NIC on
-        // virtio-MMIO and emits the token in `finish_aarch64_setup`.)
-        cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
-        #[cfg(feature = "wprof")]
-        if let Some(wprof) = self.wprof.as_ref() {
-            cmdline.push_str(" KTSTR_WPROF_ARGS=");
-            cmdline.push_str(&wprof.args_cmdline());
-        }
-        if !self.bpf_map_writes.is_empty() {
-            cmdline.push_str(" KTSTR_AWAIT_BPF_MAP_WRITE_READY=1");
-        }
-        if !self.cmdline_extra.is_empty() {
-            cmdline.push(' ');
-            cmdline.push_str(&self.cmdline_extra);
-        }
+        // function becomes `/dev/vda`. The auto-mount handshake tokens in the
+        // shared tail are transport-independent and still emitted whenever a
+        // disk is attached.
+        //
+        // No virtio-net cmdline token on x86_64 either: the NIC is a
+        // virtio-pci function (builder `.network()` sets `pci_enabled`),
+        // enumerated by the guest over ECAM and bound by the virtio-pci
+        // driver. (aarch64 keeps its NIC on virtio-MMIO and emits the token in
+        // `finish_aarch64_setup`.)
+        self.append_dynamic_cmdline_tail(&mut cmdline, " earlyprintk=serial");
         cmdline
     }
 
@@ -2204,29 +2223,8 @@ impl KtstrVm {
         memory_mib: u32,
         mbind_node_map: &[Vec<usize>],
     ) -> Result<(Option<u64>, Option<u32>)> {
-        let uncompressed_size = prepared.uncompressed_len();
+        self.ensure_initramfs_memory(&prepared, memory_mib)?;
         let compressed_size = prepared.compressed_len();
-
-        // Validate the operator-supplied memory_mib against the
-        // initramfs budget. Mirrors the x86_64 validate_and_load_initramfs
-        // contract: a builder with too-small memory_mib fails fast here
-        // instead of OOMing during boot.
-        let budget = self.memory_budget(&prepared)?;
-        let kernel_init_size = budget.kernel_init_size;
-        let min_mib = initramfs_min_memory_mib(&budget);
-        if memory_mib < min_mib {
-            anyhow::bail!(
-                "VM memory {}MiB insufficient for initramfs \
-                 (uncompressed={}MiB, compressed={}MiB, \
-                 init_size={}MiB): need {}MiB",
-                memory_mib,
-                uncompressed_size >> 20,
-                compressed_size >> 20,
-                kernel_init_size >> 20,
-                min_mib,
-            );
-        }
-
         let load_addr = aarch64_initrd_addr(
             memory_mib,
             self.topology.total_cpus(),
@@ -2265,43 +2263,15 @@ impl KtstrVm {
             " earlycon=uart,mmio,{:#x}",
             aarch64::kvm::SERIAL_MMIO_BASE
         ));
-        let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
-            .map(|v| v == "1")
-            .unwrap_or(false)
-            || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
-        if verbose {
-            cmdline.push_str(" loglevel=7");
-        } else {
-            cmdline.push_str(" loglevel=0");
-        }
-        if self.init_binary.is_some() {
-            cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
-        }
-        // Auto-mount tokens for the configured disk. aarch64 advertises
-        // the virtio-blk MMIO transport via FDT (see
+        // aarch64 advertises the virtio-blk MMIO transport via FDT (see
         // `create_fdt(..., self.disk.is_some(), ...)` below), so the
-        // `virtio_mmio.device=` cmdline form used on x86_64 is omitted.
-        // The `KTSTR_DISK0_*` tokens, however, are env-style markers
-        // consumed by the guest init at
+        // `virtio_mmio.device=` cmdline form used on x86_64 is omitted. The
+        // `KTSTR_DISK0_*` tokens the shared tail emits, however, are env-style
+        // markers consumed by the guest init at
         // `crate::vmm::rust_init::auto_mount_data_disks` — they are
         // arch-neutral and required on aarch64 for the same auto-mount
         // contract as x86_64.
-        if let Some(disk) = self.disk.as_ref() {
-            cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
-        }
-        cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
-        #[cfg(feature = "wprof")]
-        if let Some(wprof) = self.wprof.as_ref() {
-            cmdline.push_str(" KTSTR_WPROF_ARGS=");
-            cmdline.push_str(&wprof.args_cmdline());
-        }
-        if !self.bpf_map_writes.is_empty() {
-            cmdline.push_str(" KTSTR_AWAIT_BPF_MAP_WRITE_READY=1");
-        }
-        if !self.cmdline_extra.is_empty() {
-            cmdline.push(' ');
-            cmdline.push_str(&self.cmdline_extra);
-        }
+        self.append_dynamic_cmdline_tail(&mut cmdline, "");
 
         let t0 = Instant::now();
         boot::validate_cmdline(&cmdline)?;

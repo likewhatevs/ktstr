@@ -3462,6 +3462,33 @@ pub(in crate::vmm) fn acquire_as_coordinator_interruptible<T>(
     acquire_as_coordinator_impl(*coordinator.into(), Some(cancelled), step)
 }
 
+/// Drive a run-acquisition coordinator to its terminal outcome.
+///
+/// Run acquirers never return `CoordinatorStep::Prepare` from their step
+/// closure, so `Prepared` is unreachable for them; the preparation
+/// coordinator (`acquire_pending_admission`) handles that outcome itself and
+/// must not use this helper. `what` names the acquirer in the panic.
+pub(in crate::vmm) fn finish_run_coordinator<T>(
+    coordinator: Box<CoordinatorTicket>,
+    cancelled: Option<&AtomicBool>,
+    step: impl FnMut(&mut HeldLocks) -> Result<CoordinatorStep<T>>,
+    what: &'static str,
+) -> Result<Acquired<T>> {
+    let outcome = match cancelled {
+        Some(cancelled) => acquire_as_coordinator_interruptible(coordinator, cancelled, step)?,
+        None => acquire_as_coordinator(coordinator, step)?,
+    };
+    match outcome {
+        CoordinatorOutcome::Acquired(acquired) => Ok(acquired),
+        CoordinatorOutcome::Prepared(_) => {
+            unreachable!("{what} run coordinator prepared a VM intent")
+        }
+        CoordinatorOutcome::Aborted { reason } => {
+            Err(anyhow::Error::new(super::ResourceContention { reason }))
+        }
+    }
+}
+
 /// Render a blocked coordinator claim compactly for the exit-timing fallback
 /// accusation: `cpu=<i>,…,llc=<i>,…,permit=<i>,…`, each set capped so a wide
 /// claim cannot produce an unbounded line.

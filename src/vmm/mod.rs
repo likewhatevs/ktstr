@@ -2325,10 +2325,9 @@ impl KtstrVm {
             }
         } else if self.performance_mode {
             match (self.host_topo.as_ref(), self.pinning_plan.as_ref()) {
-                (Some(host_topo), Some(plan)) => Self::acquire_performance_run_locks(
+                (Some(host_topo), Some(_)) => Self::acquire_performance_run_locks(
                     host_topo,
                     &self.topology,
-                    plan,
                     wait,
                     pending,
                     memory_mib,
@@ -2436,7 +2435,6 @@ impl KtstrVm {
     fn acquire_performance_run_locks(
         host_topo: &host_topology::HostTopology,
         topology: &Topology,
-        _build_plan: &host_topology::PinningPlan,
         wait: bool,
         pending: Option<host_topology::protocol::PendingAdmission>,
         memory_mib: u32,
@@ -2454,7 +2452,7 @@ impl KtstrVm {
                 reason: "non-waiting performance admission is unsupported".into(),
             }));
         }
-        Self::acquire_performance_with_permits(candidates, pending, memory_mib, None)
+        Self::acquire_performance_with_permits(candidates, pending, memory_mib)
     }
 
     /// Enumerate the exact placements which satisfy one performance-mode
@@ -2487,7 +2485,6 @@ impl KtstrVm {
         candidates: Vec<FlexibleRunCandidate>,
         pending: Option<host_topology::protocol::PendingAdmission>,
         memory_mib: u32,
-        cancelled: Option<&AtomicBool>,
     ) -> Result<RunLocks> {
         use host_topology::protocol;
 
@@ -2588,14 +2585,14 @@ impl KtstrVm {
                 pending,
                 initial_claim.clone(),
                 watch_claim,
-                cancelled,
+                None,
                 register,
             )?
         } else {
             protocol::register_ticket_or_acquire(
                 initial_claim.clone(),
                 watch_claim,
-                cancelled,
+                None,
                 register,
             )?
         };
@@ -2644,32 +2641,15 @@ impl KtstrVm {
                 claim: designation.clone(),
             })
         };
-        let outcome = match cancelled {
-            Some(cancelled) => {
-                protocol::acquire_as_coordinator_interruptible(coordinator, cancelled, step)?
-            }
-            None => protocol::acquire_as_coordinator(coordinator, step)?,
-        };
-        match outcome {
-            protocol::CoordinatorOutcome::Acquired(acquired) => {
-                let (index, locks) = acquired.split_map(|(index, locks)| (index, locks));
-                Ok(RunLocks {
-                    locks,
-                    pinning_plan: Some(candidates[index].plan.clone_unlocked()),
-                    shared_cpu_mask: None,
-                    default_shared_cpu_claim: false,
-                    default_shared_fallback: false,
-                })
-            }
-            protocol::CoordinatorOutcome::Prepared(_) => {
-                unreachable!("performance run coordinator prepared a VM intent")
-            }
-            protocol::CoordinatorOutcome::Aborted { reason } => {
-                Err(anyhow::Error::new(host_topology::ResourceContention {
-                    reason,
-                }))
-            }
-        }
+        let acquired = protocol::finish_run_coordinator(coordinator, None, step, "performance")?;
+        let (index, locks) = acquired.split_map(|(index, locks)| (index, locks));
+        Ok(RunLocks {
+            locks,
+            pinning_plan: Some(candidates[index].plan.clone_unlocked()),
+            shared_cpu_mask: None,
+            default_shared_cpu_claim: false,
+            default_shared_fallback: false,
+        })
     }
 
     fn acquire_default_preferred_run_locks(
@@ -3065,40 +3045,23 @@ impl KtstrVm {
                 claim: designation.clone(),
             })
         };
-        let outcome = match cancelled {
-            Some(cancelled) => {
-                protocol::acquire_as_coordinator_interruptible(coordinator, cancelled, step)?
-            }
-            None => protocol::acquire_as_coordinator(coordinator, step)?,
-        };
-        match outcome {
-            protocol::CoordinatorOutcome::Acquired(acquired) => {
-                let ((index, exact), locks) =
-                    acquired.split_map(|(index, exact, locks)| ((index, exact), locks));
-                if exact {
-                    Ok(RunLocks {
-                        locks,
-                        pinning_plan: Some(candidates[index].plan.clone_unlocked()),
-                        shared_cpu_mask: None,
-                        default_shared_cpu_claim: true,
-                        default_shared_fallback: false,
-                    })
-                } else {
-                    Ok(Self::build_default_shared_run_locks(
-                        candidates[index].shared_cpus.clone(),
-                        topology.total_cpus() as usize,
-                        locks,
-                    ))
-                }
-            }
-            protocol::CoordinatorOutcome::Prepared(_) => {
-                unreachable!("default run coordinator prepared a VM intent")
-            }
-            protocol::CoordinatorOutcome::Aborted { reason } => {
-                Err(anyhow::Error::new(host_topology::ResourceContention {
-                    reason,
-                }))
-            }
+        let acquired = protocol::finish_run_coordinator(coordinator, cancelled, step, "default")?;
+        let ((index, exact), locks) =
+            acquired.split_map(|(index, exact, locks)| ((index, exact), locks));
+        if exact {
+            Ok(RunLocks {
+                locks,
+                pinning_plan: Some(candidates[index].plan.clone_unlocked()),
+                shared_cpu_mask: None,
+                default_shared_cpu_claim: true,
+                default_shared_fallback: false,
+            })
+        } else {
+            Ok(Self::build_default_shared_run_locks(
+                candidates[index].shared_cpus.clone(),
+                topology.total_cpus() as usize,
+                locks,
+            ))
         }
     }
 
@@ -3377,26 +3340,9 @@ impl KtstrVm {
                 claim: designation.clone(),
             })
         };
-        let outcome = match cancelled {
-            Some(cancelled) => {
-                protocol::acquire_as_coordinator_interruptible(coordinator, cancelled, step)?
-            }
-            None => protocol::acquire_as_coordinator(coordinator, step)?,
-        };
-        match outcome {
-            protocol::CoordinatorOutcome::Acquired(acquired) => {
-                let (cpus, locks) = acquired.split_map(|(cpus, locks)| (cpus, locks));
-                Ok((cpus, locks))
-            }
-            protocol::CoordinatorOutcome::Prepared(_) => {
-                unreachable!("CPU-shared run coordinator prepared a VM intent")
-            }
-            protocol::CoordinatorOutcome::Aborted { reason } => {
-                Err(anyhow::Error::new(host_topology::ResourceContention {
-                    reason,
-                }))
-            }
-        }
+        let acquired =
+            protocol::finish_run_coordinator(coordinator, cancelled, step, "CPU-shared")?;
+        Ok(acquired.split_map(|(cpus, locks)| (cpus, locks)))
     }
 
     fn build_default_shared_run_locks(

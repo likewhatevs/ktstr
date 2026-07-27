@@ -6295,31 +6295,18 @@ where
             })
         }
     };
-    let outcome = match cancelled {
-        Some(flag) => protocol::acquire_as_coordinator_interruptible(coordinator, flag, step)?,
-        None => protocol::acquire_as_coordinator(coordinator, step)?,
-    };
-    match outcome {
-        protocol::CoordinatorOutcome::Acquired(acquired) => {
-            let ((selected, cpus, cpu_permits, mems), locks) =
-                acquired.split_map(|(selected, locks, cpus, cpu_permits, mems)| {
-                    ((selected, cpus, cpu_permits, mems), locks)
-                });
-            Ok(materialize_llc_plan(
-                selected,
-                locks,
-                cpus,
-                cpu_permits,
-                mems,
-            ))
-        }
-        protocol::CoordinatorOutcome::Prepared(_) => {
-            unreachable!("LLC-plan coordinator prepared a VM intent")
-        }
-        protocol::CoordinatorOutcome::Aborted { reason } => {
-            Err(anyhow::Error::new(ResourceContention { reason }))
-        }
-    }
+    let acquired = protocol::finish_run_coordinator(coordinator, cancelled, step, "LLC-plan")?;
+    let ((selected, cpus, cpu_permits, mems), locks) =
+        acquired.split_map(|(selected, locks, cpus, cpu_permits, mems)| {
+            ((selected, cpus, cpu_permits, mems), locks)
+        });
+    Ok(materialize_llc_plan(
+        selected,
+        locks,
+        cpus,
+        cpu_permits,
+        mems,
+    ))
 }
 
 /// Static, ownership-free shape planner for no-perf builds.
