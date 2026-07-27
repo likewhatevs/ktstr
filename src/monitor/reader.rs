@@ -2146,6 +2146,42 @@ fn clamp_original_timeout(raw: u64, wd_jiffies: u64) -> u64 {
     if raw == 0 || raw > clamp { clamp } else { raw }
 }
 
+/// Record the `scx_sched.watchdog_timeout` write-then-read-back that
+/// [`super::WatchdogObservation`] carries to the host verdict, keeping the
+/// FIRST readable observation.
+///
+/// "Readable" is the whole point. The write lands at `kva_to_pa(*scx_root,
+/// page_offset) + watchdog_offset`; while the monitor is still racing guest
+/// boot — `page_offset` not yet resolved, or `*scx_root` pointing at a
+/// scx_sched the kernel has not finished initialising — that PA falls
+/// outside guest DRAM, where [`GuestMem::write_u64`] silently no-ops and
+/// [`GuestMem::read_u64`] bounds-returns 0. Latching that first sample
+/// unconditionally pinned an unreadable address as the run's verdict, so a
+/// run whose override did land was reported as `observed_jiffies == 0` —
+/// "the host-write missed the field" — purely because the monitor's first
+/// sample happened to precede the boot state it needs.
+///
+/// A zero is therefore provisional, not final: keep re-recording while the
+/// stored observation still reads 0 so a later sample against a resolved
+/// scx_sched replaces it. It is NOT discarded — a genuinely unwritable
+/// field (the kernel refactor that moved `watchdog_offset`, which this
+/// observation exists to catch) leaves 0 in place through the last sample
+/// and still fails the verdict loudly. Once a nonzero value is stored the
+/// observation is final, so a scheduler that legitimately overwrites the
+/// override with its own nonzero default is reported as the mismatch it is.
+fn record_watchdog_observation(
+    slot: &mut Option<super::WatchdogObservation>,
+    expected_jiffies: u64,
+    observed_jiffies: u64,
+) {
+    if slot.is_none_or(|o| o.observed_jiffies == 0) {
+        *slot = Some(super::WatchdogObservation {
+            expected_jiffies,
+            observed_jiffies,
+        });
+    }
+}
+
 /// Decide whether to forge `scx_watchdog_timestamp` this iteration, given
 /// the current guest-visible timestamp `cur_ts` and current `jiffies_64`
 /// `now_j` (both read before this call). Mutates the latch state.
@@ -3847,13 +3883,11 @@ pub(crate) fn monitor_loop(
                         mem.write_u64(ts_pa, 0, v);
                     }
                 }
-                if watchdog_observation.is_none() {
-                    let observed = mem.read_u64(pa, write_offset);
-                    watchdog_observation = Some(super::WatchdogObservation {
-                        expected_jiffies: wd_jiffies,
-                        observed_jiffies: observed,
-                    });
-                }
+                record_watchdog_observation(
+                    &mut watchdog_observation,
+                    wd_jiffies,
+                    mem.read_u64(pa, write_offset),
+                );
             }
         }
         // Per-iteration refresh of `__per_cpu_offset[]` and the
@@ -6464,6 +6498,44 @@ mod tests {
         assert_eq!(clamp_original_timeout(0, wd), 3000);
         // Garbage above the ceiling falls back to the clamp.
         assert_eq!(clamp_original_timeout(u64::MAX, wd), 3000);
+    }
+
+    /// A zero read-back is provisional: it is stored (so a field that
+    /// never becomes readable still fails the verdict rather than
+    /// vanishing into a skip) but a later readable sample replaces it.
+    /// The first nonzero observation is final — a scheduler that
+    /// overwrites the override with its own default must be reported as
+    /// the mismatch it is, not overwritten by a later sample.
+    #[test]
+    fn record_watchdog_observation_upgrades_past_unreadable_samples() {
+        let mut slot = None;
+        // Boot race: the write landed outside guest DRAM, so the
+        // read-back bounds-returned 0. Stored, but provisional.
+        record_watchdog_observation(&mut slot, 2000, 0);
+        assert_eq!(slot.map(|o| o.observed_jiffies), Some(0));
+        // Next sample, scx_sched now resolved: the real value replaces it.
+        record_watchdog_observation(&mut slot, 2000, 2000);
+        assert_eq!(
+            slot,
+            Some(super::super::WatchdogObservation {
+                expected_jiffies: 2000,
+                observed_jiffies: 2000,
+            })
+        );
+        // Final: a later sample cannot rewrite a readable observation.
+        record_watchdog_observation(&mut slot, 2000, 1500);
+        assert_eq!(slot.map(|o| o.observed_jiffies), Some(2000));
+    }
+
+    /// A genuine mismatch (the guest's own nonzero default won) latches on
+    /// the first sample and is never upgraded away — this is the
+    /// regression the observation exists to catch.
+    #[test]
+    fn record_watchdog_observation_keeps_first_readable_mismatch() {
+        let mut slot = None;
+        record_watchdog_observation(&mut slot, 2000, 20000);
+        record_watchdog_observation(&mut slot, 2000, 2000);
+        assert_eq!(slot.map(|o| o.observed_jiffies), Some(20000));
     }
 
     #[test]
