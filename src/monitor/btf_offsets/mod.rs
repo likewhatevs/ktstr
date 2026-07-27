@@ -2770,5 +2770,62 @@ pub const SCX_DSQ_LNODE_ITER_CURSOR: u32 = 1;
 #[allow(dead_code)]
 pub const RHT_PTR_LOCK_BIT: u64 = 1;
 
+/// Every BTF-derived offset group the freeze coordinator resolves once
+/// at coordinator start, bundled so they travel together through the
+/// `<vmlinux>.artifacts` sidecar.
+///
+/// Each field is `Option` for the same reason its resolver returns
+/// `Result`: a kernel built without the relevant config (no
+/// `CONFIG_NUMA`, no arena support, a stripped vmlinux) legitimately
+/// has no offsets for that group, and every consumer already skips its
+/// pass on `None`. `None` is therefore a RESOLVED answer, not a
+/// "missing, retry" marker — the sidecar stores it as such.
+///
+/// Bundling exists to keep BTF off the run path. Before these were
+/// serialized, resolving the groups was the only reason the coordinator
+/// needed the full `Btf` on an ordinary (non-dump) run, so every cell
+/// paid a `Btf::from_bytes` over the whole vmlinux BTF. With the groups
+/// precomputed in the sidecar, BTF rehydration happens only where the
+/// full type graph is genuinely required: failure-dump rendering and the
+/// probe's split-BTF Datasec walk.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DumpOffsets {
+    /// `struct bpf_map` / `struct btf` offsets for guest map discovery.
+    pub bpf_map: Option<BpfMapOffsets>,
+    /// `struct bpf_arena` / `struct vm_struct` offsets for arena rendering.
+    pub arena: Option<crate::monitor::arena::BpfArenaOffsets>,
+    /// Per-CPU CPU-time / softirq / IRQ / iowait offsets.
+    pub cpu_time: Option<CpuTimeOffsets>,
+    /// Cgroup-hierarchy offsets for the per-cgroup PSI walk.
+    pub cgroup: Option<CgroupWalkOffsets>,
+    /// SCX walker sub-groups (each independently optional inside).
+    pub scx_walker: Option<ScxWalkerOffsets>,
+    /// Per-task enrichment offsets (all-or-nothing).
+    pub task_enrichment: Option<TaskEnrichmentOffsets>,
+    /// Per-node `vm_numa_event[]` offsets.
+    pub numa: Option<NumaStatsOffsets>,
+    /// Hoisted `RunnableScanCtx` prerequisites.
+    pub runnable_scan: Option<RunnableScanOffsets>,
+}
+
+impl DumpOffsets {
+    /// Resolve every group from a pre-loaded BTF object. Per-group
+    /// failures land as `None` — this returns no `Result` because there
+    /// is no whole-bundle failure mode: a vmlinux whose BTF parsed at
+    /// all yields a usable (possibly empty) bundle.
+    pub fn from_btf(btf: &Btf) -> Self {
+        Self {
+            bpf_map: BpfMapOffsets::from_btf(btf).ok(),
+            arena: crate::monitor::arena::BpfArenaOffsets::from_btf(btf).ok(),
+            cpu_time: CpuTimeOffsets::from_btf(btf).ok(),
+            cgroup: CgroupWalkOffsets::from_btf(btf).ok(),
+            scx_walker: ScxWalkerOffsets::from_btf(btf).ok(),
+            task_enrichment: TaskEnrichmentOffsets::from_btf(btf).ok(),
+            numa: NumaStatsOffsets::from_btf(btf).ok(),
+            runnable_scan: RunnableScanOffsets::from_btf(btf).ok(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

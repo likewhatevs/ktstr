@@ -200,12 +200,121 @@ fn extract_vmlinux_build_id(elf: &goblin::elf::Elf, data: &[u8]) -> Option<Vec<u
 }
 
 /// The monitor-only subset of [`VmlinuxArtifacts`]: the BTF-backed
-/// offset tables plus the shared `Btf` handle.
+/// offset tables plus the deferred `Btf` handle.
 pub(crate) struct MonitorArtifacts {
     pub offsets: crate::monitor::btf_offsets::KernelOffsets,
     pub prog_offsets: Option<crate::monitor::btf_offsets::BpfProgOffsets>,
     pub psi_offsets: Option<crate::monitor::btf_offsets::PsiGroupOffsets>,
-    pub btf: Arc<btf_rs::Btf>,
+    pub btf: Arc<BtfProducts>,
+}
+
+/// The full vmlinux `Btf` plus everything derived from it, materialized
+/// on first demand rather than at artifact-load time.
+///
+/// Rehydrating the `.btf` sidecar is the single most expensive step of
+/// per-cell vmlinux preparation — a `Btf::from_bytes` over the whole
+/// kernel type graph, paid once per cell because the admission runner
+/// `execve`s the test binary in the same PID and every process cache
+/// starts cold. Measured against a 7.1.5 vmlinux (165,454 symbols,
+/// 5.7 MB `.btf`), a sidecar-hit [`cached_vmlinux_artifacts`] cost
+/// 69 ms and 56 MB resident with the `Btf` built eagerly, and 21 ms /
+/// 19 MB with it deferred.
+///
+/// Deferring it only pays off because [`Self::dump_offsets`] can be
+/// answered without it. Every offset group the freeze coordinator
+/// resolves at coordinator start now travels in the `.artifacts`
+/// sidecar, so an ordinary run never reaches the `Btf` at all; the
+/// remaining consumers — failure-dump rendering, the `watch_bpf_maps`
+/// split base, and the probe's split-BTF `.bss` Datasec walk, which
+/// needs the vmlinux BTF as its split base — take the cost only when
+/// they actually run.
+pub(crate) struct BtfProducts {
+    /// Canonical vmlinux path, used to rehydrate on demand.
+    canon: PathBuf,
+    /// `None` inside the `OnceLock` records a rehydration that was
+    /// attempted and failed, so a broken `.btf` sidecar is not retried
+    /// once per dump iteration.
+    btf: OnceLock<Option<Arc<btf_rs::Btf>>>,
+    dump_offsets: OnceLock<crate::monitor::btf_offsets::DumpOffsets>,
+}
+
+impl BtfProducts {
+    /// Wrap a `Btf` that is already in hand (the full-parse path), along
+    /// with the groups derived from it during that parse.
+    fn ready(
+        canon: PathBuf,
+        btf: btf_rs::Btf,
+        dump_offsets: crate::monitor::btf_offsets::DumpOffsets,
+    ) -> Self {
+        let products = Self {
+            canon,
+            btf: OnceLock::new(),
+            dump_offsets: OnceLock::new(),
+        };
+        let _ = products.btf.set(Some(Arc::new(btf)));
+        let _ = products.dump_offsets.set(dump_offsets);
+        products
+    }
+
+    /// Sidecar-hit constructor: no `Btf` yet. `dump_offsets` is `None`
+    /// only for a sidecar that carried monitor offsets without the
+    /// derived groups; that bundle is then rebuilt from the rehydrated
+    /// `Btf` on first use, exactly as the coordinator used to do.
+    fn deferred(
+        canon: PathBuf,
+        dump_offsets: Option<crate::monitor::btf_offsets::DumpOffsets>,
+    ) -> Self {
+        let products = Self {
+            canon,
+            btf: OnceLock::new(),
+            dump_offsets: OnceLock::new(),
+        };
+        if let Some(offsets) = dump_offsets {
+            let _ = products.dump_offsets.set(offsets);
+        }
+        products
+    }
+
+    /// The full vmlinux `Btf`, rehydrating it on first call. `None` when
+    /// neither the `.btf` sidecar nor the vmlinux ELF yields one.
+    ///
+    /// The ELF fallback matters for correctness, not just robustness: a
+    /// sidecar-loaded artifact commits to offsets that were derived from
+    /// BTF, so the dump path must still be able to reach the type graph
+    /// even if the `.btf` sidecar has since been evicted.
+    pub(crate) fn btf(&self) -> Option<&Arc<btf_rs::Btf>> {
+        self.btf
+            .get_or_init(|| {
+                if let Some(btf) = crate::monitor::btf_offsets::load_btf_from_sidecar(&self.canon) {
+                    return Some(Arc::new(btf));
+                }
+                let data = cached_vmlinux_bytes(&self.canon)?;
+                let elf = goblin::elf::Elf::parse(&data).ok()?;
+                crate::monitor::btf_offsets::load_btf_from_elf(&elf, &data, &self.canon)
+                    .ok()
+                    .map(Arc::new)
+            })
+            .as_ref()
+    }
+
+    /// Has [`Self::btf`] been materialized yet? The whole point of this
+    /// type is that an ordinary run answers `false`, so tests assert on
+    /// it directly rather than inferring it from timing.
+    #[cfg(test)]
+    pub(crate) fn btf_is_materialized(&self) -> bool {
+        self.btf.get().is_some()
+    }
+
+    /// The offset groups the freeze coordinator resolves at coordinator
+    /// start. Served from the sidecar without touching BTF in the
+    /// ordinary case; derived from [`Self::btf`] otherwise.
+    pub(crate) fn dump_offsets(&self) -> &crate::monitor::btf_offsets::DumpOffsets {
+        self.dump_offsets.get_or_init(|| {
+            self.btf()
+                .map(|btf| crate::monitor::btf_offsets::DumpOffsets::from_btf(btf))
+                .unwrap_or_default()
+        })
+    }
 }
 
 /// Parse the vmlinux bytes into [`VmlinuxArtifacts`], deriving the ELF
@@ -234,11 +343,14 @@ fn parse_vmlinux_artifacts(data: &[u8], path: &Path) -> Option<VmlinuxArtifacts>
         let offsets = crate::monitor::btf_offsets::KernelOffsets::from_btf(&btf).ok()?;
         let prog_offsets = crate::monitor::btf_offsets::BpfProgOffsets::from_btf(&btf).ok();
         let psi_offsets = crate::monitor::btf_offsets::PsiGroupOffsets::from_btf(&btf).ok();
+        // Derived here rather than on demand: this path already holds the
+        // BTF, and the sidecar write below needs the bundle anyway.
+        let dump_offsets = crate::monitor::btf_offsets::DumpOffsets::from_btf(&btf);
         Some(MonitorArtifacts {
             offsets,
             prog_offsets,
             psi_offsets,
-            btf: Arc::new(btf),
+            btf: Arc::new(BtfProducts::ready(path.to_path_buf(), btf, dump_offsets)),
         })
     })();
     // Scan IKCONFIG for CONFIG_HZ off the same bytes. Independent of
@@ -270,7 +382,7 @@ fn parse_vmlinux_artifacts(data: &[u8], path: &Path) -> Option<VmlinuxArtifacts>
 /// mtime freshness rule covers vmlinux changes; only ktstr-version
 /// layout drift needs this tag.)
 const ARTIFACTS_SIDECAR_VERSION: &str =
-    concat!("ktstr-vmlinux-artifacts-v4 ", env!("CARGO_PKG_VERSION"));
+    concat!("ktstr-vmlinux-artifacts-v5 ", env!("CARGO_PKG_VERSION"));
 
 /// Plain-old-data mirror of the derived half of [`VmlinuxArtifacts`],
 /// serialized to the `<vmlinux>.artifacts` sidecar via postcard.
@@ -305,6 +417,13 @@ struct ArtifactsSidecar {
     guest_hz: Option<u64>,
     /// Mirror of [`VmlinuxArtifacts::build_id`].
     build_id: Option<Vec<u8>>,
+    /// The coordinator-start offset groups ([`BtfProducts::dump_offsets`]).
+    /// Written alongside `offsets` so a sidecar hit never has to rehydrate
+    /// the `.btf` sidecar just to resolve them. The outer `Option` is the
+    /// bundle's presence, distinct from a group inside it being `None`
+    /// (which is a resolved "this kernel has no such struct" answer);
+    /// absent means the loader falls back to deriving from BTF.
+    dump_offsets: Option<crate::monitor::btf_offsets::DumpOffsets>,
 }
 
 /// Borrowed serialization mirror of [`ArtifactsSidecar`].
@@ -324,6 +443,7 @@ struct ArtifactsSidecarRef<'a> {
     psi_offsets: Option<&'a crate::monitor::btf_offsets::PsiGroupOffsets>,
     guest_hz: &'a Option<u64>,
     build_id: &'a Option<Vec<u8>>,
+    dump_offsets: Option<&'a crate::monitor::btf_offsets::DumpOffsets>,
 }
 
 /// Sidecar path for a vmlinux: append `.artifacts` to the filename so
@@ -373,14 +493,14 @@ fn atomic_write_sidecar(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
 ///
 /// `canon` is the canonicalized vmlinux path (the shared cache key),
 /// used both for the sidecar path and — when the sidecar carries
-/// monitor offsets — to reconstruct the `Arc<Btf>` from the paired
-/// `.btf` sidecar.
+/// monitor offsets — as the [`BtfProducts`] rehydration source for the
+/// consumers that eventually need the full type graph.
 ///
 /// Returns `None` (a miss the caller resolves with a full parse) on:
 /// cache-root membership or freshness failure, read/decode failure, a
 /// version-tag mismatch (silently re-derived per the version gate), OR
-/// a monitor-present sidecar whose paired `.btf` sidecar cannot rebuild
-/// the BTF (the offsets are unusable without it). A monitor-absent
+/// a monitor-present sidecar with no fresh paired `.btf` sidecar (the
+/// offsets are unusable without a BTF to back them). A monitor-absent
 /// sidecar needs no BTF and assembles directly.
 fn load_artifacts_sidecar(canon: &Path) -> Option<VmlinuxArtifacts> {
     // Same gate as the writer: source trees / distro debug paths are
@@ -409,20 +529,25 @@ fn load_artifacts_sidecar(canon: &Path) -> Option<VmlinuxArtifacts> {
         psi_offsets,
         guest_hz,
         build_id,
+        dump_offsets,
     } = decoded;
     let monitor = match offsets {
         Some(offsets) => {
-            // Monitor was present at parse time — rebuild the shared
-            // `Arc<Btf>` from the paired `.btf` sidecar. Its absence
-            // makes the stored offsets unusable, so treat the whole
-            // load as a miss and fall back to a full parse (which
-            // rewrites both sidecars).
-            let btf = crate::monitor::btf_offsets::load_btf_from_sidecar(canon)?;
+            // Monitor was present at parse time. The stored offsets are
+            // only trustworthy if the `Btf` they came from can still be
+            // rehydrated, so keep the pair check the writer gates on —
+            // but as a stat, not a parse, since the parse itself is what
+            // [`BtfProducts`] defers. A missing or stale `.btf` sidecar
+            // is still a miss, and the caller re-parses and rewrites
+            // both sidecars.
+            if !crate::monitor::btf_offsets::btf_sidecar_fresh_for(canon) {
+                return None;
+            }
             Some(MonitorArtifacts {
                 offsets,
                 prog_offsets,
                 psi_offsets,
-                btf: Arc::new(btf),
+                btf: Arc::new(BtfProducts::deferred(canon.to_path_buf(), dump_offsets)),
             })
         }
         None => None,
@@ -458,6 +583,7 @@ fn write_artifacts_sidecar(sidecar: &Path, artifacts: &VmlinuxArtifacts) {
             .and_then(|m| m.psi_offsets.as_ref()),
         guest_hz: &artifacts.guest_hz,
         build_id: &artifacts.build_id,
+        dump_offsets: artifacts.monitor.as_ref().map(|m| m.btf.dump_offsets()),
     };
     let bytes = match postcard::to_allocvec(&payload) {
         Ok(b) => b,
@@ -863,10 +989,11 @@ mod tests {
     // These exercise the cross-process sidecar (encode/decode, the
     // version gate, and the mtime freshness rule) directly with
     // synthetic offset structs — the repo ships no vmlinux fixture with
-    // BTF to drive the full parse path, and the monitor-present Arc<Btf>
-    // reconstruction needs a real `.btf` sidecar. The monitor-absent
-    // path (`monitor: None`) rehydrates without any BTF, so it round-
-    // trips through the real filesystem helpers here.
+    // BTF to drive the full parse path. Neither the monitor-absent path
+    // (`monitor: None`) nor a sidecar-carried `dump_offsets` bundle needs
+    // a parseable BTF, so both round-trip through the real filesystem
+    // helpers here; the deferred-`Btf` tests exploit that by pairing a
+    // deliberately unparseable `.btf` blob with real offsets.
 
     fn synthetic_symbols() -> crate::monitor::symbols::KernelSymbols {
         crate::monitor::symbols::KernelSymbols {
@@ -1026,6 +1153,27 @@ mod tests {
         }
     }
 
+    /// A partially-populated [`DumpOffsets`]: two groups resolved, the
+    /// rest absent. The mix is deliberate — it pins that a `None` group
+    /// round-trips as the resolved answer it is, rather than collapsing
+    /// the whole bundle.
+    fn synthetic_dump_offsets() -> crate::monitor::btf_offsets::DumpOffsets {
+        crate::monitor::btf_offsets::DumpOffsets {
+            cpu_time: Some(crate::monitor::btf_offsets::CpuTimeOffsets {
+                kernel_cpustat_cpustat: 8,
+                kstat_irqs_sum: 16,
+                kstat_softirqs: 24,
+                tick_sched_iowait_sleeptime: Some(32),
+            }),
+            numa: Some(crate::monitor::btf_offsets::NumaStatsOffsets {
+                pglist_data_node_zones: 0,
+                zone_vm_numa_event: 64,
+                zone_size: 1728,
+            }),
+            ..Default::default()
+        }
+    }
+
     /// Preparing a VM resolves the sibling vmlinux and promotes its
     /// cross-process sidecar into the process cache before admission. A
     /// second preparation must reuse the exact same immutable artifact
@@ -1133,6 +1281,7 @@ mod tests {
             psi_offsets: None,
             guest_hz: Some(250),
             build_id: None,
+            dump_offsets: None,
         };
         let bytes = postcard::to_allocvec(&payload).unwrap();
         atomic_write_sidecar(&artifacts_sidecar_path(&canon), &bytes).unwrap();
@@ -1194,12 +1343,159 @@ mod tests {
         );
     }
 
+    /// A monitor-present sidecar serves the coordinator's offset groups
+    /// WITHOUT parsing any BTF.
+    ///
+    /// The `.btf` sidecar here is deliberately not BTF — it is fresh
+    /// enough to satisfy the pair check but would fail every parse. That
+    /// is the load-bearing part: `dump_offsets()` still returns the
+    /// stored bundle, which is only possible if nothing tried to
+    /// rehydrate. `btf()` returning `None` on the same artifact confirms
+    /// the blob really is unparseable, so the first assertion cannot be
+    /// passing by accident.
+    #[test]
+    fn artifacts_sidecar_serves_dump_offsets_without_parsing_btf() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+        let entry = tmp.path().join("kentry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let vmlinux = entry.join("vmlinux");
+        std::fs::write(&vmlinux, b"not-an-elf").unwrap();
+        let canon = std::fs::canonicalize(&vmlinux).unwrap();
+        std::fs::write(entry.join("vmlinux.btf"), b"not-btf-either").unwrap();
+
+        let payload = ArtifactsSidecar {
+            version: ARTIFACTS_SIDECAR_VERSION.to_string(),
+            symbols: synthetic_symbols(),
+            all_symbols: synthetic_all_symbols_sidecar(),
+            offsets: Some(synthetic_kernel_offsets()),
+            prog_offsets: Some(synthetic_prog_offsets()),
+            psi_offsets: Some(synthetic_psi_offsets()),
+            guest_hz: Some(1000),
+            build_id: None,
+            dump_offsets: Some(synthetic_dump_offsets()),
+        };
+        let bytes = postcard::to_allocvec(&payload).unwrap();
+        atomic_write_sidecar(&artifacts_sidecar_path(&canon), &bytes).unwrap();
+
+        let loaded = load_artifacts_sidecar(&canon).expect("monitor-present sidecar must load");
+        let monitor = loaded.monitor.as_ref().expect("monitor must be present");
+        assert!(
+            !monitor.btf.btf_is_materialized(),
+            "loading a sidecar must not materialize the BTF",
+        );
+        let offsets = monitor.btf.dump_offsets();
+        assert!(
+            !monitor.btf.btf_is_materialized(),
+            "serving the stored offset groups must not materialize the BTF either",
+        );
+        assert_eq!(
+            offsets.cpu_time.map(|o| o.kstat_softirqs),
+            Some(24),
+            "the coordinator's offset groups must come straight off the \
+             sidecar; a re-derivation would need a parseable BTF, which \
+             this fixture deliberately does not have",
+        );
+        assert!(
+            offsets.arena.is_none(),
+            "a group absent at derive time must stay absent, not trigger a re-derive",
+        );
+        assert!(
+            monitor.btf.btf().is_none(),
+            "fixture invariant: the `.btf` blob must be unparseable, \
+             otherwise the assertion above proves nothing",
+        );
+    }
+
+    /// A monitor-present sidecar whose `.btf` sidecar is missing is a
+    /// miss: the stored offsets have no BTF to back the consumers that
+    /// still need the full type graph, so the caller re-parses.
+    #[test]
+    fn artifacts_sidecar_monitor_without_btf_sidecar_is_a_miss() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+        let entry = tmp.path().join("kentry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let vmlinux = entry.join("vmlinux");
+        std::fs::write(&vmlinux, b"not-an-elf").unwrap();
+        let canon = std::fs::canonicalize(&vmlinux).unwrap();
+
+        let payload = ArtifactsSidecar {
+            version: ARTIFACTS_SIDECAR_VERSION.to_string(),
+            symbols: synthetic_symbols(),
+            all_symbols: synthetic_all_symbols_sidecar(),
+            offsets: Some(synthetic_kernel_offsets()),
+            prog_offsets: None,
+            psi_offsets: None,
+            guest_hz: None,
+            build_id: None,
+            dump_offsets: Some(synthetic_dump_offsets()),
+        };
+        let bytes = postcard::to_allocvec(&payload).unwrap();
+        atomic_write_sidecar(&artifacts_sidecar_path(&canon), &bytes).unwrap();
+
+        assert!(
+            load_artifacts_sidecar(&canon).is_none(),
+            "monitor offsets with no paired `.btf` sidecar must be a miss",
+        );
+    }
+
+    /// A sidecar that carries monitor offsets but no `dump_offsets`
+    /// bundle falls back to deriving the groups from BTF, exactly as the
+    /// coordinator did before they were serialized.
+    ///
+    /// Unparseable BTF stands in for "derivation ran and produced
+    /// nothing": the observable difference from the seeded case is that
+    /// the stored groups are gone, which is only true if the fallback
+    /// path was taken.
+    #[test]
+    fn artifacts_sidecar_without_dump_offsets_falls_back_to_btf() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+        let entry = tmp.path().join("kentry");
+        std::fs::create_dir_all(&entry).unwrap();
+        let vmlinux = entry.join("vmlinux");
+        std::fs::write(&vmlinux, b"not-an-elf").unwrap();
+        let canon = std::fs::canonicalize(&vmlinux).unwrap();
+        std::fs::write(entry.join("vmlinux.btf"), b"not-btf-either").unwrap();
+
+        let payload = ArtifactsSidecar {
+            version: ARTIFACTS_SIDECAR_VERSION.to_string(),
+            symbols: synthetic_symbols(),
+            all_symbols: synthetic_all_symbols_sidecar(),
+            offsets: Some(synthetic_kernel_offsets()),
+            prog_offsets: None,
+            psi_offsets: None,
+            guest_hz: None,
+            build_id: None,
+            dump_offsets: None,
+        };
+        let bytes = postcard::to_allocvec(&payload).unwrap();
+        atomic_write_sidecar(&artifacts_sidecar_path(&canon), &bytes).unwrap();
+
+        let loaded = load_artifacts_sidecar(&canon).expect("sidecar must still load");
+        let monitor = loaded.monitor.as_ref().expect("monitor must be present");
+        let offsets = monitor.btf.dump_offsets();
+        assert!(
+            offsets.cpu_time.is_none() && offsets.numa.is_none(),
+            "with no stored bundle the groups must come from BTF, which \
+             is unparseable here, so every group resolves absent",
+        );
+    }
+
     /// Every nested offset struct survives a postcard encode/decode
     /// roundtrip losslessly — proves the serde derives on `KernelOffsets`
     /// and all of `ScxEventOffsets` / `SchedstatOffsets` /
     /// `SchedDomainOffsets` / `SchedDomainStatsOffsets` /
-    /// `ScxWatchdogOffsets` / `BpfProgOffsets` / `PsiGroupOffsets` are
-    /// wired up. No filesystem: this pins the wire mirror, not the cache.
+    /// `ScxWatchdogOffsets` / `BpfProgOffsets` / `PsiGroupOffsets` and
+    /// the `DumpOffsets` bundle are wired up. No filesystem: this pins
+    /// the wire mirror, not the cache.
     #[test]
     fn artifacts_sidecar_postcard_roundtrip_all_offsets() {
         let payload = ArtifactsSidecar {
@@ -1211,6 +1507,7 @@ mod tests {
             psi_offsets: Some(synthetic_psi_offsets()),
             guest_hz: Some(1000),
             build_id: None,
+            dump_offsets: Some(synthetic_dump_offsets()),
         };
         let encoded = postcard::to_allocvec(&payload).unwrap();
         let decoded: ArtifactsSidecar = postcard::from_bytes(&encoded).unwrap();

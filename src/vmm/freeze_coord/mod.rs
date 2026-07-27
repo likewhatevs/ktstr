@@ -6365,8 +6365,8 @@ impl KtstrVm {
             .map(|cache| cache.symbols_arc());
         let freeze_coord_kernel_symbols = host_kernel_symbols.clone();
         // Reuse the BTF and symbol products prepared before admission. In
-        // particular, a cross-process sidecar hit reconstructed this Arc<Btf>
-        // without reading the full vmlinux.
+        // particular, a cross-process sidecar hit carries the derived offset
+        // groups directly and leaves the `Btf` itself unmaterialized.
         // The coordinator previously discarded that result, eagerly read the
         // whole ELF, then parsed it twice more (`load_btf_from_bytes` and
         // `KernelSymbols::from_vmlinux_bytes`) in every VM process. Fast
@@ -6378,14 +6378,21 @@ impl KtstrVm {
             .and_then(|a| a.monitor.as_ref())
             .map(|m| Arc::clone(&m.btf));
         let freeze_coord_dump_symbols = host_kernel_symbols.clone();
-        let freeze_coord_bpf_map_offsets = host_vmlinux_artifacts
+        let freeze_coord_bpf_map_offsets = freeze_coord_dump_btf
             .as_ref()
-            .and_then(|a| a.monitor.as_ref())
-            .and_then(|m| crate::monitor::btf_offsets::BpfMapOffsets::from_btf(&m.btf).ok());
+            .and_then(|products| products.dump_offsets().bpf_map.clone());
         let freeze_coord_bpf_prog_offsets = host_vmlinux_artifacts
             .as_ref()
             .and_then(|a| a.monitor.as_ref())
             .and_then(|m| m.prog_offsets.clone());
+        // The per-cgroup psi_group is the same struct as the system-wide
+        // psi_system, so the coordinator's per-cgroup walk reuses the
+        // artifact's `psi_offsets` instead of resolving the identical
+        // group a second time.
+        let freeze_coord_cgroup_psi_offsets = host_vmlinux_artifacts
+            .as_ref()
+            .and_then(|a| a.monitor.as_ref())
+            .and_then(|m| m.psi_offsets);
         // Optional file sink for the failure-dump JSON. Cloned out
         // of the builder field so the closure owns a copy and the
         // freeze coord can write the file without touching the env
@@ -7372,7 +7379,7 @@ impl KtstrVm {
                 // `__per_cpu_offset` symbol couldn't be located in
                 // the kernel's symbol table.
                 let mut prog_per_cpu_offsets: Option<Vec<u64>> = None;
-                // BTF + arena offsets resolved once at coordinator
+                // BTF-derived offset groups, taken once at coordinator
                 // start. Used by `dump_state` after the rendezvous
                 // succeeds to render every BPF map's contents. None
                 // values disable rendering for the relevant code path
@@ -7380,77 +7387,57 @@ impl KtstrVm {
                 // offsets → arena maps fall back to an explanatory
                 // error string in the report).
                 //
-                // The parsed BTF and ELF symbols come from the shared
+                // Every group below comes precomputed off the shared
                 // vmlinux-artifact cache prepared before helper threads
-                // started. Deriving the small dump-specific offset groups
-                // below is cheap; reading and reparsing the full ELF here is
-                // neither necessary nor cancellation-safe.
+                // started, so a sidecar hit answers all of them without
+                // materializing the `Btf` at all — see
+                // [`crate::vmm::vmlinux::BtfProducts`]. Reading and
+                // reparsing the full ELF here is neither necessary nor
+                // cancellation-safe.
                 let dump_btf = freeze_coord_dump_btf;
-                let dump_arena_offsets = dump_btf
-                    .as_ref()
-                    .and_then(|btf| crate::monitor::arena::BpfArenaOffsets::from_btf(btf).ok());
+                let dump_offsets = dump_btf.as_ref().map(|products| products.dump_offsets());
+                let dump_arena_offsets = dump_offsets.and_then(|o| o.arena.clone());
                 // Per-CPU CPU-time / softirq / IRQ / iowait offsets
-                // and the matching `.data..percpu` symbol KVAs.
-                // Resolved once at coordinator start, mirroring
-                // `dump_arena_offsets`. Both Option-typed: a stripped
-                // vmlinux without any of `kernel_cpustat` / `kstat` /
-                // `tick_cpu_sched` symbols still resolves the BTF
-                // offsets fine, but the dump path checks both sides
-                // before constructing a `CpuTimeCapture` so the
-                // capture site only fires when the data is actually
-                // readable.
-                let dump_cpu_time_offsets = dump_btf
-                    .as_ref()
-                    .and_then(|btf| crate::monitor::btf_offsets::CpuTimeOffsets::from_btf(btf).ok());
+                // and the matching `.data..percpu` symbol KVAs. Both
+                // Option-typed: a stripped vmlinux without any of
+                // `kernel_cpustat` / `kstat` / `tick_cpu_sched` symbols
+                // still resolves the BTF offsets fine, but the dump path
+                // checks both sides before constructing a
+                // `CpuTimeCapture` so the capture site only fires when
+                // the data is actually readable.
+                let dump_cpu_time_offsets = dump_offsets.and_then(|o| o.cpu_time);
                 // Per-cgroup PSI-irq walk offsets (Phase A): the cgroup
                 // hierarchy field offsets + the shared psi_group offsets (a
                 // per-cgroup psi_group is the same struct as the system-wide
                 // psi_system). Either None → the per-cgroup capture is skipped
                 // (loud-absent).
-                let dump_cgroup_offsets = dump_btf.as_ref().and_then(|btf| {
-                    crate::monitor::btf_offsets::CgroupWalkOffsets::from_btf(btf).ok()
-                });
-                let dump_cgroup_psi_offsets = dump_btf.as_ref().and_then(|btf| {
-                    crate::monitor::btf_offsets::PsiGroupOffsets::from_btf(btf).ok()
-                });
+                let dump_cgroup_offsets = dump_offsets.and_then(|o| o.cgroup);
+                let dump_cgroup_psi_offsets = freeze_coord_cgroup_psi_offsets;
                 let dump_cpu_time_symbols = freeze_coord_dump_symbols;
-                // SCX walker BTF sub-group offsets. Resolved once at
-                // coord start; per-sub-group resolution failures land
-                // inside the composite as None so the walker's
-                // `missing_groups()` can report which passes are blind
-                // (a kernel built without CONFIG_NUMA loses
+                // SCX walker BTF sub-group offsets. Per-sub-group
+                // resolution failures land inside the composite as None so
+                // the walker's `missing_groups()` can report which passes
+                // are blind (a kernel built without CONFIG_NUMA loses
                 // `scx_sched_pnode`, etc.).
-                let dump_scx_walker_offsets = dump_btf
-                    .as_ref()
-                    .and_then(|btf| {
-                        crate::monitor::btf_offsets::ScxWalkerOffsets::from_btf(btf).ok()
-                    });
+                let dump_scx_walker_offsets = dump_offsets.and_then(|o| o.scx_walker.clone());
                 // Per-task enrichment BTF offsets. All-or-nothing —
-                // any missing sub-group leaves the composite Err and
+                // any missing sub-group leaves the composite absent and
                 // the enrichment capture is skipped. The walker
                 // never runs partially: every Tier-1 field must be
                 // resolvable, otherwise the dump path falls back to
                 // `REASON_NO_TASK_WALKER`.
-                let dump_task_enrichment_offsets = dump_btf
-                    .as_ref()
-                    .and_then(|btf| {
-                        crate::monitor::btf_offsets::TaskEnrichmentOffsets::from_btf(btf).ok()
-                    });
+                let dump_task_enrichment_offsets =
+                    dump_offsets.and_then(|o| o.task_enrichment.clone());
                 // Per-node NUMA event BTF offsets. Required for the
-                // per-node `vm_numa_event[]` walker. Resolved once at
-                // coord start; absent on stripped vmlinux or kernels
-                // built without `CONFIG_NUMA + CONFIG_VM_EVENT_COUNTERS`.
-                let dump_numa_offsets = dump_btf
-                    .as_ref()
-                    .and_then(|btf| {
-                        crate::monitor::btf_offsets::NumaStatsOffsets::from_btf(btf).ok()
-                    });
+                // per-node `vm_numa_event[]` walker. Absent on stripped
+                // vmlinux or kernels built without
+                // `CONFIG_NUMA + CONFIG_VM_EVENT_COUNTERS`.
+                let dump_numa_offsets = dump_offsets.and_then(|o| o.numa);
                 // Hoisted scan_ctx prerequisites. These are pure
-                // functions of the host inputs (vmlinux ELF and the
-                // already-loaded BTF), so they succeed or fail
-                // deterministically at coord-start — no boot-race
-                // window to retry through. Computing once here avoids
-                // re-parsing the BTF on every scan_ctx try_resolve
+                // functions of the host inputs (vmlinux ELF and BTF), so
+                // they succeed or fail deterministically at coord-start —
+                // no boot-race window to retry through. Taking them once
+                // here avoids re-resolving on every scan_ctx try_resolve
                 // iteration. The previous per-iteration retry pattern
                 // was harmless functionally (idempotent) but burned
                 // ~MB-scale ELF reparse work every SCAN_INTERVAL until
@@ -7462,9 +7449,7 @@ impl KtstrVm {
                 // `GuestKernel::text_kva_to_pa`), the per-rq walker uses
                 // `runqueues` + `__per_cpu_offset` to address each
                 // CPU's `rq`.
-                let scan_offsets = dump_btf.as_ref().and_then(|btf| {
-                    crate::monitor::btf_offsets::RunnableScanOffsets::from_btf(btf).ok()
-                });
+                let scan_offsets = dump_offsets.and_then(|o| o.runnable_scan);
                 // jiffies_64 lives on the KernelSymbols instance
                 // computed above for the dump capture. Reusing it
                 // pays a single from_vmlinux cost per coordinator.
@@ -8765,9 +8750,10 @@ impl KtstrVm {
                             freeze_coord_probe_dump_ready,
                             &mut probe_dump_ready_published,
                             || {
-                                let (Some(owned), Some(btf)) =
-                                    (owned_accessor.as_ref(), dump_btf.as_ref())
-                                else {
+                                let (Some(owned), Some(btf)) = (
+                                    owned_accessor.as_ref(),
+                                    dump_btf.as_ref().and_then(|products| products.btf()),
+                                ) else {
                                     return false;
                                 };
                                 let accessor = owned.as_accessor();
@@ -9041,7 +9027,8 @@ impl KtstrVm {
                             // (warn once, fall back to offset 0).
                             if cached_bss_offset.is_none()
                                 && map.btf_kva != 0
-                                && let Some(ref base) = dump_btf
+                                && let Some(base) =
+                                    dump_btf.as_ref().and_then(|products| products.btf())
                             {
                                 match load_probe_bss_offset(
                                     kernel,
@@ -10749,7 +10736,10 @@ impl KtstrVm {
                                 let reply = if let Some(owned) = owned_accessor.as_ref() {
                                     kernel_op_dispatch::dispatch_kernel_op_batch(
                                         owned.guest_kernel(),
-                                        dump_btf.as_deref(),
+                                        dump_btf
+                                            .as_ref()
+                                            .and_then(|products| products.btf())
+                                            .map(Arc::as_ref),
                                         coord_kaslr_offset(),
                                         req,
                                     )
@@ -10985,7 +10975,8 @@ impl KtstrVm {
                                 }
                             }
                             if let Some(owned) = owned_accessor.as_ref()
-                                && let Some(ref btf) = dump_btf
+                                && let Some(btf) =
+                                    dump_btf.as_ref().and_then(|products| products.btf())
                             {
                                 // Build the prog-runtime capture
                                 // when both prerequisites are ready.
@@ -11393,9 +11384,10 @@ impl KtstrVm {
                                 //     default — without that gate the
                                 //     init would cache garbage permanently
                                 //     under KASLR-on guests).
-                                //   - if we're here because `dump_btf.is_none()`,
-                                //     `dump_cpu_time_offsets` (BTF-derived
-                                //     at L2989) is also None.
+                                //   - if we're here because no BTF is
+                                //     available, the vmlinux carried no
+                                //     monitor artifact at all, so
+                                //     `dump_cpu_time_offsets` is also None.
                                 // Either way the cpu_time_capture 4-prereq
                                 // match at L6615 falls to `None` and the
                                 // walker can't run. Hardcoded empty here
@@ -11447,7 +11439,15 @@ impl KtstrVm {
                                 };
                                 tracing::warn!(
                                     owned_accessor = owned_accessor.is_some(),
-                                    dump_btf = dump_btf.is_some(),
+                                    // The materialized state, not merely
+                                    // whether an artifact exists: a monitor
+                                    // artifact whose deferred BTF fails to
+                                    // rehydrate lands in this same branch and
+                                    // must not report `dump_btf = true`.
+                                    dump_btf = dump_btf
+                                        .as_ref()
+                                        .and_then(|products| products.btf())
+                                        .is_some(),
                                     "freeze-coord: dump prerequisites unavailable; \
                                      emitting partial report with vcpu_regs only"
                                 );
@@ -17471,18 +17471,28 @@ impl KtstrVm {
                 let watch_cfg = if watch_targets.is_empty() {
                     None
                 } else {
+                    // The split-base BTF is materialized here rather than
+                    // alongside the other monitor products: this is the only
+                    // monitor consumer that needs the full type graph, and
+                    // only the cells that declared a watch target reach it.
                     match (
                         watch_prog_offsets,
                         symbols.prog_idr,
                         watch_vmlinux_data,
+                        btf.btf().cloned(),
                     ) {
-                        (Some(prog_offsets), Some(prog_idr_kva), Some(vmlinux_data)) => {
+                        (
+                            Some(prog_offsets),
+                            Some(prog_idr_kva),
+                            Some(vmlinux_data),
+                            Some(base_btf),
+                        ) => {
                             Some(monitor::reader::WatchBpfMapsCfg {
                                 targets: watch_targets,
                                 mem: Arc::clone(&mem),
                                 vmlinux: vmlinux.clone(),
                                 vmlinux_data,
-                                base_btf: Arc::clone(&btf),
+                                base_btf,
                                 cr3_pa,
                                 cr3: cr3.clone(),
                                 tcr_el1: tcr_el1_val,
