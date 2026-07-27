@@ -13,6 +13,11 @@ pub(super) use crate::monitor::test_util::name_from_str;
 /// `read_bpf_map_value` / `write_bpf_map_value` bounds test uses.
 /// Only `value_size` (the bound under test) and `value_kva` (mapped
 /// vs. unmapped) ever vary.
+///
+/// Every caller is an x86_64-only test (the bounds tests build their
+/// page tables through `setup_page_table`), so the fixture carries the
+/// same gate: on aarch64 it would be dead code under `-D warnings`.
+#[cfg(target_arch = "x86_64")]
 fn bss_map(value_size: u32, value_kva: Option<u64>) -> BpfMapInfo {
     let (name_bytes, name_len) = name_from_str("test.bss");
     BpfMapInfo {
