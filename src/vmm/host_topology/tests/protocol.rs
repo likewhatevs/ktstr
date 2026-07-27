@@ -5406,6 +5406,40 @@ fn revoked_claim_stays_charged_until_ack() {
     );
 }
 
+/// The permit axis of the grant charge. Permits have no `C_GRANT_*` family of
+/// their own — they fold into the CPU families at `permit_resource_index` —
+/// so this pins the fold at the index level, proves a junior's in-flight
+/// GRANTED permit is visible to a senior's planning snapshot, and proves the
+/// senior that acts on it keeps the junior's grant alive instead of revoking
+/// it. The blind counterpart is [`revoked_claim_stays_charged_until_ack`].
+#[test]
+fn permit_grant_charge_is_visible_and_avoidable() {
+    let _prefixes = LockPrefixesGuard::new();
+    let outcome = protocol::exercise_permit_grant_charge_avoidance_for_tests()
+        .expect("exercise permit grant-charge avoidance");
+    assert!(
+        outcome.junior_permit_charged,
+        "a granted permit claim must charge exactly its folded CPU-space index",
+    );
+    assert!(
+        outcome.planning_view_sees_permit_grant,
+        "the planning snapshot must report the charged permit and only it",
+    );
+    assert!(
+        outcome.permit_charge_is_bias_not_fence,
+        "a permit grant charge must never surface through the HELD-only holder view",
+    );
+    assert!(
+        outcome.senior_avoided_and_junior_kept_grant,
+        "a senior planning against the charge must take the grant-free permit \
+         and leave the junior's grant intact",
+    );
+    assert!(
+        outcome.charge_drains_to_zero,
+        "removing both grants must release exactly their permit charges",
+    );
+}
+
 /// A granted-EX claim is planner bias, never a fence: it must not surface
 /// through `exclusive_held` or the holder counts (which stay HELD-only), only
 /// through the grant-count accessors.

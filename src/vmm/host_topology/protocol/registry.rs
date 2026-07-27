@@ -11559,6 +11559,193 @@ pub(crate) fn exercise_grant_charge_revoke_ack_for_tests() -> Result<GrantCharge
     })
 }
 
+#[cfg(test)]
+pub(crate) struct PermitGrantChargeOutcome {
+    pub(crate) junior_permit_charged: bool,
+    pub(crate) planning_view_sees_permit_grant: bool,
+    pub(crate) permit_charge_is_bias_not_fence: bool,
+    pub(crate) senior_avoided_and_junior_kept_grant: bool,
+    pub(crate) charge_drains_to_zero: bool,
+}
+
+/// The permit axis of the grant charge, end to end. Permits carry no family
+/// of their own: they are charged into `C_GRANT_CPU_ANY`/`C_GRANT_CPU_EX` at
+/// [`permit_resource_index`], exactly as `adjust_held_counts` folds them, so
+/// this pins that fold at the index level rather than trusting the aggregate
+/// total.
+///
+/// The scenario is the positive counterpart of
+/// [`exercise_grant_charge_revoke_ack_for_tests`], which shows a senior
+/// planned blind to a junior's charge taking that junior's resource and
+/// revoking it. Here a senior REPLAN callback consults the same planning
+/// snapshot the permit-selection tier consults, sees the junior's in-flight
+/// GRANTED permit, publishes the grant-free permit instead — and the next
+/// authoritative scan grants the senior with the junior's grant intact.
+#[cfg(test)]
+pub(crate) fn exercise_permit_grant_charge_avoidance_for_tests() -> Result<PermitGrantChargeOutcome>
+{
+    anyhow::ensure!(
+        super::super::cooperative_cpu_permit_end() >= 2,
+        "permit grant-charge fixture needs at least two cooperative permits",
+    );
+    let charged_permit = 0usize;
+    let free_permit = 1usize;
+    let charged_index = permit_resource_index(charged_permit)?;
+    let free_index = permit_resource_index(free_permit)?;
+    let coordinator_cpu = 2_600usize;
+    let senior_designated_cpu = 2_601usize;
+    let senior_replacement_cpu = 2_602usize;
+    let junior_cpu = 2_603usize;
+    let coordinator_claim =
+        ClaimSet::new(std::iter::empty(), [coordinator_cpu], FlockMode::Exclusive);
+    let mut coordinator = Ticket::register(coordinator_claim.clone(), coordinator_claim, None)?;
+    // The senior's designated CPU is exclusively held, so the first scan can
+    // only hand it a speculative REPLAN callback, never a grant.
+    let senior_designated = ClaimSet::new(
+        std::iter::empty(),
+        [senior_designated_cpu],
+        FlockMode::Exclusive,
+    );
+    let senior_watch = ClaimSet::with_permits(
+        std::iter::empty(),
+        [senior_designated_cpu, senior_replacement_cpu],
+        [charged_permit, free_permit],
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let mut senior = Ticket::register(senior_designated.clone(), senior_watch.clone(), None)?;
+    let junior_claim = ClaimSet::with_permits(
+        std::iter::empty(),
+        [junior_cpu],
+        [charged_permit],
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let mut junior = Ticket::register(junior_claim.clone(), junior_claim.clone(), None)?;
+    let junior_permit_charged = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_free_for_tests(&mut table, senior_designated_cpu, false)?;
+        set_cpu_free_for_tests(&mut table, senior_replacement_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, junior_cpu, true)?;
+        set_cpu_free_for_tests(&mut table, charged_index, true)?;
+        set_cpu_free_for_tests(&mut table, free_index, true)?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+        anyhow::ensure!(
+            table
+                .record(senior.slot)?
+                .is_some_and(|record| record.state == STATE_REPLAN)
+                && table
+                    .record(junior.slot)?
+                    .is_some_and(|record| record.state == STATE_GRANTED),
+            "permit charge fixture did not publish its senior callback and junior grant",
+        );
+        grant_charge_derived_matches(&mut table)?;
+        table.header_counts(C_GRANT_CPU_ANY)[charged_index] == 1
+            && table.header_counts(C_GRANT_CPU_EX)[charged_index] == 1
+            && table.header_counts(C_GRANT_CPU_ANY)[free_index] == 0
+            && table.header_counts(C_GRANT_CPU_EX)[free_index] == 0
+    };
+    let contended_candidate = ClaimSet::with_permits(
+        std::iter::empty(),
+        [senior_replacement_cpu],
+        [charged_permit],
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let grant_free_candidate = ClaimSet::with_permits(
+        std::iter::empty(),
+        [senior_replacement_cpu],
+        [free_permit],
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    // The callback runs outside the registry EX fence, exactly where the real
+    // planner takes its snapshot and runs the two-tier permit selection.
+    let senior_designated_for_wake = senior_designated.clone();
+    let senior_watch_for_wake = senior_watch.clone();
+    let contended_for_wake = contended_candidate.clone();
+    let grant_free_for_wake = grant_free_candidate.clone();
+    let observed = std::cell::Cell::new((false, false));
+    let result = senior.run_granted(None, |current, _watch, acquisition_allowed, _, _| {
+        anyhow::ensure!(
+            !acquisition_allowed && current == &senior_designated_for_wake,
+            "permit charge senior callback received the wrong publication",
+        );
+        let snapshot = aggregate_snapshot(&senior_watch_for_wake)?;
+        let sees_grant = snapshot.grant_conflicts(&contended_for_wake)?
+            && !snapshot.grant_conflicts(&grant_free_for_wake)?;
+        // The charge is planner bias: it must not reach the HELD-only holder
+        // scalars at the folded permit index.
+        let bias_only = !snapshot.cpu_exclusive_held(charged_index)?
+            && snapshot.cpu_holder_count(charged_index)? == 0;
+        observed.set((sees_grant, bias_only));
+        // The grant-aware tier's choice: publish the permit no in-flight
+        // grant is counting on.
+        let next_claim = if snapshot.grant_conflicts(&grant_free_for_wake)? {
+            contended_for_wake.clone()
+        } else {
+            grant_free_for_wake.clone()
+        };
+        Ok(GrantAttempt::<()> {
+            acquired: None,
+            preparation_claim: None,
+            preparation_contention: None,
+            next_claim,
+            contention: None,
+        })
+    })?;
+    anyhow::ensure!(
+        matches!(result, GrantResult::Requeued),
+        "permit charge senior completion did not requeue",
+    );
+    let (planning_view_sees_permit_grant, permit_charge_is_bias_not_fence) = observed.get();
+    let senior_avoided_and_junior_kept_grant = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        table.set_pending_flag(PENDING_RESCAN);
+        table.grant_compatible_at(monotonic_now_ns()?.max(1), None)?;
+        let senior_granted_grant_free = table.record(senior.slot)?.is_some_and(|record| {
+            record.state == STATE_GRANTED && record.claim == grant_free_candidate
+        });
+        let junior_still_granted = table
+            .record(junior.slot)?
+            .is_some_and(|record| record.state == STATE_GRANTED);
+        grant_charge_derived_matches(&mut table)?;
+        senior_granted_grant_free
+            && junior_still_granted
+            && table.header_counts(C_GRANT_CPU_ANY)[charged_index] == 1
+            && table.header_counts(C_GRANT_CPU_ANY)[free_index] == 1
+    };
+    // Both tickets are removed straight out of GRANTED — the terminal path
+    // that must release a permit charge without the state ever flipping back.
+    junior.finish(None)?;
+    senior.finish(None)?;
+    coordinator.finish(None)?;
+    let charge_drains_to_zero = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        grant_charge_derived_matches(&mut table)?;
+        grant_charge_total(&table) == 0
+            && table.header_counts(C_GRANT_CPU_ANY)[charged_index] == 0
+            && table.header_counts(C_GRANT_CPU_EX)[charged_index] == 0
+            && table.header_counts(C_GRANT_CPU_ANY)[free_index] == 0
+            && table.header_counts(C_GRANT_CPU_EX)[free_index] == 0
+    };
+    Ok(PermitGrantChargeOutcome {
+        junior_permit_charged,
+        planning_view_sees_permit_grant,
+        permit_charge_is_bias_not_fence,
+        senior_avoided_and_junior_kept_grant,
+        charge_drains_to_zero,
+    })
+}
+
 /// Crash a writer mid-transaction with a live GRANTED and a live REVOKED
 /// record, then prove dirty repair rebuilds the grant charge without
 /// underflow: the demotion loop releases the GRANTED record's charge through
