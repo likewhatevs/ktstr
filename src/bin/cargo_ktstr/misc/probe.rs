@@ -1032,4 +1032,56 @@ mod tests {
             _ => panic!("expected Miss"),
         }
     }
+
+    /// A signal-killed probe carries no exit code to bucket, so
+    /// it is terminal Setup rather than a miss — later bins never
+    /// run.
+    #[test]
+    fn signal_killed_probe_is_a_terminal_setup_error() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let bins = vec![fake_bin(0), fake_bin(1)];
+        let on_success = |_bin: &Path, _out: &Output| -> Result<(), String> { Ok(()) };
+        match probe_collect_with_bins_using(
+            &bins,
+            |bin| Command::new(bin),
+            on_success,
+            |bin, _cmd| {
+                assert_eq!(bin, fake_bin(0), "a killed probe must not advance the walk");
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            },
+        ) {
+            Err(ProbeError::Setup(message)) => assert_eq!(
+                message,
+                "probe /fake/bin0 terminated by signal: 9 (SIGKILL)",
+            ),
+            _ => panic!("a signal-killed probe must be a terminal Setup error"),
+        }
+    }
+
+    /// An `on_success` failure on an exit-0 bin propagates
+    /// verbatim as Setup — a decode failure is never demoted to a
+    /// miss.
+    #[test]
+    fn on_success_error_becomes_a_setup_error() {
+        let bins = vec![fake_bin(0)];
+        let on_success = |_bin: &Path, _out: &Output| -> Result<(), String> {
+            Err("decode scheduler stamp: bad magic".to_string())
+        };
+        match probe_collect_with_bins_using(
+            &bins,
+            |bin| Command::new(bin),
+            on_success,
+            |_bin, _cmd| Ok(probe_output(0, b"", b"")),
+        ) {
+            Err(ProbeError::Setup(message)) => {
+                assert_eq!(message, "decode scheduler stamp: bad magic");
+            }
+            _ => panic!("an on_success failure must be a terminal Setup error"),
+        }
+    }
 }
