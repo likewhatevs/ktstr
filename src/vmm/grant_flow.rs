@@ -66,6 +66,10 @@ static BLOCKS: [AtomicU64; GrantBlock::COUNT] = [const { AtomicU64::new(0) }; Gr
 /// wakes that never carried a grant to lose. Read the two groups separately —
 /// like the headline totals above they are independent rates, not a
 /// conserved flow.
+///
+/// The `predecessors_*` variants are sub-counts: each also increments
+/// [`GrantBlock::Predecessors`], so they partition it by the resource axis the
+/// reservation fenced rather than adding to it.
 #[derive(Clone, Copy)]
 pub(crate) enum GrantBlock {
     /// The wake carried no grant license (a REPLAN re-designation), so no
@@ -86,10 +90,18 @@ pub(crate) enum GrantBlock {
     /// rejects unobserved and held identically, so on a mostly-idle host this
     /// is the cause that looks like contention but is not.
     Unobserved,
+    /// Sub-count of [`GrantBlock::Predecessors`]: the reserved resource is a
+    /// weighted admission permit. Permit selection walks the whole pool through
+    /// the same fence, so a busy pool raises `predecessors` without any
+    /// placement being fenced off the host.
+    PredecessorsPermit,
+    /// Sub-count of [`GrantBlock::Predecessors`]: the reserved resource is an
+    /// LLC. The CPU-axis remainder is `predecessors` minus these two.
+    PredecessorsLlc,
 }
 
 impl GrantBlock {
-    const COUNT: usize = 7;
+    const COUNT: usize = 9;
 
     const ALL: [Self; Self::COUNT] = [
         Self::Unlicensed,
@@ -99,6 +111,8 @@ impl GrantBlock {
         Self::Predecessors,
         Self::Busy,
         Self::Unobserved,
+        Self::PredecessorsPermit,
+        Self::PredecessorsLlc,
     ];
 
     const fn index(self) -> usize {
@@ -114,6 +128,8 @@ impl GrantBlock {
             Self::Predecessors => "predecessors",
             Self::Busy => "busy",
             Self::Unobserved => "unobserved",
+            Self::PredecessorsPermit => "predecessors_permit",
+            Self::PredecessorsLlc => "predecessors_llc",
         }
     }
 }
@@ -290,6 +306,8 @@ mod tests {
             "block_predecessors=",
             "block_busy=",
             "block_unobserved=",
+            "block_predecessors_permit=",
+            "block_predecessors_llc=",
         ] {
             assert!(line.contains(field), "missing {field} in {line}");
         }

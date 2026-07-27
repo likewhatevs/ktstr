@@ -1260,8 +1260,17 @@ impl GrantedProbe {
             note_block(GrantBlock::Contended);
             return Ok(false);
         }
-        if self.predecessors.conflicts(candidate)? {
+        // `first_conflict` costs exactly what `conflicts` does and names the
+        // fenced resource, so the axis split is free: permit-pool selection
+        // walks every pool entry through this fence, and a rejection there says
+        // the admission budget is spent, not that the host has no room.
+        if let Some(marker) = self.predecessors.first_conflict(candidate)? {
             note_block(GrantBlock::Predecessors);
+            match marker.blocker {
+                ResourceKey::Permit(_) => note_block(GrantBlock::PredecessorsPermit),
+                ResourceKey::Llc(_) => note_block(GrantBlock::PredecessorsLlc),
+                ResourceKey::Cpu(_) => {}
+            }
             return Ok(false);
         }
         if !self.availability.allows(candidate)? {
