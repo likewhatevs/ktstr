@@ -151,6 +151,42 @@ fn warn_kvm_clock_failure(ioctl_phase: &'static str, e: &std::io::Error) {
 /// watchdog pre-empting the grace and synthesizing a spurious timeout).
 pub(crate) const WPROF_SHIP_GRACE: Duration = Duration::from_secs(30);
 
+/// Bounded grace the error-exit teardown waits for the guest's
+/// scheduler-exit ship on a NON-wprof run.
+///
+/// The coordinator's error-class trigger is `*scx_root->exit_kind`, which
+/// `scx_claim_exit` (kernel/sched/ext/ext.c) publishes as the FIRST step of
+/// `scx_vexit` — before `ei->msg` is formatted, before the irq_work runs
+/// `scx_dump_state`, and long before the userspace scheduler's
+/// `uei_exited!` poll (100 ms cadence in scx-ktstr) notices, prints its
+/// exit report, and exits. Only when that process exits does the guest's
+/// sched-exit monitor drain the scheduler log over the bulk port
+/// (`MSG_TYPE_SCHED_LOG`) and publish `MSG_TYPE_SCHED_EXIT`.
+///
+/// Killing at dump time therefore races the guest for the scheduler log —
+/// the only host-side surface carrying the scx exit reason and the
+/// `scx_bpf_error` text that `Assert::expect_scx_bpf_error_contains` /
+/// `_matches` and `VmResult::scheduler_log` consumers assert on. The host
+/// wins that race whenever the guest's vCPUs are starved, which silently
+/// drops the evidence and fails the assertion.
+///
+/// So the non-wprof arms arm this grace instead of killing: the loop keeps
+/// running (`freeze_state == Done` blocks a re-freeze), the SCHED_EXIT
+/// dispatch promotes the kill the instant the guest's frame lands — after
+/// its log drain, which precedes it on the same ordered bulk stream — and
+/// this deadline is the backstop if the guest wedges before shipping.
+/// Costs nothing on the path that already shipped: the grace is dropped
+/// the moment the kill is promoted from any other source.
+///
+/// Sized to dominate the guest's own bounded ship: up to one 100 ms
+/// scx-ktstr poll to observe the exit, then `SCHED_FORWARDER_DRAIN_BOUND`
+/// (5 s, `vmm::rust_init::scheduler`) for the stdio forwarders to finish
+/// draining the dead child's pipes
+/// before `dump_sched_output_before_terminal` frames the log. A grace
+/// shorter than that bound would re-introduce the same race one level
+/// down.
+pub(crate) const SCHED_EXIT_SHIP_GRACE: Duration = Duration::from_secs(10);
+
 /// Force run teardown from the coordinator: set the run-level kill flag
 /// and kick its eventfd so the BSP run loop (`kill.load`) and the
 /// `'coord:` loop guard (`freeze_coord_kill.load`) both observe the edge
@@ -177,12 +213,14 @@ fn is_wprof_ship_frame(msg: &crate::vmm::bulk::BulkMessage) -> bool {
     msg.crc_ok && !msg.payload.is_empty() && msg.msg_type == crate::vmm::wire::MSG_TYPE_WPROF_TRACE
 }
 
-/// True iff an armed wprof-ship grace deadline has expired at `now`. The
-/// coordinator's per-iteration backstop kills the VM when this returns
-/// true — the bounded fallback if the guest wedges before shipping its
-/// trace. `None` (no grace armed) never kills; the boundary is inclusive
-/// (`now >= deadline`).
-fn wprof_grace_should_kill(deadline: Option<Instant>, now: Instant) -> bool {
+/// True iff an armed ship-grace deadline has expired at `now`. Shared by
+/// both error-exit graces — the wprof trace ship
+/// ([`WPROF_SHIP_GRACE`]) and the guest scheduler-exit ship
+/// ([`SCHED_EXIT_SHIP_GRACE`]). The coordinator's per-iteration backstops
+/// kill the VM when this returns true — the bounded fallback if the guest
+/// wedges before shipping. `None` (no grace armed) never kills; the
+/// boundary is inclusive (`now >= deadline`).
+fn grace_deadline_expired(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|dl| now >= dl)
 }
 
@@ -306,9 +344,10 @@ pub(crate) enum WatchdogResetTag {
     /// frozen span does not eat the workload budget
     /// (`extend_watchdog_for_freeze`).
     FreezeExtend = 3,
-    /// A wprof-ship grace extended the reset to cover the ship window
+    /// An error-exit ship grace (wprof trace or guest scheduler-exit)
+    /// extended the reset to cover the ship window
     /// (`extend_watchdog_reset_for_grace`).
-    WprofGrace = 4,
+    ShipGrace = 4,
     /// The guest emitted a `LifecyclePhase::SchedulerAttached` frame — a
     /// REAL sched_ext scheduler bound with a live child — and the dispatch
     /// thread re-armed the reset to attach-moment + workload duration. The
@@ -328,7 +367,7 @@ impl WatchdogResetTag {
             1 => Self::ScxRootLatch,
             2 => Self::ScenarioStart,
             3 => Self::FreezeExtend,
-            4 => Self::WprofGrace,
+            4 => Self::ShipGrace,
             5 => Self::GuestAttachConfirm,
             _ => Self::Unset,
         }
@@ -341,7 +380,7 @@ impl WatchdogResetTag {
             Self::ScxRootLatch => "scx-root-attach-latch",
             Self::ScenarioStart => "scenario-start",
             Self::FreezeExtend => "freeze-extend",
-            Self::WprofGrace => "wprof-grace",
+            Self::ShipGrace => "ship-grace",
             Self::GuestAttachConfirm => "guest-attach-confirm",
         }
     }
@@ -783,7 +822,7 @@ mod bpf_map_write_transaction_tests {
 }
 
 /// Extend the watchdog's reset deadline so it accommodates an armed
-/// wprof-ship grace. The watchdog fires at
+/// error-exit ship grace. The watchdog fires at
 /// `effective_deadline = reset_deadline.max(hard_deadline)` where
 /// `reset_deadline = run_start + reset_ns`. `hard_deadline` already
 /// includes `WPROF_SHIP_GRACE` (via `vm_timeout_from_entry`), but a
@@ -805,7 +844,7 @@ fn extend_watchdog_reset_for_grace(
         // Stamp provenance whenever we win the max-style store, so the
         // watchdog dump attributes this deadline to the grace and not
         // to a stale earlier writer. Relaxed is fine — diagnostic only.
-        reset_tag.store(WatchdogResetTag::WprofGrace as u8, Ordering::Relaxed);
+        reset_tag.store(WatchdogResetTag::ShipGrace as u8, Ordering::Relaxed);
     }
 }
 
@@ -822,12 +861,12 @@ fn update_watchdog_reset_max(reset_ns: &std::sync::atomic::AtomicU64, candidate_
     candidate_ns > reset_ns.fetch_max(candidate_ns, Ordering::AcqRel)
 }
 
-/// Arm the wprof-ship grace: extend the watchdog reset deadline to cover
-/// it (so the internal watchdog cannot pre-empt the grace — see
+/// Arm an error-exit ship grace: extend the watchdog reset deadline to
+/// cover it (so the internal watchdog cannot pre-empt the grace — see
 /// [`extend_watchdog_reset_for_grace`]) and return the grace deadline.
 /// Called at every grace-arm site so the deadline and the watchdog
 /// extension always move together.
-fn arm_wprof_grace(
+fn arm_ship_grace(
     run_start: Instant,
     reset_ns: &std::sync::atomic::AtomicU64,
     reset_tag: &std::sync::atomic::AtomicU8,
@@ -1129,7 +1168,7 @@ mod watchdog_reset_tag_tests {
             (WatchdogResetTag::ScxRootLatch, "scx-root-attach-latch"),
             (WatchdogResetTag::ScenarioStart, "scenario-start"),
             (WatchdogResetTag::FreezeExtend, "freeze-extend"),
-            (WatchdogResetTag::WprofGrace, "wprof-grace"),
+            (WatchdogResetTag::ShipGrace, "ship-grace"),
             (WatchdogResetTag::GuestAttachConfirm, "guest-attach-confirm"),
         ] {
             assert_eq!(tag.render(), token);
@@ -1139,10 +1178,10 @@ mod watchdog_reset_tag_tests {
         assert_eq!(WatchdogResetTag::from_u8(200), WatchdogResetTag::Unset);
     }
 
-    /// The wprof-grace writer stamps its tag alongside the ns store when
+    /// The ship-grace writer stamps its tag alongside the ns store when
     /// (and only when) it wins the max-style store.
     #[test]
-    fn grace_writer_stamps_wprof_tag_on_win() {
+    fn grace_writer_stamps_ship_tag_on_win() {
         let reset_ns = AtomicU64::new(0);
         let reset_tag = AtomicU8::new(WatchdogResetTag::ScxRootLatch as u8);
         // First arm from a zero deadline: the grace store wins, so both
@@ -1156,7 +1195,7 @@ mod watchdog_reset_tag_tests {
         assert_ne!(reset_ns.load(Ordering::Acquire), 0);
         assert_eq!(
             WatchdogResetTag::from_u8(reset_tag.load(Ordering::Relaxed)),
-            WatchdogResetTag::WprofGrace,
+            WatchdogResetTag::ShipGrace,
         );
 
         // A far-future existing deadline is NOT shrunk, so the grace does
@@ -8095,6 +8134,16 @@ impl KtstrVm {
                 // shipping. `None` = no ship pending (non-wprof runs never
                 // arm it).
                 let mut wprof_ship_deadline: Option<Instant> = None;
+                // Bounded grace for the guest's scheduler-exit ship on a
+                // NON-wprof error-class exit — see [`SCHED_EXIT_SHIP_GRACE`]
+                // for why killing at dump time drops the scheduler log the
+                // scx-error assertions read. Armed by the error-exit arms
+                // (which then do NOT kill); the SCHED_EXIT dispatch arm
+                // promotes the kill on its own once the guest's frame lands,
+                // and the per-iteration block below drops the deadline as
+                // soon as any source sets the kill, so the ordinary
+                // teardown path is unchanged. `None` = nothing pending.
+                let mut sched_exit_ship_deadline: Option<Instant> = None;
                 // Auto-repro additionally preserves the probe payload. The
                 // trace and probe terminator can arrive in either order and
                 // in different bulk-drain batches, so retain both edges until
@@ -8134,7 +8183,7 @@ impl KtstrVm {
                     // bsp_done / sched_exit_final_pass, so a SCHED_EXIT- or
                     // watchdog-set kill cannot break the loop before the
                     // guest ships its Phase-5 wprof trace. edit-c (WprofTrace)
-                    // or the `wprof_grace_should_kill` backstop clears the
+                    // or the `grace_deadline_expired` backstop clears the
                     // deadline and sets the kill; the NEXT top-of-loop check
                     // then finds this clause false and exits via the normal
                     // sched_exit_final_pass path. (The per-iteration backstop
@@ -8246,7 +8295,7 @@ impl KtstrVm {
                             Ok(n) => n,
                             // EINTR: retry the wait. This `continue` skips
                             // this iteration's wprof-grace backstop
-                            // (`wprof_grace_should_kill`) and edit-c, but the
+                            // (`grace_deadline_expired`) and edit-c, but the
                             // guard's `wprof_ship_deadline.is_some()`
                             // stay-alive keeps the loop live so the next
                             // successful epoll wake re-evaluates both. No
@@ -8458,7 +8507,7 @@ impl KtstrVm {
                                              arming wprof ship grace ({WPROF_SHIP_GRACE:?})"
                                         );
                                         wprof_ship_deadline =
-                                            Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
+                                            Some(arm_ship_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
                                     }
                                     // wprof-ship grace: if an error-exit arm
                                     // (or the SCHED_EXIT arm above) armed
@@ -8581,7 +8630,7 @@ impl KtstrVm {
                     // `!bsp_done && !sched_exit_final_pass` clause), sets
                     // `sched_exit_final_pass`, then breaks — bounded
                     // teardown, no hang.
-                    if wprof_grace_should_kill(wprof_ship_deadline, Instant::now()) {
+                    if grace_deadline_expired(wprof_ship_deadline, Instant::now()) {
                         eprintln!(
                             "freeze-coord: wprof-ship grace ({WPROF_SHIP_GRACE:?}) expired \
                              without a trace; killing"
@@ -8591,6 +8640,38 @@ impl KtstrVm {
                             &freeze_coord_kill_evt,
                         );
                         wprof_ship_deadline = None;
+                    }
+                    // Scheduler-exit ship grace: release + backstop. Same
+                    // placement rationale as the wprof backstop above.
+                    //
+                    // Release first: the grace exists only to keep the
+                    // coordinator from being the one that kills. Once ANY
+                    // source has set the kill — the SCHED_EXIT dispatch arm
+                    // (the awaited event; the guest drained its scheduler log
+                    // over the same ordered bulk stream before publishing
+                    // that frame), the host watchdog, or a BSP-done teardown
+                    // — the grace has nothing left to wait for, so drop it
+                    // and let the ordinary `sched_exit_final_pass` /
+                    // `bsp_done_final_pass` exit run. Without this release
+                    // the backstop below would keep re-killing an already
+                    // dead run until the deadline elapsed.
+                    if sched_exit_ship_deadline.is_some()
+                        && (freeze_coord_kill.load(Ordering::Acquire)
+                            || freeze_coord_bsp_done.load(Ordering::Acquire))
+                    {
+                        sched_exit_ship_deadline = None;
+                    }
+                    if grace_deadline_expired(sched_exit_ship_deadline, Instant::now()) {
+                        eprintln!(
+                            "freeze-coord: scheduler-exit ship grace \
+                             ({SCHED_EXIT_SHIP_GRACE:?}) expired without a SCHED_EXIT; \
+                             killing"
+                        );
+                        trigger_freeze_coord_kill(
+                            &freeze_coord_kill,
+                            &freeze_coord_kill_evt,
+                        );
+                        sched_exit_ship_deadline = None;
                     }
                     // Synchronous periodic-capture + watchpoint
                     // invalidation on an explicit guest swap-notify
@@ -14165,13 +14246,22 @@ impl KtstrVm {
                                 // scheduler-exit trigger fired, and serial output is
                                 // flushed.
                                 //
-                                // For a NON-wprof run no useful work remains
-                                // in the post-exit window: kill now (the BSP
-                                // run loop's `kill.load` and this loop's
-                                // `'coord:` guard both observe the edge on
-                                // the next wake) rather than looping back to
-                                // epoll_wait under EEVDF fallback for the
-                                // remainder of the host-watchdog window.
+                                // The dump is host-side state; the guest still
+                                // owes its OWN error evidence — the scheduler
+                                // log carrying the scx exit reason, drained
+                                // over the bulk port by the guest sched-exit
+                                // monitor once the scheduler process exits.
+                                // The trigger that got us here fires far
+                                // earlier than that (see
+                                // [`SCHED_EXIT_SHIP_GRACE`]), so a NON-wprof
+                                // run arms the bounded scheduler-exit grace
+                                // rather than killing: the SCHED_EXIT
+                                // dispatch arm promotes the kill the instant
+                                // the guest's frame lands. Already-set kill
+                                // means the SCHED_EXIT (or a watchdog/BSP
+                                // teardown) beat the dump here — the ship
+                                // already happened, so there is nothing to
+                                // wait for and the run tears down now.
                                 //
                                 // A wprof run ships its trace LATE (see
                                 // `wprof_ship_deadline` at its declaration):
@@ -14195,16 +14285,20 @@ impl KtstrVm {
                                          awaiting wprof ship (grace {WPROF_SHIP_GRACE:?})"
                                     );
                                     wprof_ship_deadline =
-                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
+                                        Some(arm_ship_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
+                                } else if freeze_coord_kill.load(Ordering::Acquire) {
+                                    eprintln!(
+                                        "freeze-coord: kill already promoted; \
+                                         error-exit dump capture complete"
+                                    );
                                 } else {
                                     eprintln!(
-                                        "freeze-coord: kill triggered after \
-                                         error-exit dump capture"
+                                        "freeze-coord: error-exit dump captured (Captured); \
+                                         awaiting guest scheduler-exit ship \
+                                         (grace {SCHED_EXIT_SHIP_GRACE:?})"
                                     );
-                                    trigger_freeze_coord_kill(
-                                        &freeze_coord_kill,
-                                        &freeze_coord_kill_evt,
-                                    );
+                                    sched_exit_ship_deadline =
+                                        Some(arm_ship_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, SCHED_EXIT_SHIP_GRACE));
                                 }
                             }
                             FreezeOutcome::Degraded(degraded) => {
@@ -14348,34 +14442,36 @@ impl KtstrVm {
                                 // above which uses info for the canonical
                                 // success path.
                                 //
-                                // Same wprof late-ship handling as the
-                                // Captured arm: `thaw_and_barrier` already
-                                // ran, so the guest is thawed and can still
-                                // ship its trace over the bulk port in Phase
-                                // 5; `freeze_state` is now `Done` (no
-                                // re-freeze). For a non-wprof run the kill
-                                // below is forced teardown, not clean
-                                // shutdown. For wprof, arm the bounded ship
-                                // grace instead so the `.repro.wprof.pb` is
-                                // not dropped — the TOKEN_TX drain or the
-                                // `WPROF_SHIP_GRACE` backstop promotes the
-                                // kill.
+                                // Same late-ship handling as the Captured
+                                // arm: `thaw_and_barrier` already ran, so the
+                                // guest is thawed and can still ship over the
+                                // bulk port; `freeze_state` is now `Done` (no
+                                // re-freeze). A degraded capture makes the
+                                // guest's own evidence MORE load-bearing, not
+                                // less, so the scheduler-exit grace applies
+                                // here too — the wprof trace via the
+                                // `WPROF_SHIP_GRACE` deadline, the scheduler
+                                // log via `SCHED_EXIT_SHIP_GRACE`.
                                 if freeze_coord_wprof {
                                     eprintln!(
                                         "freeze-coord: degraded dump captured (Degraded); \
                                          awaiting wprof ship (grace {WPROF_SHIP_GRACE:?})"
                                     );
                                     wprof_ship_deadline =
-                                        Some(arm_wprof_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
+                                        Some(arm_ship_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, WPROF_SHIP_GRACE));
+                                } else if freeze_coord_kill.load(Ordering::Acquire) {
+                                    eprintln!(
+                                        "freeze-coord: kill already promoted; \
+                                         degraded dump capture complete"
+                                    );
                                 } else {
                                     eprintln!(
-                                        "freeze-coord: kill triggered after \
-                                         degraded dump capture"
+                                        "freeze-coord: degraded dump captured (Degraded); \
+                                         awaiting guest scheduler-exit ship \
+                                         (grace {SCHED_EXIT_SHIP_GRACE:?})"
                                     );
-                                    trigger_freeze_coord_kill(
-                                        &freeze_coord_kill,
-                                        &freeze_coord_kill_evt,
-                                    );
+                                    sched_exit_ship_deadline =
+                                        Some(arm_ship_grace(run_start, &watchdog_reset_for_coord, &watchdog_reset_tag_for_coord, SCHED_EXIT_SHIP_GRACE));
                                 }
                             }
                             FreezeOutcome::Suppressed => {
@@ -19213,11 +19309,11 @@ mod wprof_grace_tests {
     //! wprof run), [`is_probe_output_end_frame`] (which drained frame
     //! ends the grace on an auto-repro probe run), and
     //! [`WprofShipState`] (the order-independent artifact
-    //! rendezvous), and [`wprof_grace_should_kill`] (the bounded deadline
+    //! rendezvous), and [`grace_deadline_expired`] (the bounded deadline
     //! backstop).
     use super::{
-        WprofShipState, is_probe_output_end_frame, is_sched_exit_frame, is_teardown_barrier_frame,
-        is_wprof_ship_frame, wprof_grace_should_kill,
+        WprofShipState, grace_deadline_expired, is_probe_output_end_frame, is_sched_exit_frame,
+        is_teardown_barrier_frame, is_wprof_ship_frame,
     };
     use crate::vmm::bulk::BulkMessage;
     use crate::vmm::wire::{
@@ -19357,22 +19453,22 @@ mod wprof_grace_tests {
     }
 
     #[test]
-    fn wprof_grace_should_kill_only_on_expired_armed_deadline() {
+    fn grace_deadline_expired_only_on_expired_armed_deadline() {
         let now = Instant::now();
         assert!(
-            !wprof_grace_should_kill(None, now),
+            !grace_deadline_expired(None, now),
             "no grace armed => never kill"
         );
         assert!(
-            !wprof_grace_should_kill(Some(now + Duration::from_secs(30)), now),
+            !grace_deadline_expired(Some(now + Duration::from_secs(30)), now),
             "future deadline => hold the grace open"
         );
         assert!(
-            wprof_grace_should_kill(Some(now - Duration::from_millis(1)), now),
+            grace_deadline_expired(Some(now - Duration::from_millis(1)), now),
             "expired deadline => kill (bounded fallback)"
         );
         assert!(
-            wprof_grace_should_kill(Some(now), now),
+            grace_deadline_expired(Some(now), now),
             "deadline exactly now => kill (inclusive >= boundary)"
         );
     }
