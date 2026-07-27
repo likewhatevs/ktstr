@@ -3489,26 +3489,40 @@ pub(in crate::vmm) fn finish_run_coordinator<T>(
     }
 }
 
-/// Render a blocked coordinator claim compactly for the exit-timing fallback
-/// accusation: `cpu=<i>,…,llc=<i>,…,permit=<i>,…`, each set capped so a wide
-/// claim cannot produce an unbounded line.
+/// Render a coordinator's WATCH ENVELOPE compactly for the exit-timing
+/// fallback accusation: `cpu=<i>,…,llc=<i>,…,permit=<i>,…`, each set capped so
+/// a wide claim cannot produce an unbounded line.
+///
+/// This is the union over every candidate placement the waiter would accept,
+/// not the subset that actually blocked it — the fallback tick knows only that
+/// nothing in the envelope woke it. Because the sets are sorted and truncated,
+/// an envelope over a wide host renders as its lowest indices; a `<kind>+<n>`
+/// part marks what was dropped so the prefix is not misread as a chosen
+/// placement.
 fn format_watched_resources(claim: &ClaimSet) -> String {
     const MAX_PER_KIND: usize = 8;
     let mut parts = Vec::new();
-    for cpu in claim.cpus.iter().take(MAX_PER_KIND) {
-        parts.push(format!("cpu={cpu}"));
-    }
-    for llc in claim.llcs.iter().take(MAX_PER_KIND) {
-        parts.push(format!("llc={llc}"));
-    }
-    for permit in claim.permits.iter().take(MAX_PER_KIND) {
-        parts.push(format!("permit={permit}"));
-    }
+    let mut render = |label: &str, resources: &BTreeSet<usize>| {
+        for resource in resources.iter().take(MAX_PER_KIND) {
+            parts.push(format!("{label}={resource}"));
+        }
+        if let Some(dropped) = resources.len().checked_sub(MAX_PER_KIND).filter(|n| *n > 0) {
+            parts.push(format!("{label}+{dropped}"));
+        }
+    };
+    render("cpu", &claim.cpus);
+    render("llc", &claim.llcs);
+    render("permit", &claim.permits);
     if parts.is_empty() {
         "none".to_string()
     } else {
         parts.join(",")
     }
+}
+
+#[cfg(test)]
+pub(crate) fn format_watched_resources_for_tests(claim: &ClaimSet) -> String {
+    format_watched_resources(claim)
 }
 
 /// Nonblocking physical probe of one resource lockfile: `true` iff it is
@@ -4031,10 +4045,11 @@ fn acquire_as_coordinator_impl<T>(
                             COORDINATOR_FALLBACK_WAKES.fetch_add(1, Ordering::Relaxed);
                             // Accusation: a full COORDINATOR_WAKE_FALLBACK tick
                             // rather than a live edge means a blocked claim's
-                            // release wake was missed. Name the blocking
-                            // resources and their holder so every 30s tick in CI
-                            // is attributable. Best-effort, one nonblocking SH
-                            // read; never perturbs the wait.
+                            // release wake was missed. Name the WATCHED
+                            // envelope (the tick cannot know which subset of it
+                            // blocked) and a holder within it, so every 30s
+                            // tick in CI is attributable. Best-effort, one
+                            // nonblocking SH read; never perturbs the wait.
                             if !watched_resources.cpus.is_empty()
                                 || !watched_resources.llcs.is_empty()
                                 || !watched_resources.permits.is_empty()

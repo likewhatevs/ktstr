@@ -9670,3 +9670,33 @@ fn same_wake_redesignation_releases_a_physically_acquired_alternative_on_wave_ex
     );
     assert!(replan_drained, "wave expiry must drain the ring slot");
 }
+
+/// The fallback accusation names the coordinator's whole watch envelope, and
+/// a wide envelope is truncated to its lowest indices. Without the `+<n>`
+/// parts that prefix reads exactly like a narrow chosen placement — the
+/// misreading that once made an idle-host queue stall look like every cell
+/// colliding on CPUs 0-7.
+#[test]
+fn fallback_accusation_marks_a_truncated_watch_envelope() {
+    let narrow = protocol::ClaimSet::with_modes(
+        [3usize],
+        [1usize, 2],
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    assert_eq!(
+        protocol::format_watched_resources_for_tests(&narrow),
+        "cpu=1,cpu=2,llc=3",
+    );
+
+    let wide = protocol::ClaimSet::with_modes(
+        0usize..2,
+        0usize..11,
+        crate::flock::FlockMode::Shared,
+        crate::flock::FlockMode::Shared,
+    );
+    assert_eq!(
+        protocol::format_watched_resources_for_tests(&wide),
+        "cpu=0,cpu=1,cpu=2,cpu=3,cpu=4,cpu=5,cpu=6,cpu=7,cpu+3,llc=0,llc=1",
+    );
+}
