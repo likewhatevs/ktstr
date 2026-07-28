@@ -3420,17 +3420,31 @@ impl HolderObserver {
         }
     }
 
-    fn proof_file(&mut self, key: ResourceKey) -> Result<&std::fs::File> {
+    /// The proof file for `key`, or `None` when its lockfile does not exist.
+    ///
+    /// A resource lockfile is created by the first process to flock it
+    /// (`open_lockfile` opens `O_CREAT`) and is never unlinked, so a missing
+    /// path means no process has ever held that resource. This probe must not
+    /// create it: the open is deliberately read-only so its close is
+    /// `IN_CLOSE_NOWRITE` and stays out of the coordinator's watch queue (see
+    /// [`RealInotifyWake`]), and creating a lockfile per pool index would emit
+    /// exactly the `IN_CLOSE_WRITE` storm that filter exists to avoid.
+    fn proof_file(&mut self, key: ResourceKey) -> Result<Option<&std::fs::File>> {
         if let std::collections::btree_map::Entry::Vacant(entry) = self.proof_files.entry(key) {
             let path = match key {
                 ResourceKey::Llc(index) => super::llc_lock_path(index),
                 ResourceKey::Cpu(index) => super::cpu_lock_path(index),
                 ResourceKey::Permit(index) => super::permit_lock_path(index),
             };
-            let file = std::fs::OpenOptions::new().read(true).open(&path)?;
-            entry.insert(file);
+            match std::fs::OpenOptions::new().read(true).open(&path) {
+                Ok(file) => {
+                    entry.insert(file);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(&self.proof_files[&key])
+        Ok(Some(&self.proof_files[&key]))
     }
 
     fn try_proof(&mut self, key: ResourceKey, mode: FlockMode) -> Result<bool> {
@@ -3439,14 +3453,26 @@ impl HolderObserver {
             FlockMode::Exclusive => FlockOperation::NonBlockingLockExclusive,
             FlockMode::Shared => FlockOperation::NonBlockingLockShared,
         };
-        match flock(self.proof_file(key)?, operation) {
-            Ok(()) => {
-                self.proof_locks.insert(key);
-                Ok(true)
+        let Some(file) = self.proof_file(key)? else {
+            // Never created, so never held: every mode is available. There is
+            // no proof flock to retain across the publication, so this one
+            // observation rests on the pending/serial invalidation instead —
+            // an acquirer that takes the resource in the meantime creates the
+            // lockfile, publishes BUSY, and clears the pending bit this
+            // observation must still match to be applied.
+            return Ok(true);
+        };
+        let acquired = match flock(file, operation) {
+            Ok(()) => true,
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => false,
+            Err(error) => {
+                return Err(std::io::Error::from_raw_os_error(error.raw_os_error()).into());
             }
-            Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(false),
-            Err(error) => Err(std::io::Error::from_raw_os_error(error.raw_os_error()).into()),
+        };
+        if acquired {
+            self.proof_locks.insert(key);
         }
+        Ok(acquired)
     }
 
     /// Classify one resource by the strongest lock its proof file still
@@ -3510,6 +3536,45 @@ impl HolderObserver {
             }
         }
     }
+}
+
+/// Observe one batch that names a resource whose lockfile exists beside one
+/// whose lockfile was never created.
+///
+/// The coordinator's re-observation batch spans the whole aggregate watch, and
+/// a registered VM watch names every permit in the pool — but a permit lockfile
+/// exists only once some process has flocked that index. A batch that gives up
+/// on the first missing path resolves nothing at all, leaving every index it
+/// covered UNKNOWN with its pending bit set, which `allows` then rejects
+/// exactly like a held resource.
+#[cfg(test)]
+pub(crate) fn exercise_missing_lockfile_observation_for_tests() -> Result<()> {
+    let present_cpu = 0usize;
+    let never_created_permit = 7usize;
+    crate::flock::materialize(super::cpu_lock_path(present_cpu))?;
+    let request = registry::ObservationRequest {
+        cpus: std::collections::BTreeMap::from([(present_cpu, (Some(1), Some(1)))]),
+        llcs: std::collections::BTreeMap::new(),
+        permits: std::collections::BTreeMap::from([(never_created_permit, (None, Some(1)))]),
+    };
+    let mut observer = HolderObserver::new();
+    let observation = observer.observe(&request);
+    observer.release_proofs();
+    anyhow::ensure!(
+        observation
+            .cpus
+            .get(&present_cpu)
+            .is_some_and(|observed| observed.availability == registry::ResourceAvailability::Free),
+        "a resolvable probe must survive a batch mate whose lockfile is missing",
+    );
+    anyhow::ensure!(
+        observation
+            .permits
+            .get(&never_created_permit)
+            .is_some_and(|observed| observed.availability == registry::ResourceAvailability::Free),
+        "a permit lockfile that was never created names a permit nobody has ever held",
+    );
+    Ok(())
 }
 
 /// Run the elected coordinator loop. The step closure re-plans from live holder

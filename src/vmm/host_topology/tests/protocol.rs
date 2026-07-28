@@ -111,6 +111,18 @@ fn sustained_wait_diagnostics_keep_the_largest_live_queue_in_each_bucket() {
     );
 }
 
+/// A coordinator re-observes its whole aggregate watch, and a registered VM
+/// watch names every permit in the pool — but a permit lockfile exists only
+/// once some process has flocked that index, so most of a wide pool has no
+/// path to open. The batch must classify those as free and keep the rest of
+/// its work, not abandon every resolvable probe beside them.
+#[test]
+fn observation_batch_survives_a_permit_lockfile_that_was_never_created() {
+    let _prefixes = LockPrefixesGuard::new();
+    protocol::exercise_missing_lockfile_observation_for_tests()
+        .expect("observe a batch spanning a lockfile that was never created");
+}
+
 #[test]
 fn pending_activation_republishes_an_overlapping_watch_observation() {
     let _prefixes = LockPrefixesGuard::new();
