@@ -191,6 +191,7 @@ fn step_alu64_add_k_in_range_keeps_frameaddr_and_records() {
         &[],
         &datasec_pointers,
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],
@@ -237,6 +238,7 @@ fn step_alu64_add_k_overflow_drops_frameaddr_to_unknown() {
         &[],
         &datasec_pointers,
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],
@@ -574,6 +576,7 @@ fn handle_stx_unknown_value_does_not_invalidate_prior_arena_stx_finding() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],

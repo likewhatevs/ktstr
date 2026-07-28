@@ -13,14 +13,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::console;
 use super::host_comms::BulkDrainResult;
 use super::kvm;
 use super::pi_mutex::PiMutex;
-use super::vcpu::{VcpuThread, WatchpointArm};
+use super::vcpu::WatchpointArm;
 use super::virtio_blk::{VirtioBlkCounters, VirtioBlkCountersSnapshot};
 use super::virtio_net::{VirtioNetCounters, VirtioNetCountersSnapshot};
 use super::wire;
@@ -53,6 +52,20 @@ pub enum WatchdogKillReason {
     Tier3Deadman,
     /// An AP set the kill flag (panic-driven), not a watchdog expiry.
     ApKill,
+    /// A scheduler attach consumed its host-measured service budget, then
+    /// failed to acknowledge the host's generation-tagged cancellation
+    /// within the fail-closed grace.
+    AttachCancelUnacknowledged,
+    /// The host monitor became terminal or was unavailable while a
+    /// scheduler attach attempt still owned the lifecycle watchdog.
+    AttachMonitorUnavailable,
+    /// The guest published scheduler-attach `Finished` but consumed the
+    /// delivered-service grace without completing the FinishedAck/Settled
+    /// rendezvous.
+    AttachFinishUnsettled,
+    /// A finite guest prerequisite consumed its delivered-service budget,
+    /// or the host sensor needed to account that budget became terminal.
+    ReadinessWaitFailed,
 }
 
 /// Final guest lifecycle stage as tracked by the progress ledger —
@@ -1822,21 +1835,20 @@ pub(crate) struct VmRunState {
     /// Run-relative ns of the periodic capture-window end (0 = the
     /// window never resolved) → [`VmResult::periodic_window_end`].
     pub(crate) periodic_window_end_ns_raw: u64,
+    /// Framework/infrastructure failure raised after the VM had already
+    /// started. `collect_results` performs the complete teardown first, then
+    /// returns this as a marker-typed error which cannot be inverted by
+    /// `expect_err` or classified as a resource skip.
+    pub(crate) framework_error: Option<String>,
     /// Event-anchored per-phase dilation + Body contention intervals,
     /// finalized from live proc entries plus one-shot AP exit snapshots.
     pub(crate) contention_witness: Option<ContentionWitness>,
-    pub(crate) ap_threads: Vec<VcpuThread>,
-    pub(crate) monitor_handle: Option<JoinHandle<monitor::reader::MonitorLoopResult>>,
-    pub(crate) bpf_write_handle: Option<JoinHandle<()>>,
-    /// Freeze coordinator handle, always `None` in the
-    /// production path: [`super::KtstrVm::run_vm`] joins the
-    /// coordinator BEFORE the BSP `VcpuFd` falls out of scope so the
-    /// coordinator's captured BSP `ImmediateExitHandle` cannot
-    /// outlive the kvm_run mmap (UAF prevention). The optional shape
-    /// is preserved so the field stays trivially constructible in
-    /// any future test-only or alternative-orchestration path that
-    /// might not perform the early join.
-    pub(crate) freeze_coordinator: Option<JoinHandle<()>>,
+    /// Armed owner for every AP, monitor, and BPF-map-writer thread which can
+    /// retain a raw view of guest memory. It moves directly from `run_vm` into
+    /// this handoff state without a naked-JoinHandle interval. Its Drop runs
+    /// before `vm` (field declaration order), so an unwind or an abandoned
+    /// `VmRunState` still bounded-joins all readers before guest memory unmaps.
+    pub(crate) run_threads: super::freeze_coord::RunVmThreadGuard,
     pub(crate) com1: Arc<PiMutex<console::Serial>>,
     pub(crate) com2: Arc<PiMutex<console::Serial>>,
     pub(crate) kill: Arc<AtomicBool>,
@@ -1945,8 +1957,10 @@ pub(crate) struct VmRunState {
     /// falls back to `0`, which produces correct translations on
     /// non-KASLR boots.
     pub(crate) cr3: Arc<std::sync::atomic::AtomicU64>,
-    /// Cached vmlinux bytes for collect_verifier_stats. Avoids
-    /// re-reading from disk (14-28s on cold cache).
+    /// Optional preloaded vmlinux bytes for the exceptional
+    /// `collect_verifier_stats` fallback. Ordinary VM runs leave this `None`:
+    /// the live prog accessor consumes the shared derived artifacts, and the
+    /// fallback loads bytes lazily only when it is genuinely needed.
     pub(crate) vmlinux_data: Option<Arc<Vec<u8>>>,
     /// Pre-built prog accessor from the accessor-init worker.
     /// When present, `collect_verifier_stats` skips the ~4s

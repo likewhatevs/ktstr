@@ -37,7 +37,7 @@
 //! [`crate::vmm::wire::MsgType::is_coordinator_internal`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::snapshot::decode_snapshot_request;
@@ -94,6 +94,11 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// resolving the target and before mutation. `None` on runs without a
     /// configured write, so ordinary tests allocate no fd and take no arm.
     pub bpf_map_write_ready_evt: Option<&'a Arc<EventFd>>,
+    /// Generic finite guest prerequisite/readiness-wait overlay. A
+    /// CRC-valid, canonical `ReadinessWait` frame opens or closes one
+    /// generation. The watchdog consults the same object and suppresses its
+    /// ordinary tiers only while an explicit wait is active.
+    pub readiness_wait: Option<&'a super::readiness_wait::ReadinessWaitOverlay>,
     /// Scheduler-swap notification latch. Set `true` on a CRC-valid
     /// `MSG_TYPE_SCHED_SWAP_NOTIFY` frame; the freeze coordinator's
     /// run-loop reads-and-clears it each iteration and synchronously
@@ -276,6 +281,20 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// a real forward transition, so duplicate frames never trigger `/proc`
     /// work.
     pub contention_recorder: Option<&'a crate::vmm::freeze_coord::ContentionWitnessRecorder>,
+    /// Host-authoritative scheduler attach-attempt overlay. A CRC-valid,
+    /// canonical [`crate::vmm::wire::AttachAttemptEvent`] re-anchors the
+    /// monitor's max-vCPU CPU accounting without moving the forward-only
+    /// coarse lifecycle stage. `None` only in dispatch fixtures which do not
+    /// exercise attach accounting.
+    pub attach_attempts:
+        Option<&'a crate::vmm::freeze_coord::attach_watchdog::AttachAttemptTracker>,
+    /// Port-0 host→guest control plane used to acknowledge an accepted
+    /// attach Started boundary after its CPU re-anchor is committed.
+    pub attach_control_console: Option<
+        &'a std::sync::Arc<
+            crate::vmm::pi_mutex::PiMutex<crate::vmm::virtio_console::VirtioConsole>,
+        >,
+    >,
     /// The host vmlinux's GNU build-id, compared against the booted
     /// kernel's build-id in the `MSG_TYPE_KERN_BUILD_ID` arm. `None`
     /// (the vmlinux carried no note, or none was resolved) disables the
@@ -492,20 +511,7 @@ pub(super) fn dispatch_bulk_message(
                     );
                 } else {
                     eprintln!("freeze_coord: SchedExit received; kill PROMOTED");
-                    sinks.kill.store(true, Ordering::Release);
-                    // EFD_NONBLOCK on a freshly-created eventfd never
-                    // legitimately fails; log unconditionally so a future
-                    // regression (e.g. the eventfd was closed by another
-                    // owner) surfaces in the host log instead of silently
-                    // swallowing the kill edge.
-                    if let Err(e) = sinks.kill_evt.write(1) {
-                        tracing::warn!(
-                            err = %e,
-                            "freeze_coord: kill_evt write on SCHED_EXIT \
-                             promotion failed; the kill AtomicBool above is \
-                             still authoritative"
-                        );
-                    }
+                    crate::vmm::publish_vm_kill(sinks.kill, sinks.kill_evt);
                 }
             }
             // SchedExit is verdict data — bucket only on CRC-valid
@@ -581,6 +587,37 @@ pub(super) fn dispatch_bulk_message(
             }
             None
         }
+        Some(crate::vmm::wire::MsgType::ReadinessWait) => {
+            // A readiness-wait boundary owns watchdog progress, so accept it
+            // only with both transport integrity and the exact canonical
+            // typed payload. Malformed/torn frames remain internal but cannot
+            // mask ordinary watchdog policy.
+            if msg.crc_ok
+                && let Some(event) =
+                    crate::vmm::wire::ReadinessWaitEvent::from_payload(&msg.payload)
+                && let Some(overlay) = sinks.readiness_wait
+            {
+                let update = overlay.apply(event, || {
+                    let Some(ledger) = sinks.progress_ledger else {
+                        return 0;
+                    };
+                    let wall_ns =
+                        u64::try_from(sinks.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    ledger.reanchor_phase_cpu(wall_ns)
+                });
+                if matches!(
+                    update,
+                    super::readiness_wait::ReadinessWaitUpdate::Replaced { .. }
+                ) {
+                    tracing::warn!(
+                        ?event,
+                        ?update,
+                        "freeze_coord: non-canonical readiness-wait transition"
+                    );
+                }
+            }
+            None
+        }
         Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {
             // CRC-valid, EMPTY-payload swap-notify: latch the
             // synchronous periodic-capture + watchpoint invalidation the
@@ -596,6 +633,38 @@ pub(super) fn dispatch_bulk_message(
                 sinks
                     .sched_swap_notify
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            None
+        }
+        Some(crate::vmm::wire::MsgType::AttachAttempt) => {
+            // Attach-attempt boundaries are load-bearing watchdog control
+            // frames, so both CRC and exact typed shape gate promotion. They
+            // remain coordinator-internal regardless of validity and never
+            // enter the verdict bucket.
+            if msg.crc_ok
+                && let Some(event) =
+                    crate::vmm::wire::AttachAttemptEvent::from_payload(&msg.payload)
+                && let (Some(attempts), Some(ledger), Some(control_console)) = (
+                    sinks.attach_attempts,
+                    sinks.progress_ledger,
+                    sinks.attach_control_console,
+                )
+            {
+                let wall_ns =
+                    u64::try_from(sinks.run_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let disposition = attempts.observe_event(event, ledger, wall_ns, control_console);
+                match disposition {
+                    crate::vmm::freeze_coord::attach_watchdog::AttachEventDisposition::Started
+                    | crate::vmm::freeze_coord::attach_watchdog::AttachEventDisposition::Finished
+                    | crate::vmm::freeze_coord::attach_watchdog::AttachEventDisposition::Settled
+                    | crate::vmm::freeze_coord::attach_watchdog::AttachEventDisposition::Duplicate
+                    | crate::vmm::freeze_coord::attach_watchdog::AttachEventDisposition::Stale => {}
+                    unexpected => tracing::warn!(
+                        ?event,
+                        ?unexpected,
+                        "freeze_coord: rejected conflicting scheduler attach-attempt boundary"
+                    ),
+                }
             }
             None
         }
@@ -1256,6 +1325,10 @@ mod stage_tests {
     /// dispatch and then read the ledger's post-state.
     struct SinkState {
         ledger: ProgressLedger,
+        attach_attempts: crate::vmm::freeze_coord::attach_watchdog::AttachAttemptTracker,
+        attach_control_console: std::sync::Arc<
+            crate::vmm::pi_mutex::PiMutex<crate::vmm::virtio_console::VirtioConsole>,
+        >,
         kill: Arc<AtomicBool>,
         kill_evt: Arc<EventFd>,
         sys_rdy_evt: Option<Arc<EventFd>>,
@@ -1289,6 +1362,11 @@ mod stage_tests {
         fn new() -> Self {
             Self {
                 ledger: ProgressLedger::default(),
+                attach_attempts:
+                    crate::vmm::freeze_coord::attach_watchdog::AttachAttemptTracker::default(),
+                attach_control_console: std::sync::Arc::new(crate::vmm::pi_mutex::PiMutex::new(
+                    crate::vmm::virtio_console::VirtioConsole::new(),
+                )),
                 kill: Arc::new(AtomicBool::new(false)),
                 kill_evt: Arc::new(EventFd::new(EFD_NONBLOCK).expect("kill eventfd")),
                 sys_rdy_evt: Some(Arc::new(
@@ -1331,6 +1409,7 @@ mod stage_tests {
                 run_is_wprof: false,
                 sys_rdy_evt: &mut self.sys_rdy_evt,
                 bpf_map_write_ready_evt: None,
+                readiness_wait: None,
                 snapshot_requests_pending: &mut self.snapshot_requests_pending,
                 kernel_op_requests_pending: &mut self.kernel_op_requests_pending,
                 kern_phys_base: &self.kern_phys_base,
@@ -1360,6 +1439,8 @@ mod stage_tests {
                 periodic_guest_elapsed_ns: &self.periodic_guest_elapsed_ns,
                 progress_ledger: Some(&self.ledger),
                 contention_recorder: None,
+                attach_attempts: Some(&self.attach_attempts),
+                attach_control_console: Some(&self.attach_control_console),
                 expected_kernel_build_id: None,
             }
         }
@@ -1404,6 +1485,23 @@ mod stage_tests {
         )
     }
 
+    fn attach_attempt(
+        transition: crate::vmm::wire::AttachAttemptTransition,
+        generation: u64,
+        crc_ok: bool,
+    ) -> crate::vmm::bulk::BulkMessage {
+        let event = crate::vmm::wire::AttachAttemptEvent {
+            transition,
+            kind: crate::vmm::wire::AttachAttemptKind::Replace,
+            generation,
+        };
+        frame(
+            MsgType::AttachAttempt.wire_value(),
+            event.to_payload().to_vec(),
+            crc_ok,
+        )
+    }
+
     /// Test cell path: Boot →(SysRdy)→ Attach →(PayloadStarting)→
     /// Dispatch →(ScenarioStart)→ Body →(Exit)→ Teardown. Each forward
     /// step bumps both epochs by exactly one. (The Tier-1 CPU anchor is
@@ -1440,17 +1538,63 @@ mod stage_tests {
         assert_eq!(s.progress_epoch(), 4);
     }
 
-    /// Verifier cell path reaches Body via `WorkloadDispatched` (not
-    /// ScenarioStart), and ScenarioEnd drives Teardown.
+    /// Production verifier ordering enters Body at ScenarioStart, confirms
+    /// dispatch without a duplicate epoch, then closes Body at ScenarioEnd.
+    /// The common post-workload ScenarioPause cannot regress Teardown.
     #[test]
     fn verifier_cell_reaches_body_via_workload_dispatched() {
         let mut s = SinkState::new();
         s.dispatch(&frame(MsgType::SysRdy.wire_value(), Vec::new(), true));
         s.dispatch(&lifecycle(LifecyclePhase::PayloadStarting, true));
         assert_eq!(s.phase(), LifecycleStage::Dispatch as u8);
+        s.dispatch(&frame(
+            MsgType::ScenarioStart.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+        let body_epoch = s.phase_epoch();
         s.dispatch(&lifecycle(LifecyclePhase::WorkloadDispatched, true));
         assert_eq!(s.phase(), LifecycleStage::Body as u8);
-        s.dispatch(&frame(MsgType::ScenarioEnd.wire_value(), Vec::new(), true));
+        assert_eq!(
+            s.phase_epoch(),
+            body_epoch,
+            "dispatch confirmation in the same stage is not a second milestone"
+        );
+        s.dispatch(&frame(
+            MsgType::ScenarioEnd.wire_value(),
+            vec![0; crate::vmm::wire::SCENARIO_END_PAYLOAD_SIZE],
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
+        let teardown_epoch = s.phase_epoch();
+        s.dispatch(&frame(
+            MsgType::ScenarioPause.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
+        assert_eq!(s.phase_epoch(), teardown_epoch);
+    }
+
+    /// A verifier probe which fails before WorkloadDispatched still owns the
+    /// ScenarioEnd boundary, so its cleanup cannot remain in Body either.
+    #[test]
+    fn failed_verifier_probe_still_closes_body_before_cleanup() {
+        let mut s = SinkState::new();
+        s.dispatch(&frame(MsgType::SysRdy.wire_value(), Vec::new(), true));
+        s.dispatch(&lifecycle(LifecyclePhase::PayloadStarting, true));
+        s.dispatch(&frame(
+            MsgType::ScenarioStart.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+        s.dispatch(&frame(
+            MsgType::ScenarioEnd.wire_value(),
+            vec![0; crate::vmm::wire::SCENARIO_END_PAYLOAD_SIZE],
+            true,
+        ));
         assert_eq!(s.phase(), LifecycleStage::Teardown as u8);
     }
 
@@ -1621,6 +1765,116 @@ mod stage_tests {
             crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm as u8,
             "the confirm arm must stamp GuestAttachConfirm provenance",
         );
+    }
+
+    #[test]
+    fn attach_attempt_reanchors_cpu_overlay_without_stage_regression_or_bucket() {
+        let mut s = SinkState::new();
+        s.dispatch(&frame(
+            MsgType::ScenarioStart.wire_value(),
+            Vec::new(),
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+        let phase_epoch = s.phase_epoch();
+        let progress_epoch = s.progress_epoch();
+
+        assert!(
+            s.dispatch(&attach_attempt(
+                crate::vmm::wire::AttachAttemptTransition::Started,
+                41,
+                true,
+            ))
+            .is_none(),
+            "attach control frame leaked into verdict bucket",
+        );
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+        assert_eq!(s.phase_epoch(), phase_epoch + 1);
+        assert_eq!(s.progress_epoch(), progress_epoch + 1);
+        assert_eq!(
+            s.attach_control_console.lock().pending_rx_bytes_for_test(),
+            crate::vmm::wire::encode_attach_started_ack(41),
+            "host did not acknowledge the accepted/re-anchored Started generation",
+        );
+
+        // Duplicate start is idempotent and cannot reset the CPU budget.
+        s.dispatch(&attach_attempt(
+            crate::vmm::wire::AttachAttemptTransition::Started,
+            41,
+            true,
+        ));
+        assert_eq!(s.phase_epoch(), phase_epoch + 1);
+        let mut expected_control = crate::vmm::wire::encode_attach_started_ack(41).to_vec();
+        expected_control.extend_from_slice(&crate::vmm::wire::encode_attach_started_ack(41));
+        assert_eq!(
+            s.attach_control_console.lock().pending_rx_bytes_for_test(),
+            expected_control,
+            "duplicate Started was not re-acknowledged idempotently",
+        );
+
+        // CRC-bad finish cannot close or re-anchor the live generation.
+        s.dispatch(&attach_attempt(
+            crate::vmm::wire::AttachAttemptTransition::Finished,
+            41,
+            false,
+        ));
+        assert_eq!(s.phase_epoch(), phase_epoch + 1);
+
+        s.dispatch(&attach_attempt(
+            crate::vmm::wire::AttachAttemptTransition::Finished,
+            41,
+            true,
+        ));
+        assert_eq!(s.phase(), LifecycleStage::Body as u8);
+        assert_eq!(
+            s.phase_epoch(),
+            phase_epoch + 2,
+            "Finished must reanchor the service-accounted overlay until Settled",
+        );
+        assert_eq!(s.progress_epoch(), progress_epoch + 2);
+        expected_control.extend_from_slice(&crate::vmm::wire::encode_attach_finished_ack(41));
+        assert_eq!(
+            s.attach_control_console.lock().pending_rx_bytes_for_test(),
+            expected_control,
+            "accepted Finished generation was not acknowledged",
+        );
+
+        // A retried finish is re-ACKed without moving either anchor.
+        s.dispatch(&attach_attempt(
+            crate::vmm::wire::AttachAttemptTransition::Finished,
+            41,
+            true,
+        ));
+        assert_eq!(s.phase_epoch(), phase_epoch + 2);
+        assert_eq!(s.progress_epoch(), progress_epoch + 2);
+        expected_control.extend_from_slice(&crate::vmm::wire::encode_attach_finished_ack(41));
+        assert_eq!(
+            s.attach_control_console.lock().pending_rx_bytes_for_test(),
+            expected_control,
+            "duplicate Finished was not re-acknowledged idempotently",
+        );
+
+        s.dispatch(&attach_attempt(
+            crate::vmm::wire::AttachAttemptTransition::Settled,
+            41,
+            true,
+        ));
+        assert_eq!(s.phase_epoch(), phase_epoch + 3);
+        assert_eq!(s.progress_epoch(), progress_epoch + 3);
+        assert_eq!(
+            s.attach_control_console.lock().pending_rx_bytes_for_test(),
+            expected_control,
+            "Settled must not add a fourth control-plane packet",
+        );
+
+        // A duplicate Settled is idempotent and cannot reset coarse budget.
+        s.dispatch(&attach_attempt(
+            crate::vmm::wire::AttachAttemptTransition::Settled,
+            41,
+            true,
+        ));
+        assert_eq!(s.phase_epoch(), phase_epoch + 3);
+        assert_eq!(s.progress_epoch(), progress_epoch + 3);
     }
 
     /// A CRC-bad lifecycle frame must NOT forge stage progress, but STILL

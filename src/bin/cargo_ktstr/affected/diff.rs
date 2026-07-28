@@ -86,6 +86,7 @@ pub(crate) fn changed_paths_worktree(repo: &gix::Repository) -> Result<BTreeSet<
         .context("open worktree status")?
         .untracked_files(gix::status::UntrackedFiles::Files)
         .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
+        .index_worktree_options_mut(ktstr::git_status::configure_index_worktree_parallelism)
         .into_iter(Vec::<BString>::new())
         .context("create worktree status iterator")?;
 

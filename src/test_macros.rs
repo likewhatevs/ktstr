@@ -451,4 +451,43 @@ mod tests {
             "panic must frame contention as transient, never host incapacity; got: {msg:?}",
         );
     }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn ktstr_test_macro_expect_err_cannot_invert_framework_failure() {
+        let result = std::panic::catch_unwind(|| {
+            let result: Result<(), anyhow::Error> = Err(anyhow::Error::new(
+                crate::vmm::host_topology::TopologyInsufficient {
+                    reason: "injected capacity-looking substrate error".into(),
+                },
+            )
+            .context("injected prepared-initrd CAS failure")
+            .context(crate::test_support::FrameworkInfrastructureFailure)
+            .context("build ktstr_test VM"));
+            match result {
+                Ok(_) => panic!("expected test to fail but it passed"),
+                Err(e) => {
+                    if crate::test_support::is_framework_infrastructure_failure(&e) {
+                        panic!("ktstr: FAIL: {e:#}");
+                    }
+                    match crate::test_support::classify_host_error(&e, false) {
+                        crate::test_support::HostClass::Skip { .. } => {}
+                        crate::test_support::HostClass::Fail { reason } => {
+                            panic!("ktstr: FAIL: {reason}")
+                        }
+                        crate::test_support::HostClass::NotHostClass => {}
+                    }
+                }
+            }
+        });
+        let panic = result.expect_err(
+            "macro/direct expect_err path must hard-fail framework infrastructure errors",
+        );
+        let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            message.contains("ktstr: FAIL:")
+                && message.contains("injected prepared-initrd CAS failure"),
+            "unexpected direct-path panic: {message:?}",
+        );
+    }
 }

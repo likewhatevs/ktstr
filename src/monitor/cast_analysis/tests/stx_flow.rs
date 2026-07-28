@@ -76,6 +76,7 @@ fn stx_flow_alloc_return_records_arena_finding() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],
@@ -139,6 +140,7 @@ fn stx_flow_alloc_return_propagates_through_mov() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],
@@ -210,6 +212,7 @@ fn stx_flow_alloc_return_round_trips_through_stack() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],
@@ -294,6 +297,7 @@ fn stx_flow_alias_tracking_propagates_via_ldx() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],
@@ -391,6 +395,7 @@ fn stx_flow_conflict_with_kptr_drops_both() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],
@@ -538,6 +543,7 @@ fn stx_flow_resolves_target_via_shape_inference_under_alias_tracking() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 4,
         }],

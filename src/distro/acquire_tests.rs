@@ -12,6 +12,7 @@ fn pkg(name: &str, sha: &str) -> PackageRef {
         name: name.to_string(),
         version: "1.0-1".to_string(),
         url: format!("https://example/{name}.rpm"),
+        alternate_urls: Vec::new(),
         sha256: sha.to_string(),
         size: None,
     }
@@ -28,6 +29,34 @@ fn resolved(distro: &str, release: &str, arch: &str, primary_sha: &str) -> Resol
         ],
         debuginfo: vec![pkg("kernel-debuginfo", "aaaa")],
     }
+}
+
+#[test]
+fn package_download_origins_fail_over_in_declared_order() {
+    let mut package = pkg("kernel-debuginfo", "aaaa");
+    package.url = "https://ddebs.ubuntu.com/package.ddeb".to_string();
+    package.alternate_urls =
+        vec!["https://launchpad.net/ubuntu/+archive/primary/+files/package.ddeb".to_string()];
+    let mut attempts = Vec::new();
+
+    let result = try_package_urls_with(
+        &package,
+        || false,
+        |url| {
+            attempts.push(url.to_string());
+            if url == package.url.as_str() {
+                bail!("primary unavailable");
+            }
+            Ok(17)
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result, 17);
+    assert_eq!(
+        attempts,
+        [package.url.clone(), package.alternate_urls[0].clone()]
+    );
 }
 
 // -- cache-key composition --

@@ -383,7 +383,7 @@ pub(crate) fn worker_dispatch_event(event_set: EventSet, token: u64) -> WorkerDi
 /// `placement` is applied via `pin_current_thread` /
 /// `set_thread_cpumask` BEFORE epoll setup so the entire worker
 /// lifecycle (epoll setup, drain calls, syscalls) inherits the
-/// chosen affinity. Both `service_cpu` and `no_perf_cpus` `None`
+/// chosen affinity. Both `service_cpu` and `shared_cpus` `None`
 /// means inherit the parent thread's affinity (the no-topology
 /// default); the topology layer guarantees at most one is `Some`.
 #[cfg(not(test))]
@@ -420,7 +420,7 @@ pub(crate) fn worker_thread_main(
     // device.
     if let Some(cpu) = placement.service_cpu {
         crate::vmm::vcpu::pin_current_thread(cpu, "virtio-blk worker");
-    } else if let Some(ref cpus) = placement.no_perf_cpus {
+    } else if let Some(ref cpus) = placement.shared_cpus {
         crate::vmm::vcpu::set_thread_cpumask(cpus, "virtio-blk worker");
     }
     // Clear the "construction-time paused" sentinel now that the

@@ -109,9 +109,26 @@ struct ktstr_arena_ctx {
 __u64 ktstr_alloc_count;
 
 /* Test fixture: BSS-resident struct whose `arena_target` u64 carries
- * the user-side address of the most recent ktstr_arena_ctx allocation.
+ * the user-side address of the FIRST ktstr_arena_ctx allocation.
  * Renders inside the dump's `.bss` map and exercises the cast intercept
  * on the `arena_target` member.
+ *
+ * First, not most-recent, because the dump-time chase must land on a
+ * slot that is still LIVE. `ktstr_exit_task` frees the taskc when its
+ * task exits, so a holder tracking the most recent allocation dangles as
+ * soon as that task exits before the dump fires: the renderer faithfully
+ * chases the stale pointer, the freed slot no longer carries the
+ * alloc-time sentinel (failing dumps read an all-zero `ktstr_arena_ctx`
+ * there, and its slot is absent from the allocator's live set in
+ * `sdt_allocations`), and the E2E magic assertion fails on healthy
+ * scheduler state. `scx_enable` walks the existing task list and calls
+ * `ops.init_task` for every task that predates the scheduler, so the
+ * first-published taskc belongs to a task the workload did not create
+ * and did not reap.
+ *
+ * The check-then-publish is deliberately unsynchronized: concurrent
+ * init_task calls can only race over WHICH of those pre-existing tasks
+ * wins, and any of them satisfies the fixture.
  *
  * `ktstr_train_bss_to_arena` (below) loads `arena_target` and
  * dereferences the resulting u64 as a `struct ktstr_arena_ctx __arena *`,
@@ -414,19 +431,18 @@ s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
 void BPF_STRUCT_OPS(ktstr_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	__sync_fetch_and_add(&nr_enqueued, 1);
-	/* A stall must trap only the workload's SCHED_NORMAL tasks — never
-	 * kernel threads. In full-switch mode (no SCX_OPS_SWITCH_PARTIAL)
-	 * scx-ktstr owns every SCHED_NORMAL task, INCLUDING the kworker that
-	 * runs the sched_ext runnable-timeout watchdog
-	 * (scx_watchdog_workfn on system_unbound_wq). Parking that kworker in
-	 * SHARED_DSQ under the `if (stall) return` dispatch guard stalls the
-	 * watchdog itself, so it never runs to observe the stalled workload
-	 * and SCX_EXIT_ERROR_STALL never fires — the stall is silently
-	 * suppressed on a quiet host where no other activity keeps the
-	 * watchdog kworker off scx's DSQs. Keep kthreads on a local DSQ so
-	 * the watchdog kworker (and other kernel machinery) keeps running and
-	 * fires deterministically on the parked workload task. */
-	if (stall && (p->flags & PF_KTHREAD)) {
+	/* Kernel threads must never enter SHARED_DSQ. In full-switch mode (no
+	 * SCX_OPS_SWITCH_PARTIAL) scx-ktstr owns every SCHED_NORMAL task,
+	 * INCLUDING the kworker that runs the sched_ext runnable-timeout
+	 * watchdog (scx_watchdog_workfn on the kernel's default/unbound
+	 * workqueue, depending on kernel version). A watchdog
+	 * kworker may already be queued before `stall` flips; gating this
+	 * route on `stall` strands that pre-existing task in SHARED_DSQ under
+	 * ktstr_dispatch's stall guard, preventing the watchdog from observing
+	 * the stalled workload. Routing every kthread locally keeps kernel
+	 * machinery runnable across the transition while workload tasks retain
+	 * the selected shared/scattershot/degrade behavior below. */
+	if (p->flags & PF_KTHREAD) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
 		return;
 	}
@@ -952,11 +968,18 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init_task, struct task_struct *p,
 	 * because BPF_LD_IMM64 of a map value clears RegState; the STX
 	 * therefore records nothing on the .bss side. The cast detection
 	 * runs through the LDX path inside `ktstr_train_bss_to_arena`,
-	 * not this STX. */
-	ktstr_bss_arena_holder.arena_target = (__u64)(unsigned long)taskc;
+	 * not this STX.
+	 *
+	 * Publish once (see the holder's declaration): re-stamping on every
+	 * init_task leaves the holder pointing at whichever task was
+	 * initialized last, which `ktstr_exit_task` can free before the dump
+	 * fires. `bss_plain_counter` still counts every init_task — it is the
+	 * negative control for the analyzer, not a pointer. */
+	if (!ktstr_bss_arena_holder.arena_target)
+		ktstr_bss_arena_holder.arena_target = (__u64)(unsigned long)taskc;
 	__sync_fetch_and_add(&ktstr_bss_arena_holder.bss_plain_counter, 1);
 
-	/* Run the BSS→arena trainer with the freshly-stamped arena VA.
+	/* Run the BSS→arena trainer with the published arena VA.
 	 * The helper's body teaches the analyzer to recognize the
 	 * `arena_target` u64 as a `ktstr_arena_ctx __arena *` cast.
 	 * Failing the helper does not abort init_task — the trainer is
@@ -1098,5 +1121,22 @@ SCX_OPS_DEFINE(ktstr_ops,
 	       .dump_task	= (void *)ktstr_dump_task,
 	       .init		= (void *)ktstr_init,
 	       .exit		= (void *)ktstr_exit,
-	       .timeout_ms	= 20000,
+	       /* Runnable-timeout watchdog budget baked into the scheduler at
+		* enable. The host lowers the LIVE timeout to ~5s post-attach
+		* (the timestamp-forge / watchdog-override path in
+		* monitor::reader), so steady-state scenarios are governed by
+		* that override, not this value; nothing depends on a longer
+		* baked budget (scx-ktstr dispatches promptly and only the
+		* deliberate `stall` path holds a task undispatched). This value
+		* governs only the pre-override window. On kernels where the
+		* timeout lives inside the per-scheduler struct (arms at enable,
+		* before the host can deref the scheduler root to override it),
+		* a 20s bake made the kernel watchdog kworker first fire at
+		* timeout/2 = 10s, so an intentional `--stall-after` eviction
+		* landed ~10s in — racing the bounded teardown AP-kill under
+		* host load and flaking the cast-analysis expect_err tests. 4s
+		* arms a ~2s kworker cadence so the deliberate stall evicts in
+		* ~2-4s, matching the prompt, stable eviction the static-global
+		* override kernels already get. */
+	       .timeout_ms	= 4000,
 	       .name		= "ktstr");

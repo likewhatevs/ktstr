@@ -15,10 +15,11 @@
 //!   per-frame CRC mismatches (`crc_ok=false` on the affected entry,
 //!   parsing continues for subsequent frames).
 //!
-//! - [`request_dump`] and [`request_shutdown`] push virtio-console
-//!   RX wake bytes that the guest's `hvc0_poll_loop` recognises
-//!   directly. The SysRq-D dispatch is triggered by the
-//!   `SIGNAL_VC_DUMP` wake byte alone.
+//! - [`request_dump`], [`request_shutdown`],
+//!   [`acknowledge_attach_started`], [`acknowledge_attach_finished`], and
+//!   [`request_attach_cancel`] push virtio-console RX control packets that the
+//!   guest's `hvc0_poll_loop` recognises directly. The SysRq-D dispatch is
+//!   triggered by the `SIGNAL_VC_DUMP` wake byte alone.
 //!
 //! # No drop counter
 //!
@@ -31,11 +32,11 @@
 use std::sync::Arc;
 use zerocopy::FromBytes;
 
-use super::bulk::MAX_BULK_FRAME_PAYLOAD;
+use super::bulk::{MAX_BULK_FRAME_PAYLOAD, find_next_valid_frame};
 use super::pi_mutex::PiMutex;
 use super::virtio_console::{
-    SIGNAL_ACCESSOR_READY, SIGNAL_BPF_WRITE_DONE, SIGNAL_PERIODIC_READY, SIGNAL_VC_DUMP,
-    SIGNAL_VC_SHUTDOWN, VirtioConsole,
+    SIGNAL_ACCESSOR_READY, SIGNAL_BPF_WRITE_DONE, SIGNAL_PERIODIC_READY, SIGNAL_PROBE_DUMP_READY,
+    SIGNAL_VC_DUMP, SIGNAL_VC_SHUTDOWN, VirtioConsole,
 };
 use super::wire::{FRAME_HEADER_SIZE, ShmEntry, ShmMessage};
 
@@ -93,9 +94,9 @@ pub fn drain_bulk(dev: &mut VirtioConsole) -> BulkDrainResult {
 /// allocating the per-frame `Vec<u8>` payload. Mirrors the same
 /// check applied by [`super::bulk::HostAssembler`] so the
 /// streaming and one-shot consumers agree on what counts as a
-/// legitimate frame. On rejection, the walk stops — subsequent
-/// bytes cannot be trusted (the announced length cannot be relied
-/// on to advance past the bogus payload).
+/// legitimate frame. If the remaining bytes contain a complete,
+/// CRC-valid frame with a known FourCC, the parser resynchronizes at
+/// that self-authenticating boundary; otherwise the walk stops.
 pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
     let mut entries: Vec<ShmEntry> = Vec::new();
     let mut pos = 0usize;
@@ -135,6 +136,17 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
         // cursor past the bogus payload, so any trailing bytes
         // are unparseable.
         if msg.length > MAX_BULK_FRAME_PAYLOAD {
+            if let Some(next) = find_next_valid_frame(buf, pos + 1) {
+                tracing::warn!(
+                    abandoned = next - pos,
+                    next,
+                    msg_type = msg.msg_type,
+                    length = msg.length,
+                    "parse_tlv_stream: resynchronized after an oversized/abandoned prefix"
+                );
+                pos = next;
+                continue;
+            }
             tracing::warn!(
                 msg_type = msg.msg_type,
                 length = msg.length,
@@ -147,6 +159,17 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
         // payload than the buffer holds. Stop parsing rather than
         // attempting an over-read or oversized allocation.
         if (msg.length as usize) > buf.len().saturating_sub(hdr_end) {
+            if let Some(next) = find_next_valid_frame(buf, pos + 1) {
+                tracing::warn!(
+                    abandoned = next - pos,
+                    next,
+                    msg_type = msg.msg_type,
+                    length = msg.length,
+                    "parse_tlv_stream: resynchronized past an incomplete abandoned frame"
+                );
+                pos = next;
+                continue;
+            }
             break;
         }
         let payload_end = hdr_end + msg.length as usize;
@@ -154,6 +177,21 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
         let computed_crc = crc32fast::hash(&payload);
         let crc_ok = computed_crc == msg.crc32;
         if !crc_ok {
+            if let Some(next) = find_next_valid_frame(buf, pos + 1)
+                && next < payload_end
+            {
+                tracing::warn!(
+                    abandoned = next - pos,
+                    next,
+                    msg_type = msg.msg_type,
+                    length = msg.length,
+                    expected_crc = msg.crc32,
+                    computed_crc,
+                    "parse_tlv_stream: CRC mismatch exposed an abandoned partial frame; resynchronized"
+                );
+                pos = next;
+                continue;
+            }
             // Surface per-frame CRC mismatches for diagnostics —
             // Mirrors the assembly path so a corrupted bulk-stream frame
             // appears in the operator log instead of being dropped
@@ -195,16 +233,53 @@ pub fn request_shutdown(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
     virtio_con.lock().queue_input(&[SIGNAL_VC_SHUTDOWN]);
 }
 
-/// Notify the guest that the host's `bpf-map-write` thread finished
-/// applying every queued `bpf_map_write`. Pushes
-/// `SIGNAL_BPF_WRITE_DONE` through the virtio-console RX queue; the
-/// guest's `hvc0_poll_loop` recognises the byte and sets the
-/// `bpf_map_write_done` latch so a scenario blocked on
-/// [`crate::scenario::Ctx::wait_for_map_write`] resumes. Replaces the
-/// legacy SHM signal-slot rendezvous (host writes slot 0, guest blocks
-/// on slot 0) with a single wake byte.
-pub fn request_bpf_map_write_done(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
-    virtio_con.lock().queue_input(&[SIGNAL_BPF_WRITE_DONE]);
+/// Ask the guest to cancel the exact scheduler-attach generation whose host
+/// service budget expired.
+///
+/// The fixed-size packet is queued atomically into the port-0 pending FIFO;
+/// virtio may split it across guest reads, so the hvc0 side retains decoder
+/// state until all generation digits arrive.
+pub fn request_attach_cancel(
+    virtio_con: &Arc<PiMutex<VirtioConsole>>,
+    generation: u64,
+    cause: super::wire::AttachCancelCause,
+) {
+    let packet = super::wire::encode_attach_cancel(generation, cause);
+    virtio_con.lock().queue_input(&packet);
+}
+
+/// Acknowledge that the host accepted and CPU-reanchored one scheduler-attach
+/// `Started` generation. The guest waits for this rendezvous before spawning
+/// the scheduler, so host starvation cannot collapse Started and Finished
+/// into a zero-observation interval.
+pub fn acknowledge_attach_started(virtio_con: &Arc<PiMutex<VirtioConsole>>, generation: u64) {
+    let packet = super::wire::encode_attach_started_ack(generation);
+    virtio_con.lock().queue_input(&packet);
+}
+
+/// Acknowledge that the host accepted and CPU-reanchored one
+/// scheduler-attach `Finished` generation. The guest does not report attach
+/// success until this exact rendezvous arrives. Duplicate terminal frames are
+/// deliberately re-acknowledged without moving the accounting anchor.
+pub fn acknowledge_attach_finished(virtio_con: &Arc<PiMutex<VirtioConsole>>, generation: u64) {
+    let packet = super::wire::encode_attach_finished_ack(generation);
+    virtio_con.lock().queue_input(&packet);
+}
+
+/// Notify the guest that the host's `bpf-map-write` thread finished applying
+/// every queued `bpf_map_write`.
+///
+/// The BPF-map writer acquires the console before mutating the live scheduler
+/// map and holds that guard through completion publication. This variant keeps
+/// the map mutation and its guest rendezvous indivisible with respect to vCPU
+/// console MMIO, so a scheduler crash caused by the mutation cannot overtake a
+/// second, post-mutation mutex acquisition. Pushes
+/// `SIGNAL_BPF_WRITE_DONE` through the virtio-console RX queue; the guest's
+/// `hvc0_poll_loop` recognises the byte and sets the `bpf_map_write_done` latch
+/// so a scenario blocked on [`crate::scenario::Ctx::wait_for_map_write`]
+/// resumes.
+pub(crate) fn request_bpf_map_write_done(virtio_con: &mut VirtioConsole) {
+    virtio_con.queue_input(&[SIGNAL_BPF_WRITE_DONE]);
 }
 
 /// Notify the guest that the freeze coordinator has adopted its
@@ -216,6 +291,17 @@ pub fn request_bpf_map_write_done(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
 /// Mirrors [`request_bpf_map_write_done`].
 pub fn request_accessor_ready(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
     virtio_con.lock().queue_input(&[SIGNAL_ACCESSOR_READY]);
+}
+
+/// Notify an opt-in guest that the real failure-dump decoder can read
+/// the probe's complete per-CPU counter slab. Pushes
+/// [`SIGNAL_PROBE_DUMP_READY`] only after accessor adoption, split-BTF
+/// lookup, `.bss` variable-offset resolution, and the full array read
+/// have all succeeded. The guest gates scheduler launch on the matching
+/// sticky latch, so scheduler-relative failure injection cannot race
+/// the diagnostic substrate.
+pub fn request_probe_dump_ready(virtio_con: &Arc<PiMutex<VirtioConsole>>) {
+    virtio_con.lock().queue_input(&[SIGNAL_PROBE_DUMP_READY]);
 }
 
 /// Notify a periodic-capture guest that ALL periodic-capture prereqs
@@ -338,6 +424,46 @@ mod tests {
         assert!(r.entries.is_empty());
     }
 
+    #[test]
+    fn attach_cancel_delivery_queues_exact_generation_packet() {
+        let dev = Arc::new(PiMutex::new(VirtioConsole::new()));
+        request_attach_cancel(
+            &dev,
+            0x1234_abcd_9876_ef01,
+            super::super::wire::AttachCancelCause::ServiceBudget,
+        );
+
+        assert_eq!(
+            dev.lock().pending_rx_bytes_for_test(),
+            super::super::wire::encode_attach_cancel(
+                0x1234_abcd_9876_ef01,
+                super::super::wire::AttachCancelCause::ServiceBudget,
+            ),
+        );
+    }
+
+    #[test]
+    fn attach_started_ack_delivery_queues_exact_generation_packet() {
+        let dev = Arc::new(PiMutex::new(VirtioConsole::new()));
+        acknowledge_attach_started(&dev, 0x1020_3040_5060_7080);
+
+        assert_eq!(
+            dev.lock().pending_rx_bytes_for_test(),
+            super::super::wire::encode_attach_started_ack(0x1020_3040_5060_7080),
+        );
+    }
+
+    #[test]
+    fn attach_finished_ack_delivery_queues_exact_generation_packet() {
+        let dev = Arc::new(PiMutex::new(VirtioConsole::new()));
+        acknowledge_attach_finished(&dev, 0x1122_3344_5566_7788);
+
+        assert_eq!(
+            dev.lock().pending_rx_bytes_for_test(),
+            super::super::wire::encode_attach_finished_ack(0x1122_3344_5566_7788),
+        );
+    }
+
     /// Hostile-input guard: a header announcing
     /// `length > MAX_BULK_FRAME_PAYLOAD` is rejected before any
     /// per-frame allocation. The walk stops at the bogus header —
@@ -428,14 +554,11 @@ mod tests {
         assert!(r.entries[0].crc_ok);
     }
 
-    /// An oversized header followed by a fully-valid frame: the
-    /// walk stops at the oversized header and the trailing valid
-    /// frame is NOT returned. The bogus `length` cannot be trusted
-    /// to advance the cursor past its claimed payload, so any
-    /// bytes that follow are unparseable — even when those bytes
-    /// happen to encode a structurally legitimate frame.
+    /// A fresh complete frame after an abandoned oversized header is a
+    /// self-authenticating retry boundary (known FourCC + cap + CRC), so the
+    /// one-shot final drain recovers it just like `HostAssembler`.
     #[test]
-    fn parse_stops_at_oversized_does_not_return_subsequent_valid() {
+    fn parse_resynchronizes_at_valid_frame_after_oversized_prefix() {
         use zerocopy::IntoBytes;
         let bad = ShmMessage {
             msg_type: MSG_TYPE_STIMULUS,
@@ -450,10 +573,10 @@ mod tests {
         // stopping, this frame would be picked up.
         combined.extend_from_slice(&frame_bytes(MSG_TYPE_EXIT, b"valid"));
         let r = parse_tlv_stream(&combined);
-        assert!(
-            r.entries.is_empty(),
-            "no entries: parser must stop at the oversized header and not resume on the trailing valid frame"
-        );
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].msg_type, MSG_TYPE_EXIT);
+        assert_eq!(r.entries[0].payload, b"valid");
+        assert!(r.entries[0].crc_ok);
     }
 
     /// Every new postcard-migration MsgType variant round-trips
@@ -465,12 +588,27 @@ mod tests {
     fn parse_recognises_all_new_msg_type_variants() {
         use super::super::wire::{
             MSG_TYPE_DMESG, MSG_TYPE_EXEC_EXIT, MSG_TYPE_LIFECYCLE, MSG_TYPE_PROBE_OUTPUT,
-            MSG_TYPE_SCHED_LOG, MSG_TYPE_STDERR, MSG_TYPE_STDOUT, MsgType,
+            MSG_TYPE_SCHED_LOG, MSG_TYPE_SCHED_STDERR, MSG_TYPE_SCHED_STDERR_FINAL,
+            MSG_TYPE_SCHED_STDOUT, MSG_TYPE_SCHED_STDOUT_FINAL, MSG_TYPE_STDERR, MSG_TYPE_STDOUT,
+            MsgType,
         };
+        let empty_final = super::super::wire::encode_sched_stream_final_chunk(0, 0, &[]);
         let cases: &[(u32, MsgType, &[u8])] = &[
             (MSG_TYPE_STDOUT, MsgType::Stdout, b"hello\n"),
             (MSG_TYPE_STDERR, MsgType::Stderr, b"error\n"),
             (MSG_TYPE_SCHED_LOG, MsgType::SchedLog, b"---SCHED---\n"),
+            (MSG_TYPE_SCHED_STDOUT, MsgType::SchedStdout, b"sched out\n"),
+            (MSG_TYPE_SCHED_STDERR, MsgType::SchedStderr, b"sched err\n"),
+            (
+                MSG_TYPE_SCHED_STDOUT_FINAL,
+                MsgType::SchedStdoutFinal,
+                &empty_final,
+            ),
+            (
+                MSG_TYPE_SCHED_STDERR_FINAL,
+                MsgType::SchedStderrFinal,
+                &empty_final,
+            ),
             // Lifecycle payload layout: 1-byte phase + reason
             // bytes. Use the InitStarted phase (=1) here.
             (MSG_TYPE_LIFECYCLE, MsgType::Lifecycle, &[1u8]),

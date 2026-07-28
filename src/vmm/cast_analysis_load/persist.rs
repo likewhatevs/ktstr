@@ -1,7 +1,10 @@
 use crate::monitor::cast_analysis::{AddrSpace, CastHit, CastMap};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use super::FwdIndexEntry;
 
@@ -15,7 +18,12 @@ use super::FwdIndexEntry;
 // the `target_type_id == 0` arena entries, so a stale v12 cache rendered
 // the affected BSS u64 fields as plain integers instead of typed
 // pointers).
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
+const CACHE_LOCK_DIR: &str = ".locks-v14";
+const CACHE_GC_STAMP: &str = ".gc-v14";
+const CACHE_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const CACHE_MAX_BYTES: u64 = 256 << 20;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedAddrSpace(u8);
@@ -94,22 +102,220 @@ impl PersistedFwdIndexEntry {
 struct PersistedCastAnalysis {
     schema_version: u32,
     content_hash: u64,
-    cast_entries: Vec<((u32, u32), PersistedCastHit)>,
+    cast_maps: Vec<Vec<((u32, u32), PersistedCastHit)>>,
     fwd_entries: Vec<(String, PersistedFwdIndexEntry)>,
     btf_count: u32,
     alloc_size_types: Vec<(u64, String)>,
 }
 
-fn cache_dir() -> Option<PathBuf> {
-    let dir = crate::cache::resolve_cache_root_with_suffix("cast_analysis").ok()?;
+pub(super) struct CachedCastAnalysis {
+    pub(super) cast_maps: Vec<CastMap>,
+    pub(super) fwd_index: HashMap<String, FwdIndexEntry>,
+    pub(super) btf_count: usize,
+    pub(super) alloc_size_types: Vec<(u64, String)>,
+}
+
+fn cache_dir() -> Result<PathBuf> {
+    let dir = crate::cache::resolve_cache_root_with_suffix("cast_analysis")
+        .context("resolve cast-analysis cache root")?;
     // Reclaim `*.bin.tmp.<pid>` staging files left by interrupted prior
     // runs, once per process on first cache access. try_save writes a
     // pid-suffixed temp then renames; a process that dies between the write
-    // and the rename (Ctrl-C / crash — notably on the detached precompute
-    // threads) orphans the temp, and nothing else reclaims it.
+    // and the rename orphans the temp, and nothing else reclaims it.
     static SWEEP_ONCE: std::sync::Once = std::sync::Once::new();
     SWEEP_ONCE.call_once(|| sweep_stale_tmp(&dir));
-    Some(dir)
+    maybe_gc_cache(&dir)?;
+    Ok(dir)
+}
+
+fn cache_file_name(hash: u64) -> String {
+    format!("v{SCHEMA_VERSION}_{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_{hash:016x}.bin")
+}
+
+fn cache_lock_name(hash: u64) -> String {
+    format!("{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_{hash:016x}.lock")
+}
+
+fn current_hash_from_cache_name(name: &str) -> Option<u64> {
+    let prefix = format!("v{SCHEMA_VERSION}_{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_");
+    let hash = name.strip_prefix(&prefix)?.strip_suffix(".bin")?;
+    (hash.len() == 16).then(|| u64::from_str_radix(hash, 16).ok())?
+}
+
+fn open_gc_lock(path: &std::path::Path) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open cast-analysis cache lock {}", path.display()))
+}
+
+fn cache_entry_is_old(metadata: &std::fs::Metadata, now: SystemTime) -> bool {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= CACHE_MAX_AGE)
+}
+
+fn remove_if_present(path: &std::path::Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove cast-analysis cache {}", path.display()))
+        }
+    }
+}
+
+fn try_remove_current_entry(
+    lock_dir: &std::path::Path,
+    hash: u64,
+    path: &std::path::Path,
+) -> Result<bool> {
+    let lock_path = lock_dir.join(cache_lock_name(hash));
+    let lock = open_gc_lock(&lock_path)?;
+    match crate::cache::content::flock_retry(
+        &lock,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    ) {
+        Ok(()) => {
+            let removed = remove_if_present(path)?;
+            remove_if_present(&lock_path)?;
+            Ok(removed)
+        }
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "try-lock cast-analysis cache entry for cleanup {}",
+                lock_path.display()
+            )
+        }),
+    }
+}
+
+fn gc_cache_at(root: &std::path::Path, now: SystemTime, max_bytes: u64) -> Result<()> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("create cast-analysis cache dir {}", root.display()))?;
+    let lock_dir = root.join(CACHE_LOCK_DIR);
+    std::fs::create_dir_all(&lock_dir)
+        .with_context(|| format!("create cast-analysis lock dir {}", lock_dir.display()))?;
+    let namespace_gate_path = lock_dir.join("namespace.lock");
+    let namespace_gate = open_gc_lock(&namespace_gate_path)?;
+    match crate::cache::content::flock_retry(
+        &namespace_gate,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    ) {
+        Ok(()) => {}
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => return Ok(()),
+        Err(error) => {
+            return Err(error).context("lock cast-analysis namespace for cleanup");
+        }
+    }
+
+    struct Candidate {
+        path: PathBuf,
+        hash: Option<u64>,
+        modified: SystemTime,
+        len: u64,
+        expired: bool,
+    }
+    let mut candidates = Vec::new();
+    let mut total_bytes = 0u64;
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("scan cast-analysis cache {}", root.display()))?
+    {
+        let entry = entry.context("read cast-analysis cache entry")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(".bin") || name.contains(".tmp.") {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("stat cast-analysis cache {}", entry.path().display()))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        candidates.push(Candidate {
+            path: entry.path(),
+            hash: current_hash_from_cache_name(name),
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            len: metadata.len(),
+            expired: cache_entry_is_old(&metadata, now),
+        });
+    }
+    candidates.sort_by_key(|candidate| candidate.modified);
+    for candidate in candidates {
+        if !candidate.expired && total_bytes <= max_bytes {
+            continue;
+        }
+        let removed = match candidate.hash {
+            Some(hash) => try_remove_current_entry(&lock_dir, hash, &candidate.path)?,
+            // An older record has no writer in the current namespace. Atomic
+            // rename/open-file semantics make unlink safe even if an old
+            // process still has the inode open.
+            None => remove_if_present(&candidate.path)?,
+        };
+        if removed {
+            total_bytes = total_bytes.saturating_sub(candidate.len);
+        }
+    }
+
+    let current_lock_prefix = format!("{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_");
+    for entry in std::fs::read_dir(&lock_dir)
+        .with_context(|| format!("scan cast-analysis locks {}", lock_dir.display()))?
+    {
+        let entry = entry.context("read cast-analysis lock entry")?;
+        let name = entry.file_name();
+        let Some(hash) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&current_lock_prefix))
+            .and_then(|name| name.strip_suffix(".lock"))
+            .filter(|hash| hash.len() == 16)
+            .and_then(|hash| u64::from_str_radix(hash, 16).ok())
+        else {
+            continue;
+        };
+        let data_path = root.join(cache_file_name(hash));
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("stat cast-analysis lock {}", entry.path().display()))?;
+        if !data_path.exists() && cache_entry_is_old(&metadata, now) {
+            try_remove_current_entry(&lock_dir, hash, &data_path)?;
+        }
+    }
+
+    let stamp = root.join(CACHE_GC_STAMP);
+    let stamp_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&stamp)
+        .with_context(|| format!("update cast-analysis GC stamp {}", stamp.display()))?;
+    stamp_file
+        .sync_data()
+        .with_context(|| format!("sync cast-analysis GC stamp {}", stamp.display()))?;
+    Ok(())
+}
+
+fn maybe_gc_cache(root: &std::path::Path) -> Result<()> {
+    let stamp = root.join(CACHE_GC_STAMP);
+    if stamp.metadata().ok().is_some_and(|metadata| {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_none_or(|age| age < CACHE_GC_INTERVAL)
+    }) {
+        return Ok(());
+    }
+    gc_cache_at(root, SystemTime::now(), CACHE_MAX_BYTES)
 }
 
 /// Remove `*.bin.tmp.<pid>` staging files in `dir` whose owning pid is no
@@ -126,7 +332,8 @@ fn sweep_stale_tmp(dir: &std::path::Path) {
         let Some(pid) = name
             .to_str()
             .and_then(|n| n.rsplit_once(".bin.tmp."))
-            .and_then(|(_, p)| p.parse::<i32>().ok())
+            .and_then(|(_, suffix)| suffix.split('.').next())
+            .and_then(|pid| pid.parse::<i32>().ok())
         else {
             continue;
         };
@@ -170,41 +377,61 @@ const ANALYZER_FINGERPRINT: &str = env!("KTSTR_CAST_ANALYZER_FINGERPRINT");
 /// rebuilds.
 const CARGO_LOCK_FINGERPRINT: &str = env!("KTSTR_CARGO_LOCK_FINGERPRINT");
 
-fn cache_path(hash: u64) -> Option<PathBuf> {
-    cache_dir().map(|d| {
-        d.join(format!(
-            "v{SCHEMA_VERSION}_{ANALYZER_FINGERPRINT}_{CARGO_LOCK_FINGERPRINT}_{hash:016x}.bin"
-        ))
+fn cache_path(hash: u64) -> Result<PathBuf> {
+    Ok(cache_dir()?.join(cache_file_name(hash)))
+}
+
+pub(super) struct CoordinationPaths {
+    pub(super) lock: PathBuf,
+    pub(super) namespace_gate: PathBuf,
+}
+
+pub(super) fn coordination_paths(hash: u64) -> Result<CoordinationPaths> {
+    let lock_dir = cache_dir()?.join(CACHE_LOCK_DIR);
+    std::fs::create_dir_all(&lock_dir)
+        .with_context(|| format!("create cast-analysis lock dir {}", lock_dir.display()))?;
+    Ok(CoordinationPaths {
+        lock: lock_dir.join(cache_lock_name(hash)),
+        namespace_gate: lock_dir.join("namespace.lock"),
     })
 }
 
-#[allow(clippy::type_complexity)]
-pub(super) fn try_load(
-    hash: u64,
-    expected_btf_count: usize,
-) -> Option<(CastMap, HashMap<String, FwdIndexEntry>, Vec<(u64, String)>)> {
+pub(super) fn try_load(hash: u64) -> Result<Option<CachedCastAnalysis>> {
     let path = cache_path(hash)?;
-    let bytes = std::fs::read(&path).ok()?;
-    let persisted: PersistedCastAnalysis = postcard::from_bytes(&bytes).ok()?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read cast-analysis cache {}", path.display()));
+        }
+    };
+    let persisted: PersistedCastAnalysis = postcard::from_bytes(&bytes)
+        .with_context(|| format!("decode cast-analysis cache {}", path.display()))?;
 
-    if persisted.schema_version != SCHEMA_VERSION {
-        return None;
-    }
-    if persisted.content_hash != hash {
-        return None;
-    }
-    if persisted.btf_count as usize != expected_btf_count {
-        tracing::debug!(
-            expected = expected_btf_count,
-            cached = persisted.btf_count,
-            "cast_analysis: disk cache btf_count mismatch; treating as miss"
-        );
-        return None;
-    }
-
-    let mut cast_map = BTreeMap::new();
-    for (key, hit) in persisted.cast_entries {
-        cast_map.insert(key, hit.into_cast_hit()?);
+    anyhow::ensure!(
+        persisted.schema_version == SCHEMA_VERSION,
+        "cast-analysis cache schema mismatch in {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        persisted.content_hash == hash,
+        "cast-analysis cache content hash mismatch in {}",
+        path.display()
+    );
+    let mut cast_maps = Vec::with_capacity(persisted.cast_maps.len());
+    for persisted_map in persisted.cast_maps {
+        let mut cast_map = BTreeMap::new();
+        for (key, hit) in persisted_map {
+            let hit = hit.into_cast_hit().with_context(|| {
+                format!(
+                    "invalid address space in cast-analysis cache {}",
+                    path.display()
+                )
+            })?;
+            cast_map.insert(key, hit);
+        }
+        cast_maps.push(cast_map);
     }
 
     let mut fwd_index = HashMap::new();
@@ -213,68 +440,85 @@ pub(super) fn try_load(
     }
 
     tracing::info!(
-        casts = cast_map.len(),
+        casts = cast_maps.iter().map(BTreeMap::len).sum::<usize>(),
         fwd = fwd_index.len(),
         path = %path.display(),
         "cast_analysis: loaded from disk cache"
     );
-    Some((cast_map, fwd_index, persisted.alloc_size_types))
+    Ok(Some(CachedCastAnalysis {
+        cast_maps,
+        fwd_index,
+        btf_count: persisted.btf_count as usize,
+        alloc_size_types: persisted.alloc_size_types,
+    }))
 }
 
 pub(super) fn try_save(
     hash: u64,
-    cast_map: &CastMap,
+    cast_maps: &[std::sync::Arc<CastMap>],
     fwd_index: &HashMap<String, FwdIndexEntry>,
     btf_count: usize,
     alloc_size_types: &[(u64, String)],
-) {
-    // Symmetric with get_full's read-side collapse (mod.rs:401/442):
-    // a result with no cast entries AND an empty fwd index loads back
-    // as None, so persisting it only wastes a disk write plus a
-    // recompute on every subsequent run. Skip the write. (alloc_size_types
-    // alone never resurrects a cached result -- the read-side collapse
-    // ignores it -- so it does not gate this guard.)
-    if cast_map.is_empty() && fwd_index.is_empty() {
-        return;
-    }
-    let Some(path) = cache_path(hash) else { return };
+) -> Result<()> {
+    let path = cache_path(hash)?;
+    let btf_count = u32::try_from(btf_count).context("cast-analysis BTF count exceeds u32")?;
 
     let persisted = PersistedCastAnalysis {
         schema_version: SCHEMA_VERSION,
         content_hash: hash,
-        cast_entries: cast_map.iter().map(|(&k, &v)| (k, v.into())).collect(),
+        cast_maps: cast_maps
+            .iter()
+            .map(|cast_map| {
+                cast_map
+                    .iter()
+                    .map(|(&key, &hit)| (key, hit.into()))
+                    .collect()
+            })
+            .collect(),
         fwd_entries: fwd_index
             .iter()
             .map(|(k, v)| (k.clone(), v.into()))
             .collect(),
-        btf_count: btf_count as u32,
+        btf_count,
         alloc_size_types: alloc_size_types.to_vec(),
     };
 
-    let encoded = match postcard::to_stdvec(&persisted) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(error = %e, "cast_analysis: failed to encode for disk cache");
-            return;
-        }
-    };
+    let encoded = postcard::to_stdvec(&persisted).context("encode cast analysis for disk cache")?;
 
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create cast-analysis cache dir {}", parent.display()))?;
     }
 
-    let tmp = path.with_extension(format!("bin.tmp.{}", std::process::id()));
-    if std::fs::write(&tmp, &encoded).is_ok() {
-        if std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        } else {
-            tracing::debug!(
-                path = %path.display(),
-                bytes = encoded.len(),
-                "cast_analysis: saved to disk cache"
-            );
-        }
-    }
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(
+            ".cast-analysis-{hash:016x}.bin.tmp.{}.",
+            std::process::id()
+        ))
+        .tempfile_in(
+            path.parent()
+                .context("cast-analysis cache path has no parent")?,
+        )
+        .context("create cast-analysis cache temp")?;
+    use std::io::Write as _;
+    temporary
+        .write_all(&encoded)
+        .context("write cast-analysis cache temp")?;
+    temporary
+        .as_file()
+        .sync_all()
+        .context("sync cast-analysis cache temp")?;
+    temporary
+        .persist(&path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish cast-analysis cache {}", path.display()))?;
+    crate::cache::fsync_parent(&path).context("sync cast-analysis cache parent")?;
+    tracing::debug!(
+        path = %path.display(),
+        bytes = encoded.len(),
+        "cast_analysis: saved to disk cache"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -310,6 +554,53 @@ mod tests {
     }
 
     #[test]
+    fn gc_bounds_records_and_current_locks_without_unlinking_live_builder() {
+        let root = tempfile::TempDir::new().unwrap();
+        let lock_dir = root.path().join(CACHE_LOCK_DIR);
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        let removable_hash = 0x1111_1111_1111_1111;
+        let live_hash = 0x2222_2222_2222_2222;
+        let obsolete = root.path().join("v13_obsolete.bin");
+        std::fs::write(
+            root.path().join(cache_file_name(removable_hash)),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        std::fs::write(lock_dir.join(cache_lock_name(removable_hash)), b"").unwrap();
+        std::fs::write(
+            root.path().join(cache_file_name(live_hash)),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        let live_lock_path = lock_dir.join(cache_lock_name(live_hash));
+        let live_lock = open_gc_lock(&live_lock_path).unwrap();
+        crate::cache::content::flock_retry(&live_lock, rustix::fs::FlockOperation::LockExclusive)
+            .unwrap();
+        std::fs::write(&obsolete, vec![0u8; 4096]).unwrap();
+
+        let future = SystemTime::now() + CACHE_MAX_AGE + Duration::from_secs(1);
+        gc_cache_at(root.path(), future, 0).unwrap();
+        assert!(!root.path().join(cache_file_name(removable_hash)).exists());
+        assert!(!lock_dir.join(cache_lock_name(removable_hash)).exists());
+        assert!(
+            !obsolete.exists(),
+            "obsolete schema records must be bounded"
+        );
+        assert!(
+            root.path().join(cache_file_name(live_hash)).exists(),
+            "GC must skip a record whose builder lock is live"
+        );
+        assert!(live_lock_path.exists());
+
+        drop(live_lock);
+        gc_cache_at(root.path(), future, 0).unwrap();
+        assert!(!root.path().join(cache_file_name(live_hash)).exists());
+        assert!(!live_lock_path.exists());
+        assert!(lock_dir.join("namespace.lock").exists());
+        assert!(root.path().join(CACHE_GC_STAMP).exists());
+    }
+
+    #[test]
     fn roundtrip_save_load() {
         let _env_lock = lock_env();
         let _cache = isolated_cache_dir();
@@ -341,11 +632,16 @@ mod tests {
         );
 
         let hash = 0xDEAD_BEEF_CAFE_1234u64;
-        try_save(hash, &cast_map, &fwd_index, 2, &[]);
+        let cast_maps = vec![
+            std::sync::Arc::new(cast_map),
+            std::sync::Arc::new(BTreeMap::new()),
+        ];
+        try_save(hash, &cast_maps, &fwd_index, 2, &[]).expect("save cast analysis");
 
-        let loaded = try_load(hash, 2);
+        let loaded = try_load(hash).expect("load cast analysis");
         assert!(loaded.is_some(), "roundtrip must succeed");
-        let (loaded_map, loaded_fwd, _alloc_types) = loaded.unwrap();
+        let loaded = loaded.unwrap();
+        let loaded_map = &loaded.cast_maps[0];
         assert_eq!(loaded_map.len(), 2);
         assert_eq!(loaded_map.get(&(2, 8)).unwrap().target_type_id, 5);
         assert_eq!(
@@ -356,20 +652,18 @@ mod tests {
             loaded_map.get(&(3, 16)).unwrap().addr_space,
             AddrSpace::Kernel
         );
-        assert_eq!(loaded_fwd.len(), 1);
-        assert_eq!(loaded_fwd["cgx_target"].btfs_idx, 1);
-        assert_eq!(loaded_fwd["cgx_target"].type_id, 4);
+        assert!(loaded.cast_maps[1].is_empty());
+        assert_eq!(loaded.btf_count, 2);
+        assert_eq!(loaded.fwd_index.len(), 1);
+        assert_eq!(loaded.fwd_index["cgx_target"].btfs_idx, 1);
+        assert_eq!(loaded.fwd_index["cgx_target"].type_id, 4);
     }
 
     #[test]
-    fn load_wrong_btf_count_returns_none() {
+    fn roundtrip_preserves_independent_btf_count() {
         let _env_lock = lock_env();
         let _cache = isolated_cache_dir();
 
-        // Non-empty cast map so try_save actually persists -- the
-        // empty-result guard would otherwise skip the write and this test
-        // would pass vacuously via a nonexistent-file miss instead of
-        // exercising the btf_count check it names.
         let mut cast_map = BTreeMap::new();
         cast_map.insert(
             (1, 0),
@@ -381,37 +675,44 @@ mod tests {
         );
         let fwd_index = HashMap::new();
         let hash = 0x1234_5678_9ABC_DEF0u64;
-        try_save(hash, &cast_map, &fwd_index, 3, &[]);
+        try_save(hash, &[std::sync::Arc::new(cast_map)], &fwd_index, 3, &[])
+            .expect("save independent BTF count");
 
-        assert!(
-            try_load(hash, 5).is_none(),
-            "btf_count mismatch must return None"
-        );
+        let loaded = try_load(hash)
+            .expect("load independent BTF count")
+            .expect("persisted entry");
+        assert_eq!(loaded.btf_count, 3);
     }
 
     #[test]
     fn load_nonexistent_returns_none() {
         let _env_lock = lock_env();
-        assert!(try_load(0xFFFF_FFFF_FFFF_FFFFu64, 1).is_none());
+        assert!(
+            try_load(0xFFFF_FFFF_FFFF_FFFFu64)
+                .expect("nonexistent cache lookup")
+                .is_none()
+        );
     }
 
     #[test]
-    fn try_save_skips_empty_result() {
+    fn try_save_persists_empty_result_as_negative_entry() {
         let _env_lock = lock_env();
         let _cache = isolated_cache_dir();
 
-        // An empty result (no cast entries, empty fwd index) loads back as
-        // None via get_full's collapse, so try_save must not persist it --
-        // otherwise every run pays a disk write plus a recompute on the
-        // next load. Verify the write is skipped: try_load finds no file.
+        // Empty analysis is still a completed content-addressed result.
+        // Persisting it lets cross-process waiters distinguish a negative hit
+        // from a miss instead of serially repeating the expensive analysis.
         let cast_map = BTreeMap::new();
         let fwd_index = HashMap::new();
         let hash = 0xABCD_1234_5678_9999u64;
-        try_save(hash, &cast_map, &fwd_index, 2, &[]);
+        try_save(hash, &[std::sync::Arc::new(cast_map)], &fwd_index, 2, &[])
+            .expect("persist negative entry");
 
-        assert!(
-            try_load(hash, 2).is_none(),
-            "empty result must not be persisted"
-        );
+        let loaded = try_load(hash)
+            .expect("load negative entry")
+            .expect("empty negative result must be persisted");
+        assert!(loaded.cast_maps.iter().all(BTreeMap::is_empty));
+        assert!(loaded.fwd_index.is_empty());
+        assert!(loaded.alloc_size_types.is_empty());
     }
 }

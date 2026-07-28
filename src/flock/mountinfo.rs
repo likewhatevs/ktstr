@@ -35,11 +35,8 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 /// Read `/proc/self/mountinfo` once. Callers that need to derive
-/// needles for multiple lockfiles in a single pass (e.g.
-/// `acquire_llc_plan`'s DISCOVER phase, which visits every host
-/// LLC's lockfile on every DISCOVER attempt) read mountinfo via
-/// this helper once per batch and hand the resulting `String` to
-/// [`super::proc_locks::read_holders_with_mountinfo`] /
+/// needles for multiple lockfiles in a single pass read mountinfo via
+/// this helper once and hand the resulting `String` to
 /// [`needle_from_path_with_mountinfo`].
 ///
 /// One-shot callers ([`needle_from_path`],
@@ -72,9 +69,8 @@ pub(crate) fn needle_from_path(path: &Path) -> Result<String> {
 /// byte-identical needles for the same `path` — this one just
 /// skips the mountinfo read.
 ///
-/// Used by [`super::proc_locks::read_holders_with_mountinfo`] so a
-/// caller walking N lockfiles pays for exactly one mountinfo read
-/// instead of N.
+/// Used by the batched holder readers in [`super::proc_locks`] so a caller
+/// walking N lockfiles pays for exactly one mountinfo read instead of N.
 pub(crate) fn needle_from_path_with_mountinfo(path: &Path, mountinfo: &str) -> Result<String> {
     use anyhow::Context;
     use std::fs;

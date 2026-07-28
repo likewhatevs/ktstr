@@ -13,6 +13,57 @@ use super::*;
 /// its stash/take exercises so the ordering is well defined.
 static DEFERRED_PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn phase_a_status_is_consumed_and_missing_publication_fails_closed() {
+    let pipeline = ProbePipeline::new();
+    *pipeline.phase_a_status.lock().unwrap() = Some(Ok(()));
+    assert_eq!(take_phase_a_status(&pipeline), Ok(()));
+    assert!(
+        take_phase_a_status(&pipeline)
+            .unwrap_err()
+            .contains("without publishing status"),
+        "a terminal latch cannot be interpreted as implicit success"
+    );
+
+    *pipeline.phase_a_status.lock().unwrap() = Some(Err("exit hook rejected".to_string()));
+    assert_eq!(
+        take_phase_a_status(&pipeline),
+        Err("exit hook rejected".to_string()),
+        "the concrete worker failure must cross the Phase-A latch"
+    );
+}
+
+#[test]
+fn primary_probe_dump_arg_is_injected_only_for_opted_in_cells() {
+    let mut default_args = vec!["run".to_string()];
+    append_primary_probe_dump_arg(&KtstrTestEntry::DEFAULT, &mut default_args);
+    assert_eq!(default_args, ["run"]);
+
+    let opted_in = KtstrTestEntry {
+        name: "primary-probe-dump-ready",
+        probe_dump_ready_gate: true,
+        ..KtstrTestEntry::DEFAULT
+    };
+    let mut opted_in_args = vec!["run".to_string()];
+    append_primary_probe_dump_arg(&opted_in, &mut opted_in_args);
+    assert_eq!(
+        extract_probe_stack_arg(&opted_in_args).as_deref(),
+        Some(PRIMARY_PROBE_DUMP_STACK),
+        "the primary VM must load the base probe skeleton and one live \
+         sched_ext kprobe before waiting"
+    );
+
+    append_primary_probe_dump_arg(&opted_in, &mut opted_in_args);
+    assert_eq!(
+        opted_in_args
+            .iter()
+            .filter(|arg| arg.starts_with("--ktstr-probe-stack="))
+            .count(),
+        1,
+        "an explicit probe request must not be duplicated"
+    );
+}
+
 /// The auto-repro VM's host deadline must include PROBE_DRAIN_GRACE beyond the
 /// base workload timeout, so the watchdog cannot fire during the post-trigger
 /// probe-drain tail and truncate the captured-arg payload (the repro
@@ -27,6 +78,7 @@ fn repro_vm_builder_adds_probe_drain_grace_to_deadline() {
         &entry,
         Path::new("/dummy/kernel"),
         None,
+        &[],
         Path::new("/dummy/ktstr"),
         None,
         &[],
@@ -1356,13 +1408,12 @@ fn classify_repro_vm_status_malformed_not_attached_falls_through() {
 // -- render_failure_dump_file -----------------------------------
 //
 // The auto-repro path reads its `{name}-{variant_hash}.repro.failure-dump.json`
-// sidecar back, sniffs the `schema` discriminant to choose
-// between [`FailureDumpReport`] and [`DualFailureDumpReport`],
-// and emits the Display rendering as a tail block. These tests
-// pin every branch of that helper: missing file, both schemas,
-// absent schema (back-compat), unknown schema, malformed JSON.
-// tempfile gives us scratch paths without polluting the working
-// directory or relying on sidecar_dir() machinery.
+// sidecar metadata and emits only its exact path and byte size.
+// The payload remains exclusively in the artifact. These tests pin
+// missing-file handling, schema-independent preservation, and the
+// hard output bound for a synthetic report much larger than the
+// inline diagnostic ceiling. tempfile gives us scratch paths without
+// polluting the working directory or relying on sidecar_dir() machinery.
 
 #[test]
 fn render_failure_dump_file_missing_returns_none() {
@@ -1392,14 +1443,15 @@ fn render_failure_dump_file_single_schema() {
         rendered.starts_with("--- repro VM failure dump ---"),
         "header missing: {rendered}"
     );
-    // FailureDumpReport's empty Display body is "(empty failure dump)";
-    // pin the substring that the FailureDumpReport's own Display
-    // emits for an empty-but-valid report so we know the body
-    // came from FailureDumpReport::fmt and not a different path.
     assert!(
-        rendered.contains("(empty failure dump)"),
-        "single-schema body must come from FailureDumpReport Display: {rendered}"
+        rendered.contains(&tmp.path().display().to_string()),
+        "summary must point at the exact artifact path: {rendered}"
     );
+    assert_eq!(
+        rendered.lines().count(),
+        MAX_INLINE_FAILURE_DUMP_SUMMARY_LINES
+    );
+    assert!(!rendered.contains("(empty failure dump)"));
 }
 
 #[test]
@@ -1423,50 +1475,101 @@ fn render_failure_dump_file_dual_schema() {
         "header missing: {rendered}"
     );
     assert!(
-        rendered.contains("DualFailureDumpReport:"),
-        "dual-schema body must come from DualFailureDumpReport Display: {rendered}"
+        rendered.contains(&tmp.path().display().to_string()),
+        "dual-schema summary must point at the exact artifact path: {rendered}"
     );
+    assert!(!rendered.contains("DualFailureDumpReport:"));
 }
 
 #[test]
-fn render_failure_dump_file_absent_schema_returns_none() {
-    // JSON without the `schema` field: the dispatcher at
-    // `FailureDumpReportAny::from_json` requires an explicit
-    // schema discriminant. Per the dispatcher doc, the previous
-    // "absent ⇒ single" fallback was deliberately removed to
-    // avoid silently mis-routing a richer wrapper as a lossy
-    // single shape. So absent-schema JSON returns None — the
-    // helper does not invent a schema choice.
+fn render_failure_dump_file_absent_schema_still_preserves_artifact_pointer() {
+    // The console summary is deliberately schema-agnostic. A malformed
+    // or older artifact is more important to retain and point at than
+    // it is to render inline.
     let json = r#"{"maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
 
-    assert!(
-        render_failure_dump_file(tmp.path()).is_none(),
-        "absent-schema JSON must return None to avoid silent mis-routing"
-    );
+    let rendered = render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
+    assert!(rendered.contains(&tmp.path().display().to_string()));
 }
 
 #[test]
-fn render_failure_dump_file_unknown_schema_returns_none() {
-    // A schema value the helper doesn't know about (e.g. a
-    // future "triple" wrapper) returns None — the helper does
-    // not silently fall back to single, since that could
-    // mis-render a richer wrapper as the lossy single shape.
+fn render_failure_dump_file_unknown_schema_still_preserves_artifact_pointer() {
     let json = r#"{"schema":"triple","maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), json).expect("write tempfile");
-    assert!(render_failure_dump_file(tmp.path()).is_none());
+    let rendered = render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
+    assert!(rendered.contains(&tmp.path().display().to_string()));
 }
 
 #[test]
-fn render_failure_dump_file_invalid_json_returns_none() {
-    // Garbage bytes on disk: the initial
-    // `serde_json::from_str::<Value>` call returns Err, and the
-    // helper short-circuits to None without panicking.
+fn render_failure_dump_file_invalid_json_still_preserves_artifact_pointer() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     std::fs::write(tmp.path(), "not json").expect("write tempfile");
-    assert!(render_failure_dump_file(tmp.path()).is_none());
+    let rendered = render_failure_dump_file(tmp.path()).expect("existing artifact must summarize");
+    assert!(rendered.contains(&tmp.path().display().to_string()));
+}
+
+#[test]
+fn render_failure_dump_file_large_payload_is_strictly_bounded() {
+    use crate::monitor::arena::{ArenaPage, ArenaSnapshot};
+    use crate::monitor::dump::{FailureDumpMap, FailureDumpReport};
+
+    const SENTINEL: &str = "KTSTR_UNBOUNDED_FAILURE_DUMP_SENTINEL";
+    let huge = FailureDumpReport {
+        maps: vec![FailureDumpMap {
+            name: "synthetic_large_arena".to_string(),
+            arena: Some(ArenaSnapshot {
+                pages: vec![ArenaPage {
+                    user_addr: 0,
+                    bytes: vec![255u8; 256 * 1024],
+                }],
+                declared_pages: 1,
+                ..Default::default()
+            }),
+            error: Some(SENTINEL.repeat(4096)),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let json = serde_json::to_vec(&huge).expect("serialize synthetic large report");
+    assert!(
+        json.len() > MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES,
+        "fixture must be larger than the inline diagnostic ceiling"
+    );
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    std::fs::write(tmp.path(), &json).expect("write tempfile");
+
+    let rendered = render_failure_dump_file(tmp.path()).expect("large report must summarize");
+    assert_eq!(
+        std::fs::read(tmp.path()).expect("read preserved artifact"),
+        json,
+        "rendering the console summary must not modify the forensic artifact"
+    );
+    assert!(
+        rendered.len() <= MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES,
+        "summary exceeded hard byte ceiling: {} > {}",
+        rendered.len(),
+        MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES,
+    );
+    assert_eq!(
+        rendered.lines().count(),
+        MAX_INLINE_FAILURE_DUMP_SUMMARY_LINES,
+        "summary exceeded hard line ceiling: {rendered}"
+    );
+    assert!(
+        !rendered.contains(SENTINEL),
+        "forensic payload escaped into stderr: {rendered}"
+    );
+    assert!(
+        rendered.contains(&tmp.path().display().to_string()),
+        "summary omitted the exact artifact path: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("{} bytes", json.len())),
+        "summary omitted the artifact byte size: {rendered}"
+    );
 }
 
 // -- stitch_drop_cause / format_probe_diagnostics events line --
@@ -1507,10 +1610,10 @@ fn diag_with_events(
 
 #[test]
 fn stitch_drop_cause_trigger_never_fired() {
-    // bpf_trigger_fires == 0 → the tp_btf handler never executed.
+    // bpf_trigger_fires == 0 → the selected handler never executed.
     // Either the scheduler clean-exited (kind < SCX_EXIT_ERROR
     // hits the early-return at probe.bpf.c:565) or the scheduler
-    // crashed before reaching the tracepoint at all. The cause
+    // crashed before reaching the selected trigger at all. The cause
     // string MUST mention "trigger never fired" so an operator
     // grepping the section can land on the lifecycle bug rather
     // than chasing a stitch failure.
@@ -2835,13 +2938,13 @@ fn condense_probe_reason_prefers_libbpf_log_tail() {
     // condense_probe_reason surfaces that tail line, not the leading errno.
     let err = "skeleton load (retry): Permission denied; original error \
                before retry: Permission denied; LIBBPF-LOG>>>\n\
-               libbpf: prog 'ktstr_trigger_tp': BPF program load failed\n\
-               libbpf: failed to find kernel BTF type ID of 'sched_ext_exit': -3\n\
+               libbpf: prog 'ktstr_trigger_vexit_return': BPF program load failed\n\
+               libbpf: failed to load raw scx_vexit return probe: -22\n\
                <<<LIBBPF-LOG";
     let condensed = condense_probe_reason(err);
     assert_eq!(
         condensed,
-        "libbpf: failed to find kernel BTF type ID of 'sched_ext_exit': -3",
+        "libbpf: failed to load raw scx_vexit return probe: -22",
     );
 }
 

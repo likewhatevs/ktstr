@@ -5,6 +5,411 @@
 use super::*;
 use std::cmp::Ordering;
 
+#[test]
+fn ubuntu_package_indexes_use_published_repository_roots() {
+    assert_eq!(
+        deb_packages_url(UBUNTU_ARCHIVE, "noble", "amd64"),
+        "https://archive.ubuntu.com/ubuntu/dists/noble-updates/main/binary-amd64/Packages.gz",
+    );
+    assert_eq!(
+        deb_packages_url(UBUNTU_PORTS, "noble", "arm64"),
+        "https://ports.ubuntu.com/ubuntu-ports/dists/noble-updates/main/binary-arm64/Packages.gz",
+    );
+    assert_eq!(
+        deb_packages_url(UBUNTU_DDEBS, "noble", "arm64"),
+        "https://ddebs.ubuntu.com/dists/noble-updates/main/binary-arm64/Packages.gz",
+    );
+}
+
+#[test]
+fn ubuntu_ddeb_ref_has_independent_launchpad_download_origin() {
+    let packages = parse_deb_packages(
+        "Package: linux-image-unsigned-6.17.0-38-generic-dbgsym\n\
+         Version: 6.17.0-38.42~24.04.1\n\
+         Filename: pool/main/l/linux-hwe-6.17/linux-image-dbgsym.ddeb\n\
+         SHA256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\
+         Size: 4096\n",
+    );
+    let package = ubuntu_ddeb_package_ref(&packages[0]).unwrap();
+
+    assert_eq!(
+        package.url,
+        "https://ddebs.ubuntu.com/pool/main/l/linux-hwe-6.17/linux-image-dbgsym.ddeb"
+    );
+    assert_eq!(
+        package.alternate_urls,
+        ["https://launchpad.net/ubuntu/+archive/primary/+files/linux-image-dbgsym.ddeb"]
+    );
+    assert_eq!(package.size, Some(4096));
+}
+
+#[test]
+fn launchpad_dbgsym_query_constrains_every_identity_axis() {
+    let url = Url::parse(
+        &launchpad_ddeb_query_url(
+            "noble",
+            "arm64",
+            "linux-image-unsigned-6.8.0-101-generic-dbgsym",
+            "6.8.0-101.101",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+    assert_eq!(
+        url.as_str().split('?').next().unwrap(),
+        LAUNCHPAD_PRIMARY_ARCHIVE_API
+    );
+    assert_eq!(query["ws.op"], "getPublishedBinaries");
+    assert_eq!(
+        query["binary_name"],
+        "linux-image-unsigned-6.8.0-101-generic-dbgsym"
+    );
+    assert_eq!(query["exact_match"], "true");
+    assert_eq!(query["version"], "6.8.0-101.101");
+    assert_eq!(
+        query["distro_arch_series"],
+        "https://api.launchpad.net/devel/ubuntu/noble/arm64"
+    );
+    assert_eq!(query["pocket"], "Updates");
+    assert_eq!(query["status"], "Published");
+}
+
+#[test]
+fn launchpad_dbgsym_responses_preserve_exact_verified_artifact() {
+    let name = "linux-image-unsigned-6.8.0-101-generic-dbgsym";
+    let version = "6.8.0-101.101";
+    let publication = serde_json::to_vec(&serde_json::json!({
+        "total_size": 1,
+        "entries": [{
+            "self_link": "https://api.launchpad.net/devel/ubuntu/+archive/primary/+binarypub/239341554",
+            "binary_package_name": name,
+            "binary_package_version": version,
+            "distro_arch_series_link": "https://api.launchpad.net/devel/ubuntu/noble/amd64",
+            "status": "Published",
+            "pocket": "Updates",
+            "is_debug": true
+        }]
+    }))
+    .unwrap();
+    let publication = exact_launchpad_publication(&publication, "noble", "amd64", name, version)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        launchpad_binary_files_url(&publication.self_link).unwrap(),
+        "https://api.launchpad.net/devel/ubuntu/+archive/primary/+binarypub/239341554?ws.op=binaryFileUrls&include_meta=true"
+    );
+
+    let files = serde_json::to_vec(&serde_json::json!([{
+        "url": format!(
+            "https://launchpad.net/ubuntu/+archive/primary/+files/{name}_{version}_amd64.ddeb"
+        ),
+        "size": 1_741_755_652_u64,
+        "sha1": "ignored-by-ktstr",
+        "sha256": TEST_SHA256
+    }]))
+    .unwrap();
+    let package = launchpad_ddeb_package_ref(&files, name, version, "amd64").unwrap();
+    assert_eq!(package.name, name);
+    assert_eq!(package.version, version);
+    assert_eq!(package.sha256, TEST_SHA256);
+    assert_eq!(package.size, Some(1_741_755_652));
+}
+
+#[test]
+fn launchpad_dbgsym_responses_reject_identity_or_file_mismatch() {
+    let name = "linux-image-unsigned-6.8.0-101-generic-dbgsym";
+    let version = "6.8.0-101.101";
+    let wrong_publication = serde_json::to_vec(&serde_json::json!({
+        "total_size": 1,
+        "entries": [{
+            "self_link": "https://api.launchpad.net/devel/ubuntu/+archive/primary/+binarypub/239341554",
+            "binary_package_name": name,
+            "binary_package_version": version,
+            "distro_arch_series_link": "https://api.launchpad.net/devel/ubuntu/noble/arm64",
+            "status": "Published",
+            "pocket": "Updates",
+            "is_debug": true
+        }]
+    }))
+    .unwrap();
+    let error = exact_launchpad_publication(&wrong_publication, "noble", "amd64", name, version)
+        .expect_err("mismatched architecture must be rejected");
+    assert!(error.to_string().contains("identity mismatch"));
+
+    let wrong_file = serde_json::to_vec(&serde_json::json!([{
+        "url": format!(
+            "https://launchpad.net/ubuntu/+archive/primary/+files/{name}_{version}_arm64.ddeb"
+        ),
+        "size": 4096,
+        "sha256": TEST_SHA256
+    }]))
+    .unwrap();
+    let error = launchpad_ddeb_package_ref(&wrong_file, name, version, "amd64")
+        .expect_err("mismatched file architecture must be rejected");
+    assert!(error.to_string().contains("invalid primary-archive"));
+}
+
+// ---- Complete-resolution last-known-good cache -------------------
+
+const TEST_SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn cached_package(name: &str) -> PackageRef {
+    PackageRef {
+        name: name.to_string(),
+        version: "1.2.3-4".to_string(),
+        url: format!("https://packages.example.test/{name}"),
+        alternate_urls: Vec::new(),
+        sha256: TEST_SHA256.to_string(),
+        size: Some(4096),
+    }
+}
+
+fn cached_resolution(
+    kind: DistroKind,
+    release: Option<&str>,
+    host_arch: &str,
+) -> ResolvedDistroKernel {
+    let (distro, arch) = match kind {
+        DistroKind::Fedora => (
+            format!("fedora{}", release.unwrap_or("44")),
+            host_arch.to_string(),
+        ),
+        DistroKind::Ubuntu => (
+            format!("ubuntu{}-hwe", release.unwrap_or("24.04")),
+            match host_arch {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => other,
+            }
+            .to_string(),
+        ),
+        DistroKind::AmazonLinux => ("al2023".to_string(), host_arch.to_string()),
+        DistroKind::SteamOs => (
+            format!("steamos{}", release.unwrap_or("3.8")),
+            host_arch.to_string(),
+        ),
+        DistroKind::Gke => ("gke129".to_string(), host_arch.to_string()),
+    };
+    ResolvedDistroKernel {
+        distro,
+        kernel_release: "6.12.34-1".to_string(),
+        arch,
+        packages: vec![cached_package("kernel")],
+        debuginfo: if kind == DistroKind::SteamOs {
+            Vec::new()
+        } else {
+            vec![cached_package("kernel-debuginfo")]
+        },
+    }
+}
+
+fn assert_cached_resolution_invalid(
+    kind: DistroKind,
+    release: Option<&str>,
+    host_arch: &str,
+    resolved: &ResolvedDistroKernel,
+    message: &str,
+) {
+    let error = validate_cached_resolution(kind, release, host_arch, resolved)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(message),
+        "expected {message:?} in validation error, got {error:?}"
+    );
+}
+
+#[test]
+fn distro_resolution_cache_key_is_versioned_and_covers_every_input_axis() {
+    assert_eq!(
+        distro_resolution_cache_key(DistroKind::Fedora, None, "x86_64"),
+        "distro-resolution-v1/fedora/latest/x86_64"
+    );
+    assert_eq!(
+        distro_resolution_cache_key(DistroKind::Fedora, Some("44"), "x86_64"),
+        "distro-resolution-v1/fedora/release=44/x86_64"
+    );
+
+    let baseline = distro_resolution_cache_key(DistroKind::Fedora, None, "x86_64");
+    assert_ne!(
+        baseline,
+        distro_resolution_cache_key(DistroKind::Ubuntu, None, "x86_64")
+    );
+    assert_ne!(
+        baseline,
+        distro_resolution_cache_key(DistroKind::Fedora, Some("44"), "x86_64")
+    );
+    assert_ne!(
+        baseline,
+        distro_resolution_cache_key(DistroKind::Fedora, None, "aarch64")
+    );
+
+    let amazonlinux = distro_resolution_cache_key(DistroKind::AmazonLinux, None, "x86_64");
+    assert_eq!(
+        amazonlinux,
+        "distro-resolution-v1/amazonlinux/rolling-al2023/x86_64"
+    );
+    assert_eq!(
+        amazonlinux,
+        distro_resolution_cache_key(DistroKind::AmazonLinux, Some("2023"), "x86_64"),
+        "equivalent Amazon Linux selectors must share one rolling AL2023 fallback",
+    );
+}
+
+#[test]
+fn cached_resolution_validator_accepts_every_repository_distro_shape() {
+    for (kind, release, arch) in [
+        (DistroKind::Fedora, None, "x86_64"),
+        (DistroKind::Fedora, Some("44"), "aarch64"),
+        (DistroKind::Ubuntu, None, "aarch64"),
+        (DistroKind::Ubuntu, Some("24.04"), "x86_64"),
+        (DistroKind::AmazonLinux, None, "aarch64"),
+        (DistroKind::AmazonLinux, Some("2023"), "x86_64"),
+        (DistroKind::SteamOs, None, "x86_64"),
+        (DistroKind::SteamOs, Some("3.8"), "x86_64"),
+    ] {
+        let resolved = cached_resolution(kind, release, arch);
+        validate_cached_resolution(kind, release, arch, &resolved)
+            .unwrap_or_else(|error| panic!("{kind:?}/{release:?}/{arch}: {error:#}"));
+    }
+}
+
+#[test]
+fn cached_resolution_validator_rejects_request_identity_mismatches() {
+    let mut resolved = cached_resolution(DistroKind::Fedora, Some("44"), "x86_64");
+    resolved.distro = "fedora43".to_string();
+    assert_cached_resolution_invalid(
+        DistroKind::Fedora,
+        Some("44"),
+        "x86_64",
+        &resolved,
+        "does not match requested release",
+    );
+
+    let mut resolved = cached_resolution(DistroKind::Ubuntu, None, "aarch64");
+    resolved.arch = "amd64".to_string();
+    assert_cached_resolution_invalid(
+        DistroKind::Ubuntu,
+        None,
+        "aarch64",
+        &resolved,
+        "expected \"arm64\"",
+    );
+
+    let resolved = cached_resolution(DistroKind::SteamOs, None, "x86_64");
+    assert_cached_resolution_invalid(
+        DistroKind::SteamOs,
+        None,
+        "aarch64",
+        &resolved,
+        "requires x86_64",
+    );
+
+    let resolved = cached_resolution(DistroKind::Gke, None, "x86_64");
+    assert_cached_resolution_invalid(
+        DistroKind::Gke,
+        None,
+        "x86_64",
+        &resolved,
+        "does not match requested release",
+    );
+}
+
+#[test]
+fn cached_resolution_validator_rejects_incomplete_payloads_and_debug_policy() {
+    let mut resolved = cached_resolution(DistroKind::Fedora, None, "x86_64");
+    resolved.kernel_release.clear();
+    assert_cached_resolution_invalid(
+        DistroKind::Fedora,
+        None,
+        "x86_64",
+        &resolved,
+        "kernel release is empty",
+    );
+
+    let mut resolved = cached_resolution(DistroKind::Fedora, None, "x86_64");
+    resolved.packages.clear();
+    assert_cached_resolution_invalid(
+        DistroKind::Fedora,
+        None,
+        "x86_64",
+        &resolved,
+        "no kernel packages",
+    );
+
+    let mut resolved = cached_resolution(DistroKind::Ubuntu, None, "x86_64");
+    resolved.debuginfo.clear();
+    assert_cached_resolution_invalid(
+        DistroKind::Ubuntu,
+        None,
+        "x86_64",
+        &resolved,
+        "no mandatory debuginfo",
+    );
+
+    let mut resolved = cached_resolution(DistroKind::SteamOs, None, "x86_64");
+    resolved
+        .debuginfo
+        .push(cached_package("unexpected-debuginfo"));
+    assert_cached_resolution_invalid(
+        DistroKind::SteamOs,
+        None,
+        "x86_64",
+        &resolved,
+        "unexpectedly contains debuginfo",
+    );
+}
+
+#[test]
+fn cached_resolution_validator_rejects_malformed_package_fields() {
+    let valid = cached_resolution(DistroKind::Fedora, None, "x86_64");
+
+    let mut resolved = valid.clone();
+    resolved.packages[0].name = " ".to_string();
+    assert_cached_resolution_invalid(DistroKind::Fedora, None, "x86_64", &resolved, "empty name");
+
+    let mut resolved = valid.clone();
+    resolved.packages[0].version.clear();
+    assert_cached_resolution_invalid(
+        DistroKind::Fedora,
+        None,
+        "x86_64",
+        &resolved,
+        "empty version",
+    );
+
+    for url in [
+        "ftp://packages.example.test/kernel",
+        "https://",
+        "not a URL",
+    ] {
+        let mut resolved = valid.clone();
+        resolved.packages[0].url = url.to_string();
+        assert_cached_resolution_invalid(DistroKind::Fedora, None, "x86_64", &resolved, "URL");
+    }
+
+    for sha256 in [
+        "abc",
+        "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    ] {
+        let mut resolved = valid.clone();
+        resolved.packages[0].sha256 = sha256.to_string();
+        assert_cached_resolution_invalid(
+            DistroKind::Fedora,
+            None,
+            "x86_64",
+            &resolved,
+            "invalid sha256",
+        );
+    }
+
+    let mut resolved = valid;
+    resolved.packages[0].size = Some(0);
+    assert_cached_resolution_invalid(DistroKind::Fedora, None, "x86_64", &resolved, "zero size");
+}
+
 // ---- rpmvercmp / EVR ----------------------------------------------
 
 #[test]
@@ -382,6 +787,49 @@ fn newest_kernel_with_debuginfo_falls_back_when_newest_ddeb_lags() {
 }
 
 #[test]
+fn exact_dbgsym_provider_checks_candidates_newest_first() {
+    let debs = parse_deb_packages(
+        "Package: linux-image-6.17.0-40-generic\nVersion: 6.17.0-40.44~24.04.1\n\n\
+         Package: linux-image-6.17.0-38-generic\nVersion: 6.17.0-38.42~24.04.1\n",
+    );
+    let expected = "linux-image-unsigned-6.17.0-38-generic-dbgsym";
+    let mut requests = Vec::new();
+    let selected = newest_kernel_with_exact_dbgsym_lookup(&debs, |name, version| {
+        requests.push((name.to_string(), version.to_string()));
+        if name != expected {
+            return Ok(None);
+        }
+        Ok(Some(PackageRef {
+            name: name.to_string(),
+            version: version.to_string(),
+            url: format!("https://launchpad.net/ubuntu/+archive/primary/+files/{name}.ddeb"),
+            alternate_urls: Vec::new(),
+            sha256: TEST_SHA256.to_string(),
+            size: Some(4096),
+        }))
+    })
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(selected.kver, "6.17.0-38");
+    assert_eq!(selected.debuginfo.name, expected);
+    assert_eq!(
+        requests,
+        [
+            (
+                "linux-image-unsigned-6.17.0-40-generic-dbgsym".to_string(),
+                "6.17.0-40.44~24.04.1".to_string(),
+            ),
+            (
+                "linux-image-6.17.0-40-generic-dbgsym".to_string(),
+                "6.17.0-40.44~24.04.1".to_string(),
+            ),
+            (expected.to_string(), "6.17.0-38.42~24.04.1".to_string(),),
+        ]
+    );
+}
+
+#[test]
 fn parse_deb_packages_and_hwe_chain() {
     let debs = parse_deb_packages(DEB_PACKAGES);
     assert_eq!(debs.len(), 4);
@@ -632,7 +1080,9 @@ fn fedora_latest_from_json_picks_max_numeric() {
 fn assert_pkg_shape(p: &PackageRef) {
     assert!(!p.name.is_empty(), "empty package name");
     assert!(!p.version.is_empty(), "empty version for {}", p.name);
-    assert!(p.url.starts_with("http"), "bad url: {}", p.url);
+    for url in std::iter::once(&p.url).chain(&p.alternate_urls) {
+        assert!(url.starts_with("http"), "bad url: {url}");
+    }
     assert_eq!(
         p.sha256.len(),
         64,
@@ -662,16 +1112,15 @@ fn assert_resolved_shape(r: &ResolvedDistroKernel) {
 /// robust against a mirror that rejects HEAD; a server that ignores the
 /// `Range` header still only ships headers here — the blocking body is
 /// lazily read and we never read it, so no full package is pulled.
-/// `ddebs.ubuntu.com` is plain http, which the shared client handles. A
-/// non-success status (notably 404) is a hard failure so an upstream
+/// Ubuntu dbgsym packages may resolve through the DDEB archive or Launchpad's
+/// independent primary-archive file store. The fetch helper bounds response
+/// stalls and retries transient transport/
+/// gateway failures while preserving this ranged request on every attempt.
+/// A non-success status (notably 404) is a hard failure so an upstream
 /// URL/layout change trips CI in advance of any real download.
 fn assert_url_exists(url: &str) {
-    let resp = crate::fetch::shared_client()
-        .get(url)
-        .header(reqwest::header::RANGE, "bytes=0-0")
-        .send()
+    let status = crate::fetch::probe_url_status(url)
         .unwrap_or_else(|e| panic!("existence probe for {url} failed: {e}"));
-    let status = resp.status();
     assert!(
         status.is_success(),
         "package URL does not exist upstream ({status}): {url}",

@@ -1128,3 +1128,4 @@ fn call_insn() -> BpfInsn {
 mod index;
 mod parse;
 mod patch;
+mod real_scheduler_seam;

@@ -12,13 +12,35 @@ use std::env;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[path = "build_support/cargo_make.rs"]
+mod cargo_make;
+
 #[cfg(feature = "vendored")]
 use libbpf_cargo::SkeletonBuilder;
+
+#[cfg(feature = "wprof")]
+use ahash as gix_acquire_ahash;
+#[cfg(feature = "wprof")]
+use fs2 as gix_acquire_fs2;
+#[cfg(feature = "wprof")]
+use gix as gix_acquire_gix;
+#[cfg(feature = "wprof")]
+use jobserver as gix_acquire_jobserver;
+#[cfg(feature = "wprof")]
+#[path = "build_support/gix_acquire.rs"]
+mod gix_acquire;
 
 include!("src/kernel_path.rs");
 include!("src/build_helpers.rs");
 
+#[cfg(any(feature = "vendored", feature = "wprof"))]
+fn cargo_coordinated_make() -> cargo_make::CargoCoordinatedMake {
+    cargo_make::CargoCoordinatedMake::new()
+}
+
 fn main() {
+    #[cfg(feature = "wprof")]
+    println!("cargo:rerun-if-changed=build_support/gix_acquire.rs");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // docs.rs / non-`vendored` builds cannot compile the vendored libbpf
@@ -87,10 +109,11 @@ fn emit_docsrs_stubs(out_dir: &std::path::Path) {
 /// body apart from taking `out_dir` as a parameter.
 #[cfg(feature = "vendored")]
 fn vendored_main(out_dir: PathBuf) {
-    // Cache invalidation: track the env var that selects a kernel
-    // and the build-script inputs (kernel_path resolver, C generator
-    // source). Deliberately NOT emitting a `rerun-if-changed` on the
-    // BTF source path itself:
+    // Cache invalidation: track the ordinary kernel selector, the explicit
+    // compile-BTF selector used by cargo-ktstr's content-addressed producer,
+    // and the build-script inputs (kernel_path resolver, C generator source).
+    // Deliberately NOT emitting a `rerun-if-changed` on the BTF source path
+    // itself:
     //
     //   1. `vmlinux` is consumed here only as the BTF source for
     //      `vmlinux.h` generation on the C side below, not as an
@@ -122,6 +145,13 @@ fn vendored_main(out_dir: PathBuf) {
     // mirrors `src/test_support/sidecar/mod.rs::sidecar_variant_hash`
     // so the project uses a single stable hash family.
     println!("cargo:rerun-if-env-changed=KTSTR_KERNEL");
+    println!("cargo:rerun-if-env-changed=KTSTR_BUILD_BTF");
+    // Build-blob publication uses the same cache-root cascade as runtime
+    // artifacts. ghars supplies one trust-zone-wide KTSTR_CACHE_DIR to every
+    // runner; the fallbacks retain ordinary local Cargo behavior.
+    for variable in ["KTSTR_CACHE_DIR", "XDG_CACHE_HOME", "HOME"] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
     println!("cargo:rerun-if-changed=src/kernel_path.rs");
     println!("cargo:rerun-if-changed=src/bpf/vmlinux_gen.c");
     let ktstr_kernel = env::var("KTSTR_KERNEL").ok();
@@ -137,7 +167,16 @@ fn vendored_main(out_dir: PathBuf) {
     // anyway), so a disappearing source is not a build-blocking
     // event. A MISSING `vmlinux.h` still panics below because we
     // have nothing to fall back on.
-    let current_btf = resolve_btf(ktstr_kernel.as_deref());
+    // cargo-ktstr deliberately decouples compile-time BPF type generation
+    // from the selected guest kernel: all matrix lanes on one host/arch use
+    // one explicitly content-keyed BTF, while libbpf applies CO-RE against
+    // each guest's real BTF at load time. Direct Cargo builds retain the
+    // historical KTSTR_KERNEL -> local/host resolver when the explicit build
+    // input is absent.
+    let current_btf = env::var_os("KTSTR_BUILD_BTF")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| resolve_btf(ktstr_kernel.as_deref()));
     // Hash the BTF source for drift detection. Fault-tolerant: a
     // BTF path that resolved but whose bytes cannot be read (EACCES,
     // or a race where the file vanished between resolve and read)
@@ -368,8 +407,10 @@ int main(void) {{
     //
     // Hermeticity contract:
     //
-    //  - The tarball is fetched ONCE per OUT_DIR and cached at
-    //    `$OUT_DIR/busybox`. `cargo clean` forces a re-fetch.
+    //  - The pinned source is fetched and compiled once per exact build-input
+    //    tuple in the machine-wide content cache. Every Cargo OUT_DIR gets a
+    //    private FICLONE inode over that immutable executable; `cargo clean`
+    //    therefore does not repeat the C build.
     //  - The fetched bytes are SHA-256-verified against
     //    [`BUSYBOX_TARBALL_SHA256`] before extraction. A mismatch
     //    panics with the actual vs expected hash so the operator
@@ -387,8 +428,8 @@ int main(void) {{
     //    with a clear "shell mode unavailable" rather than an
     //    opaque "exec format error" on the 0-byte file. Mirrors
     //    the existing `KTSTR_SKIP_WPROF_BUILD` escape hatch below.
-    //  - `KTSTR_BUSYBOX_BIN=<path>` copies a pre-built busybox binary
-    //    directly into `$OUT_DIR/busybox`, skipping fetch + compile.
+    //  - `KTSTR_BUSYBOX_BIN=<path>` COW-materializes a pre-built busybox
+    //    binary directly into `$OUT_DIR/busybox`, skipping fetch + compile.
     //    `cargo-ktstr` sets it (via `run_cargo.rs`) to the busybox it
     //    already embedded and extracted (`src/bin/cargo_ktstr/blobs.rs`),
     //    so a downstream `cargo ktstr test` reuses that binary instead
@@ -400,7 +441,12 @@ int main(void) {{
     // refactor: a clone bypasses the SHA gate (no tarball to
     // verify), and `KTSTR_BUSYBOX_TARBALL` covers the
     // tarball-fetch-failed case more cleanly.
+    const BUSYBOX_URL: &str = "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
+    const BUSYBOX_REVISION: &str = "busybox-1_36_1";
+    const BUSYBOX_BUILD_RECIPE: &str = "busybox-static-v3:defconfig;CONFIG_STATIC=y;\
+         CONFIG_TC=n;oldconfig-null;KBUILD_OUTPUT=;KCONFIG_CONFIG=.config";
     let busybox_bin = out_dir.join("busybox");
+    let busybox_stamp = out_dir.join(".busybox-content-key");
     println!("cargo:rerun-if-env-changed=KTSTR_SKIP_BUSYBOX_BUILD");
     println!("cargo:rerun-if-env-changed=KTSTR_BUSYBOX_TARBALL");
     println!("cargo:rerun-if-env-changed=KTSTR_BUSYBOX_BIN");
@@ -408,152 +454,185 @@ int main(void) {{
         .ok()
         .filter(|v| !v.is_empty())
         .is_some();
+    let prebuilt_busybox = if skip_busybox {
+        PrebuiltBlobStatus::NotRequested
+    } else {
+        install_prebuilt_blob(
+            std::env::var_os("KTSTR_BUSYBOX_BIN").as_deref(),
+            &busybox_bin,
+            &busybox_stamp,
+            "busybox",
+            BUSYBOX_REVISION,
+        )
+    };
+    if prebuilt_busybox == PrebuiltBlobStatus::Rejected {
+        // A requested-but-invalid handoff must fall through to a real
+        // acquisition, not silently retain an older embedded output.
+        let _ = std::fs::remove_file(&busybox_bin);
+        let _ = std::fs::remove_file(&busybox_stamp);
+    }
+    let reusable_prebuilt_busybox = matches!(
+        prebuilt_busybox,
+        PrebuiltBlobStatus::Reused | PrebuiltBlobStatus::Refreshed
+    ) || (prebuilt_busybox == PrebuiltBlobStatus::NotRequested
+        && reuse_prebuilt_blob_without_source(
+            &busybox_stamp,
+            &busybox_bin,
+            "busybox",
+            BUSYBOX_REVISION,
+        ));
     if skip_busybox {
         println!(
             "cargo:warning=KTSTR_SKIP_BUSYBOX_BUILD set — writing 0-byte \
              $OUT_DIR/busybox placeholder; shell mode will be unavailable \
              in the resulting cargo-ktstr binary"
         );
-        if !busybox_bin.exists() {
-            std::fs::write(&busybox_bin, b"").unwrap_or_else(|e| {
-                panic!(
-                    "write 0-byte busybox placeholder {}: {e}",
-                    busybox_bin.display()
-                )
-            });
-        }
-    } else if !busybox_bin.exists()
-        && !copy_prebuilt_blob(
-            std::env::var("KTSTR_BUSYBOX_BIN").ok().as_deref(),
-            &busybox_bin,
-            "busybox",
-        )
-    {
-        println!("cargo:warning=compiling busybox (first build only)...");
-
-        // Check required tools before attempting build.
-        if Command::new("make").arg("--version").output().is_err() {
-            panic!(
-                "busybox build requires 'make' — install build-essential \
-                 (Debian/Ubuntu) or base-devel (Fedora/Arch)"
-            );
-        }
-        if Command::new("gcc").arg("--version").output().is_err() {
-            panic!(
-                "busybox build requires 'gcc' — install build-essential \
-                 (Debian/Ubuntu) or base-devel (Fedora/Arch)"
-            );
-        }
-
-        let busybox_src = out_dir.join("busybox-src");
-
-        // Recover from interrupted download: if the directory exists but
-        // has no Makefile, the previous extraction was incomplete.
-        if busybox_src.exists() && !busybox_src.join("Makefile").exists() {
-            std::fs::remove_dir_all(&busybox_src).expect("remove incomplete busybox-src");
-        }
-
-        // Source the tarball: from a local path when
-        // KTSTR_BUSYBOX_TARBALL is set, otherwise from the pinned
-        // upstream URL with retry. Either path lands in
-        // `tarball_bytes` which is then SHA-verified before any
-        // extraction touches the filesystem.
-        if !busybox_src.join("Makefile").exists() {
-            const TARBALL_URL: &str =
-                "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
-            let tarball_bytes = match std::env::var("KTSTR_BUSYBOX_TARBALL")
-                .ok()
-                .filter(|v| !v.is_empty())
-            {
-                Some(local) => {
-                    println!(
-                        "cargo:warning=KTSTR_BUSYBOX_TARBALL set — reading {local} \
-                         instead of fetching from {TARBALL_URL}"
-                    );
-                    std::fs::read(&local).unwrap_or_else(|e| {
-                        panic!(
-                            "read KTSTR_BUSYBOX_TARBALL={local}: {e} — the env \
-                             var must point at a readable tarball matching the \
-                             pinned SHA-256"
-                        )
-                    })
-                }
-                None => fetch_busybox_tarball(TARBALL_URL),
-            };
-
-            verify_busybox_tarball_sha256(&tarball_bytes);
-
-            // Extract verified bytes into busybox-src/.
-            let extract_dir = out_dir.join("busybox-extract");
-            if extract_dir.exists() {
-                let _ = std::fs::remove_dir_all(&extract_dir);
+        // SKIP is authoritative even when Cargo reuses an OUT_DIR that
+        // already contains a real embedded or locally built binary.
+        install_skipped_blob(&busybox_bin, &busybox_stamp, "busybox");
+    } else if !reusable_prebuilt_busybox {
+        let build_tools = BusyboxBuildTools::from_environment();
+        let toolchain = build_tools.fingerprint();
+        let environment = busybox_build_environment_fingerprint();
+        let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
+        let host = std::env::var("HOST").unwrap_or_else(|_| "unknown-host".to_string());
+        let arch =
+            std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "unknown-arch".to_string());
+        assert!(
+            BUSYBOX_TARBALL_SHA256.len() == 64
+                && BUSYBOX_TARBALL_SHA256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "BUSYBOX_TARBALL_SHA256 must be a pinned 64-digit SHA-256 before the shared BusyBox CAS can identify accepted source bytes"
+        );
+        let key_parts = [
+            BUSYBOX_BUILD_RECIPE,
+            BUSYBOX_URL,
+            BUSYBOX_REVISION,
+            BUSYBOX_TARBALL_SHA256,
+            target.as_str(),
+            host.as_str(),
+            arch.as_str(),
+            toolchain.as_str(),
+            environment.as_str(),
+        ];
+        // Remove pre-CAS private source trees from reused OUT_DIRs. New builds
+        // happen only in the elected cache stage.
+        for legacy in [out_dir.join("busybox-src"), out_dir.join("busybox-extract")] {
+            if legacy.exists() {
+                std::fs::remove_dir_all(&legacy).unwrap_or_else(|error| {
+                    panic!("remove legacy BusyBox tree {}: {error}", legacy.display())
+                });
             }
-            let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(&tarball_bytes[..]));
-            let mut archive = tar::Archive::new(gz);
-            archive
-                .unpack(&extract_dir)
-                .unwrap_or_else(|e| panic!("extract busybox tarball: {e}"));
-            let inner = extract_dir.join("busybox-1_36_1");
-            std::fs::rename(&inner, &busybox_src).unwrap_or_else(|e| {
-                panic!(
-                    "expected extracted directory {} — tarball layout may have changed: {e}",
-                    inner.display()
-                )
-            });
-            std::fs::remove_dir_all(&extract_dir).ok();
         }
+        let cache_root = build_blob_cache_root("busybox")
+            .unwrap_or_else(|error| panic!("resolve shared BusyBox cache: {error}"));
+        ensure_materialized_build_blob(
+            &cache_root,
+            &key_parts,
+            "BusyBox exact source + binary",
+            "busybox",
+            &busybox_bin,
+            &busybox_stamp,
+            |stage| {
+                let busybox_src = stage.join("source");
+                let tarball_bytes = match std::env::var("KTSTR_BUSYBOX_TARBALL")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(local) => {
+                        println!(
+                            "cargo:warning=KTSTR_BUSYBOX_TARBALL set — reading {local} \
+                             instead of fetching from {BUSYBOX_URL}"
+                        );
+                        std::fs::read(&local).map_err(|error| {
+                            format!(
+                                "read KTSTR_BUSYBOX_TARBALL={local}: {error} — the env var \
+                                 must point at a readable tarball matching the pinned SHA-256"
+                            )
+                        })?
+                    }
+                    None => fetch_busybox_tarball(BUSYBOX_URL),
+                };
+                verify_busybox_tarball_sha256(&tarball_bytes);
 
-        // Configure busybox.
-        let status = Command::new("make")
-            .arg("defconfig")
-            .current_dir(&busybox_src)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .expect("make defconfig");
-        assert!(status.success(), "busybox make defconfig failed");
+                let extract_dir = stage.join("extract");
+                let gz =
+                    flate2::read::GzDecoder::new(std::io::Cursor::new(&tarball_bytes[..]));
+                let mut archive = tar::Archive::new(gz);
+                archive
+                    .unpack(&extract_dir)
+                    .map_err(|error| format!("extract BusyBox tarball: {error}"))?;
+                let inner = extract_dir.join(BUSYBOX_REVISION);
+                std::fs::rename(&inner, &busybox_src).map_err(|error| {
+                    format!(
+                        "expected extracted directory {} — tarball layout may have changed: {error}",
+                        inner.display()
+                    )
+                })?;
+                std::fs::remove_dir_all(&extract_dir)
+                    .map_err(|error| format!("remove BusyBox extraction tree: {error}"))?;
 
-        // Enable static linking, disable CONFIG_TC (requires iproute2 headers).
-        let config_path = busybox_src.join(".config");
-        let config = std::fs::read_to_string(&config_path).expect("read busybox .config");
-        let config = config
-            .replace("# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
-            .replace("CONFIG_TC=y", "# CONFIG_TC is not set");
-        std::fs::write(&config_path, config).expect("write patched busybox .config");
+                let mut make = cargo_coordinated_make();
+                build_tools.configure_make(&mut make);
+                let status = make
+                    .arg("defconfig")
+                    .current_dir(&busybox_src)
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .map_err(|error| format!("spawn BusyBox make defconfig: {error}"))?;
+                if !status.success() {
+                    return Err(format!("BusyBox make defconfig exited {status}"));
+                }
+                let config_path = busybox_src.join(".config");
+                let config = std::fs::read_to_string(&config_path)
+                    .map_err(|error| format!("read BusyBox .config: {error}"))?;
+                let config = config
+                    .replace("# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
+                    .replace("CONFIG_TC=y", "# CONFIG_TC is not set");
+                std::fs::write(&config_path, config)
+                    .map_err(|error| format!("write patched BusyBox .config: {error}"))?;
 
-        // Resolve patched config non-interactively. Busybox's Kbuild
-        // lacks olddefconfig; pipe empty input to oldconfig so every
-        // NEW prompt accepts its default without blocking on stdin.
-        let status = Command::new("make")
-            .arg("oldconfig")
-            .current_dir(&busybox_src)
-            .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .expect("make oldconfig");
-        assert!(status.success(), "busybox make oldconfig failed");
-
-        // Build busybox.  Single-threaded `-j1`: busybox is a pure-C
-        // build dominated by gcc invocations that are already
-        // parallelisable inside gcc's own job server when invoked
-        // from a parallel parent; for a one-shot build out of a
-        // build.rs the wall-time difference between `-j1` and
-        // `-jN` is small (single-digit seconds on a developer box),
-        // and `-j1` keeps the build deterministic + race-free
-        // across hosts.
-        let status = Command::new("make")
-            .arg("-j1")
-            .current_dir(&busybox_src)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .expect("busybox make");
-        assert!(status.success(), "busybox build failed");
-
-        // Copy binary to OUT_DIR.
-        std::fs::copy(busybox_src.join("busybox"), &busybox_bin)
-            .expect("copy busybox binary to OUT_DIR");
+                let mut make = cargo_coordinated_make();
+                build_tools.configure_make(&mut make);
+                let status = make
+                    .arg("oldconfig")
+                    .current_dir(&busybox_src)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .map_err(|error| format!("spawn BusyBox make oldconfig: {error}"))?;
+                if !status.success() {
+                    return Err(format!("BusyBox make oldconfig exited {status}"));
+                }
+                let mut make = cargo_coordinated_make();
+                build_tools.configure_make(&mut make);
+                let status = make
+                    .current_dir(&busybox_src)
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .map_err(|error| format!("spawn BusyBox make: {error}"))?;
+                if !status.success() {
+                    return Err(format!("BusyBox make exited {status}"));
+                }
+                let built = busybox_src.join("busybox");
+                if !is_nonempty_regular_file(&built) {
+                    return Err(format!(
+                        "BusyBox build succeeded but binary is missing at {}",
+                        built.display()
+                    ));
+                }
+                std::fs::rename(&built, stage.join("busybox"))
+                    .map_err(|error| format!("stage completed BusyBox binary: {error}"))?;
+                std::fs::remove_dir_all(&busybox_src)
+                    .map_err(|error| format!("remove private BusyBox build tree: {error}"))?;
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|error| panic!("obtain exact BusyBox binary: {error}"));
     }
 
     // wprof build: gated behind the `wprof` cargo feature (default
@@ -574,354 +653,483 @@ int main(void) {{
     }
     #[cfg(feature = "wprof")]
     {
-        println!("cargo:rerun-if-env-changed=KTSTR_SKIP_WPROF_BUILD");
-        println!("cargo:rerun-if-env-changed=KTSTR_WPROF_BIN");
-        let skip_wprof = std::env::var("KTSTR_SKIP_WPROF_BUILD")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some();
+        prepare_wprof(&out_dir, &wprof_bin);
+    } // #[cfg(feature = "wprof")]
+}
 
-        // Pin to a fixed rev so a clean fetch is reproducible. The
-        // former `git clone --depth=1` only resolved the remote's
-        // default-branch HEAD with no pin — that is how upstream's
-        // wpb/wrust sub-crates silently appeared (HEAD moved). Bump
-        // deliberately, re-verifying the wprof build at the new rev.
-        // v0.4, the latest published upstream release. Pin the release commit
-        // rather than unreleased master so ktstr does not silently absorb
-        // upstream build/API churn.
-        const WPROF_REV: &str = "9afa9ee5493814c7791586f2179aa93528fde54a";
-        let wprof_src = out_dir.join("wprof-src");
+#[cfg(feature = "vendored")]
+struct BusyboxBuildTools {
+    assignments: Vec<(&'static str, String)>,
+}
 
-        // Prefer the wprof binary cargo-ktstr already embedded
-        // (KTSTR_WPROF_BIN -> the extracted WPROF_BYTES); copying it
-        // skips the recursive git clone + compile. Computed before the
-        // rev-enforcement below so a copied binary is not mistaken for a
-        // stale clone and wiped. Unset/empty/missing/0-byte falls
-        // through to the clone+build (first-ever build, or a SKIP-built
-        // cargo-ktstr).
-        let copied_wprof = !skip_wprof
-            && !wprof_bin.exists()
-            && copy_prebuilt_blob(
-                std::env::var("KTSTR_WPROF_BIN").ok().as_deref(),
-                &wprof_bin,
-                "wprof",
-            );
-
-        // Make the pin authoritative over a cached build. The gate
-        // below (`!wprof_bin.exists()`) builds wprof once and reuses the
-        // cached binary, and `is_wprof_clone_complete` (.git/HEAD +
-        // src/Makefile) does NOT encode the rev — so without this a
-        // cached tree at a DIFFERENT rev (a WPROF_REV bump, a pre-pin
-        // clone that tracked HEAD, or a 0-byte skip placeholder) would
-        // be reused and the pin would be merely advisory. Wipe the clone
-        // AND its binary whenever the clone is incomplete OR not at
-        // WPROF_REV, so the gate re-fetches the pinned rev. A failed
-        // rev-parse (init-only partial clone with no commit) yields
-        // None → treated as a mismatch → wipe (never a panic); the rev
-        // read uses the same hermetic GIT_CONFIG env as the fetch.
-        // One-time on a rev change, then stable. Skipped under
-        // KTSTR_SKIP_WPROF_BUILD (that path writes a rev-less
-        // placeholder by design).
-        let wprof_clone_rev = |dir: &std::path::Path| -> Option<String> {
-            let out = Command::new("git")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .current_dir(dir)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .ok()?;
-            out.status
-                .success()
-                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        };
-        if !copied_wprof
-            && !skip_wprof
-            && (!is_wprof_clone_complete(&wprof_src)
-                || wprof_clone_rev(&wprof_src).as_deref() != Some(WPROF_REV))
-        {
-            if wprof_src.exists() {
-                std::fs::remove_dir_all(&wprof_src).expect("remove stale/incomplete wprof-src");
-            }
-            if wprof_bin.exists() {
-                std::fs::remove_file(&wprof_bin).expect("remove stale wprof binary");
+#[cfg(feature = "vendored")]
+impl BusyboxBuildTools {
+    fn from_environment() -> Self {
+        fn selected(name: &str, default: String) -> String {
+            match std::env::var_os(name) {
+                Some(value) => value.into_string().unwrap_or_else(|value| {
+                    panic!(
+                        "BusyBox tool override {name}={value:?} is not valid UTF-8 and cannot be passed as an exact make assignment"
+                    )
+                }),
+                None => default,
             }
         }
 
-        if skip_wprof {
-            println!(
-                "cargo:warning=KTSTR_SKIP_WPROF_BUILD set — writing 0-byte \
+        let cross_compile = selected("CROSS_COMPILE", String::new());
+        let cc = selected("CC", format!("{cross_compile}gcc"));
+        let assignments = vec![
+            ("CROSS_COMPILE", cross_compile.clone()),
+            ("HOSTCC", selected("HOSTCC", "gcc".to_string())),
+            ("AS", selected("AS", format!("{cross_compile}as"))),
+            ("CC", cc.clone()),
+            ("LD", selected("LD", format!("{cc} -nostdlib"))),
+            ("CPP", selected("CPP", format!("{cc} -E"))),
+            ("AR", selected("AR", format!("{cross_compile}ar"))),
+            (
+                "RANLIB",
+                selected("RANLIB", format!("{cross_compile}ranlib")),
+            ),
+            ("NM", selected("NM", format!("{cross_compile}nm"))),
+            ("STRIP", selected("STRIP", format!("{cross_compile}strip"))),
+            (
+                "OBJCOPY",
+                selected("OBJCOPY", format!("{cross_compile}objcopy")),
+            ),
+            (
+                "OBJDUMP",
+                selected("OBJDUMP", format!("{cross_compile}objdump")),
+            ),
+        ];
+        Self { assignments }
+    }
+
+    fn command(&self, name: &str) -> &str {
+        self.assignments
+            .iter()
+            .find_map(|(candidate, value)| (*candidate == name).then_some(value.as_str()))
+            .unwrap_or_else(|| panic!("missing normalized BusyBox tool assignment {name}"))
+    }
+
+    fn configure_make(&self, make: &mut cargo_make::CargoCoordinatedMake) {
+        configure_hermetic_busybox_make(make);
+        for (name, value) in &self.assignments {
+            make.arg(format!("{name}={value}"));
+        }
+    }
+
+    fn run_tool(&self, name: &str, args: &[&str]) -> std::process::Output {
+        let command = self.command(name);
+        let script = format!("exec {command} \"$@\"");
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .arg(format!("ktstr-busybox-{name}"))
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("BusyBox build requires {name}={command:?}, but probing it failed: {error}")
+            });
+        if !output.status.success() {
+            panic!(
+                "BusyBox build requires working {name}={command:?}, but probing it with {} exited {}: {}",
+                args.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        output
+    }
+
+    fn version(&self, name: &str, args: &[&str]) -> String {
+        let output = self.run_tool(name, args);
+        format!(
+            "{name}\0{}\0{}\0{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    fn compiler_input(&self, args: &[&str], label: &str) -> String {
+        let output = self.run_tool("CC", args);
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let digest = snapshot_prebuilt_blob(std::path::Path::new(&path), label)
+            .map(|snapshot| format!("{}:{}", snapshot.len, snapshot.content_key))
+            .unwrap_or_else(|error| format!("unavailable:{error}"));
+        let basename = std::path::Path::new(&path)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("<no-basename>");
+        format!("{label}\0{}:{basename}\0{digest}", basename.len())
+    }
+
+    fn fingerprint(&self) -> String {
+        let mut parts = vec![
+            format!(
+                "make-assignments\0{}",
+                self.assignments
+                    .iter()
+                    .map(|(name, value)| {
+                        let identity = if *name == "CROSS_COMPILE" {
+                            let basename = std::path::Path::new(value)
+                                .file_name()
+                                .and_then(std::ffi::OsStr::to_str)
+                                .unwrap_or(value);
+                            format!("tool-prefix:{}:{basename}", basename.len())
+                        } else {
+                            stable_tool_command_identity(value).unwrap_or_else(|error| {
+                                panic!(
+                                    "normalize BusyBox tool assignment {name}={value:?} for shared cache identity: {error}"
+                                )
+                            })
+                        };
+                        format!("{name}={}:{}", identity.len(), identity)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\0")
+            ),
+            {
+                let output = Command::new("make")
+                    .arg("--version")
+                    .output()
+                    .unwrap_or_else(|error| panic!("probe BusyBox make: {error}"));
+                if !output.status.success() {
+                    panic!("probe BusyBox make exited {}", output.status);
+                }
+                format!(
+                    "make\0{}\0{}\0{}",
+                    stable_tool_program_identity("make").unwrap_or_else(|error| {
+                        panic!("fingerprint BusyBox make executable: {error}")
+                    }),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            },
+        ];
+        for name in [
+            "HOSTCC", "AS", "CC", "LD", "CPP", "AR", "RANLIB", "NM", "STRIP", "OBJCOPY", "OBJDUMP",
+        ] {
+            parts.push(self.version(name, &["--version"]));
+        }
+        parts.push(self.version("CC", &["-dumpmachine"]));
+        // Compiler search directories often contain a ghars lane prefix.
+        // Their semantically selected static inputs are fingerprinted by
+        // content below; retaining the diagnostic's raw pathname spelling
+        // would split otherwise identical machine-wide cache entries.
+        parts.push(self.compiler_input(&["-print-file-name=libc.a"], "static-libc"));
+        parts.push(self.compiler_input(&["-print-libgcc-file-name"], "static-libgcc"));
+        parts.join("\n--tool--\n")
+    }
+}
+
+#[cfg(feature = "vendored")]
+fn busybox_build_environment_fingerprint() -> String {
+    const TOOL_VARIABLES: &[&str] = &[
+        "AR",
+        "AS",
+        "CC",
+        "CPP",
+        "CROSS_COMPILE",
+        "HOSTCC",
+        "LD",
+        "NM",
+        "OBJCOPY",
+        "OBJDUMP",
+        "RANLIB",
+        "STRIP",
+    ];
+    // PATH selects the executables fingerprinted above, but its raw spelling
+    // is intentionally absent from the cache key: ghars runner homes differ
+    // while the resolved tool payloads are identical.
+    println!("cargo:rerun-if-env-changed=PATH");
+    for variable in TOOL_VARIABLES {
+        // BusyboxBuildTools::fingerprint includes these as normalized command
+        // argv plus executable content identities. Retain Cargo invalidation,
+        // but never duplicate their runner-local pathname spelling here.
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
+    let mut fingerprint = String::new();
+    for variable in BUSYBOX_KEYED_BUILD_ENVIRONMENT {
+        println!("cargo:rerun-if-env-changed={variable}");
+        let value = std::env::var_os(variable);
+        fingerprint.push_str(variable);
+        fingerprint.push('\0');
+        fingerprint.push_str(&format!("{value:?}"));
+        fingerprint.push('\n');
+    }
+    fingerprint
+}
+
+#[cfg(feature = "wprof")]
+fn prepare_wprof(out_dir: &std::path::Path, wprof_bin: &std::path::Path) {
+    const WPROF_URL: &str = "https://github.com/anakryiko/wprof.git";
+    // v0.4 release commit. Every root/submodule checkout below is depth-one
+    // and detached at the exact committed object id.
+    const WPROF_REF: &str = "refs/tags/v0.4";
+    const WPROF_REV: &str = "9afa9ee5493814c7791586f2179aa93528fde54a";
+    const WPROF_STAMP: &str = ".wprof-content-key";
+
+    println!("cargo:rerun-if-env-changed=KTSTR_SKIP_WPROF_BUILD");
+    println!("cargo:rerun-if-env-changed=KTSTR_WPROF_BIN");
+    for variable in [
+        "PATH",
+        "CFLAGS",
+        "CPPFLAGS",
+        "EXTRA_CFLAGS",
+        "EXTRA_LDFLAGS",
+        "LDFLAGS",
+        "CARGO",
+        "RUSTC",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
+    let skip = std::env::var("KTSTR_SKIP_WPROF_BUILD")
+        .ok()
+        .is_some_and(|value| !value.is_empty());
+    let stamp_path = out_dir.join(WPROF_STAMP);
+
+    // A cargo-ktstr parent can hand this build the already embedded binary.
+    // Keep that zero-network path ahead of tool probing and source acquisition,
+    // and refresh it when the handed-over bytes change in a reused OUT_DIR.
+    let prebuilt_wprof = if skip {
+        PrebuiltBlobStatus::NotRequested
+    } else {
+        install_prebuilt_blob(
+            std::env::var_os("KTSTR_WPROF_BIN").as_deref(),
+            wprof_bin,
+            &stamp_path,
+            "wprof",
+            WPROF_REV,
+        )
+    };
+    if matches!(
+        prebuilt_wprof,
+        PrebuiltBlobStatus::Reused | PrebuiltBlobStatus::Refreshed
+    ) {
+        return;
+    }
+
+    if skip {
+        println!(
+            "cargo:warning=KTSTR_SKIP_WPROF_BUILD set — writing 0-byte \
              $OUT_DIR/wprof placeholder; do NOT use the resulting \
              cargo-ktstr binary for wprof capture"
-            );
-            if !wprof_bin.exists() {
-                std::fs::write(&wprof_bin, b"").unwrap_or_else(|e| {
-                    panic!(
-                        "write 0-byte wprof placeholder {}: {e}",
-                        wprof_bin.display()
-                    )
-                });
-            }
-        } else if !wprof_bin.exists() {
-            println!("cargo:warning=cloning + compiling wprof (first build only)...");
+        );
+        // The opt-out must remain authoritative when this OUT_DIR already
+        // contains a real binary from an earlier non-skipped build.
+        install_skipped_blob(wprof_bin, &stamp_path, "wprof");
+        return;
+    }
 
-            for tool in ["git", "make", "gcc", "clang", "mold"] {
-                if Command::new(tool).arg("--version").output().is_err() {
-                    panic!(
-                        "wprof build requires '{tool}' on PATH — install via your \
-                     distro's package manager (build-essential / base-devel for \
-                     make+gcc; clang+mold for BPF and LTO host compilation; \
-                     git for submodule clone)"
-                    );
+    if prebuilt_wprof == PrebuiltBlobStatus::Rejected {
+        // A requested-but-invalid handoff falls through to the normal
+        // content-addressed source build, never an older embedded output.
+        let _ = std::fs::remove_file(wprof_bin);
+        let _ = std::fs::remove_file(&stamp_path);
+    }
+    if prebuilt_wprof == PrebuiltBlobStatus::NotRequested
+        && reuse_prebuilt_blob_without_source(&stamp_path, wprof_bin, "wprof", WPROF_REV)
+    {
+        return;
+    }
+
+    let toolchain = wprof_toolchain_fingerprint();
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
+    let host = std::env::var("HOST").unwrap_or_else(|_| "unknown-host".to_string());
+    let key_parts = [
+        "wprof-binary-v2",
+        WPROF_URL,
+        WPROF_REF,
+        WPROF_REV,
+        target.as_str(),
+        host.as_str(),
+        toolchain.as_str(),
+    ];
+    // Clean up the old pre-CAS per-OUT_DIR clone once. The new builder always
+    // uses a private staged checkout and publishes only its immutable binary.
+    let old_source = out_dir.join("wprof-src");
+    if old_source.exists() {
+        if !is_wprof_clone_complete(&old_source) {
+            println!("cargo:warning=removing incomplete legacy wprof source checkout");
+        }
+        std::fs::remove_dir_all(&old_source).expect("remove legacy wprof source checkout");
+    }
+
+    let binary_cache_root = build_blob_cache_root("wprof")
+        .unwrap_or_else(|error| panic!("resolve shared wprof binary cache: {error}"));
+    let source_cache_root = gix_acquire::cache_root("source-nodes")
+        .unwrap_or_else(|| out_dir.join(".ktstr-content-cache").join("source-nodes"));
+    ensure_materialized_build_blob(
+        &binary_cache_root,
+        &key_parts,
+        "wprof exact source + binary",
+        "wprof",
+        wprof_bin,
+        &stamp_path,
+        |stage| {
+            let progress = gix_acquire::ProgressReporter::new("wprof exact source graph");
+            let source = stage.join("source");
+            gix_acquire::assemble_exact_recursive_cached(
+                &source_cache_root,
+                WPROF_URL,
+                WPROF_REF,
+                WPROF_REV,
+                &source,
+                &progress,
+            )?;
+            // Upstream's Makefile contains `git submodule update` fallbacks.
+            // The exact source graph must make every guard true so the build
+            // cannot cross back into an executable transport.
+            for required in ["libbpf/src", "bpftool/src", "blazesym/src"] {
+                if !source.join(required).is_dir() {
+                    return Err(format!(
+                        "exact wprof source graph is missing {required}; refusing \
+                         upstream's executable submodule fallback"
+                    ));
                 }
             }
-
-            // Clone into OUT_DIR like busybox — re-fetches on `cargo
-            // clean` and stays per-workspace-isolated (matches the
-            // shape of the other vendored binary).
-            //
-            // The wprof Makefile runs a standalone `cargo build` for
-            // each of its three `src/` sub-crates (demangle, wpb,
-            // wrust → lib*_c.a), none of which carries a `[workspace]`
-            // table. `isolate_wprof_subcrate_workspaces` (invoked below,
-            // before make) appends the sentinel to each so cargo's
-            // upward workspace walk stops at the sub-crate instead of
-            // reaching ktstr-root's `[workspace]` via target/ — see that
-            // helper's doc for the mechanism and scope. blazesym (a
-            // sibling submodule with its own `[workspace]`) and
-            // vmlinux.h (a header dir the Makefile never cargo-builds)
-            // are correctly left untouched.
-            //
-            // Tradeoff acknowledged: `cargo clean && cargo build`
-            // re-fetches the FULL wprof tree (~590MB working tree of
-            // which ~20MB is .git after the `--depth 1` pinned fetch +
-            // shallow submodules) — measured 60+ seconds wall time on
-            // slow CI links. Within a single cargo invocation, build.rs
-            // runs ONCE per (package, profile, feature-combo) thanks to
-            // cargo's build-script dedup, so multi-target builds against
-            // the same ktstr package amortise the fetch. Across
-            // different cargo invocations (e.g. dev iteration switching
-            // between debug and release), each does its own fetch. The
-            // cost buys: (1) per-workspace isolation — different ktstr
-            // checkouts can't share a stale wprof tree; (2) `cargo
-            // clean` consistency — no out-of-band
-            // `~/.cache/ktstr/wprof-src` rm needed; (3) a fixed,
-            // reproducible wprof rev (WPROF_REV) instead of whatever
-            // upstream HEAD happened to be at fetch time. Operators who
-            // want incremental builds should prefer `cargo build -p
-            // ktstr` over `cargo clean`.
-            // The rev-enforcement above already wiped any incomplete or
-            // off-rev clone, so reaching here means wprof_src is either
-            // a complete clone at WPROF_REV (reuse) or absent (fetch).
-            let wprof_makefile = wprof_src.join("src").join("Makefile");
-            if !wprof_makefile.exists() {
-                let git_url = "https://github.com/anakryiko/wprof.git";
-                // The pinned shallow fetch (init + fetch --depth 1 +
-                // checkout + submodule update) is multi-step and not
-                // atomic: a failure partway (commonly a submodule fetch
-                // over a flaky network: libbpf, bpftool, blazesym,
-                // vmlinux.h, usdt, strobelight-libs) leaves wprof_src
-                // half-populated. Retry with bounded attempts +
-                // exponential backoff via the shared
-                // `retry_with_backoff` helper (also used by the
-                // busybox tarball download with `MAX_TARBALL_ATTEMPTS
-                // = 4`). Both call sites share backoff timing,
-                // attempt counting, and log wording.
-                //
-                // Per-attempt cleanup of partial wprof_src lives
-                // INSIDE the closure.
-                println!(
-                    "cargo:warning=fetching {git_url} @ {WPROF_REV} into {} (recursive — \
-                 pulls libbpf, bpftool, blazesym, vmlinux.h, usdt, \
-                 strobelight-libs)",
-                    wprof_src.display()
-                );
-                const MAX_CLONE_ATTEMPTS: u32 = 4;
-                let clone_attempt = |i: u32| -> Result<(), String> {
-                    // After a failed attempt, wprof_src may be in a
-                    // partial-fetch state. Wipe before retry so `git
-                    // init` starts from an empty dir; swallow cleanup
-                    // errors with a log so the retry still proceeds (if
-                    // the partial state genuinely blocks the next
-                    // attempt, git will surface the error in this
-                    // iteration's status). First attempt skips because
-                    // the outer !exists() check above guaranteed the dir
-                    // is empty.
-                    if i > 1
-                        && let Err(e) = std::fs::remove_dir_all(&wprof_src)
-                    {
-                        println!(
-                            "cargo:warning=wprof partial-fetch cleanup before attempt {i} \
-                         failed: {e}; continuing to next attempt anyway"
-                        );
-                    }
-                    // GIT_CONFIG_GLOBAL=/dev/null +
-                    // GIT_CONFIG_SYSTEM=/dev/null bypass any host-level
-                    // `~/.gitconfig` / `/etc/gitconfig` rewriting
-                    // (e.g. `url.<base>.insteadOf`) that would re-route
-                    // the public github.com URL through a private proxy.
-                    // Build.rs must work reproducibly on any host AND
-                    // must never bake host-private endpoints into the
-                    // build graph. Repository URL stays the upstream
-                    // public one.
-                    //
-                    // GIT_TERMINAL_PROMPT=0 + GIT_ASKPASS=/bin/false
-                    // prevent git from blocking the build on a stdin
-                    // credential prompt when an HTTP 401/403 hits.
-                    // A retry that hangs on a prompt
-                    // is worse than no retry — fail fast and let the
-                    // outer panic surface the error.
-                    //
-                    // http.lowSpeedLimit=1000 + http.lowSpeedTime=60
-                    // bound each attempt: git aborts the transfer if
-                    // throughput stays below 1 KB/s for 60 s. Without
-                    // this, a half-open TCP connection (NAT timeout,
-                    // blackholed route) hangs git until the OS TCP
-                    // keepalive fires — typically minutes to hours
-                    // per attempt. Passing via `-c key=value` rather
-                    // than env vars keeps the setting scoped to this
-                    // single invocation.
-                    let run_git = |args: &[&str]| -> Result<(), String> {
-                        let status = Command::new("git")
-                            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                            .env("GIT_TERMINAL_PROMPT", "0")
-                            .env("GIT_ASKPASS", "/bin/false")
-                            .arg("-c")
-                            .arg("http.lowSpeedLimit=1000")
-                            .arg("-c")
-                            .arg("http.lowSpeedTime=60")
-                            .current_dir(&wprof_src)
-                            .args(args)
-                            .stdout(Stdio::inherit())
-                            .stderr(Stdio::inherit())
-                            .status()
-                            .map_err(|e| format!("spawn git {}: {e}", args.join(" ")))?;
-                        if status.success() {
-                            Ok(())
-                        } else {
-                            Err(format!("git {} exited {status}", args.join(" ")))
-                        }
-                    };
-                    // `git clone --depth=1` only resolves a ref tip, so
-                    // it cannot pin an arbitrary rev. Init an empty repo,
-                    // fetch exactly WPROF_REV at depth 1 (GitHub serves
-                    // any commit reachable from an advertised ref),
-                    // detach onto it, then init submodules pinned by that
-                    // tree's recorded gitlink SHAs. `current_dir` is the
-                    // freshly-created wprof_src for every step.
-                    std::fs::create_dir_all(&wprof_src)
-                        .map_err(|e| format!("create wprof_src dir: {e}"))?;
-                    run_git(&["init", "-q"])?;
-                    run_git(&["remote", "add", "origin", git_url])?;
-                    run_git(&["fetch", "-q", "--depth", "1", "origin", WPROF_REV])?;
-                    run_git(&["checkout", "-q", "--detach", "FETCH_HEAD"])?;
-                    run_git(&[
-                        "submodule",
-                        "update",
-                        "--init",
-                        "--recursive",
-                        "--depth",
-                        "1",
-                    ])
-                };
-                if let Err(err) =
-                    retry_with_backoff("wprof pinned fetch", MAX_CLONE_ATTEMPTS, clone_attempt)
-                {
-                    panic!(
-                        "wprof pinned fetch failed after {MAX_CLONE_ATTEMPTS} attempts \
-                     (last error: {err}). Check network connectivity to \
-                     {git_url}; if the cache directory is in an \
-                     unrecoverable state, `rm -rf {}` and re-run `cargo build`.",
-                        wprof_src.display()
-                    );
-                }
-            }
-
-            // Isolate every wprof src/ sub-crate from ktstr's workspace
-            // before invoking make, which runs a standalone `cargo
-            // build` per sub-crate (demangle, wpb, wrust → lib*_c.a).
-            // See `isolate_wprof_subcrate_workspaces` for why the
-            // sentinel is required and why the scope is src/ children
-            // only (the blazesym submodule is its own workspace).
-            isolate_wprof_subcrate_workspaces(&wprof_src);
-
-            // Build wprof.  Single-threaded `-j1` instead of `-j{nproc}`:
-            // the upstream wprof Makefile has a missing prerequisite
-            // edge between the `libdemangle_c.a` build (a recursive
-            // `cargo build` inside the demangle sub-crate) and the
-            // sibling `cp` that copies the produced archive into
-            // wprof's OUTPUT dir.  Under `-jN` the `cp` races the
-            // cargo build and fires before the .a exists, surfacing
-            // as `cp: cannot stat .../libdemangle_c.a` → `wprof build
-            // failed`.  `-j1` serialises the recipe so the dependency
-            // ordering the Makefile *intends* is the ordering it gets.
-            // The wall-time cost is small in practice: the dominant
-            // builds (blazesym, demangle) are individual `cargo build`
-            // invocations that already parallelise internally per
-            // CARGO_BUILD_JOBS / `--jobs`, so `make`'s outer
-            // parallelism would only overlap distinct cargo
-            // invocations against each other — which is exactly the
-            // pattern that triggers the race.
-            // Clear RUSTC_WORKSPACE_WRAPPER (set to clippy-driver by an
-            // outer `cargo clippy`): the Makefile's inner `cargo build`
-            // of each wprof sub-crate (wpb/wrust/demangle) would
-            // otherwise inherit it and run UPSTREAM wprof code through
-            // ktstr's clippy under `-D warnings`, turning wprof's own
-            // lints (missing_safety_doc, needless_update) into hard build
-            // errors. ktstr does not lint vendored upstream crates.
-            //
-            // The Makefile copies those nested Cargo artifacts from each
-            // sub-crate's own target/ directory. An outer CARGO_TARGET_DIR
-            // redirects them elsewhere without updating the copy source,
-            // producing a false "cannot stat lib*.a" failure. Keep the
-            // outer target choice scoped to ktstr and let wprof use the
-            // layout its Makefile requires.
-            let status = Command::new("make")
+            isolate_wprof_subcrate_workspaces(&source);
+            progress.set_phase("compiling wprof");
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+            let status = cargo_coordinated_make()
+                // v0.4's outer Makefile is missing the prerequisite edge
+                // between its recursive demangle Cargo build and the sibling
+                // archive copy. Parallel outer recipes deterministically race
+                // (`cp: cannot stat .../libdemangle_c.a`) in CI. Keep only
+                // this outer make serial; recursive Cargo/sub-makes still use
+                // the authenticated Cargo jobserver configured above.
                 .arg("-j1")
-                // Upstream's host code uses Clang-supported C23 constructs
-                // (including empty initialization of a variable-length
-                // array) and already requires Clang for its BPF objects.
-                // Pin the host compiler too so older distro GCC versions do
-                // not reject unchanged upstream source. Select mold
-                // explicitly so Clang's enabled-by-default LTO never depends
-                // on a distro-provided LLVMgold plugin; this preserves the
-                // upstream optimized build instead of disabling LTO.
+                // Pin Makefile policy inputs that are not supported ktstr
+                // overrides. Supported compiler/linker flags remain inherited
+                // and are part of the content key below.
+                .args([
+                    "CLANG=clang",
+                    "AWK=awk",
+                    "DEBUG=",
+                    "BLAZESYM_DEBUG=",
+                    "STATIC=",
+                    "LTO=1",
+                    "DESTDIR=",
+                    "CROSS_COMPILE=",
+                    "AR=ar",
+                    "LD=ld",
+                    "NM=nm",
+                    "OBJCOPY=objcopy",
+                    "RANLIB=ranlib",
+                    "STRIP=strip",
+                ])
+                .arg(format!("CARGO={cargo}"))
+                .arg("CC=clang -fuse-ld=mold -Wno-unused-command-line-argument")
                 .env(
                     "CC",
                     "clang -fuse-ld=mold -Wno-unused-command-line-argument",
                 )
+                .env_remove("ARCH")
+                .env_remove("BPFTOOL")
+                .env_remove("BPFTOOL_OUTPUT")
+                .env_remove("BPFTOOL_OUTPUT_ABS")
+                .env_remove("CLANG_BPF_SYS_INCLUDES")
                 .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_TARGET")
                 .env_remove("CARGO_TARGET_DIR")
-                .current_dir(wprof_src.join("src"))
+                .current_dir(source.join("src"))
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .status()
-                .expect("spawn make for wprof");
-            assert!(status.success(), "wprof build failed");
+                .map_err(|err| format!("spawn make for wprof: {err}"))?;
+            if !status.success() {
+                return Err(format!("wprof make exited {status}"));
+            }
+            let built = source.join("src/wprof");
+            if !built.is_file() {
+                return Err(format!(
+                    "wprof build succeeded but binary is missing at {}",
+                    built.display()
+                ));
+            }
+            std::fs::rename(&built, stage.join("wprof"))
+                .map_err(|err| format!("stage completed wprof binary: {err}"))?;
+            // The cache publishes only the immutable result. Source/build state
+            // is private to the elected builder and never shared with `make`.
+            std::fs::remove_dir_all(&source)
+                .map_err(|err| format!("remove private wprof build tree: {err}"))?;
+            progress.finish();
+            Ok(())
+        },
+    )
+    .unwrap_or_else(|err| panic!("obtain exact wprof binary: {err}"));
+}
 
-            // The wprof Makefile emits the binary at src/wprof (the
-            // submodule-init + libbpf-link pattern in
-            // github.com/anakryiko/wprof/src/Makefile).
-            let built_bin = wprof_src.join("src").join("wprof");
-            assert!(
-                built_bin.exists(),
-                "wprof build succeeded but binary not found at expected path: {}",
-                built_bin.display()
+#[cfg(feature = "wprof")]
+fn wprof_toolchain_fingerprint() -> String {
+    fn version(tool: &str, args: &[&str]) -> String {
+        let output = Command::new(tool)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "wprof build requires '{tool}' on PATH: {err}. Install the \
+                     build toolchain (make, gcc, clang, mold, and rustc)."
+                )
+            });
+        if !output.status.success() {
+            panic!(
+                "wprof build requires a working '{tool}', but `{tool} {}` exited {}",
+                args.join(" "),
+                output.status
             );
-            std::fs::copy(&built_bin, &wprof_bin).expect("copy wprof binary to OUT_DIR");
         }
-    } // #[cfg(feature = "wprof")]
+        format!(
+            "{}\n{}\n{}",
+            stable_tool_program_identity(tool)
+                .unwrap_or_else(|err| panic!("fingerprint wprof tool '{tool}': {err}")),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let versions = [
+        version("make", &["--version"]),
+        version("gcc", &["--version"]),
+        version("clang", &["--version"]),
+        version("mold", &["--version"]),
+        version("ar", &["--version"]),
+        version("ld", &["--version"]),
+        version("nm", &["--version"]),
+        version("objcopy", &["--version"]),
+        version("ranlib", &["--version"]),
+        version("strip", &["--version"]),
+        version(&rustc, &["-vV"]),
+        version(&cargo, &["-vV"]),
+    ];
+    let environment: Vec<String> = [
+        "CFLAGS",
+        "CPPFLAGS",
+        "EXTRA_CFLAGS",
+        "EXTRA_LDFLAGS",
+        "LDFLAGS",
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+    ]
+    .into_iter()
+    .map(|name| format!("{name}={}", std::env::var(name).unwrap_or_default()))
+    .collect();
+    let parts: Vec<&str> = versions
+        .iter()
+        .chain(environment.iter())
+        .map(String::as_str)
+        .collect();
+    gix_acquire::content_id(&parts)
 }
 
 /// SHA-256 hex digest of the upstream busybox-1.36.1 release tarball
 /// (`busybox-1_36_1.tar.gz` from the `mirror/busybox` github archive).
-///
-/// **Sentinel value**: `""` means the pin is not yet recorded for this
-/// checkout. In that case [`verify_busybox_tarball_sha256`] emits the
-/// computed digest as a `cargo:warning` and continues — first-build
-/// integration. To activate the verification gate, replace the empty
-/// string with the printed digest, then commit. Subsequent builds
-/// fail on mismatch.
 ///
 /// **Rotation**: bumping the busybox version requires updating BOTH
 /// the URL in the `fetch_busybox_tarball` call site AND this pin in
@@ -932,7 +1140,8 @@ int main(void) {{
 /// vendoring covers crate sources, not arbitrary C-source tarballs
 /// downloaded by a build script. The verification has to live in
 /// `build.rs` itself.
-const BUSYBOX_TARBALL_SHA256: &str = "";
+const BUSYBOX_TARBALL_SHA256: &str =
+    "ea5494846c51d946e5e801d1c099b438f683af8147e0be24ca4001073143110f";
 
 /// Fetch the upstream busybox tarball with retry; return the raw
 /// gzip-compressed bytes (NOT yet SHA-verified — caller passes the
@@ -1023,18 +1232,11 @@ fn fetch_busybox_tarball(url: &str) -> Vec<u8> {
 
 /// Verify the downloaded busybox tarball against [`BUSYBOX_TARBALL_SHA256`].
 ///
-/// Three outcomes:
-///
-///   - **Pin empty**: log the computed digest as a `cargo:warning` and
-///     continue. First-build bootstrap path — the operator pastes the
-///     printed value into `BUSYBOX_TARBALL_SHA256` to lock the pin.
-///   - **Pin matches**: silent pass.
-///   - **Pin mismatches**: panic with both digests. The operator
-///     investigates: a regenerated upstream archive (github does this
-///     rarely; cf. the 2023 git-archive checksum change) requires a
-///     pin refresh, whereas an unexplained mismatch on a fixed pin
-///     indicates supply-chain tampering and warrants investigation
-///     before the bytes hit the build.
+/// A matching pin passes silently. A mismatch panics with both digests. The
+/// operator investigates: a regenerated upstream archive (github does this
+/// rarely; cf. the 2023 git-archive checksum change) requires a pin refresh,
+/// whereas an unexplained mismatch on a fixed pin indicates supply-chain
+/// tampering and warrants investigation before the bytes hit the build.
 fn verify_busybox_tarball_sha256(tarball_bytes: &[u8]) {
     use sha2::{Digest, Sha256};
     let actual = {
@@ -1042,15 +1244,6 @@ fn verify_busybox_tarball_sha256(tarball_bytes: &[u8]) {
         hasher.update(tarball_bytes);
         hex_encode_lowercase(&hasher.finalize())
     };
-    if BUSYBOX_TARBALL_SHA256.is_empty() {
-        println!(
-            "cargo:warning=BUSYBOX_TARBALL_SHA256 is unset — first-build \
-             bootstrap. Computed SHA-256: {actual}\n\
-             To lock the pin: update BUSYBOX_TARBALL_SHA256 in build.rs to\n\
-             this value and commit. Subsequent builds will fail on mismatch."
-        );
-        return;
-    }
     if !BUSYBOX_TARBALL_SHA256.eq_ignore_ascii_case(&actual) {
         panic!(
             "busybox tarball SHA-256 mismatch.\n\

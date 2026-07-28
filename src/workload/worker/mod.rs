@@ -162,6 +162,30 @@ fn build_phase_slice(
     }
 }
 
+/// Whether `epoch` names a measured scenario step.
+///
+/// Epoch 0 is the pre-first-step baseline and `u32::MAX` is the inter-step
+/// gap. A backdrop worker may begin running only after the parent has already
+/// published a measured epoch; in that case it has no earlier transition to
+/// observe, but its open slice still belongs to that step and must be finalized
+/// at shutdown.
+fn is_measured_phase_epoch(epoch: u32) -> bool {
+    epoch != 0 && epoch != u32::MAX
+}
+
+/// Whether `work_type` uses the generic drain-on-change phase carrier.
+///
+/// Schbench and Taobench watch the epoch inside their own engines and push
+/// authoritative engine-specific [`PhaseSlice`] values before breaking out of
+/// the outer worker loop. Running the generic final drain for either would add
+/// a second slice for the same worker/phase.
+fn uses_generic_phase_slices(work_type: &WorkType) -> bool {
+    !matches!(
+        work_type,
+        WorkType::Schbench { .. } | WorkType::Taobench { .. }
+    )
+}
+
 /// Wrap `FUTEX_WAKE` on `futex_ptr`, waking up to `n_waiters` tasks.
 /// Thin wrapper around `libc::syscall(SYS_futex, ...)` — callers of the
 /// wake path duplicate the 7-arg layout in every spot otherwise.
@@ -4105,11 +4129,18 @@ pub(super) fn worker_main(
 
     // Final drain: a backdrop worker that observed at least one phase
     // transition has one still-open phase with no closing epoch change.
-    // Finalize it here, reusing the whole-run end snapshots computed
-    // above (`cpu_time_ns`, `schedstat_end`, `numa_pages`,
-    // `vmstat_migrated_end`); `numa_pages` is cloned because the report
-    // below moves the original.
-    if observed_change {
+    // A worker can also start after StepStart and initialize directly in a
+    // measured epoch; if StepEnd + stop arrive while its final blocking work
+    // iteration is returning, it may never execute the transition block above.
+    // Finalize that already-active measured epoch too, or all of its whole-run
+    // samples survive while its per-phase carrier is silently empty.
+    //
+    // Reuse the whole-run end snapshots computed above (`cpu_time_ns`,
+    // `schedstat_end`, `numa_pages`, `vmstat_migrated_end`); `numa_pages` is
+    // cloned because the report below moves the original.
+    if uses_generic_phase_slices(&work_type)
+        && (observed_change || is_measured_phase_epoch(cur_epoch))
+    {
         let phase_wall_ns = end.duration_since(phase_start).as_nanos() as u64;
         phase_slices.push(build_phase_slice(
             cur_epoch,

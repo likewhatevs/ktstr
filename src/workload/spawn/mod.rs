@@ -631,12 +631,12 @@ pub struct WorkerReport {
     /// reasoning as [`Self::affinity_error`]: no `skip_serializing_if`.
     pub sched_policy_error: Option<String>,
     /// Per-phase telemetry slices for a backdrop (persistent) worker
-    /// that spanned multiple scenario steps. EMPTY for step-local
-    /// workers and for any backdrop worker that observed no phase
-    /// boundary: the worker pushes a [`PhaseSlice`] only when the
-    /// parent-driven `phase_epoch` actually changes, so a worker whose
-    /// epoch never moved (step-local pools are never bumped) ships none
-    /// — keeping the wire empty on the common path. Each slice carries
+    /// that spanned scenario steps. EMPTY for step-local workers and
+    /// for a backdrop worker that remained in the pre-step baseline or
+    /// inter-step sentinel epoch. A worker drains its open measured
+    /// epoch either when the parent-driven `phase_epoch` changes or at
+    /// shutdown, including when a delayed worker first runs after the
+    /// parent has already published a measured epoch. Each slice carries
     /// the per-phase subset of the whole-run telemetry above, scoped to
     /// one phase's hold window; the host expands these into per-epoch
     /// `PhaseBucket` entries — the per-phase attribution a backdrop

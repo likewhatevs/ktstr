@@ -870,7 +870,7 @@ pub struct VirtioBlk {
     /// Per-thread CPU placement applied at the top of
     /// `worker_thread_main` before the worker enters its `epoll_wait`
     /// loop. Mirrors the host topology's perf-mode (`pin_target`) and
-    /// `--cpu-cap` no-perf (`no_perf_cpus`) split: at most one of the
+    /// shared-pool (`shared_cpus`) split: at most one of the
     /// two is `Some`, both `None` means inherit the parent thread's
     /// affinity (no placement applied). Set via
     /// [`Self::set_worker_placement`] after `with_options`; defaults
@@ -897,7 +897,7 @@ pub struct WorkerPlacement {
     pub service_cpu: Option<usize>,
     /// CPU mask (no-perf + `--cpu-cap`). Equivalent to
     /// `set_thread_cpumask(cpus, "virtio-blk worker")`.
-    pub no_perf_cpus: Option<Vec<usize>>,
+    pub shared_cpus: Option<Vec<usize>>,
 }
 
 impl VirtioBlk {
@@ -1122,7 +1122,7 @@ impl VirtioBlk {
     /// placement, matching cloud-hypervisor's "topology applied at
     /// thread start" pattern.
     ///
-    /// `WorkerPlacement::service_cpu` and `no_perf_cpus` are mutually
+    /// `WorkerPlacement::service_cpu` and `shared_cpus` are mutually
     /// exclusive — the topology layer (perf-mode vs `--cpu-cap`)
     /// produces at most one. Both `None` means inherit the parent
     /// thread's affinity (the test/inline path and the no-topology

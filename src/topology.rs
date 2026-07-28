@@ -431,8 +431,9 @@ fn intersect_online_with_affinity(
 /// [`TestTopology::from_system`]'s per-CPU scan so the loop stays
 /// under the source-function size guard.
 ///
-/// `online_cpus` — the sysfs-online set already intersected with the
-/// calling task's `sched_getaffinity(0)` cpuset (sorted ascending).
+/// `online_cpus` — the sorted sysfs-online set, optionally already
+/// intersected with the calling task's `sched_getaffinity(0)` cpuset by the
+/// caller.
 ///
 /// Returns `(cpus, llc_map, numa_nodes)`:
 /// - `cpus` — CPUs whose `/sys/devices/system/cpu/cpuN/` directory
@@ -601,6 +602,21 @@ impl TestTopology {
     /// restriction surfaces at construction with a warn that names
     /// the dropped CPUs.
     pub fn from_system() -> Result<Self> {
+        Self::from_system_impl(true)
+    }
+
+    /// Discover the host-global physical topology without intersecting the
+    /// calling task's affinity mask.
+    ///
+    /// Host resource admission uses this view so LLC ordinals and complete
+    /// cache-domain CPU membership remain identical across processes running
+    /// under different cpusets. Workload placement applies its allowed mask
+    /// separately.
+    pub(crate) fn from_system_unfiltered() -> Result<Self> {
+        Self::from_system_impl(false)
+    }
+
+    fn from_system_impl(filter_affinity: bool) -> Result<Self> {
         let online_str =
             fs::read_to_string("/sys/devices/system/cpu/online").context("read online cpus")?;
         let online_cpus_sysfs = parse_cpu_list(&online_str)?;
@@ -614,9 +630,13 @@ impl TestTopology {
         // ceiling — both cases fall back to the full sysfs set
         // (status quo). Returns u32 ids; widen to usize for the
         // intersection.
-        let allowed: Option<BTreeSet<usize>> =
-            crate::cpu_util::read_affinity(0).map(|v| v.into_iter().map(|c| c as usize).collect());
-        let online_cpus = intersect_online_with_affinity(&online_cpus_sysfs, allowed)?;
+        let online_cpus = if filter_affinity {
+            let allowed: Option<BTreeSet<usize>> = crate::cpu_util::read_affinity(0)
+                .map(|v| v.into_iter().map(|c| c as usize).collect());
+            intersect_online_with_affinity(&online_cpus_sysfs, allowed)?
+        } else {
+            online_cpus_sysfs
+        };
 
         let (cpus, llc_map, mut numa_nodes) = scan_online_cpus(&online_cpus);
 

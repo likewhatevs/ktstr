@@ -12,7 +12,10 @@
 use crate::sync::MutexExt;
 use crate::vmm::IoapicHandle;
 use crate::vmm::PiMutex;
-use crate::vmm::vcpu::{SCX_EXIT_ERROR_THRESHOLD, WatchpointArm, self_arm_watchpoint};
+use crate::vmm::vcpu::{
+    GuestDebugState, ImmediateExitVcpu, SCX_EXIT_ERROR_THRESHOLD, WatchpointArm,
+    self_arm_watchpoint,
+};
 use crate::vmm::{console, kvm, pci, virtio_blk, virtio_console, virtio_net};
 use kvm_ioctls::VcpuExit;
 use serde::{Deserialize, Serialize};
@@ -115,7 +118,7 @@ pub struct VcpuRegSnapshot {
 /// the dump reflects "registers unavailable" rather than panicking
 /// the freeze path.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuRegSnapshot> {
+pub(crate) fn capture_vcpu_regs(vcpu: &kvm_ioctls::VcpuFd) -> Option<VcpuRegSnapshot> {
     let regs = vcpu.get_regs().ok()?;
     let sregs = vcpu.get_sregs().ok()?;
     Some(VcpuRegSnapshot {
@@ -131,7 +134,7 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuRegSnapshot> {
+pub(crate) fn capture_vcpu_regs(vcpu: &kvm_ioctls::VcpuFd) -> Option<VcpuRegSnapshot> {
     // ARM core register IDs encode
     // `(offsetof(struct kvm_regs, field) / sizeof(u32))` in the low
     // bits, OR'd with KVM_REG_ARM64 + KVM_REG_SIZE_U64 +
@@ -242,12 +245,12 @@ pub(crate) fn capture_vcpu_regs(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<VcpuReg
 /// in the GuestKernel's `tcr_el1` field — the walker rejects T1SZ=0
 /// and the affected lookups skip cleanly.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn read_tcr_el1(_vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+pub(crate) fn read_tcr_el1(_vcpu: &kvm_ioctls::VcpuFd) -> Option<u64> {
     None
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn read_tcr_el1(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+pub(crate) fn read_tcr_el1(vcpu: &kvm_ioctls::VcpuFd) -> Option<u64> {
     // Same encoding constants as `capture_vcpu_regs`. TCR_EL1 packs
     // to (Op0=3, Op1=0, CRn=2, CRm=0, Op2=2) under the
     // KVM_REG_ARM64_SYSREG namespace.
@@ -280,12 +283,12 @@ pub(crate) fn read_tcr_el1(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
 /// non-zero value so a stale `0` does not displace a previously
 /// latched non-zero CR3.
 #[cfg(target_arch = "x86_64")]
-pub(crate) fn read_cr3(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+pub(crate) fn read_cr3(vcpu: &kvm_ioctls::VcpuFd) -> Option<u64> {
     vcpu.get_sregs().ok().map(|s| s.cr3)
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn read_cr3(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+pub(crate) fn read_cr3(vcpu: &kvm_ioctls::VcpuFd) -> Option<u64> {
     // TTBR1_EL1 holds the kernel-half page-table base (matches the
     // `page_table_root` field in `VcpuRegSnapshot`). Same encoding
     // as `capture_vcpu_regs`: (Op0=3, Op1=0, CRn=2, CRm=0, Op2=1)
@@ -554,12 +557,20 @@ const ESR_ELX_EC_MASK: u32 = 0x3F;
 /// taken AFTER the store retires (Intel SDM Vol. 3B 17.2.4
 /// "Trap-class debug exceptions"), so re-entry advances normally
 /// without the disable-step-rearm dance.
+///
+/// `foreign_debug` is the aarch64 "this exception is not ours"
+/// latch. It is set whenever the exit cannot be attributed to one
+/// of our own armed slots, and `self_arm_watchpoint` reacts by
+/// disarming guest debug on that vCPU (see the sticky-disarm block
+/// there for why nothing else works). Never cleared: once the
+/// guest owns debug on a vCPU we do not take it back.
 pub(crate) fn dispatch_watchpoint_hit(
     watchpoint: &WatchpointArm,
     debug_arch: &kvm_bindings::kvm_debug_exit_arch,
     armed_slots: &[u64; 4],
     single_step_pending: &mut bool,
     single_step_slot: &mut usize,
+    foreign_debug: &mut bool,
 ) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -583,20 +594,51 @@ pub(crate) fn dispatch_watchpoint_hit(
         // entering KVM_RUN advances normally without the
         // disable-step-rearm dance. Consume the unused inputs to
         // keep the per-arch helper signature shared.
+        //
+        // `foreign_debug` is likewise aarch64-only.
+        // `arch/x86/kvm/vmx/vmx.c::vmx_update_exception_bitmap` sets
+        // the BP_VECTOR intercept bit only when guest_debug carries
+        // `KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP`; we arm with
+        // `KVM_GUESTDBG_USE_HW_BP`, so a guest kprobe's `int3` is
+        // never intercepted and goes straight to the guest IDT —
+        // there is no x86 analogue of arm64's BRK swallowed under
+        // MDCR_EL2.TDE. That is NOT a blanket exemption: DB_VECTOR is
+        // in the exception bitmap unconditionally, and under
+        // `KVM_GUESTDBG_USE_HW_BP` `handle_exception_nmi` reflects
+        // every guest #DB to userspace instead of reinjecting it. The
+        // reason ktstr sees none is narrower — x86 kprobes no longer
+        // single-step with EFLAGS.TF
+        // (`arch/x86/kernel/kprobes/core.c::setup_singlestep`) and
+        // guest DR writes are shadowed while we hold guest debug.
         let _ = armed_slots;
-        let _ = (&mut *single_step_pending, &mut *single_step_slot);
+        let _ = (
+            &mut *single_step_pending,
+            &mut *single_step_slot,
+            &mut *foreign_debug,
+        );
         let dr6 = debug_arch.dr6;
         let trap_bits = (dr6 & 0xF) as u8;
         if trap_bits == 0 {
             // KVM exited via KVM_EXIT_DEBUG with no DR0..3 trap
-            // bits set — possible when a single-step (BS, bit 14)
-            // or task-switch (BT, bit 15) fired without a data/
-            // code breakpoint match. ktstr never arms BS/BT, so
-            // this is either a host-side debug stub leaking
-            // through or a synthetic exit — log and ignore.
-            // Mirrors the aarch64 "no FAR match" debug log so
-            // both arches surface unexpected debug exits the
-            // same way.
+            // bits set — a single-step (BS, bit 14) or task-switch
+            // (BT, bit 15) fired without a data/code breakpoint
+            // match. ktstr never arms BS/BT, so the source is
+            // outside our slots: a host-side debug stub, a
+            // synthetic exit, or a GUEST-originated #DB, which
+            // reaches us because DB_VECTOR is intercepted
+            // unconditionally and `handle_exception_nmi` reflects
+            // it to userspace under `KVM_GUESTDBG_USE_HW_BP`
+            // instead of reinjecting. The guest sources are a known
+            // accepted gap: EFLAGS.TF single-stepping (uprobe XOL,
+            // `ptrace(PTRACE_SINGLESTEP)`) and ICEBP. Swallowing
+            // one cannot wedge the vCPU the way an arm64 BRK does
+            // (#DB is trap-class, so the instruction retired), and
+            // routing it into the aarch64 `foreign_debug` release
+            // would be the worse trade: that latch is sticky, so one
+            // spurious #DB would forfeit the failure-dump watchpoint
+            // for the rest of the run. Log and ignore. `debug!`
+            // rather than `warn!` because a guest that does step
+            // would emit one of these per stepped instruction.
             tracing::debug!(
                 dr6,
                 "KVM_EXIT_DEBUG fired with no DR0..DR3 trap bit set \
@@ -635,10 +677,25 @@ pub(crate) fn dispatch_watchpoint_hit(
             // trigger; this exit only signals "one instruction
             // executed cleanly past the watched store".
             //
-            // If the flag is NOT set we got a soft-step exit
-            // we did not request (e.g. host kernel quirk, peer
-            // tooling); log and ignore — there is no slot to
-            // restore.
+            // If the flag is NOT set, this exit should be
+            // unreachable. A software-step exception requires
+            // MDSCR_EL1.SS == 1, and while `vcpu->guest_debug`
+            // is non-zero the guest never sees its own
+            // MDSCR_EL1: `arch/arm64/kvm/debug.c::
+            // setup_external_mdscr` builds `external_mdscr_el1`
+            // as the guest value with SS/MDE/KDE cleared,
+            // re-adding SS only under
+            // `KVM_GUESTDBG_SINGLESTEP`, and `hyp/include/hyp/
+            // sysreg-sr.h::ctxt_mdscr_el1` loads that value on
+            // entry whenever the host owns the debug regs. So
+            // no in-guest agent can raise a soft-step while we
+            // are attached — unlike the BRK/breakpoint ECs
+            // below, which are genuinely guest-owned. Reaching
+            // here means our own `single_step_pending`
+            // bookkeeping desynced. Treat it as a blunt safety
+            // valve: we cannot service the exit and must not
+            // keep swallowing it, so flag it foreign and let
+            // `self_arm_watchpoint` hand debug back.
             if *single_step_pending {
                 *single_step_pending = false;
                 // Zero `single_step_slot` defensively. The
@@ -654,21 +711,42 @@ pub(crate) fn dispatch_watchpoint_hit(
                 // readers cannot trip on a leftover bitmap.
                 *single_step_slot = 0;
             } else {
-                tracing::debug!(
+                *foreign_debug = true;
+                tracing::warn!(
                     hsr = debug_arch.hsr,
                     "KVM_EXIT_DEBUG soft-step EC with no \
-                     single-step pending; ignoring (likely \
-                     spurious kernel-side step exit)"
+                     single-step pending; MDSCR_EL1.SS is \
+                     host-masked while we hold guest debug, so this \
+                     is an internal single-step bookkeeping desync \
+                     — disarming guest debug on this vCPU"
                 );
             }
             return;
         }
         if ec != ESR_ELX_EC_WATCHPT_LOW {
-            tracing::debug!(
+            // Every other EC that can reach here is a debug
+            // exception the GUEST raised for itself: a kprobe's
+            // `brk #KPROBES_BRK_IMM`, a kretprobe/step-out-of-line
+            // BRK, `BRK #BUG_BRK_IMM`, or a guest-side
+            // `hw_breakpoint` code breakpoint. ktstr plants guest
+            // kprobes as core functionality, so these are expected,
+            // not exotic.
+            //
+            // We cannot service them and we must not swallow them.
+            // Returning here re-enters KVM_RUN with the guest PC
+            // still on the BRK, and because our arm keeps
+            // MDCR_EL2.TDE set the same instruction traps to EL2
+            // again — forever. Flag it foreign so
+            // `self_arm_watchpoint` drops guest debug before the
+            // next entry; the re-executed BRK then reaches the
+            // guest's own EL1 debug vector.
+            *foreign_debug = true;
+            tracing::warn!(
                 hsr = debug_arch.hsr,
                 ec,
-                "KVM_EXIT_DEBUG with non-watchpoint EC; ignoring \
-                 (breakpoint/BRK paths are not used by ktstr)"
+                "KVM_EXIT_DEBUG with non-watchpoint EC — guest-owned \
+                 debug exception; disarming guest debug on this vCPU \
+                 so the guest can take it"
             );
             return;
         }
@@ -705,13 +783,32 @@ pub(crate) fn dispatch_watchpoint_hit(
             }
         }
         if matched_mask == 0 {
-            tracing::debug!(
+            // Not a guest-armed watchpoint: while `vcpu->guest_debug`
+            // is non-zero `arch/arm64/kvm/debug.c` marks the vCPU
+            // VCPU_DEBUG_HOST_OWNED, and
+            // `hyp/include/hyp/debug-sr.h::__vcpu_debug_regs` then
+            // loads `external_debug_state` — our own
+            // KVM_SET_GUEST_DEBUG payload — so the guest's
+            // DBGWCR/DBGWVR are not in hardware at all. This is one
+            // of OURS whose FAR landed outside the watched window;
+            // ARM ARM D2.10.5 permits an imprecise FAR, and
+            // `arch/arm64/kernel/hw_breakpoint.c` documents the same
+            // ("hardware does not always report a watchpoint hit
+            // address that matches one of the watchpoints set"),
+            // which is why Linux attributes by closest match rather
+            // than an exact range test like the one above. There is
+            // no slot to single-step past, so re-entering KVM_RUN
+            // replays the same store and re-traps forever (the
+            // aarch64 watchpoint trap is taken BEFORE the access
+            // retires). Give debug back to the guest.
+            *foreign_debug = true;
+            tracing::warn!(
                 hsr = debug_arch.hsr,
                 far,
                 armed = ?armed_slots,
                 "KVM_EXIT_DEBUG watchpoint fired but FAR matched no \
-                 armed slot (possible KVM watchpoint match-distance \
-                 fallback or stale arm); not latching"
+                 armed slot; not latching and disarming guest debug \
+                 on this vCPU"
             );
             return;
         }
@@ -875,7 +972,7 @@ fn latch_slot0_with_gate(watchpoint: &WatchpointArm) {
 /// dance itself is Cloud Hypervisor-specific.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn vcpu_run_loop_unified(
-    vcpu: &mut kvm_ioctls::VcpuFd,
+    vcpu: &mut ImmediateExitVcpu,
     com1: &Arc<PiMutex<console::Serial>>,
     com2: &Arc<PiMutex<console::Serial>>,
     virtio_con: Option<&Arc<PiMutex<virtio_console::VirtioConsole>>>,
@@ -925,6 +1022,18 @@ pub(crate) fn vcpu_run_loop_unified(
     let mut single_step_pending: bool = false;
     let mut single_step_slot: usize = 0;
     let mut armed_single_step: bool = false;
+    // Sticky aarch64 "the guest owns debug now" latch — set by
+    // `dispatch_watchpoint_hit` on a debug exit we cannot attribute
+    // to one of our slots (a guest kprobe's `brk`, typically), acted
+    // on by `self_arm_watchpoint`, which disarms guest debug so the
+    // guest can take the exception itself.
+    let mut foreign_debug: bool = false;
+    // What the KERNEL holds, as opposed to what `armed_slots`
+    // requests. The two diverge whenever the coordinator releases
+    // every slot while this thread runs; only this local can tell
+    // `self_arm_watchpoint`'s disarm path whether a control-0 ioctl
+    // is still owed. Inert on x86_64.
+    let mut guest_debug_state = GuestDebugState::Released;
     loop {
         if kill.load(Ordering::Acquire) {
             break;
@@ -966,6 +1075,8 @@ pub(crate) fn vcpu_run_loop_unified(
             single_step_pending,
             single_step_slot,
             &mut armed_single_step,
+            foreign_debug,
+            &mut guest_debug_state,
         );
 
         match vcpu.run() {
@@ -1005,6 +1116,7 @@ pub(crate) fn vcpu_run_loop_unified(
                         &armed_slots,
                         &mut single_step_pending,
                         &mut single_step_slot,
+                        &mut foreign_debug,
                     );
                     if kill.load(Ordering::Acquire) {
                         break;
@@ -1023,38 +1135,18 @@ pub(crate) fn vcpu_run_loop_unified(
                 ) {
                     Some(ExitAction::Continue) | None => {}
                     Some(ExitAction::Shutdown) => {
-                        kill.store(true, Ordering::Release);
-                        // Wake the freeze coordinator's epoll loop
-                        // so it sees the kill flag without waiting
-                        // up to one full epoll timeout. Failure
-                        // (EAGAIN under EFD_NONBLOCK from a
-                        // saturated counter) is benign — any prior
-                        // pending edge already wakes the coord, and
-                        // the AtomicBool above remains the source
-                        // of truth.
-                        let _ = kill_evt.write(1);
+                        super::publish_vm_kill(kill, kill_evt);
                         break;
                     }
                     Some(ExitAction::Fatal(_)) => {
-                        // AP fatal exit (FailEntry / InternalError):
-                        // surface in tracing AND propagate the kill
-                        // signal. Without `kill.store(true)` and the
-                        // kill_evt write, the AP thread silently
-                        // exits while peer vCPUs and the freeze
-                        // coordinator stay running — peers eventually
-                        // hit FREEZE_RENDEZVOUS_TIMEOUT instead of
-                        // shutting down promptly. Mirrors the
-                        // Shutdown arm's kill-propagation pattern.
-                        tracing::error!("AP fatal exit");
-                        kill.store(true, Ordering::Release);
-                        let _ = kill_evt.write(1);
+                        publish_ap_fatal_exit(kill, kill_evt);
                         break;
                     }
                 }
             }
             Err(e) => {
                 if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN {
-                    vcpu.set_kvm_immediate_exit(0);
+                    vcpu.set_immediate_exit(0);
                     if kill.load(Ordering::Acquire) {
                         break;
                     }
@@ -1063,6 +1155,9 @@ pub(crate) fn vcpu_run_loop_unified(
                 if kill.load(Ordering::Acquire) {
                     break;
                 }
+                tracing::error!(%e, "AP KVM_RUN failed");
+                publish_ap_fatal_exit(kill, kill_evt);
+                break;
             }
         }
 
@@ -1070,6 +1165,17 @@ pub(crate) fn vcpu_run_loop_unified(
             break;
         }
     }
+}
+
+/// Publish an AP's unrecoverable KVM exit to every peer and blocking
+/// coordinator. Kept as one primitive so the production Fatal arm and the
+/// real-KVM relay regression exercise the exact same edge.
+pub(super) fn publish_ap_fatal_exit(kill: &AtomicBool, kill_evt: &EventFd) {
+    // Without the shared kill publication, the AP thread silently exits while
+    // peer vCPUs and the freeze coordinator stay running; peers eventually hit
+    // FREEZE_RENDEZVOUS_TIMEOUT instead of shutting down promptly.
+    tracing::error!("AP fatal exit");
+    super::publish_vm_kill(kill, kill_evt);
 }
 
 /// Drain pending PIO/MMIO state and park the vCPU until freeze
@@ -1106,7 +1212,7 @@ pub(crate) fn vcpu_run_loop_unified(
 /// kill-check at the top of the loop.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_freeze(
-    vcpu: &mut kvm_ioctls::VcpuFd,
+    vcpu: &mut ImmediateExitVcpu,
     has_immediate_exit: bool,
     kill: &Arc<AtomicBool>,
     freeze: &Arc<AtomicBool>,
@@ -1121,7 +1227,7 @@ pub(crate) fn handle_freeze(
     // calling vcpu.run() with the cap absent would re-enter the
     // guest instead of returning EINTR.
     if has_immediate_exit {
-        vcpu.set_kvm_immediate_exit(1);
+        vcpu.set_immediate_exit(1);
         // Drain dance: KVM_RUN with immediate_exit=1 commits any
         // pending PIO/MMIO from the prior exit and returns EINTR
         // without entering the guest (per the KVM API contract). EINTR
@@ -1139,7 +1245,7 @@ pub(crate) fn handle_freeze(
                  pending PIO/MMIO may not have committed before park"
             );
         }
-        vcpu.set_kvm_immediate_exit(0);
+        vcpu.set_immediate_exit(0);
     }
 
     // Capture vCPU registers BEFORE the Release store on `parked`.

@@ -47,8 +47,7 @@ fn __ktstr_inner_demo_verifier_brief(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_VERIFIER_BRIEF: KtstrTestEntry = KtstrTestEntry {
     name: "demo_verifier_brief",
     func: __ktstr_inner_demo_verifier_brief,
@@ -95,8 +94,7 @@ fn __ktstr_inner_demo_verifier_diff(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_VERIFIER_DIFF: KtstrTestEntry = KtstrTestEntry {
     name: "demo_verifier_diff",
     func: __ktstr_inner_demo_verifier_diff,
@@ -141,8 +139,7 @@ fn __ktstr_inner_verifier_cycle_collapse(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_CYCLE_COLLAPSE: KtstrTestEntry = KtstrTestEntry {
     name: "verifier_cycle_collapse",
     func: __ktstr_inner_verifier_cycle_collapse,
@@ -184,8 +181,7 @@ fn assert_verifier_rejected(result: &VmResult) -> Result<()> {
     Ok(())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_FAIL_VERIFY: KtstrTestEntry = KtstrTestEntry {
     name: "demo_verifier_fail_verify",
     func: scenario_fail_verify,
@@ -209,8 +205,7 @@ static __KTSTR_ENTRY_FAIL_VERIFY: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_VERIFY_REJECT: KtstrTestEntry = KtstrTestEntry {
     name: "demo_verifier_cycle_collapse",
     func: scenario_fail_verify,

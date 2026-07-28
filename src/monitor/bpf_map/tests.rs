@@ -9,6 +9,27 @@ use crate::monitor::symbols::START_KERNEL_MAP;
 // [`crate::monitor::test_util`].
 pub(super) use crate::monitor::test_util::name_from_str;
 
+/// Single-entry `.bss`-shaped ARRAY fixture — the shape every
+/// `read_bpf_map_value` / `write_bpf_map_value` bounds test uses.
+/// Only `value_size` (the bound under test) and `value_kva` (mapped
+/// vs. unmapped) ever vary.
+///
+/// Every caller is an x86_64-only test (the bounds tests build their
+/// page tables through `setup_page_table`), so the fixture carries the
+/// same gate: on aarch64 it would be dead code under `-D warnings`.
+#[cfg(target_arch = "x86_64")]
+fn bss_map(value_size: u32, value_kva: Option<u64>) -> BpfMapInfo {
+    let (name_bytes, name_len) = name_from_str("test.bss");
+    BpfMapInfo {
+        name_bytes,
+        name_len,
+        map_type: BPF_MAP_TYPE_ARRAY,
+        value_size,
+        value_kva,
+        ..Default::default()
+    }
+}
+
 /// Test-only alias: many value-I/O tests don't thread an
 /// `&BpfMapOffsets` through, because `read_value` / `write_value`
 /// never touch one. Build the full [`AccessorCtx`] by borrowing
@@ -664,22 +685,7 @@ fn write_bpf_map_value_u32_roundtrip() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 64,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(64, Some(kva));
 
     // Write u32 at offset 4 within the value region.
     assert!(write_bpf_map_value_u32(
@@ -1192,22 +1198,7 @@ fn write_bpf_map_value_bytes_roundtrip() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 16,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(16, Some(kva));
 
     let payload = [0xDE, 0xAD, 0xBE, 0xEF];
     assert!(write_bpf_map_value(
@@ -1232,20 +1223,13 @@ fn write_bpf_map_value_fails_on_unmapped_kva() {
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
     let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
         name_bytes: name_from_str("test.bss").0,
         name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
         value_size: 16,
-        max_entries: 0,
         value_kva: Some(0xFFFF_FFFF_8000_0000), // Unmapped KVA.
         btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     assert!(!write_bpf_map_value(
@@ -1600,22 +1584,7 @@ fn write_bpf_map_value_nonzero_offset() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 64,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(64, Some(kva));
 
     // Write at offset 8 within the value region.
     let payload = [0x11, 0x22, 0x33, 0x44];
@@ -1643,22 +1612,7 @@ fn write_bpf_map_value_empty_data() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 64,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(64, Some(kva));
 
     // Zero-length write should succeed without doing anything.
     assert!(write_bpf_map_value(
@@ -1679,22 +1633,7 @@ fn write_bpf_map_value_u32_5level() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 64,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(64, Some(kva));
 
     assert!(write_bpf_map_value_u32(
         &value_ctx(&mem, cr3_pa, true),
@@ -2030,21 +1969,13 @@ fn write_bpf_map_value_across_page_boundary() {
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
     let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
         name_bytes: name_from_str("test.bss").0,
         name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
         value_size: 0x2000,
-        max_entries: 0,
         // value_kva at the start of page 1.
         value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     // Write a u32 at offset 0xFFE within the value region.
@@ -2075,22 +2006,7 @@ fn write_bpf_map_value_single_byte_on_second_page() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 0x2000,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(0x2000, Some(kva));
 
     // Write exactly at offset 0x1000 — first byte of page 2.
     assert!(write_bpf_map_value(
@@ -2245,22 +2161,7 @@ fn read_bpf_map_value_u32_roundtrip() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 64,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(64, Some(kva));
 
     let val = read_bpf_map_value_u32(&value_ctx(&mem, cr3_pa, false), &info, 4);
     assert_eq!(val, Some(0xCAFE_BABE));
@@ -2275,22 +2176,7 @@ fn read_bpf_map_value_bytes() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 64,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(64, Some(kva));
 
     let bytes = read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0, 4);
     assert_eq!(bytes, Some(vec![0xAA, 0xBB, 0xCC, 0xDD]));
@@ -2304,22 +2190,7 @@ fn read_bpf_map_value_empty() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 64,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(64, Some(kva));
 
     let bytes = read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0, 0);
     assert_eq!(bytes, Some(vec![]));
@@ -2334,20 +2205,13 @@ fn read_bpf_map_value_unmapped_returns_none() {
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
     let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
         name_bytes: name_from_str("test.bss").0,
         name_len: name_from_str("test.bss").1,
         map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
         value_size: 16,
-        max_entries: 0,
         value_kva: Some(0xFFFF_FFFF_8000_0000), // Unmapped KVA.
         btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     assert_eq!(
@@ -2375,20 +2239,14 @@ fn read_bpf_map_array_value_per_key() {
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
     let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
         name_bytes: name_from_str("test_array").0,
         name_len: name_from_str("test_array").1,
         map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
         key_size: 4,
         value_size: 4,
         max_entries: 3,
         value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     let ctx = value_ctx(&mem, cr3_pa, false);
@@ -2421,22 +2279,7 @@ fn write_then_read_bpf_map_value_roundtrip() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 64,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(64, Some(kva));
 
     // Write then read u32.
     assert!(write_bpf_map_value_u32(
@@ -2478,22 +2321,7 @@ fn read_bpf_map_value_across_page_boundary() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 0x2000,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(0x2000, Some(kva));
 
     let bytes = read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0xFFE, 4);
     assert_eq!(bytes, Some(vec![0xAA, 0xBB, 0xCC, 0xDD]));
@@ -2508,22 +2336,7 @@ fn read_bpf_map_value_u32_5level() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 64,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(64, Some(kva));
 
     assert_eq!(
         read_bpf_map_value_u32(&value_ctx(&mem, cr3_pa, true), &info, 0),
@@ -2694,20 +2507,12 @@ fn read_value_returns_none_for_non_array_map() {
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
     let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
         name_bytes: name_from_str("hash.map").0,
         name_len: name_from_str("hash.map").1,
         map_type: 1, // HASH
         map_flags: 0,
-        key_size: 0,
         value_size: 64,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     assert!(read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 0, 4).is_none());
@@ -2723,20 +2528,12 @@ fn write_value_returns_false_for_non_array_map() {
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
     let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
         name_bytes: name_from_str("hash.map").0,
         name_len: name_from_str("hash.map").1,
         map_type: 1, // HASH
         map_flags: 0,
-        key_size: 0,
         value_size: 64,
-        max_entries: 0,
-        value_kva: None,
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
+        ..Default::default()
     };
 
     assert!(!write_bpf_map_value(
@@ -2930,22 +2727,7 @@ fn read_value_rejects_out_of_bounds() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 8,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(8, Some(kva));
 
     // Exactly at boundary: offset=4, len=4 -> 4+4=8 == value_size, ok.
     assert!(read_bpf_map_value(&value_ctx(&mem, cr3_pa, false), &info, 4, 4).is_some());
@@ -2965,22 +2747,7 @@ fn write_value_rejects_out_of_bounds() {
     // whose backing storage outlives the GuestMem use.
     let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
 
-    let info = BpfMapInfo {
-        map_pa: 0,
-        map_kva: 0,
-        name_bytes: name_from_str("test.bss").0,
-        name_len: name_from_str("test.bss").1,
-        map_type: BPF_MAP_TYPE_ARRAY,
-        map_flags: 0,
-        key_size: 0,
-        value_size: 8,
-        max_entries: 0,
-        value_kva: Some(kva),
-        btf_kva: 0,
-        btf_value_type_id: 0,
-        btf_vmlinux_value_type_id: 0,
-        btf_key_type_id: 0,
-    };
+    let info = bss_map(8, Some(kva));
 
     // Within bounds: offset=0, len=8.
     assert!(write_bpf_map_value(

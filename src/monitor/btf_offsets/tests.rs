@@ -1053,6 +1053,59 @@ fn load_btf_empty_ktstr_cache_dir_falls_through() {
     );
 }
 
+/// The mapped sidecar loader must describe the SAME type graph as the
+/// owned one. `BtfProducts` hands one form to the probe/watch paths and
+/// the other to dump rendering purely as a cost tradeoff, so a backend
+/// that disagreed about ids, names, or member offsets would silently
+/// give the two paths different kernel layouts — and only the run path
+/// would notice, by reading the wrong guest bytes.
+///
+/// Checked against a real vmlinux because the divergence risk lives in
+/// btf-rs's two section decoders, not in a synthetic blob small enough
+/// to hand-verify.
+#[test]
+fn mapped_sidecar_load_describes_the_same_types_as_the_owned_parse() {
+    let Some(path) = crate::monitor::find_test_vmlinux() else {
+        return;
+    };
+    if path.starts_with("/sys/") {
+        return;
+    }
+
+    let _env = crate::test_support::test_helpers::lock_env();
+    let staged = stage_in_cache(&path);
+    let vmlinux = staged.vmlinux.as_path();
+    // Writes the `.btf` sidecar both loaders read below.
+    let _ = load_btf_from_path(vmlinux).expect("load must succeed inside cache root");
+
+    let owned = load_btf_from_sidecar(vmlinux).expect("owned sidecar load");
+    let mapped = load_btf_from_sidecar_mapped(vmlinux).expect("mapped sidecar load");
+
+    let owned_ids = owned
+        .resolve_ids_by_name("task_struct")
+        .expect("task_struct resolves in the owned parse");
+    assert!(
+        !owned_ids.is_empty(),
+        "fixture invariant: the staged vmlinux must carry task_struct, \
+         otherwise the comparison below is vacuous",
+    );
+    assert_eq!(
+        mapped
+            .resolve_ids_by_name("task_struct")
+            .expect("task_struct resolves in the mapped parse"),
+        owned_ids,
+        "both backends must return the same ids for one name",
+    );
+
+    let (owned_struct, _) = find_struct(&owned, "task_struct").expect("owned task_struct");
+    let (mapped_struct, _) = find_struct(&mapped, "task_struct").expect("mapped task_struct");
+    assert_eq!(
+        member_byte_offset(&mapped, &mapped_struct, "pid").expect("mapped pid offset"),
+        member_byte_offset(&owned, &owned_struct, "pid").expect("owned pid offset"),
+        "a member offset resolved through the mapped backend must match the owned one",
+    );
+}
+
 /// Mid-process `KTSTR_CACHE_DIR` change: a load that wrote a
 /// sidecar under cache_a must produce no sidecar under cache_b
 /// for the same vmlinux on the next call after the env points
@@ -1133,7 +1186,7 @@ fn load_btf_fresh_resolution_per_call() {
 // core to miss the transition under TSO-violating reorder. This
 // test pins the BPF bytecode against that regression by parsing
 // the compiled `probe.o` and asserting at least one atomic op is
-// present in the `tp_btf/sched_ext_exit` program section.
+// present in each kernel-generation trigger program section.
 //
 // BPF instruction encoding (uapi/linux/bpf.h):
 //   - opcode byte: bits[2:0] = class (BPF_STX = 0x03),
@@ -1154,9 +1207,8 @@ fn probe_bpf_object_emits_atomic_for_err_exit_latch() {
     // broken and the test should surface that loudly.
     //
     // Limitation: this test counts ANY BPF_CMPXCHG instruction
-    // in the `tp_btf/sched_ext_exit` section, not specifically
-    // the cmpxchg targeting `ktstr_err_exit_detected`. Today
-    // the section contains exactly one
+    // in each selected trigger section, not specifically the cmpxchg
+    // targeting `ktstr_err_exit_detected`. Today each section contains one
     // `__sync_val_compare_and_swap` call (against the latch),
     // so any cmpxchg present must be the latch's; if a future
     // change adds a second atomic in the same handler, the
@@ -1183,62 +1235,124 @@ fn probe_bpf_object_emits_atomic_for_err_exit_latch() {
             probe_obj_path.display()
         )
     });
-    // Locate the program section. libbpf names sections after
-    // the SEC() macro argument; tp_btf programs land in
-    // `tp_btf/sched_ext_exit`. Match exact name; a future
-    // restructure that splits the program into a different
-    // section would surface as a clear test failure with the
-    // expected name.
-    const TARGET_SECTION: &str = "tp_btf/sched_ext_exit";
-    let mut found_section = false;
-    let mut atomic_count: usize = 0;
-    for sh in &elf.section_headers {
-        let Some(name) = elf.shdr_strtab.get_at(sh.sh_name) else {
-            continue;
-        };
-        if name != TARGET_SECTION {
-            continue;
-        }
-        found_section = true;
-        // BPF programs are SHT_PROGBITS sections of `n` 8-byte
-        // instructions. Read the section bytes via offset/size.
-        let off = sh.sh_offset as usize;
-        let sz = sh.sh_size as usize;
-        assert!(
-            sz.is_multiple_of(8),
-            "BPF section size {sz} must be a multiple of 8 (instruction width)"
-        );
-        let prog = &bytes[off..off + sz];
-        // BPF_STX | BPF_ATOMIC | BPF_W = 0xc3
-        // BPF_STX | BPF_ATOMIC | BPF_DW = 0xc3 | 0x18 = 0xdb
-        // The latch is u32, so we expect 0xc3 specifically — but
-        // accept either width to keep the test robust against
-        // a future widening to u64.
-        const STX_ATOMIC_W: u8 = 0xc3;
-        const STX_ATOMIC_DW: u8 = 0xdb;
-        // BPF_CMPXCHG = 0xf0 | BPF_FETCH(0x01) = 0xf1
-        const BPF_CMPXCHG_IMM: i32 = 0xf1;
-        for chunk in prog.chunks_exact(8) {
-            let opcode = chunk[0];
-            if opcode == STX_ATOMIC_W || opcode == STX_ATOMIC_DW {
-                let imm = i32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-                if imm == BPF_CMPXCHG_IMM {
-                    atomic_count += 1;
+    // Locate all program sections. libbpf names sections after the SEC()
+    // macro argument. The raw scx_vexit entry half only saves arguments;
+    // its return half publishes the latch and therefore owns the cmpxchg.
+    // A future restructure that drops either correlation half must fail even
+    // though only the return section is expected to contain an atomic.
+    const TARGET_SECTIONS: &[(&str, bool)] = &[
+        ("tp_btf/sched_ext_exit", true),
+        ("kprobe/scx_vexit", false),
+        ("kretprobe/scx_vexit", true),
+        ("fentry/scx_dump_state", true),
+    ];
+    for (target_section, requires_atomic) in TARGET_SECTIONS {
+        let mut found_section = false;
+        let mut atomic_count: usize = 0;
+        for sh in &elf.section_headers {
+            let Some(name) = elf.shdr_strtab.get_at(sh.sh_name) else {
+                continue;
+            };
+            if name != *target_section {
+                continue;
+            }
+            found_section = true;
+            // BPF programs are SHT_PROGBITS sections of `n` 8-byte
+            // instructions. Read the section bytes via offset/size.
+            let off = sh.sh_offset as usize;
+            let sz = sh.sh_size as usize;
+            assert!(
+                sz.is_multiple_of(8),
+                "BPF section size {sz} must be a multiple of 8 (instruction width)"
+            );
+            let prog = &bytes[off..off + sz];
+            // BPF_STX | BPF_ATOMIC | BPF_W = 0xc3
+            // BPF_STX | BPF_ATOMIC | BPF_DW = 0xc3 | 0x18 = 0xdb
+            // The latch is u32, so we expect 0xc3 specifically — but
+            // accept either width to keep the test robust against
+            // a future widening to u64.
+            const STX_ATOMIC_W: u8 = 0xc3;
+            const STX_ATOMIC_DW: u8 = 0xdb;
+            // BPF_CMPXCHG = 0xf0 | BPF_FETCH(0x01) = 0xf1
+            const BPF_CMPXCHG_IMM: i32 = 0xf1;
+            for chunk in prog.chunks_exact(8) {
+                let opcode = chunk[0];
+                if opcode == STX_ATOMIC_W || opcode == STX_ATOMIC_DW {
+                    let imm = i32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                    if imm == BPF_CMPXCHG_IMM {
+                        atomic_count += 1;
+                    }
                 }
             }
         }
+        assert!(
+            found_section,
+            "probe.o is missing the expected `{target_section}` section — \
+             SEC() macro changed?"
+        );
+        if *requires_atomic {
+            assert!(
+                atomic_count >= 1,
+                "probe.o `{target_section}` section has no BPF_STX|BPF_ATOMIC|cmpxchg \
+                 instruction — `__sync_val_compare_and_swap` was silently \
+                 lowered to a non-atomic store. Cross-core ordering on aarch64 \
+                 would be broken by this regression."
+            );
+        }
     }
+}
+
+/// The pre-tracepoint scx_vexit path uses BPF_PROG_TYPE_KPROBE, where 7.1
+/// rejects the sched_ext-only `scx_bpf_events` kfunc. Pin the compiled ELF
+/// rather than only the C source: a future refactor may move the call through
+/// another inline helper while still looking harmless at the raw wrapper.
+#[test]
+fn raw_scx_vexit_programs_do_not_reference_tracing_only_kfunc() {
+    let probe_obj_path = std::path::PathBuf::from(env!("OUT_DIR")).join("probe.o");
+    let bytes = std::fs::read(&probe_obj_path).unwrap_or_else(|e| {
+        panic!(
+            "probe.o missing or unreadable at {}: {e}",
+            probe_obj_path.display()
+        )
+    });
+    let elf = goblin::elf::Elf::parse(&bytes).unwrap_or_else(|e| {
+        panic!(
+            "probe.o at {} is not valid ELF: {e}",
+            probe_obj_path.display()
+        )
+    });
+
+    let referenced_symbols = |target_section: &str| {
+        let target_idx = elf
+            .section_headers
+            .iter()
+            .position(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(target_section))
+            .unwrap_or_else(|| panic!("probe.o is missing `{target_section}`"));
+
+        elf.shdr_relocs
+            .iter()
+            .filter(|(reloc_idx, _)| elf.section_headers[*reloc_idx].sh_info as usize == target_idx)
+            .flat_map(|(_, relocs)| relocs.iter())
+            .filter_map(|reloc| elf.syms.get(reloc.r_sym))
+            .filter_map(|sym| elf.strtab.get_at(sym.st_name))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    for section in ["kprobe/scx_vexit", "kretprobe/scx_vexit"] {
+        let symbols = referenced_symbols(section);
+        assert!(
+            !symbols.contains("scx_bpf_events"),
+            "`{section}` must not reference tracing-only scx_bpf_events; \
+             7.1 rejects the whole probe object when a raw kprobe contains \
+             that kfunc relocation (symbols: {symbols:?})"
+        );
+    }
+
+    let trace_symbols = referenced_symbols("tp_btf/sched_ext_exit");
     assert!(
-        found_section,
-        "probe.o is missing the expected `{TARGET_SECTION}` section — \
-         SEC() macro changed?"
-    );
-    assert!(
-        atomic_count >= 1,
-        "probe.o `{TARGET_SECTION}` section has no BPF_STX|BPF_ATOMIC|cmpxchg \
-         instruction — `__sync_val_compare_and_swap` was silently \
-         lowered to a non-atomic store. Cross-core ordering on aarch64 \
-         would be broken by this regression."
+        trace_symbols.contains("scx_bpf_events"),
+        "the typed tracepoint should retain the event-counter snapshot; \
+         otherwise the raw-path absence check is vacuous"
     );
 }
 
@@ -1890,4 +2004,54 @@ fn resolve_map_field_offset_width_rejects_non_int_and_bitfield_leaves() {
     ];
     let bbtf = Btf::from_bytes(&cast_build_btf(&btypes, &bstrings)).expect("synthetic btf");
     assert_eq!(resolve_map_field_offset_width(&bbtf, 2, "bit"), None);
+}
+
+/// BTF's `kind_flag` is struct-wide: when any member is a bitfield, btf-rs
+/// returns `Some(0)` from `Member::bitfield_size()` for every ordinary member
+/// in that struct. A zero width means "not a bitfield", so the shared
+/// offset+width resolver must retain the regular member while still rejecting
+/// its positive-width bitfield sibling.
+#[test]
+fn resolve_offset_width_accepts_zero_width_member_in_kind_flag_struct() {
+    let (strings, off) = build_strtab(&["u32", "mixed_t", "plain", "bits"]);
+    let (u32n, mixed_t, plain, bits) = (off[0], off[1], off[2], off[3]);
+    let types = vec![
+        CastSynType::Int {
+            name_off: u32n,
+            size: 4,
+            encoding: 0,
+            offset: 0,
+            bits: 32,
+        }, // id 1
+        CastSynType::BitfieldStruct {
+            name_off: mixed_t,
+            size: 8,
+            members: vec![
+                CastSynBitMember {
+                    name_off: bits,
+                    type_id: 1,
+                    bit_offset: 0,
+                    bitfield_size: 4,
+                },
+                CastSynBitMember {
+                    name_off: plain,
+                    type_id: 1,
+                    bit_offset: 32,
+                    bitfield_size: 0,
+                },
+            ],
+        }, // id 2
+    ];
+    let btf = Btf::from_bytes(&cast_build_btf(&types, &strings)).expect("synthetic mixed BTF");
+
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 2, "plain"),
+        Some((4, 4)),
+        "Some(0) identifies an ordinary member in a kind_flag struct"
+    );
+    assert_eq!(
+        resolve_map_field_offset_width(&btf, 2, "bits"),
+        None,
+        "a positive-width bitfield must remain unsupported"
+    );
 }

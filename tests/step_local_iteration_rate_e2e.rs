@@ -74,7 +74,6 @@ fn assert_step_local_iteration_rates(result: &VmResult) -> Result<()> {
     llcs = 1,
     cores = 4,
     threads = 1,
-    memory_mib = 2048,
     duration_s = 12,
     watchdog_timeout_s = 25,
     num_snapshots = 12,

@@ -44,10 +44,21 @@ cargo ktstr verifier --raw
 See [cargo-ktstr verifier](cargo-ktstr.md#verifier) for the flag
 list.
 
-In a workspace with multiple ktstr versions, the one-shot command
-enumerates only packages linked to the current cargo-ktstr version.
-Older test packages are skipped with a short update-or-exclude message;
-current scheduler declarations continue in the same run.
+In a workspace with multiple ktstr versions, a bare/unscoped one-shot
+command considers every workspace package and enumerates those compatible
+with the current cargo-ktstr version; explicit package selectors remain
+scoped to the request. Older test packages are skipped with a short
+update-or-exclude message, while current scheduler declarations continue
+in the same run. Compatible
+direct optional ktstr dependencies are matched through ktstr-only feature
+aliases, and only those package-qualified roots are auto-injected.
+Conventional feature-gated declarations are therefore discovered by a
+bare `cargo ktstr verifier`; older workspace packages remain outside the
+selection. Cargo metadata cannot identify arbitrary source-level `cfg`
+expressions, so other arrangements such as a transitive optional helper or
+a composite gate remain opt-in through `--features`. Target-specific optional
+ktstr dependencies are inferred when their manifest platform expression
+matches the effective Cargo target and its rustc-reported cfg set.
 
 ## A real sweep
 
@@ -65,8 +76,8 @@ ktstr::declare_scheduler!(BPFLAND, {
 // ... same for scx_lavd, scx_p2dq
 ```
 
-<!-- captured: cargo ktstr verifier --kernel <local sched_ext dev tree> --test docs_real_scheds tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
-<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel ../linux --test my_schedulers tiny-1llc tiny-2llc odd-3llc smt-2llc</span></div>
+<!-- captured: cargo ktstr verifier --kernel <local sched_ext dev tree> --test docs_real_scheds 4cpu-1llc-nosmt 4cpu-2llc-nosmt 9cpu-3llc-nosmt 8cpu-2llc-smt | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel ../linux --test my_schedulers 4cpu-1llc-nosmt 4cpu-2llc-nosmt 9cpu-3llc-nosmt 8cpu-2llc-smt</span></div>
 
 <pre><span class="t-b">verifier verified_insns (per scheduler; rows: kernel, cols: BPF program, cell: range across topologies):</span>
 
@@ -81,43 +92,43 @@ scx_p2dq:
 verifier results (per scheduler; rows: topology, cols: kernel):
 
 scx_bpfland: 4 ✅  0 ❌
-┌───────────┬──────────────┐
-│ topology  │ kernel_local │
-╞═══════════╪══════════════╡
-│ odd-3llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ smt-2llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-1llc │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-2llc │ <span class="t-grn">✓</span>            │
-└───────────┴──────────────┘
+┌─────────────────┬──────────────┐
+│ topology        │ kernel_local │
+╞═════════════════╪══════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 8cpu-2llc-smt   │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 9cpu-3llc-nosmt │ <span class="t-grn">✓</span>            │
+└─────────────────┴──────────────┘
 
 scx_lavd: 0 ✅  <span class="t-red">4 ❌</span>
-┌───────────┬──────────────┐
-│ topology  │ kernel_local │
-╞═══════════╪══════════════╡
-│ odd-3llc  │ <span class="t-red">✗</span>            │
-├───────────┼──────────────┤
-│ smt-2llc  │ <span class="t-red">✗</span>            │
-├───────────┼──────────────┤
-│ tiny-1llc │ <span class="t-red">✗</span>            │
-├───────────┼──────────────┤
-│ tiny-2llc │ <span class="t-red">✗</span>            │
-└───────────┴──────────────┘
+┌─────────────────┬──────────────┐
+│ topology        │ kernel_local │
+╞═════════════════╪══════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-red">✗</span>            │
+├─────────────────┼──────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-red">✗</span>            │
+├─────────────────┼──────────────┤
+│ 8cpu-2llc-smt   │ <span class="t-red">✗</span>            │
+├─────────────────┼──────────────┤
+│ 9cpu-3llc-nosmt │ <span class="t-red">✗</span>            │
+└─────────────────┴──────────────┘
 
 scx_p2dq: 4 ✅  0 ❌
-┌───────────┬──────────────┐
-│ topology  │ kernel_local │
-╞═══════════╪══════════════╡
-│ odd-3llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ smt-2llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-1llc │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-2llc │ <span class="t-grn">✓</span>            │
-└───────────┴──────────────┘</pre></div>
+┌─────────────────┬──────────────┐
+│ topology        │ kernel_local │
+╞═════════════════╪══════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 8cpu-2llc-smt   │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 9cpu-3llc-nosmt │ <span class="t-grn">✓</span>            │
+└─────────────────┴──────────────┘</pre></div>
 
 That all-✗ `scx_lavd` grid is the sweep doing its job. This
 development kernel removed the deprecated `scx_bpf_cpu_rq()` kfunc;
@@ -178,8 +189,8 @@ With multiple kernels resolved, each cell runs against its own, the
 pass/fail grid grows one column per kernel, so a per-kernel ✓/✗ is
 read straight off the cell — no separate failing list:
 
-<!-- captured: cargo ktstr verifier --kernel 7.0.14-tarball-x86_64-kcabd40422 --kernel local-8cd2b47-x86_64-kcabd40422 --scheduler ktstr_sched --test kaslr_axis_e2e tiny-1llc tiny-2llc | ktstr 0.23.0 | kernels 7.0.14 + v7.1-patched -->
-<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --kernel ../linux --scheduler ktstr_sched tiny-1llc tiny-2llc</span></div>
+<!-- captured: cargo ktstr verifier --kernel 7.0.14-tarball-x86_64-kcabd40422 --kernel local-8cd2b47-x86_64-kcabd40422 --scheduler ktstr_sched --test kaslr_axis_e2e 4cpu-1llc-nosmt 4cpu-2llc-nosmt | ktstr 0.23.0 | kernels 7.0.14 + v7.1-patched -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --kernel ../linux --scheduler ktstr_sched 4cpu-1llc-nosmt 4cpu-2llc-nosmt</span></div>
 
 <pre>ktstr_sched:
  kernel               ktstr_dispatch  ktstr_dump  ktstr_dump_cpu  ktstr_dump_task  ktstr_enqueue  ktstr_exit  ktstr_exit_task  ktstr_init  ktstr_init_task  ktstr_select_cp  ktstr_yield
@@ -189,13 +200,13 @@ read straight off the cell — no separate failing list:
 verifier results (per scheduler; rows: topology, cols: kernel):
 
 ktstr_sched: 4 ✅  0 ❌
-┌───────────┬───────────────┬─────────────────────┐
-│ topology  │ kernel_7_0_14 │ kernel_local_8cd2b4 │
-╞═══════════╪═══════════════╪═════════════════════╡
-│ tiny-1llc │ <span class="t-grn">✓</span>             │ <span class="t-grn">✓</span>                   │
-├───────────┼───────────────┼─────────────────────┤
-│ tiny-2llc │ <span class="t-grn">✓</span>             │ <span class="t-grn">✓</span>                   │
-└───────────┴───────────────┴─────────────────────┘</pre></div>
+┌─────────────────┬───────────────┬─────────────────────┐
+│ topology        │ kernel_7_0_14 │ kernel_local_8cd2b4 │
+╞═════════════════╪═══════════════╪═════════════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-grn">✓</span>             │ <span class="t-grn">✓</span>                   │
+├─────────────────┼───────────────┼─────────────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-grn">✓</span>             │ <span class="t-grn">✓</span>                   │
+└─────────────────┴───────────────┴─────────────────────┘</pre></div>
 
 Flat rows across kernels are the boring, reassuring case — the same
 BPF verified identically on both. A kfunc or verifier change between
@@ -245,10 +256,10 @@ store through a null pointer — the verifier walks the loop, then
 rejects the store. Note the collapse markers: the loop body is shown
 once, not eight times:
 
-<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_broken --test verifier_pipeline tiny-1llc (scratch declare_scheduler! running scx-ktstr with --verify-loop) | ktstr 0.23.0 | kernel 7.0.14 -->
-<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --scheduler ktstr_broken --test verifier_pipeline tiny-1llc</span></div>
+<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_broken --test verifier_pipeline 4cpu-1llc-nosmt (scratch declare_scheduler! running scx-ktstr with --verify-loop) | ktstr 0.23.0 | kernel 7.0.14 -->
+<div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel 7.0 --scheduler ktstr_broken --test verifier_pipeline 4cpu-1llc-nosmt</span></div>
 
-<pre>=== ktstr_broken | kernel kernel_7_0 | topology tiny-1llc ===
+<pre>=== ktstr_broken | kernel kernel_7_0 | topology 4cpu-1llc-nosmt ===
 
 verifier
   <span class="t-red">scheduler: NOT ATTACHED — scheduler process exited during BPF load/startup</span>
@@ -285,11 +296,11 @@ processed 186 insns (limit 1000000) max_states_per_insn 0 total_states 7 peak_st
 verifier results (per scheduler; rows: topology, cols: kernel):
 
 ktstr_broken: 0 ✅  <span class="t-red">1 ❌</span>
-┌───────────┬────────────┐
-│ topology  │ kernel_7_0 │
-╞═══════════╪════════════╡
-│ tiny-1llc │ <span class="t-red">✗</span>          │
-└───────────┴────────────┘</pre></div>
+┌─────────────────┬────────────┐
+│ topology        │ kernel_7_0 │
+╞═════════════════╪════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-red">✗</span>          │
+└─────────────────┴────────────┘</pre></div>
 
 The interleaved `; source line @ file:line` comments name the C
 statement each instruction group came from — the offending store is
@@ -351,7 +362,7 @@ declare_scheduler!(MY_SCHED, {
     name = "my_sched",
     binary = "scx_my_sched",
     verifier_exclude_topologies = [
-        "240cpu-15llc-smt2",
+        "240cpu-15llc-smt",
         "240cpu-15llc-nosmt",
     ],
 });
@@ -363,10 +374,10 @@ gauntlet variants. Individual `#[ktstr_test]` functions do not
 participate in the verifier matrix in the first place; verifier cells
 come from `declare_scheduler!` registrations.
 
-Two catalog shapes exist mainly for this wider battery: `numa2-2llc`
-(2 nodes, one LLC each, SMT) and `uneven-11llc` — 192 vCPUs across
+Two catalog shapes exist mainly for this wider battery: `2numa-32cpu-2llc-smt`
+(2 nodes, one LLC each, SMT) and `192cpu-11llc-smt` — 192 vCPUs across
 **non-uniform** LLCs (ten of 18 CPUs, one of 12) that breaks per-LLC
-math assuming equal-sized caches. `uneven-11llc` additionally carries a
+math assuming equal-sized caches. `192cpu-11llc-smt` additionally carries a
 forced 96-CPU budget, so its 192 vCPUs **always** overcommit (>=2x,
 deeper on smaller hosts) — continuous exercise of the time-slicing path.
 It is verifier-only: its non-uniform layout cannot be expressed through

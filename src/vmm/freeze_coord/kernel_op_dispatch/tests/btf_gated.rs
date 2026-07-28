@@ -46,6 +46,26 @@ fn u64_int(name_off: u32) -> CastSynType {
     }
 }
 
+fn u8_int(name_off: u32) -> CastSynType {
+    CastSynType::Int {
+        name_off,
+        size: 1,
+        encoding: 0,
+        offset: 0,
+        bits: 8,
+    }
+}
+
+fn u32_int(name_off: u32) -> CastSynType {
+    CastSynType::Int {
+        name_off,
+        size: 4,
+        encoding: 0,
+        offset: 0,
+        bits: 32,
+    }
+}
+
 // ===============================================================
 // resolve_per_cpu_field_pa
 // ===============================================================
@@ -438,11 +458,18 @@ const TF_PID: u32 = 4242;
 /// `sched_ext_entity` struct), so `nested_member_byte_offset`
 /// descends into it for `scx.dsq` / `scx.runnable_node`.
 ///
-/// Type ids: 1=u64 Int (leaf), 2=sched_ext_entity, 3=task_struct,
-/// 4=signal_struct.
+/// Models the modern packed runqueue flags exactly: `on_rq` is a `u8`
+/// immediately followed by the independent `is_blocked` byte. The fixture
+/// paints `is_blocked=1`, so reading four bytes at `on_rq` would reproduce the
+/// real-kernel false value 256.
+///
+/// Type ids: 1=u64 Int, 2=u8 Int (runqueue flags), 3=u32 Int,
+/// 4=sched_ext_entity, 5=task_struct, 6=signal_struct.
 fn task_struct_btf() -> Vec<u8> {
     let mut strings: Vec<u8> = vec![0];
     let n_u64 = push_str(&mut strings, "u64");
+    let n_u8 = push_str(&mut strings, "u8");
+    let n_u32 = push_str(&mut strings, "u32");
     let n_sched_ext_entity = push_str(&mut strings, "sched_ext_entity");
     let n_dsq = push_str(&mut strings, "dsq");
     let n_runnable_node = push_str(&mut strings, "runnable_node");
@@ -451,6 +478,7 @@ fn task_struct_btf() -> Vec<u8> {
     let n_start_time = push_str(&mut strings, "start_time");
     let n_state = push_str(&mut strings, "__state");
     let n_on_rq = push_str(&mut strings, "on_rq");
+    let n_is_blocked = push_str(&mut strings, "is_blocked");
     let n_sched_class = push_str(&mut strings, "sched_class");
     let n_start_boottime = push_str(&mut strings, "start_boottime");
     let n_scx = push_str(&mut strings, "scx");
@@ -468,7 +496,9 @@ fn task_struct_btf() -> Vec<u8> {
 
     let types = vec![
         u64_int(n_u64), // id=1
-        // id=2: sched_ext_entity { dsq@0x0, runnable_node@0x8 }.
+        u8_int(n_u8),   // id=2
+        u32_int(n_u32), // id=3
+        // id=4: sched_ext_entity { dsq@0x0, runnable_node@0x8 }.
         // scx.dsq → 0x48 + 0x0 = SCX_DSQ_OFF; scx.runnable_node →
         // 0x48 + 0x8 = SCX_RUNNABLE_NODE_OFF (see super::common).
         CastSynType::Struct {
@@ -476,26 +506,27 @@ fn task_struct_btf() -> Vec<u8> {
             size: 0x10,
             members: vec![member(n_dsq, 1, 0x0), member(n_runnable_node, 1, 0x8)],
         },
-        // id=3: task_struct. scalar members → id=1; scx → id=2 so
-        // nested descent reaches sched_ext_entity. Offsets are the
-        // synth_task consts.
+        // id=5: task_struct. Time/pointer members → id=1; packed
+        // runqueue flags → id=2; pid/state → id=3; scx → id=4 so nested
+        // descent reaches sched_ext_entity. Offsets are the synth_task consts.
         CastSynType::Struct {
             name_off: n_task_struct,
             size: 0x80,
             members: vec![
-                member(n_pid, 1, synth_task::PID_OFF as u32),
+                member(n_pid, 3, synth_task::PID_OFF as u32),
                 member(n_start_time, 1, synth_task::START_TIME_OFF as u32),
-                member(n_state, 1, synth_task::STATE_OFF as u32),
-                member(n_on_rq, 1, synth_task::ON_RQ_OFF as u32),
+                member(n_state, 3, synth_task::STATE_OFF as u32),
+                member(n_on_rq, 2, synth_task::ON_RQ_OFF as u32),
+                member(n_is_blocked, 2, synth_task::ON_RQ_OFF as u32 + 1),
                 member(n_sched_class, 1, synth_task::SCHED_CLASS_OFF as u32),
                 member(n_start_boottime, 1, synth_task::START_BOOTTIME_OFF as u32),
-                member(n_scx, 2, synth_task::SCX_DSQ_OFF as u32),
+                member(n_scx, 4, synth_task::SCX_DSQ_OFF as u32),
                 member(n_tasks, 1, synth_task::TASKS_OFF as u32),
                 member(n_signal, 1, synth_task::SIGNAL_OFF as u32),
                 member(n_thread_node, 1, synth_task::THREAD_NODE_OFF as u32),
             ],
         },
-        // id=4: signal_struct { thread_head@SIGNAL_THREAD_HEAD_OFF }.
+        // id=6: signal_struct { thread_head@SIGNAL_THREAD_HEAD_OFF }.
         CastSynType::Struct {
             name_off: n_signal_struct,
             size: 0x20,
@@ -521,6 +552,10 @@ fn tf_init_task_kva() -> u64 {
 /// stores in `sched_class`), so the L6 identity check passes.
 fn paint_task_field_fixture(buf: &mut [u8]) -> std::collections::HashMap<String, u64> {
     paint_valid_task(buf, TF_LEADER_PA as usize, TF_PID);
+    // Modern kernels place `u8 is_blocked` immediately after `u8 on_rq`.
+    // A sleeping worker has on_rq=0 and may have is_blocked=1. A stale u32
+    // reader at the on_rq offset therefore observes 0x0000_0100 (256).
+    buf[TF_LEADER_PA as usize + synth_task::ON_RQ_OFF + 1] = 1;
     // init_task.tasks.next → leader node.
     let head_link_pa = TF_INIT_TASK_PA + synth_task::TASKS_OFF as u64;
     let leader_node_kva = PAGE_OFFSET + TF_LEADER_PA + synth_task::TASKS_OFF as u64;
@@ -556,6 +591,33 @@ fn resolve_and_validate_task_field_happy_path_returns_task_pa() {
         task_pa, TF_LEADER_PA,
         "must return the leader's direct-map PA"
     );
+}
+
+/// Modern kernels pack `on_rq` and `is_blocked` into adjacent u8 fields.
+/// A four-byte read at `on_rq` turns the valid sleeping layout
+/// `{ on_rq: 0, is_blocked: 1 }` into 256. Pin both the BTF-resolved width and
+/// the full validation path so that false rejection cannot recur.
+#[test]
+fn task_validation_reads_only_modern_u8_on_rq() {
+    let blob = task_struct_btf();
+    let btf = Btf::from_bytes(&blob).expect("synthetic task_struct BTF parses");
+    let offsets =
+        TaskValidationOffsets::resolve_from_btf(&btf).expect("validation offsets must resolve");
+    assert_eq!(offsets.on_rq.offset, synth_task::ON_RQ_OFF);
+    assert_eq!(offsets.on_rq.width, 1);
+
+    let mut buf = vec![0u8; 0x4000];
+    let symbols = paint_task_field_fixture(&mut buf);
+    assert_eq!(
+        &buf[TF_LEADER_PA as usize + synth_task::ON_RQ_OFF
+            ..TF_LEADER_PA as usize + synth_task::ON_RQ_OFF + 2],
+        &[0, 1],
+        "fixture must reproduce sleeping on_rq plus nonzero adjacent is_blocked"
+    );
+    let kernel = build_test_kernel(&mut buf, symbols);
+
+    resolve_and_validate_task_field(&kernel, Some(&btf), 0, TF_PID, DEFAULT_START_TIME)
+        .expect("on_rq=0 must pass regardless of adjacent is_blocked=1");
 }
 
 /// End-to-end TaskField write through the production dispatcher: the

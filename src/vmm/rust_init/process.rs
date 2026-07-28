@@ -4,6 +4,662 @@
 //! parent module (`super`), reached via the glob below.
 use super::*;
 
+const PIDFD_RIGHTS_PAYLOAD: u8 = 0x4b;
+const PIDFD_RIGHTS_ACK: u8 = 0xb7;
+const PIDFD_RIGHTS_SPACE: usize =
+    unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
+
+/// Ancillary-data storage aligned for `cmsghdr`.
+#[repr(C)]
+union PidfdRightsControl {
+    _header: std::mem::ManuallyDrop<libc::cmsghdr>,
+    bytes: [u8; PIDFD_RIGHTS_SPACE],
+}
+
+/// Spawn a child and acquire its pidfd before `exec`, without ever reopening a
+/// numeric pid in the parent.
+///
+/// Stable Rust does not expose `CLONE_PIDFD` through `Command`. Instead, a
+/// CLOEXEC `SOCK_SEQPACKET` socket is inherited across `fork`; the child's
+/// `pre_exec` hook opens a pidfd for `getpid()` while that task is necessarily
+/// alive and passes it to a parent receiver thread with `SCM_RIGHTS`. The child
+/// does not return from `pre_exec` until that receiver has transferred the
+/// validated descriptor to this thread and acknowledged it. A receive,
+/// validation, or receiver-thread failure therefore closes the socket and
+/// fails the pre-exec hook: `Command::spawn` never returns a live exec'd child
+/// unless its exact pidfd is already owned by the parent. The queued descriptor
+/// pins that exact task even if the exec'd program exits and is auto-reaped
+/// before `Command::spawn` returns.
+///
+/// The command is one-shot after this call: `pre_exec` hooks cannot be removed
+/// from `std::process::Command`, and this hook captures per-spawn socket fds.
+pub(crate) fn spawn_with_pidfd(command: &mut Command) -> std::io::Result<(Child, OwnedFd)> {
+    spawn_with_pidfd_inner(command, false, false, false, |_| {})
+}
+
+fn spawn_with_pidfd_inner(
+    command: &mut Command,
+    force_child_handshake_failure: bool,
+    force_invalid_child_payload: bool,
+    force_parent_receive_failure: bool,
+    after_spawn: impl FnOnce(&mut Child),
+) -> std::io::Result<(Child, OwnedFd)> {
+    let mut sockets = [-1; 2];
+    // SAFETY: `sockets` is a two-element output array. SOCK_CLOEXEC prevents
+    // either endpoint from leaking past the child exec or a later unrelated
+    // exec in the parent.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            sockets.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: socketpair returned two fresh descriptors owned by this scope.
+    let parent_socket = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
+    let child_socket = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
+    let parent_raw = parent_socket.as_raw_fd();
+    let child_raw = child_socket.as_raw_fd();
+
+    // SAFETY: the hook performs only libc syscalls and stack writes. It neither
+    // allocates nor touches locks, which is the required post-fork discipline
+    // in a potentially multi-threaded process.
+    unsafe {
+        command.pre_exec(move || {
+            let _ = libc::close(parent_raw);
+            if force_child_handshake_failure {
+                let _ = libc::close(child_raw);
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+
+            let pidfd = libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0u32) as libc::c_int;
+            if pidfd < 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = libc::close(child_raw);
+                return Err(error);
+            }
+
+            let mut payload = if force_invalid_child_payload {
+                PIDFD_RIGHTS_PAYLOAD ^ 0xff
+            } else {
+                PIDFD_RIGHTS_PAYLOAD
+            };
+            let mut iov = libc::iovec {
+                iov_base: (&mut payload as *mut u8).cast::<libc::c_void>(),
+                iov_len: 1,
+            };
+            let mut control = PidfdRightsControl {
+                bytes: [0; PIDFD_RIGHTS_SPACE],
+            };
+            let mut message: libc::msghdr = std::mem::zeroed();
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.bytes.as_mut_ptr().cast::<libc::c_void>();
+            message.msg_controllen = PIDFD_RIGHTS_SPACE;
+
+            let cmsg = libc::CMSG_FIRSTHDR(&message);
+            if cmsg.is_null() {
+                let _ = libc::close(pidfd);
+                let _ = libc::close(child_raw);
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize;
+            std::ptr::write(libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), pidfd);
+
+            let sent = libc::sendmsg(child_raw, &message, libc::MSG_NOSIGNAL);
+            let send_error = if sent == 1 {
+                None
+            } else if sent < 0 {
+                Some(std::io::Error::last_os_error())
+            } else {
+                Some(std::io::Error::from_raw_os_error(libc::EIO))
+            };
+            let _ = libc::close(pidfd);
+            if let Some(error) = send_error {
+                let _ = libc::close(child_raw);
+                return Err(error);
+            }
+
+            let mut ack = 0u8;
+            let received = loop {
+                let rc = libc::recv(
+                    child_raw,
+                    (&mut ack as *mut u8).cast::<libc::c_void>(),
+                    1,
+                    0,
+                );
+                if rc >= 0 {
+                    break rc;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    let _ = libc::close(child_raw);
+                    return Err(error);
+                }
+            };
+            let _ = libc::close(child_raw);
+            if received != 1 || ack != PIDFD_RIGHTS_ACK {
+                Err(std::io::Error::from_raw_os_error(libc::EPROTO))
+            } else {
+                Ok(())
+            }
+        });
+    }
+
+    // The channel is bounded so the receiver can transfer ownership before it
+    // sends the ACK without waiting for this thread, which is blocked inside
+    // Command::spawn until the child leaves pre_exec.
+    let (pidfd_tx, pidfd_rx) = std::sync::mpsc::sync_channel(1);
+    let receiver = std::thread::Builder::new()
+        .name("ktstr-pidfd-recv".into())
+        .spawn(move || -> std::io::Result<()> {
+            if force_parent_receive_failure {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "injected parent pidfd receive failure",
+                ));
+            }
+            let pidfd = recv_spawn_pidfd(&parent_socket).map_err(|(error, _pidfd)| error)?;
+            pidfd_tx.send(pidfd).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "spawn caller dropped the received pidfd channel",
+                )
+            })?;
+            send_spawn_pidfd_ack(&parent_socket)
+        })?;
+
+    let spawn_result = command.spawn();
+    // The child closes this endpoint in pre_exec. Dropping the parent's copy
+    // after Command::spawn returns also guarantees a receiver blocked on a
+    // child-side setup failure observes EOF before we join it.
+    drop(child_socket);
+    let receiver_result = match receiver.join() {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::other(
+            "pidfd receiver thread panicked before completing the handshake",
+        )),
+    };
+
+    let mut child = spawn_result?;
+
+    // A successful exec proves the child received PIDFD_RIGHTS_ACK. The
+    // receiver sends that ACK only after this bounded channel owns the exact
+    // descriptor, so disconnection here is a broken internal invariant rather
+    // than a recoverable no-handle Child state. The PID-1 guest uses
+    // panic=abort, which also prevents a process from escaping ownership if
+    // memory unsafety ever violated that invariant.
+    let pidfd = pidfd_rx.recv().expect(
+        "successful pidfd-gated exec must have transferred its exact descriptor before ACK",
+    );
+    if let Err(error) = receiver_result {
+        let cleanup = terminate_scheduler_via_pidfd(&mut child, &pidfd);
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; exact pidfd cleanup after receiver failure failed: {cleanup_error}"
+                ),
+            )),
+        };
+    }
+    after_spawn(&mut child);
+    Ok((child, pidfd))
+}
+
+fn send_spawn_pidfd_ack(socket: &OwnedFd) -> std::io::Result<()> {
+    let ack = PIDFD_RIGHTS_ACK;
+    loop {
+        // SAFETY: `ack` is one readable byte and `socket` is the live parent
+        // endpoint of the private SOCK_SEQPACKET handshake.
+        let sent = unsafe {
+            libc::send(
+                socket.as_raw_fd(),
+                (&ack as *const u8).cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent == 1 {
+            return Ok(());
+        }
+        if sent >= 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+type SpawnPidfdReceiveError = (std::io::Error, Option<OwnedFd>);
+
+fn invalid_pidfd_envelope(message: &'static str, pidfd: Option<OwnedFd>) -> SpawnPidfdReceiveError {
+    (
+        std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+        pidfd,
+    )
+}
+
+fn recv_spawn_pidfd(socket: &OwnedFd) -> Result<OwnedFd, SpawnPidfdReceiveError> {
+    let mut payload = 0u8;
+    let mut iov = libc::iovec {
+        iov_base: (&mut payload as *mut u8).cast::<libc::c_void>(),
+        iov_len: 1,
+    };
+    let mut control = PidfdRightsControl {
+        bytes: [0; PIDFD_RIGHTS_SPACE],
+    };
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = unsafe { control.bytes.as_mut_ptr().cast::<libc::c_void>() };
+    message.msg_controllen = PIDFD_RIGHTS_SPACE;
+
+    let received = loop {
+        // recvmsg mutates these fields even on some interrupted paths. Restore
+        // the full input contract before every attempt so an EINTR cannot turn
+        // the retry into a zero-sized ancillary receive or preserve stale
+        // truncation flags.
+        payload = 0;
+        message.msg_controllen = PIDFD_RIGHTS_SPACE;
+        message.msg_flags = 0;
+        unsafe {
+            control.bytes.fill(0);
+        }
+        // SAFETY: all message buffers are live and writable for the syscall.
+        // MSG_CMSG_CLOEXEC makes the received descriptor CLOEXEC atomically.
+        let rc = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+        if rc >= 0 {
+            break rc;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err((error, None));
+        }
+    };
+
+    // Extract and own an installed SCM_RIGHTS descriptor before validating the
+    // surrounding envelope. This is load-bearing: malformed payload/flags must
+    // keep every installed descriptor owned while the receiver rejects the
+    // handshake, and every invalid return must close it through OwnedFd.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    let cmsg_data_base = unsafe { libc::CMSG_LEN(0) as usize };
+    let one_fd_len =
+        unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as libc::c_uint) as usize };
+    let first_cmsg_is_one_right = !cmsg.is_null()
+        && unsafe { (*cmsg).cmsg_level } == libc::SOL_SOCKET
+        && unsafe { (*cmsg).cmsg_type } == libc::SCM_RIGHTS
+        && unsafe { (*cmsg).cmsg_len } == one_fd_len;
+    let trailing = if cmsg.is_null() {
+        std::ptr::null_mut()
+    } else {
+        // SAFETY: cmsg came from CMSG_FIRSTHDR for this message.
+        unsafe { libc::CMSG_NXTHDR(&message, cmsg) }
+    };
+
+    let mut pidfd = None;
+    let mut received_rights = 0usize;
+    let mut current = cmsg;
+    while !current.is_null() {
+        let header = unsafe { &*current };
+        if header.cmsg_level == libc::SOL_SOCKET
+            && header.cmsg_type == libc::SCM_RIGHTS
+            && header.cmsg_len >= cmsg_data_base
+            && header.cmsg_len <= message.msg_controllen
+        {
+            let data_bytes = header.cmsg_len - cmsg_data_base;
+            if data_bytes % std::mem::size_of::<libc::c_int>() == 0 {
+                let count = data_bytes / std::mem::size_of::<libc::c_int>();
+                for index in 0..count {
+                    // SAFETY: the kernel reported `count` complete c_ints in
+                    // this SCM_RIGHTS record. Take ownership of every one;
+                    // extras are dropped immediately so malformed envelopes
+                    // cannot leak descriptors.
+                    let raw = unsafe {
+                        std::ptr::read(libc::CMSG_DATA(current).cast::<libc::c_int>().add(index))
+                    };
+                    if raw >= 0 {
+                        received_rights += 1;
+                        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+                        if pidfd.is_none() {
+                            pidfd = Some(owned);
+                        }
+                    }
+                }
+            }
+        }
+        // SAFETY: `current` is an ancillary header within `message`.
+        current = unsafe { libc::CMSG_NXTHDR(&message, current) };
+    }
+    let cmsg_is_one_right = first_cmsg_is_one_right && trailing.is_null() && received_rights == 1;
+
+    if received != 1 || payload != PIDFD_RIGHTS_PAYLOAD {
+        return Err(invalid_pidfd_envelope(
+            "child pidfd handshake returned an invalid payload",
+            pidfd,
+        ));
+    }
+    if message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+        return Err(invalid_pidfd_envelope(
+            "child pidfd handshake ancillary data was truncated",
+            pidfd,
+        ));
+    }
+    if !cmsg_is_one_right || pidfd.is_none() {
+        return Err(invalid_pidfd_envelope(
+            "child pidfd handshake did not contain exactly one SCM_RIGHTS descriptor",
+            pidfd,
+        ));
+    }
+    Ok(pidfd
+        .take()
+        .expect("validated child pidfd handshake owns one descriptor"))
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_with_pidfd_after_spawn_for_test(
+    command: &mut Command,
+    after_spawn: impl FnOnce(&mut Child),
+) -> std::io::Result<(Child, OwnedFd)> {
+    spawn_with_pidfd_inner(command, false, false, false, after_spawn)
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_with_pidfd_handshake_failure_for_test(
+    command: &mut Command,
+) -> std::io::Result<(Child, OwnedFd)> {
+    spawn_with_pidfd_inner(command, true, false, false, |_| {})
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_with_pidfd_invalid_payload_for_test(
+    command: &mut Command,
+) -> std::io::Result<(Child, OwnedFd)> {
+    spawn_with_pidfd_inner(command, false, true, false, |_| {})
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_with_pidfd_parent_receive_failure_for_test(
+    command: &mut Command,
+) -> std::io::Result<(Child, OwnedFd)> {
+    spawn_with_pidfd_inner(command, false, false, true, |_| {})
+}
+
+#[cfg(test)]
+mod spawn_pidfd_tests {
+    use super::*;
+
+    const TWO_RIGHTS_SPACE: usize = unsafe {
+        libc::CMSG_SPACE((2 * std::mem::size_of::<libc::c_int>()) as libc::c_uint) as usize
+    };
+
+    #[repr(C)]
+    union TwoRightsControl {
+        _header: std::mem::ManuallyDrop<libc::cmsghdr>,
+        bytes: [u8; TWO_RIGHTS_SPACE],
+    }
+
+    fn open_fd_count() -> usize {
+        fs::read_dir("/proc/self/fd")
+            .expect("enumerate process fds")
+            .count()
+    }
+
+    fn send_test_rights(socket: &OwnedFd, fds: &[&OwnedFd], payload: u8) {
+        assert!(!fds.is_empty() && fds.len() <= 2);
+        let mut payload = payload;
+        let mut iov = libc::iovec {
+            iov_base: (&mut payload as *mut u8).cast::<libc::c_void>(),
+            iov_len: 1,
+        };
+        let mut control = TwoRightsControl {
+            bytes: [0; TWO_RIGHTS_SPACE],
+        };
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = unsafe { control.bytes.as_mut_ptr().cast::<libc::c_void>() };
+        message.msg_controllen = unsafe {
+            libc::CMSG_SPACE((fds.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint)
+                as usize
+        };
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&message) };
+        assert!(!cmsg.is_null());
+        unsafe {
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN((fds.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint)
+                    as usize;
+            for (index, fd) in fds.iter().enumerate() {
+                std::ptr::write(
+                    libc::CMSG_DATA(cmsg).cast::<libc::c_int>().add(index),
+                    fd.as_raw_fd(),
+                );
+            }
+        }
+        let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
+        assert_eq!(
+            sent,
+            1,
+            "send malformed pidfd envelope: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn socket_pair() -> (OwnedFd, OwnedFd) {
+        let mut sockets = [-1; 2];
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                sockets.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "create test socketpair: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe {
+            (
+                OwnedFd::from_raw_fd(sockets[0]),
+                OwnedFd::from_raw_fd(sockets[1]),
+            )
+        }
+    }
+
+    fn wait_for_pidfd_exit(pidfd: &OwnedFd) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if !pidfd_is_alive(pidfd).expect("poll child pidfd") {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fast child did not reach pidfd exit readiness"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn fast_exit_still_returns_the_pre_exec_process_identity() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 23"]);
+        let (mut child, pidfd) = spawn_with_pidfd_after_spawn_for_test(&mut command, |_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        })
+        .expect("receive pidfd after child fast-exit");
+        wait_for_pidfd_exit(&pidfd);
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn child_handshake_failure_fails_spawn_without_a_numeric_cleanup() {
+        let mut command = Command::new("/bin/true");
+        let error = match spawn_with_pidfd_handshake_failure_for_test(&mut command) {
+            Err(error) => error,
+            Ok(_) => panic!("pre-exec handshake failure must abort spawn"),
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn parent_receive_failure_prevents_exec_without_a_numeric_cleanup() {
+        let dir = tempfile::tempdir().expect("create pidfd handshake tempdir");
+        let marker = dir.path().join("exec-ran");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "printf executed > \"$1\"", "sh"])
+            .arg(&marker);
+
+        let error = match spawn_with_pidfd_parent_receive_failure_for_test(&mut command) {
+            Err(error) => error,
+            Ok(_) => panic!("parent receive failure must fail the gated spawn"),
+        };
+        assert!(
+            matches!(
+                error.raw_os_error(),
+                Some(code)
+                    if code == libc::EPIPE
+                        || code == libc::ECONNRESET
+                        || code == libc::EPROTO
+            ),
+            "unexpected child-side handshake failure: {error}"
+        );
+        assert!(
+            !marker.exists(),
+            "child reached exec without its exact pidfd owned by the parent"
+        );
+    }
+
+    #[test]
+    fn invalid_ancillary_envelope_prevents_exec_without_a_numeric_cleanup() {
+        let dir = tempfile::tempdir().expect("create pidfd handshake tempdir");
+        let marker = dir.path().join("exec-ran");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "printf executed > \"$1\"", "sh"])
+            .arg(&marker);
+
+        let error = match spawn_with_pidfd_invalid_payload_for_test(&mut command) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid ancillary envelope must fail the gated spawn"),
+        };
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::EPROTO),
+            "child must reject the missing parent ACK: {error}"
+        );
+        assert!(
+            !marker.exists(),
+            "child reached exec after the parent rejected its pidfd envelope"
+        );
+    }
+
+    #[test]
+    fn malformed_envelopes_close_received_fds_and_leave_bystander_alive() {
+        // Detach a short-lived helper thread's fd table so parallel tests
+        // opening unrelated descriptors cannot perturb the exact before/after
+        // count. CLONE_FILES unshare is unprivileged and dies with this thread.
+        std::thread::spawn(|| {
+            assert_eq!(
+                unsafe { libc::unshare(libc::CLONE_FILES) },
+                0,
+                "unshare fd table for deterministic leak test: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30");
+            let (mut bystander, bystander_pidfd) =
+                spawn_with_pidfd(&mut command).expect("spawn exact bystander");
+            let baseline = open_fd_count();
+
+            for _ in 0..32 {
+                let (receiver, sender) = socket_pair();
+                send_test_rights(&sender, &[&bystander_pidfd], PIDFD_RIGHTS_PAYLOAD ^ 0xff);
+                let (error, received) =
+                    recv_spawn_pidfd(&receiver).expect_err("reject malformed payload");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    received.is_some(),
+                    "retain the installed exact descriptor through validation failure"
+                );
+                drop(received);
+                drop(sender);
+                drop(receiver);
+
+                let (receiver, sender) = socket_pair();
+                send_test_rights(
+                    &sender,
+                    &[&bystander_pidfd, &bystander_pidfd],
+                    PIDFD_RIGHTS_PAYLOAD,
+                );
+                let (error, received) =
+                    recv_spawn_pidfd(&receiver).expect_err("reject multiple SCM_RIGHTS fds");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(
+                    received.is_some(),
+                    "retain one exact descriptor while closing malformed extras"
+                );
+                drop(received);
+                drop(sender);
+                drop(receiver);
+            }
+
+            assert_eq!(
+                open_fd_count(),
+                baseline,
+                "malformed SCM_RIGHTS envelopes leaked descriptors"
+            );
+            assert!(
+                pidfd_is_alive(&bystander_pidfd).expect("poll bystander pidfd"),
+                "envelope rejection must never signal the unrelated pinned process"
+            );
+            terminate_scheduler_via_pidfd(&mut bystander, &bystander_pidfd)
+                .expect("clean exact bystander");
+        })
+        .join()
+        .expect("join isolated malformed-envelope test");
+    }
+
+    #[test]
+    fn exact_pidfd_wait_returns_at_its_bound_without_numeric_cleanup() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let (mut child, pidfd) =
+            spawn_with_pidfd(&mut command).expect("spawn exact timeout stand-in");
+        let timeout = std::time::Duration::from_millis(20);
+        let started = std::time::Instant::now();
+        let error = wait_scheduler_pidfd_exit_bounded(&mut child, &pidfd, timeout)
+            .expect_err("live unsignaled process must hit the finite bound");
+        assert!(error.contains("timed out"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "finite pidfd wait unexpectedly blocked: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            pidfd_is_alive(&pidfd).expect("poll exact timeout stand-in"),
+            "timeout path must not synthesize a numeric-pid kill"
+        );
+        terminate_scheduler_via_pidfd(&mut child, &pidfd).expect("clean exact timeout stand-in");
+    }
+}
+
 /// Reboot immediately. Used for fatal init errors and normal shutdown.
 pub(crate) fn force_reboot() -> ! {
     let _ = reboot(RebootMode::RB_AUTOBOOT);
@@ -17,59 +673,286 @@ pub(crate) fn force_reboot() -> ! {
     }
 }
 
-/// Live identity of the currently-attached scheduler, parallel to
-/// [`SCHED_PID`]'s pid side-channel. `null` means "no scheduler
-/// attached" — the initial value at process start and the post-
-/// `Op::DetachScheduler` state. Non-null points at a
-/// `&'static SchedulerSpec` (the `binary` field of the
-/// `&'static Scheduler` the Op carries), so consumers can read
-/// `has_bpf_scheduler()` / `has_active_scheduling()` against the
-/// LIVE identity rather than the boot-time `entry.scheduler`
-/// descriptor that goes stale after `Op::ReplaceScheduler` swaps
-/// the attached binary mid-scenario.
+/// Every resource which identifies or observes the live scheduler process.
 ///
-/// Storage: `AtomicPtr<SchedulerSpec>` because the value is a
-/// reference to immutable static data (every `Scheduler` const
-/// declared via `declare_scheduler!` lives in `.rodata` for the
-/// lifetime of the process); the producer stores the `&'static
-/// SchedulerSpec` re-cast to `*mut`, the consumer reads back as
-/// `*const` and dereferences under the SAFETY argument that the
-/// pointer either originated from a `&'static SchedulerSpec` (so
-/// the `'static` lifetime is the entire process) or is `null`
-/// (filtered by the wrapper). `*mut` storage is the only Atomic*
-/// type the standard library exposes for raw pointer values — the
-/// `*mut` vs `*const` is a Rust-level type distinction, not a
-/// kernel-level mutability claim; the pointed-to data is never
-/// mutated through this pointer.
-///
-/// `Acquire`/`Release` ordering pairs with [`SCHED_PID`]'s — the
-/// two side channels co-publish a single logical scheduler-attach
-/// event, and a reader that observes the new pid via
-/// [`sched_pid`] also observes the new scheduler identity via
-/// [`current_scheduler`].
-static CURRENT_SCHEDULER: std::sync::atomic::AtomicPtr<crate::test_support::SchedulerSpec> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// Keeping the child, its original pidfd, declared scheduler identity, log,
+/// attach generation, and monitor in one record prevents a lifecycle Op from
+/// publishing a new pid while Phase 6 still owns the boot child, or from
+/// dropping the only reap handle after a successful replacement.
+pub(crate) struct CurrentSchedulerProcess {
+    pub(crate) generation: u64,
+    pub(crate) child: Child,
+    pub(crate) pidfd: OwnedFd,
+    pub(crate) log_path: String,
+    pub(crate) scheduler: Option<&'static crate::test_support::SchedulerSpec>,
+    pub(crate) monitor: Option<SchedExitStop>,
+    /// A bounded terminal wait already expired (or failed). Drop may issue one
+    /// final exact signal, but must not spend a second teardown budget waiting
+    /// for a process the imminent VM reboot will reap.
+    pub(crate) drop_reap_exhausted: bool,
+}
 
-/// Active [`SchedExitStop`] handle for the currently-running
-/// scheduler's exit monitor. The boot path installs the initial
-/// handle here via [`install_initial_sched_exit_monitor`]; the
-/// scheduler-lifecycle Op dispatcher swaps it out via
-/// [`stop_sched_exit_monitor`] + [`restart_sched_exit_monitor_with_log`]
-/// so each post-Op scheduler PID gets its own monitor watching it.
-///
-/// Mutex (not Atomic) because [`SchedExitStop`] is move-only —
-/// `stop_and_join` consumes it. `Option` because Op::DetachScheduler
-/// leaves no scheduler attached, so the slot is empty between
-/// detach and the next attach.
-static SCHED_EXIT_MONITOR_SLOT: OnceLock<std::sync::Mutex<Option<SchedExitStop>>> = OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PidfdSignalOutcome {
+    Delivered,
+    AlreadyExited,
+}
 
-/// Boot-captured context that
-/// [`restart_sched_exit_monitor_with_log`] needs to re-supply when
-/// it spawns a fresh monitor against the post-Op scheduler PID.
-/// `suppress_sched_log` + `probe_output_done` are determined at boot
-/// (based on whether the probe stack is active) and don't change
-/// across Op dispatches — capturing once at install time keeps
-/// the restart helper signature minimal.
+#[derive(Debug)]
+pub(crate) enum SchedulerReapOutcome {
+    Status(std::process::ExitStatus),
+    /// The retained pidfd proved terminal readiness, but SIGCHLD=SIG_IGN
+    /// auto-reaped the child before `Child::wait` could recover a status.
+    TerminalWithoutStatus,
+    TimedOut,
+    ObserverError(String),
+}
+
+impl SchedulerReapOutcome {
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(self, Self::Status(_) | Self::TerminalWithoutStatus)
+    }
+
+    pub(crate) fn status(&self) -> Option<&std::process::ExitStatus> {
+        match self {
+            Self::Status(status) => Some(status),
+            Self::TerminalWithoutStatus | Self::TimedOut | Self::ObserverError(_) => None,
+        }
+    }
+}
+
+impl CurrentSchedulerProcess {
+    pub(crate) fn pid(&self) -> libc::pid_t {
+        self.child.id() as libc::pid_t
+    }
+
+    /// Stop and join the monitor before an intentional process transition.
+    /// The returned bit preserves an already-observed exit for verifier
+    /// cleanup.
+    pub(crate) fn stop_monitor(&mut self) -> bool {
+        self.monitor
+            .take()
+            .is_some_and(SchedExitStop::stop_and_join)
+    }
+
+    /// Signal this exact process identity through its retained pidfd. The
+    /// typed outcome distinguishes kernel-accepted delivery from ESRCH, which
+    /// lets verifier cleanup reject an already-dead process.
+    pub(crate) fn send_signal(&self, signal: libc::c_int) -> Result<PidfdSignalOutcome, String> {
+        pidfd_send_signal(&self.pidfd, signal)
+    }
+
+    /// Revalidate this exact process without consulting a numeric pid or
+    /// procfs.
+    pub(crate) fn is_alive(&self) -> Result<bool, String> {
+        pidfd_is_alive(&self.pidfd)
+    }
+
+    /// Kill and reap this exact owner. The pidfd pins the target across the
+    /// bounded readiness wait; `Child::wait` only reaps the already-pinned
+    /// child after the pidfd reports terminal readiness.
+    pub(crate) fn terminate_exact(&mut self) -> Result<(), String> {
+        let result = terminate_scheduler_via_pidfd(&mut self.child, &self.pidfd);
+        self.drop_reap_exhausted = result.is_err();
+        result
+    }
+
+    /// Wait for terminal readiness on the original pidfd, then consume the
+    /// Child wait status exactly once. A timeout leaves both handles owned for
+    /// a later SIGKILL/reap.
+    pub(crate) fn reap_bounded_status(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> SchedulerReapOutcome {
+        let outcome = self.reap_bounded_status_inner(timeout);
+        self.drop_reap_exhausted = matches!(
+            &outcome,
+            SchedulerReapOutcome::TimedOut | SchedulerReapOutcome::ObserverError(_)
+        );
+        outcome
+    }
+
+    fn reap_bounded_status_inner(&mut self, timeout: std::time::Duration) -> SchedulerReapOutcome {
+        match self.child.try_wait() {
+            Ok(Some(status)) => return SchedulerReapOutcome::Status(status),
+            Ok(None) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => match self.is_alive() {
+                Ok(false) => return SchedulerReapOutcome::TerminalWithoutStatus,
+                Ok(true) => {}
+                Err(error) => return SchedulerReapOutcome::ObserverError(error),
+            },
+            Err(error) => {
+                tracing::warn!(
+                    pid = self.pid(),
+                    error = %error,
+                    "scheduler Child::try_wait failed before pidfd terminal observation"
+                );
+            }
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return match self.is_alive() {
+                    Ok(false) => self.status_after_pidfd_terminal(),
+                    Ok(true) => SchedulerReapOutcome::TimedOut,
+                    Err(error) => SchedulerReapOutcome::ObserverError(error),
+                };
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let timeout_ms =
+                remaining.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+            let mut pfd = libc::pollfd {
+                fd: self.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one retained pidfd and a finite millisecond timeout.
+            let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if rc < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                tracing::warn!(
+                    pid = self.pid(),
+                    error = %error,
+                    "scheduler pidfd terminal wait failed"
+                );
+                return SchedulerReapOutcome::ObserverError(error.to_string());
+            }
+            if rc == 0 {
+                continue;
+            }
+            if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+                return self.status_after_pidfd_terminal();
+            }
+            if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                tracing::warn!(
+                    pid = self.pid(),
+                    revents = pfd.revents,
+                    "scheduler pidfd returned invalid terminal wait events"
+                );
+                return SchedulerReapOutcome::ObserverError(format!(
+                    "scheduler pidfd returned invalid terminal wait events {:#x}",
+                    pfd.revents
+                ));
+            }
+        }
+    }
+
+    fn status_after_pidfd_terminal(&mut self) -> SchedulerReapOutcome {
+        match self.child.wait() {
+            Ok(status) => SchedulerReapOutcome::Status(status),
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+                SchedulerReapOutcome::TerminalWithoutStatus
+            }
+            Err(error) => SchedulerReapOutcome::ObserverError(format!(
+                "scheduler pidfd was terminal but Child::wait failed: {error}"
+            )),
+        }
+    }
+}
+
+impl Drop for CurrentSchedulerProcess {
+    fn drop(&mut self) {
+        let _ = self.stop_monitor();
+        if self.drop_reap_exhausted {
+            // Phase 6 already consumed its finite reap allowance. Preserve the
+            // exact-target invariant with a final pidfd signal, but leave the
+            // uninterruptible straggler for the immediately following reboot.
+            let _ = pidfd_send_signal(&self.pidfd, libc::SIGKILL);
+            let _ = self.child.try_wait();
+            return;
+        }
+        if let Err(error) = self.terminate_exact() {
+            tracing::error!(
+                pid = self.pid(),
+                generation = self.generation,
+                error = %error,
+                "failed to exact-kill scheduler owner from Drop"
+            );
+        }
+    }
+}
+
+static CURRENT_SCHEDULER_PROCESS: std::sync::Mutex<Option<CurrentSchedulerProcess>> =
+    std::sync::Mutex::new(None);
+
+/// Guard which serializes every detach/attach/replace transition. Callers keep
+/// this guard across old-owner teardown, replacement spawn, and new-owner
+/// commit, so no observer can compose fields from different generations.
+pub(crate) struct SchedulerProcessOwnerGuard<'a> {
+    guard: std::sync::MutexGuard<'a, Option<CurrentSchedulerProcess>>,
+}
+
+impl SchedulerProcessOwnerGuard<'_> {
+    pub(crate) fn current(&self) -> Option<&CurrentSchedulerProcess> {
+        self.guard.as_ref()
+    }
+
+    pub(crate) fn current_mut(&mut self) -> Option<&mut CurrentSchedulerProcess> {
+        self.guard.as_mut()
+    }
+
+    pub(crate) fn take(&mut self) -> Option<CurrentSchedulerProcess> {
+        self.guard.take()
+    }
+
+    pub(crate) fn install(
+        &mut self,
+        process: CurrentSchedulerProcess,
+    ) -> Result<(), Box<CurrentSchedulerProcess>> {
+        if self.guard.is_some() {
+            return Err(Box::new(process));
+        }
+        *self.guard = Some(process);
+        Ok(())
+    }
+}
+
+pub(crate) fn lock_scheduler_process_owner() -> SchedulerProcessOwnerGuard<'static> {
+    SchedulerProcessOwnerGuard {
+        guard: CURRENT_SCHEDULER_PROCESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn scheduler_process_owner_for_test(
+    slot: &std::sync::Mutex<Option<CurrentSchedulerProcess>>,
+) -> SchedulerProcessOwnerGuard<'_> {
+    SchedulerProcessOwnerGuard {
+        guard: slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    }
+}
+
+/// Remove the one live owner for terminal Phase 6 cleanup. No later scheduler
+/// transition is legal after this edge, so returning the owned record is both
+/// exact and sufficient.
+pub(crate) fn take_current_scheduler_process() -> Option<CurrentSchedulerProcess> {
+    lock_scheduler_process_owner().take()
+}
+
+/// Immutable boot scheduler declaration. Restart always returns to this spec,
+/// independent of whichever staged scheduler a prior Replace installed.
+static BOOT_SCHEDULER: OnceLock<Option<&'static crate::test_support::SchedulerSpec>> =
+    OnceLock::new();
+
+pub(crate) fn install_boot_scheduler(
+    scheduler: Option<&'static crate::test_support::SchedulerSpec>,
+) {
+    let _ = BOOT_SCHEDULER.set(scheduler);
+}
+
+pub(crate) fn boot_scheduler() -> Option<&'static crate::test_support::SchedulerSpec> {
+    BOOT_SCHEDULER.get().copied().flatten()
+}
+
+/// Boot-captured context used for every pending scheduler-exit monitor.
 struct SchedExitMonitorBootCtx {
     suppress_sched_log: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
@@ -77,185 +960,342 @@ struct SchedExitMonitorBootCtx {
 
 static SCHED_EXIT_MONITOR_BOOT_CTX: OnceLock<SchedExitMonitorBootCtx> = OnceLock::new();
 
-/// Install the boot-time scheduler-exit monitor handle and capture
-/// the dispatch context [`restart_sched_exit_monitor_with_log`]
-/// needs to spawn replacement monitors. Called once at boot
-/// after [`start_sched_exit_monitor`] returns.
-///
-/// `boot_stop` may be `None` when [`start_sched_exit_monitor`]
-/// returned None (no scheduler configured at boot); the slot
-/// stays empty and the first Op::AttachScheduler dispatch
-/// populates it via [`restart_sched_exit_monitor_with_log`].
-pub(crate) fn install_initial_sched_exit_monitor(
-    boot_stop: Option<SchedExitStop>,
+pub(crate) fn install_sched_exit_monitor_context(
     suppress_sched_log: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
 ) {
-    let slot = SCHED_EXIT_MONITOR_SLOT.get_or_init(|| std::sync::Mutex::new(None));
-    *slot.lock().unwrap() = boot_stop;
     let _ = SCHED_EXIT_MONITOR_BOOT_CTX.set(SchedExitMonitorBootCtx {
         suppress_sched_log,
         probe_output_done,
     });
 }
 
-/// Stop the currently-installed scheduler-exit monitor (if any).
-/// The scheduler-lifecycle Op handler calls this BEFORE SIGTERM-ing
-/// the scheduler so the monitor thread exits cleanly without
-/// sending the `MSG_TYPE_SCHED_EXIT` message that the host's
-/// freeze coordinator would otherwise promote into the run-wide
-/// kill flag (per `src/vmm/freeze_coord/dispatch.rs` SchedExit
-/// arm). Returns true when the monitor observed scheduler exit (including
-/// the race where stop suppressed the frame) or the monitor failed, so
-/// verifier cleanup can fail closed.
-/// Idempotent — returns false when the slot is already empty.
-pub(crate) fn stop_sched_exit_monitor() -> bool {
-    let Some(slot) = SCHED_EXIT_MONITOR_SLOT.get() else {
-        return false;
-    };
-    let prev = slot.lock().unwrap().take();
-    if let Some(stop) = prev {
-        stop.stop_and_join()
-    } else {
-        false
-    }
-}
-
-/// Returns true iff no scheduler-exit monitor is currently installed.
-/// Used by the scenario-Op dispatch layer in `kill_current_scheduler`
-/// to `debug_assert!` that `stop_sched_exit_monitor` properly cleared
-/// the slot before the subsequent spawn restarts the monitor. The
-/// `Op::AttachScheduler` path legitimately bypasses the kill helper
-/// (no prior scheduler to stop) and the defensive `take()` in
-/// [`restart_sched_exit_monitor_with_log`] handles that path's
-/// possibly-non-empty entry — so the invariant is "after kill, slot
-/// is empty," not "always empty before restart." Briefly locks the
-/// slot mutex; release builds where the assertion is a no-op still
-/// pay the lock cost, which is negligible vs the surrounding
-/// procfs writes + signal delivery + polling the dispatch site is
-/// already doing.
-pub(crate) fn sched_exit_monitor_slot_is_empty() -> bool {
-    let Some(slot) = SCHED_EXIT_MONITOR_SLOT.get() else {
-        return true;
-    };
-    slot.lock().unwrap().is_none()
-}
-
-/// Spawn a fresh scheduler-exit monitor for the live SCHED_PID
-/// and install it into the slot. Op handler calls this AFTER the
-/// new scheduler is spawned and SCHED_PID is published, so the
-/// monitor watches the post-Op PID. `log_path` is the per-spawn
-/// log file path — all three lifecycle Ops (Attach, Replace,
-/// Restart) pass the seq-suffixed path from
-/// `staged_scheduler_log_path`.
-///
-/// Uses the boot-captured `suppress_sched_log` + `probe_output_done`
-/// so the new monitor behaves identically to the boot monitor. If
-/// the boot ctx was never installed (degenerate test environment
-/// where `install_initial_sched_exit_monitor` never ran) the
-/// helper is a no-op and the new scheduler stays unmonitored —
-/// the boot path is the only legitimate context that installs
-/// the ctx.
-pub(crate) fn restart_sched_exit_monitor_with_log(log_path: Option<&str>) {
-    let Some(ctx) = SCHED_EXIT_MONITOR_BOOT_CTX.get() else {
-        return;
-    };
-    let slot = SCHED_EXIT_MONITOR_SLOT.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = slot.lock().unwrap();
-    // Defensive: if the Op handler skipped stop_sched_exit_monitor
-    // for any reason, stop_and_join the stale handle before
-    // installing the new one. The take() leaves the slot empty
-    // for the duration of start_sched_exit_monitor — readers in
-    // that window observe "no monitor", which is correct since
-    // the new monitor hasn't been spawned yet.
-    if let Some(prev) = guard.take() {
-        let _ = prev.stop_and_join();
-    }
-    *guard = start_sched_exit_monitor(
-        sched_pid().map(|p| p as u32),
+/// Build a pending monitor against a duplicate of the exact spawn pidfd.
+/// Publication and arming are deliberately separate in
+/// [`commit_spawned_scheduler`] so an early exit cannot race ahead of the
+/// owner record.
+pub(crate) fn start_pending_sched_exit_monitor_with_log(
+    pid: u32,
+    pidfd: OwnedFd,
+    log_path: Option<&str>,
+) -> std::io::Result<SchedExitStop> {
+    let ctx = SCHED_EXIT_MONITOR_BOOT_CTX.get().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "scheduler-exit monitor boot context is not installed",
+        )
+    })?;
+    start_pending_sched_exit_monitor(
+        pid,
+        pidfd,
         log_path,
         ctx.suppress_sched_log.clone(),
         ctx.probe_output_done.clone(),
-    );
+    )
 }
 
-/// Read the scheduler PID published by [`start_scheduler`]. Returns
-/// `None` when the scheduler has not been spawned yet (the atomic
-/// reads as `0`, the sentinel for "unset"). `Acquire` synchronises
-/// against the producer's `Release` store so any side effects
-/// `start_scheduler` performed before the publish are visible to the
-/// reader.
+/// Finish a provisional spawn and atomically install the one live scheduler
+/// owner. The host's Finished ACK precedes owner publication. The monitor gate
+/// then re-polls its exact pidfd and keeps publication Pending while emitting
+/// Settled plus the caller's success frames; only after those FIFO frames are
+/// queued does it arm unexpected-exit publication.
+pub(crate) fn commit_spawned_scheduler(
+    owner: &mut SchedulerProcessOwnerGuard<'_>,
+    spawned: &mut SpawnedScheduler,
+    scheduler: Option<&'static crate::test_support::SchedulerSpec>,
+    publish_success: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(current) = owner.current() {
+        let error = format!(
+            "cannot commit scheduler while pid {} generation {} is still owned",
+            current.pid(),
+            current.generation
+        );
+        let cleanup = spawned.terminate_after_monitor_failure();
+        return Err(format!("{error}; provisional cleanup={cleanup:?}"));
+    }
+
+    let pid = match spawned.child_id() {
+        Ok(pid) => pid,
+        Err(error) => {
+            let cleanup = spawned.terminate_after_monitor_failure();
+            return Err(format!(
+                "scheduler child handoff failed: {error}; provisional cleanup={cleanup:?}"
+            ));
+        }
+    };
+    let monitor_pidfd = match spawned.clone_pidfd() {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            let cleanup = spawned.terminate_after_monitor_failure();
+            return Err(format!(
+                "scheduler pidfd handoff failed: {error}; provisional cleanup={cleanup:?}"
+            ));
+        }
+    };
+    let pending = match start_pending_sched_exit_monitor_with_log(
+        pid,
+        monitor_pidfd,
+        Some(&spawned.log_path),
+    ) {
+        Ok(pending) => pending,
+        Err(error) => {
+            let cleanup = spawned.terminate_after_monitor_failure();
+            return Err(format!(
+                "scheduler exit-monitor installation failed: {error}; \
+                 provisional cleanup={cleanup:?}"
+            ));
+        }
+    };
+
+    if let Err(error) = spawned.confirm_alive_after_monitor_install() {
+        let monitor_observed_exit = pending.stop_and_join();
+        let cleanup = spawned.terminate_after_monitor_failure();
+        return Err(format!(
+            "scheduler exited during exit-monitor handoff: {error}; \
+             monitor_observed_exit={monitor_observed_exit}; provisional cleanup={cleanup:?}"
+        ));
+    }
+
+    let finished = spawned.await_attach_finished_ack();
+    if let Err(error) = finished {
+        let finished_acked = spawned.finished_ack_consumed();
+        let monitor_observed_exit = pending.stop_and_join();
+        let process_cleanup = spawned.terminate_provisional_process();
+        let attach_close = spawned.close_failed_attach_attempt();
+        return Err(format!(
+            "scheduler attach Finished boundary failed: {error}; \
+             finished_acked={finished_acked}; monitor_observed_exit={monitor_observed_exit}; \
+             process_cleanup={process_cleanup:?}; attach_close={attach_close:?}"
+        ));
+    }
+
+    let process = match spawned.take_current_process(scheduler, pending) {
+        Ok(process) => process,
+        Err(error) => {
+            let cleanup = spawned.terminate_after_monitor_failure();
+            return Err(format!(
+                "construct scheduler owner after Finished ACK: {error}; cleanup={cleanup:?}"
+            ));
+        }
+    };
+    if let Err(mut process) = owner.install(process) {
+        let existing = owner
+            .current()
+            .map(|current| format!("pid {} generation {}", current.pid(), current.generation))
+            .unwrap_or_else(|| "unknown owner".to_string());
+        let _ = process.stop_monitor();
+        let cleanup = process.terminate_exact();
+        let attach_close = spawned.close_failed_attach_attempt();
+        return Err(format!(
+            "scheduler owner became occupied by {existing}; cleanup={cleanup:?}; \
+             attach_close={attach_close:?}"
+        ));
+    }
+
+    let monitor_commit = owner
+        .current()
+        .and_then(|process| process.monitor.as_ref())
+        .expect("installed scheduler owner always carries a pending monitor")
+        .commit_with(|| {
+            spawned.settle_attach_attempt()?;
+            publish_success()
+        });
+    if let Err(error) = monitor_commit {
+        let mut failed = owner
+            .take()
+            .expect("failed pending monitor belongs to installed owner");
+        let monitor_observed_exit = failed.stop_monitor();
+        let cleanup = failed.terminate_exact();
+        let attach_close = spawned.close_failed_attach_attempt();
+        return Err(format!(
+            "scheduler owner success publication failed under monitor gate: {error}; \
+             monitor_observed_exit={monitor_observed_exit}; cleanup={cleanup:?}; \
+             attach_close={attach_close:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Read both scheduler pid and identity from the one ownership record.
 pub(crate) fn sched_pid() -> Option<libc::pid_t> {
-    let v = SCHED_PID.load(Ordering::Acquire);
-    if v == 0 { None } else { Some(v) }
+    #[cfg(test)]
+    {
+        let injected = TEST_SCHED_PID.load(Ordering::Acquire);
+        if injected != 0 {
+            return Some(injected);
+        }
+    }
+    CURRENT_SCHEDULER_PROCESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(CurrentSchedulerProcess::pid)
 }
 
-/// Publish `pid` to the [`SCHED_PID`] side channel. Used by the
-/// scheduler-lifecycle Op dispatch on the guest to swap the live PID
-/// across Detach (`pid = 0`) / Attach (`pid = new child`) /
-/// Replace (`pid = swap`) transitions. The boot path
-/// ([`spawn_scheduler_from_paths`], via `try_spawn_scheduler`)
-/// bypasses this helper and stores the freshly-spawned
-/// `child.id()` into [`SCHED_PID`] directly.
-///
-/// `Release` ordering pairs with the `Acquire` load in
-/// [`sched_pid`]; the writer's side effects (Op log emit, prior
-/// kill) are visible to the next reader.
+/// Host-only unit tests which exercise probe folding without a guest process
+/// can inject a synthetic liveness pid. Production has no split pid channel.
+#[cfg(test)]
+static TEST_SCHED_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(test)]
 pub(crate) fn set_sched_pid(pid: libc::pid_t) {
-    SCHED_PID.store(pid, Ordering::Release);
+    TEST_SCHED_PID.store(pid, Ordering::Release);
 }
 
-/// Read the live scheduler identity published by the dispatch
-/// arms of `Op::AttachScheduler` / `Op::ReplaceScheduler` (the
-/// matching `set_current_scheduler` call site lives in
-/// `src/scenario/ops/dispatch.rs`). Returns `None` when no scheduler
-/// is currently attached — the pre-attach state at process start
-/// and the post-`Op::DetachScheduler` state.
-///
-/// `Acquire` ordering synchronises against the producer's
-/// `Release` store so any side effects the dispatch path
-/// performed before the publish are visible to the reader.
-///
-/// The returned reference inherits the `'static` lifetime of the
-/// stored `&'static SchedulerSpec` — every `Scheduler` declared
-/// via `declare_scheduler!` lives in `.rodata` for the process
-/// lifetime, and the producer always stores a reference into that
-/// region.
 pub fn current_scheduler() -> Option<&'static crate::test_support::SchedulerSpec> {
-    let ptr = CURRENT_SCHEDULER.load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        // SAFETY: every non-null value stored in CURRENT_SCHEDULER
-        // came from a `&'static SchedulerSpec` re-cast to `*mut`
-        // via `set_current_scheduler`; the pointee is in `.rodata`
-        // and outlives the process, so the `&'static` lifetime is
-        // sound. The `*mut` → `*const` conversion is a no-op at
-        // runtime — only required because `AtomicPtr<T>` exposes
-        // `*mut T` storage even when the program never mutates
-        // through the pointer.
-        Some(unsafe { &*(ptr as *const _) })
+    CURRENT_SCHEDULER_PROCESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|process| process.scheduler)
+}
+
+pub(crate) fn current_scheduler_alive() -> Result<bool, String> {
+    Ok(current_scheduler_liveness()?.unwrap_or(false))
+}
+
+/// Read exact scheduler presence and liveness under one owner lock. `None`
+/// distinguishes an intentional no-scheduler/Detach state from a terminal
+/// pidfd, so scenario liveness checks never need to reopen a numeric pid.
+pub(crate) fn current_scheduler_liveness() -> Result<Option<bool>, String> {
+    let owner = lock_scheduler_process_owner();
+    match owner.current() {
+        Some(process) => process.is_alive().map(Some),
+        None => Ok(None),
     }
 }
 
-/// Publish `scheduler` as the currently-attached scheduler, or
-/// clear the slot when `None`. Called by the
-/// `Op::AttachScheduler` / `Op::ReplaceScheduler` /
-/// `Op::DetachScheduler` dispatch arms in
-/// `src/scenario/ops/dispatch.rs` immediately after the corresponding
-/// pid change so the two side channels (pid + identity) stay
-/// co-published.
-///
-/// `Release` ordering pairs with the `Acquire` load in
-/// [`current_scheduler`].
-pub(crate) fn set_current_scheduler(
-    scheduler: Option<&'static crate::test_support::SchedulerSpec>,
-) {
-    let ptr = match scheduler {
-        Some(r) => r as *const _ as *mut _,
-        None => std::ptr::null_mut(),
+/// Clone the exact current scheduler identity for an evented observer without
+/// reopening its numeric pid after releasing the owner lock.
+pub(crate) fn clone_current_scheduler_pidfd() -> Result<Option<(libc::pid_t, OwnedFd)>, String> {
+    let owner = lock_scheduler_process_owner();
+    owner
+        .current()
+        .map(|process| {
+            process
+                .pidfd
+                .try_clone()
+                .map(|pidfd| (process.pid(), pidfd))
+                .map_err(|error| format!("clone current scheduler pidfd: {error}"))
+        })
+        .transpose()
+}
+
+pub(crate) fn pidfd_send_signal(
+    pidfd: &OwnedFd,
+    signal: libc::c_int,
+) -> Result<PidfdSignalOutcome, String> {
+    // SAFETY: `pidfd` pins one process identity; a null siginfo and zero flags
+    // are the documented pidfd_send_signal(2) form.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0u32,
+        )
     };
-    CURRENT_SCHEDULER.store(ptr, Ordering::Release);
+    if rc == 0 {
+        return Ok(PidfdSignalOutcome::Delivered);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(PidfdSignalOutcome::AlreadyExited)
+    } else {
+        Err(format!("pidfd_send_signal({signal}): {error}"))
+    }
+}
+
+pub(crate) fn pidfd_is_alive(pidfd: &OwnedFd) -> Result<bool, String> {
+    let mut pfd = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` is one initialized pollfd and the zero timeout makes this
+    // an authoritative nonblocking liveness snapshot.
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if rc < 0 {
+        return Err(format!(
+            "scheduler pidfd liveness poll: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Err(format!(
+            "scheduler pidfd returned invalid events {:#x}",
+            pfd.revents
+        ));
+    }
+    Ok(pfd.revents & (libc::POLLIN | libc::POLLHUP) == 0)
+}
+
+pub(crate) fn terminate_scheduler_via_pidfd(
+    child: &mut Child,
+    pidfd: &OwnedFd,
+) -> Result<(), String> {
+    let _delivered = pidfd_send_signal(pidfd, libc::SIGKILL)?;
+    wait_scheduler_pidfd_exit_bounded(child, pidfd, SCHED_REAP_TIMEOUT)
+}
+
+fn wait_scheduler_pidfd_exit_bounded(
+    child: &mut Child,
+    pidfd: &OwnedFd,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    if child.try_wait().ok().flatten().is_some() {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            if !pidfd_is_alive(pidfd)? {
+                let _ = child.wait();
+                return Ok(());
+            }
+            return Err(format!(
+                "timed out after {timeout:?} waiting for signaled scheduler pidfd"
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let timeout_ms = remaining
+            .as_millis()
+            .saturating_add(u128::from(
+                !remaining.subsec_nanos().is_multiple_of(1_000_000),
+            ))
+            .clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut pfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one retained pidfd; EINTR is retried and the finite timeout
+        // keeps every cleanup site within the guest teardown allowance.
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("wait for SIGKILLed scheduler pidfd: {error}"));
+        }
+        if rc == 0 {
+            continue;
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(format!(
+                "SIGKILLed scheduler pidfd returned unexpected poll events {:#x}",
+                pfd.revents
+            ));
+        }
+        if pfd.revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let _ = child.wait();
+            return Ok(());
+        }
+    }
 }
 
 /// RAII guard that flips SIGCHLD to a target disposition on
@@ -389,6 +1429,7 @@ where
 /// where SIGCHLD might be ignored. Returns `true` when `/proc/{pid}`
 /// exists (process alive or pre-reap), `false` when it does not
 /// (process exited and the kernel has dropped the procfs entry).
+#[cfg(test)]
 pub(crate) fn proc_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
@@ -401,17 +1442,10 @@ pub(crate) fn proc_pid_alive(pid: u32) -> bool {
 /// notable case (the scheduler binary either ignored SIGTERM or its
 /// userspace signal handler ran too slow against the grace window).
 //
-// `#[allow(dead_code)]` because the helper has no production caller.
-// The Op::DetachScheduler / Op::RestartScheduler /
-// Op::ReplaceScheduler dispatchers deliberately bypass it: they
-// route kills through `kill_current_scheduler`, which uses direct
-// `libc::kill(SIGTERM)` + `wait_for_scx_disabled` because this
-// helper's strict /proc-absence verification can fire
-// `StillAliveAfterSigkill` when the scheduler's exit blocks on BPF
-// detach (see src/scenario/ops/dispatch.rs). Tests in this module
-// exercise every variant + the InvalidPid error path, so the
-// helper is verified-correct.
-#[allow(dead_code)]
+// This legacy generic numeric-pid helper is test-only. Production scheduler
+// transitions retain the original pidfd inside CurrentSchedulerProcess and
+// signal that exact owner around the sched_ext disabled-state barrier.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KillSchedulerOutcome {
     /// `pid` was not alive when the call started — `/proc/{pid}`
@@ -440,7 +1474,7 @@ pub(crate) enum KillSchedulerOutcome {
 /// caller-supplied invariant (a kill-able pid) was violated or the
 /// kernel refused to honor a SIGKILL — neither is recoverable at the
 /// call site, but both carry distinct operator diagnostics.
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KillSchedulerError {
     /// `pid` was not a positive pid_t value. POSIX `kill(2)` reserves
@@ -495,12 +1529,8 @@ pub(crate) enum KillSchedulerError {
 ///
 /// # Pid lifecycle semantic
 ///
-/// This function does NOT mutate [`SCHED_PID`]. The
-/// scheduler-lifecycle dispatcher owns that side channel and is
-/// responsible for storing 0 after a successful detach so subsequent
-/// liveness checks (`sched_pid()` readers) short-circuit. Keeping
-/// the kill helper generic (no implicit singleton-pid assumption)
-/// lets unit tests exercise it against any spawned child pid.
+/// This generic helper does not inspect or mutate the live scheduler owner;
+/// callers may exercise it against any spawned child pid.
 ///
 /// # Wait mechanism
 ///
@@ -510,7 +1540,7 @@ pub(crate) enum KillSchedulerError {
 /// The post-SIGKILL grace is the module-level [`POST_SIGKILL_GRACE`]
 /// const (see that const's doc for the 200ms-vs-magic-number
 /// rationale).
-#[allow(dead_code)] // production callers (Op::*Scheduler dispatch) wire up in follow-up work
+#[cfg(test)]
 pub(crate) fn kill_scheduler_process(
     pid: libc::pid_t,
     sigterm_grace: std::time::Duration,
@@ -574,6 +1604,7 @@ pub(crate) fn kill_scheduler_process(
 /// const so the value is greppable + paired with a single doc
 /// explaining the choice rather than left as a magic number at the
 /// call site.
+#[cfg(test)]
 const POST_SIGKILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Wait (kernel-evented via `pidfd_wait_exit`) for `/proc/{pid}`
@@ -589,6 +1620,7 @@ const POST_SIGKILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2
 /// scheduler launch. Both call sites need the same SIG_IGN-safe
 /// latency profile, so folding the loop here keeps a future EINTR
 /// or signal-pause refinement applied uniformly.
+#[cfg(test)]
 pub(crate) fn poll_proc_pid_absent(
     pid: u32,
     _interval: std::time::Duration,

@@ -6,7 +6,7 @@
 //!    per-CPU locks at `{lock_dir}/ktstr-cpu-{C}.lock` where
 //!    `lock_dir` is resolved by `crate::cache::resolve_lock_dir`
 //!    (`KTSTR_LOCK_DIR` env var, fallback `/tmp`). See
-//!    `crate::vmm::host_topology::acquire_resource_locks` and
+//!    `crate::vmm::host_topology::try_acquire_resources` and
 //!    friends.
 //!  - Per-cache-entry coordination locks at
 //!    `{cache_root}/.locks/{cache_key}.lock` (see
@@ -104,13 +104,18 @@ pub(crate) mod primitives;
 pub(crate) mod proc_locks;
 
 pub use holder::format_holder_list;
-pub use primitives::{FlockWait, block_flock, block_flock_deadline, block_flock_step, try_flock};
+pub use primitives::{
+    FlockWait, block_flock, block_flock_deadline, block_flock_step, interruptible_flock_waiter_id,
+    start_interruptible_flock_broker, stop_interruptible_flock_broker, try_flock,
+    wake_interruptible_flock_waiter,
+};
 
 pub(crate) use acquire::acquire_flock_with_timeout;
 pub(crate) use holder::NO_HOLDERS_RECORDED;
-pub(crate) use mountinfo::read_mountinfo;
-pub(crate) use primitives::materialize;
-pub(crate) use proc_locks::{read_holders, read_holders_with_mountinfo};
+pub(crate) use primitives::{
+    InterruptibleFlockWaiter, TryFlockOutcome, materialize, try_flock_with_witness,
+};
+pub(crate) use proc_locks::read_holders;
 
 /// Subdirectory name (under whatever root each caller picks) that
 /// holds advisory `flock(2)` sentinels. Both [`crate::cache`] and

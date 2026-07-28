@@ -319,8 +319,7 @@ fn scenario_ficlone_clone_writable_and_fresh(_ctx: &ktstr::scenario::Ctx) -> Res
 // Entry registrations
 // ----------------------------------------------------------------------------
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_BTRFS_TEMPLATE_BUILD: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "disk_template_e2e_btrfs_template_build",
@@ -335,8 +334,7 @@ static __KTSTR_ENTRY_BTRFS_TEMPLATE_BUILD: ktstr::test_support::KtstrTestEntry =
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_FICLONE_CLONE_ISOLATED: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "disk_template_e2e_ficlone_clone_isolated",
@@ -364,8 +362,7 @@ const CARGO_KTSTR_BINARY: &str = env!("CARGO_BIN_EXE_cargo-ktstr");
 
 /// Resolve the linux source tree (`../linux` relative to this crate).
 fn linux_source_dir() -> std::path::PathBuf {
-    let crate_root = env!("CARGO_MANIFEST_DIR");
-    std::path::PathBuf::from(crate_root)
+    ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("linux")
 }

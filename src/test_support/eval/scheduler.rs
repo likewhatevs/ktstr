@@ -1,7 +1,7 @@
 //! Scheduler-binary resolution: maps a `SchedulerSpec` to a path plus a
-//! `ResolveSource` provenance (the env override, `$PATH` lookup, or
-//! on-demand workspace build) and dedups include-file lists. Split out
-//! of eval/mod.rs to keep the module under the size ceiling.
+//! `ResolveSource` provenance (the orchestrator manifest, env override,
+//! `$PATH` lookup, or on-demand workspace build) and dedups include-file
+//! lists. Split out of eval/mod.rs to keep the module under the size ceiling.
 
 use super::*;
 
@@ -91,13 +91,10 @@ pub(crate) fn dedupe_include_files(
 /// declaring crate's workspace and therefore know its source commit
 /// matches that workspace's HEAD."
 ///
-/// Only the [`AutoBuilt`](Self::AutoBuilt) variant carries an honest
-/// source-commit guarantee: every other binary-producing branch
-/// (`Path`, `EnvVar`, `PathLookup`) locates a file whose provenance is
-/// outside this process's knowledge. Callers that need to stamp a
-/// sidecar with a scheduler-specific commit must discard the hash for
-/// every non-`AutoBuilt` resolution — an operator-supplied path or a
-/// binary on `$PATH` can be arbitrarily old.
+/// Only the [`AutoBuilt`](Self::AutoBuilt) variant carries an in-child
+/// source-commit guarantee. A manifest artifact was elected by the parent and
+/// can represent either a workspace build or the global operator override, so
+/// the child records that fact without guessing its source commit.
 ///
 /// `Eevdf` / `KernelBuiltin` / `Path` resolutions do not go through
 /// the `Discover` flow:
@@ -112,6 +109,9 @@ pub(crate) fn dedupe_include_files(
 /// [`resolve_scheduler`] so a reviewer can scan both lists in lockstep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolveSource {
+    /// Resolved through the authoritative parent-written scheduler artifact
+    /// manifest. No per-child search or Cargo invocation ran.
+    Manifest,
     /// Resolved via the literal path the caller supplied as
     /// `SchedulerSpec::Path(p)`. No env-var or filesystem search
     /// involved — the path arrived in the test entry directly.
@@ -151,6 +151,7 @@ impl ResolveSource {
     /// representation. Variant order matches the resolution order.
     pub const fn as_str(&self) -> &'static str {
         match self {
+            Self::Manifest => "manifest",
             Self::Path => "path",
             Self::EnvVar => "env_var",
             Self::PathLookup => "path_lookup",
@@ -255,14 +256,17 @@ where
 ///   user-space binary).
 /// - `Path(p)` → `(Some(p), Path)` (explicit caller-named path;
 ///   validated for existence).
-/// - `Discover(name)` → three steps:
-///   1. `KTSTR_SCHEDULER` env override
+/// - `Discover(name)` → four steps:
+///   1. exact parent manifest lookup
+///      ([`Manifest`](ResolveSource::Manifest)). Presence is authoritative:
+///      invalid or missing data is a hard error and cannot fall through.
+///   2. `KTSTR_SCHEDULER` env override
 ///      ([`EnvVar`](ResolveSource::EnvVar)) — a global, name-agnostic
 ///      binary path applying to every `Discover` scheduler.
-///   2. cargo-test mode only: `$PATH` lookup
+///   3. cargo-test mode only: `$PATH` lookup
 ///      ([`PathLookup`](ResolveSource::PathLookup)), so an installed
 ///      scheduler resolves without a workspace build.
-///   3. `cargo build -p <name>` in the declaring crate's workspace
+///   4. `cargo build -p <name>` in the declaring crate's workspace
 ///      ([`AutoBuilt`](ResolveSource::AutoBuilt)), in BOTH modes.
 ///
 ///   Cargo owns freshness: it rebuilds when the scheduler's sources
@@ -280,6 +284,18 @@ pub fn resolve_scheduler(
     spec: &SchedulerSpec,
     manifest_dir: &str,
 ) -> Result<(Option<PathBuf>, ResolveSource)> {
+    if matches!(spec, SchedulerSpec::Discover(_) | SchedulerSpec::Path(_)) {
+        match crate::scheduler_artifact::scheduler_artifact_from_env(None, spec, manifest_dir) {
+            Ok(Some(path)) => return Ok((Some(path), ResolveSource::Manifest)),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(error
+                    .context(FrameworkInfrastructureFailure)
+                    .context("ktstr_test: parent scheduler artifact handoff is invalid"));
+            }
+        }
+    }
+
     match spec {
         SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => {
             Ok((None, ResolveSource::NotFound))
@@ -298,7 +314,7 @@ pub fn resolve_scheduler(
             Ok((Some(path), ResolveSource::Path))
         }
         SchedulerSpec::Discover(name) => {
-            // 1. KTSTR_SCHEDULER env override (global / name-agnostic —
+            // 2. KTSTR_SCHEDULER env override (global / name-agnostic —
             // applies to every Discover scheduler regardless of name).
             if let Ok(p) = std::env::var(crate::KTSTR_SCHEDULER_ENV) {
                 let path = PathBuf::from(&p);
@@ -307,7 +323,7 @@ pub fn resolve_scheduler(
                 }
             }
 
-            // 2. cargo-test mode only: $PATH lookup, so a user who
+            // 3. cargo-test mode only: $PATH lookup, so a user who
             // installed the scheduler on PATH can run the test without a
             // workspace build. Gated to cargo-test mode — the
             // orchestrated path skips it and always builds so gauntlet
@@ -319,7 +335,7 @@ pub fn resolve_scheduler(
                 return Ok((Some(found), ResolveSource::PathLookup));
             }
 
-            // 3. Build the scheduler in its declaring crate's workspace.
+            // 4. Build the scheduler in its declaring crate's workspace.
             // Cargo owns freshness: `cargo build -p {name}` rebuilds on
             // source change, no-ops when fresh, and errors when the
             // scheduler cannot build (or cargo is absent, or no bin

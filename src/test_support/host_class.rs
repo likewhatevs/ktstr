@@ -21,8 +21,9 @@
 //! [`TopologyUnrepresentable`], [`ResourceContention`], and
 //! [`TopologyInsufficient`]. A `KernelUnavailable` reaches this classifier
 //! on every nextest invocation: nextest suppresses the plain `#[test]`
-//! wrapper, so the entry runs as `ktstr/{name}` via the `--exact` dispatch
-//! → `run_named_test` → `err_to_exit_code`, NOT the macro body. It is a SKIP
+//! wrapper, so a VM entry runs as `ktstr/{name}` (and a host-only entry as
+//! `host/{name}`) via the `--exact` dispatch → `run_named_test` →
+//! `err_to_exit_code`, NOT the macro body. It is a SKIP
 //! by default — a developer running `cargo nextest run`, or `cargo ktstr
 //! test` without `--kernel`, on a kernel-less host gets a clean skip rather
 //! than a hard fail on every entry — promoted to a FAIL under

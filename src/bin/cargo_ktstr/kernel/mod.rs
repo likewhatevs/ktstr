@@ -179,16 +179,13 @@ pub(crate) fn canonicalize_cache_dir(cache_dir: PathBuf) -> PathBuf {
 ///
 /// Extracted from `resolve_kernel_set`'s rayon body so the per-
 /// spec match arm is one shared function rather than five inline
-/// arms: [`resolve_one_spec`] fans a Range out to per-version
-/// `Version` ids and calls here once per version (all on the same
-/// bounded rayon pool), and every other spec calls here once.
+/// arms: [`prepare_kernel_resolve_work`] fans a Range out to
+/// per-version `Version` ids and this function is called once per
+/// prepared item (all on the same bounded rayon pool).
 ///
 /// Range fan-out lives on the caller because the
 /// `expand_kernel_range` step yields a `Vec<String>` that has to
-/// be expanded into the same parallel pool — `flat_map_iter` is
-/// the wrong shape for "fan out N items into the parent
-/// iterator." See the parallel comment block in
-/// [`resolve_kernel_set`] for the full strategy.
+/// be expanded before the private pool can be sized to exact work.
 pub(crate) fn resolve_one(
     id: ktstr::kernel_path::KernelId,
     mp: Option<&ktstr::cli::FetchProgress>,
@@ -251,11 +248,11 @@ pub(crate) fn resolve_one(
             let dir = canonicalize_cache_dir(cache_dir);
             // Extract a discriminating label from the cache key —
             // tarball keys yield the version prefix
-            // (`6.14.2-tarball-…` → `6.14.2`), git keys yield the
-            // ref (`for-next-git-…` → `for-next`), local keys yield
-            // `local_{hash6}` (or `local_unknown` for non-git
-            // trees). See [`cache_key_to_version_label`] for the
-            // full per-shape contract and fallback behavior.
+            // (`6.14.2-tarball-…` → `6.14.2`), content-addressed git
+            // keys yield a compact kind/ref-hash label, and local keys
+            // yield `local_{hash6}` (or `local_unknown` for non-git
+            // trees). See [`cache_key_to_version_label`] for the full
+            // per-shape contract and fallback behavior.
             let label = cache_key_to_version_label(key).to_string();
             Ok((label, dir))
         }
@@ -357,8 +354,9 @@ pub(crate) fn resolve_one(
 ///   don't collide).
 /// - Version / Range expansion → the version string verbatim
 ///   (e.g. `6.14.2`, `6.15-rc3`).
-/// - CacheKey → the version prefix (everything before the first
-///   `-tarball-` / `-git-` / `-local-` component).
+/// - CacheKey → the compact semantic label produced by
+///   `cache_key_to_version_label` for tarball, content-addressed git,
+///   and local key shapes.
 /// - Git → `git_{owner}_{repo}_{kind}_{ref}` extracted from the URL,
 ///   the ref kind (tag/branch/sha), and the git ref.
 ///
@@ -384,18 +382,89 @@ pub(crate) fn resolve_kernel_set(
     Ok(resolved)
 }
 
-/// Resolve one trimmed `--kernel` spec into the `(label, path)`
-/// results it expands to.
+/// One independently resolvable kernel after trimming, validation, and Range
+/// expansion.
 ///
-/// Returns a `Vec` so the caller can splice it into the rayon
-/// `flat_map_iter` parent iterator via `.into_iter()`: a Range
-/// yields one element per expanded version, every other spec
-/// yields exactly one element. Each element is an opaque
-/// `Result<(String, PathBuf), String>` driven by
-/// [`resolve_one_with_progress`]; the caller's `collect` on
-/// `Result` short-circuits on the first error.
+/// Keeping the Range origin lets the resolver preserve the more specific
+/// `resolve kernel <version>` error context that Range children historically
+/// carried, while still presenting one flat work vector to rayon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KernelResolveWork {
+    id: ktstr::kernel_path::KernelId,
+    range_version: Option<String>,
+}
+
+/// Turn the user-facing spec vector into its exact flat work vector before
+/// creating any worker threads.
 ///
-/// Each spec resolves independently:
+/// Every non-empty non-Range spec contributes one item. A Range is expanded
+/// first and contributes one item per release. Consequently the eventual
+/// private rayon pool can be sized to actual work rather than the host CPU
+/// count: a normal one-kernel invocation stays on the caller thread, while a
+/// single large Range still retains per-version parallelism.
+///
+/// The expansion callback is injected so trimming, validation, ordering, and
+/// Range fan-out can be tested without repository metadata or network I/O.
+fn prepare_kernel_resolve_work_with<E>(
+    specs: &[String],
+    mut expand_range: E,
+) -> Result<Vec<KernelResolveWork>, String>
+where
+    E: FnMut(&str, &str) -> Result<Vec<String>, String>,
+{
+    use ktstr::kernel_path::KernelId;
+
+    let mut work = Vec::new();
+    for raw in specs {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id = KernelId::parse(trimmed);
+        id.validate()
+            .map_err(|error| format!("--kernel {id}: {error}"))?;
+        match id {
+            KernelId::Range { start, end, .. } => {
+                for version in expand_range(&start, &end)? {
+                    work.push(KernelResolveWork {
+                        id: KernelId::Version(version.clone()),
+                        range_version: Some(version),
+                    });
+                }
+            }
+            id => work.push(KernelResolveWork {
+                id,
+                range_version: None,
+            }),
+        }
+    }
+    Ok(work)
+}
+
+fn prepare_kernel_resolve_work(
+    specs: &[String],
+    include_eol: bool,
+) -> Result<Vec<KernelResolveWork>, String> {
+    prepare_kernel_resolve_work_with(specs, |start, end| {
+        ktstr::cli::expand_kernel_range(start, end, "cargo ktstr", include_eol)
+            .map_err(|error| format!("{error:#}"))
+    })
+}
+
+/// Resolve one prepared item with the Range-specific error context preserved.
+fn resolve_prepared_kernel_work(
+    work: KernelResolveWork,
+    mp: &ktstr::cli::FetchProgress,
+) -> Result<(String, PathBuf), String> {
+    let range_version = work.range_version;
+    let result = resolve_one_with_progress(work.id, mp);
+    match range_version {
+        Some(version) => result.map_err(|error| format!("resolve kernel {version}: {error}")),
+        None => result,
+    }
+}
+
+/// Each prepared item resolves independently:
 ///   - Path → cache lookup → maybe build (no network).
 ///     Clean source trees hit the local-source cache key
 ///     `local-{hash7}-{arch}-kc{suffix}`; cache miss reaches
@@ -404,16 +473,14 @@ pub(crate) fn resolve_kernel_set(
 ///     Dirty trees skip the cache store and build in place.
 ///   - Version / CacheKey → cache lookup → maybe download +
 ///     build.
-///   - Range → fetch releases.json once, then per-version
-///     cache lookup → maybe download + build for each
-///     expanded version.
-///   - Git → resolve the commit (kind-directed ls-remote) → cache
-///     lookup → GitHub codeload snapshot or non-GitHub shallow
-///     clone → maybe build.
+///   - Range children → per-version cache lookup → maybe download + build.
+///   - Git branch/tag → one exact-ref gix prepare → content-cache /
+///     builder election → receive only for the winner → maybe build.
+///     An explicit GitHub SHA uses codeload.
 ///
 /// Two phases of work happen behind the per-spec resolvers:
-/// (1) network I/O — kernel.org tarball download, a GitHub codeload
-///     snapshot, or a `git_clone` shallow fetch — which is
+/// (1) network I/O — kernel.org tarball download, an explicit-SHA
+///     GitHub codeload snapshot, or an exact-ref gix shallow fetch — which is
 ///     independent across specs and overlaps freely.
 /// (2) build — `make -j$(nproc)` invoked under an LLC flock
 ///     plus a cgroup v2 sandbox (`acquire_build_reservation`
@@ -441,80 +508,11 @@ pub(crate) fn resolve_kernel_set(
 /// own lock and finds the just-written entry, skipping the
 /// redundant build.
 ///
-/// A Range spec expands to N versions; this fn resolves them
-/// concurrently via [`resolve_versions_parallel`] rather than
-/// serializing versions against itself. That is the same
-/// parallelism peer specs (other top-level `--kernel` arguments)
-/// already get: builds do NOT serialize against each other (the
-/// LLC flock is shared — see above), and each expanded version is
-/// a distinct tarball cache key hitting its own per-key store
-/// lock, so a range's versions are as independent as separate
-/// `--kernel` flags.
+/// Range versions and peer top-level specs share this one flat ordered work
+/// vector, so one Range retains the same parallelism as N explicit versions.
+/// Rayon consumes an indexed `Vec`, preserving input order in the successful
+/// output regardless of completion order.
 ///
-/// Fail-fast is unchanged from the pre-parallel form: the helper's
-/// `collect` gathers every version's `Result`, then the outer
-/// `collect::<Result<_, _>>` in `resolve_specs_parallel` aborts on
-/// the first Err it observes — which version surfaces is not
-/// deterministic under concurrency, but a single failure still
-/// aborts the whole resolve just as the sequential loop did.
-fn resolve_one_spec(
-    trimmed: String,
-    mp: &ktstr::cli::FetchProgress,
-    include_eol: bool,
-) -> Vec<Result<(String, PathBuf), String>> {
-    use ktstr::kernel_path::KernelId;
-
-    // Validation runs first so an inverted Range bails
-    // before any I/O — same diagnostic timing the
-    // pre-parallel loop preserved.
-    let id = KernelId::parse(&trimmed);
-    if let Err(e) = id.validate() {
-        return vec![Err(format!("--kernel {id}: {e}"))];
-    }
-    match id {
-        KernelId::Range { start, end, .. } => {
-            match ktstr::cli::expand_kernel_range(&start, &end, "cargo ktstr", include_eol) {
-                Ok(versions) => resolve_versions_parallel(versions, |ver| {
-                    resolve_one_with_progress(KernelId::Version(ver.to_string()), mp)
-                        .map_err(|e| format!("resolve kernel {ver}: {e}"))
-                }),
-                Err(e) => vec![Err(format!("{e:#}"))],
-            }
-        }
-        other => vec![resolve_one_with_progress(other, mp)],
-    }
-}
-
-/// Resolve every version of an expanded Range concurrently,
-/// preserving input (version) order in the returned Vec.
-///
-/// `Vec::into_par_iter` is an `IndexedParallelIterator`, so
-/// `collect` writes each result into its input slot — the output
-/// is in the same order as `versions` regardless of which worker
-/// finishes first (so a downstream `resolved[0] -> KTSTR_KERNEL`
-/// choice stays deterministic). The nested `into_par_iter` runs on
-/// whatever rayon pool the caller is installed under
-/// ([`resolve_specs_parallel`]'s bounded pool), sharing it via
-/// work-stealing rather than spawning a second pool, so
-/// `KTSTR_KERNEL_PARALLELISM` still bounds total width. `collect`
-/// gathers EVERY version's `Result` (Ok and Err alike); the
-/// caller's outer `collect::<Result<_, _>>` is what aborts the
-/// cohort on the first Err.
-///
-/// The per-version `resolve` closure is injected so this
-/// concurrency + order contract can be unit-tested without
-/// network / build I/O.
-fn resolve_versions_parallel<R>(
-    versions: Vec<String>,
-    resolve: R,
-) -> Vec<Result<(String, PathBuf), String>>
-where
-    R: Fn(&str) -> Result<(String, PathBuf), String> + Sync,
-{
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    versions.into_par_iter().map(|ver| resolve(&ver)).collect()
-}
-
 /// `resolve_one` plus per-resolve progress feedback.
 ///
 /// A user passing `--kernel 6.10..6.20` (10+ versions) sees
@@ -544,7 +542,7 @@ fn resolve_one_with_progress(
 ) -> Result<(String, PathBuf), String> {
     let result = resolve_one(id, Some(mp));
     if let Ok((label, _)) = &result {
-        eprintln!("cargo ktstr: resolved kernel {label:?}");
+        ktstr::ktstr_status!("cargo ktstr: resolved kernel {label:?}");
     }
     result
 }
@@ -567,74 +565,84 @@ fn resolve_specs_parallel(
     mp: &ktstr::cli::FetchProgress,
     include_eol: bool,
 ) -> Result<Vec<(String, PathBuf)>, String> {
+    resolve_specs_parallel_with_pool_builder(specs, mp, include_eol, |max_threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(max_threads)
+            .build()
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// [`resolve_specs_parallel`] with an injected bounded-pool builder.
+///
+/// The seam lets tests force the `pthread_create` failure path without
+/// changing process limits. Production passes Rayon's real builder.
+fn resolve_specs_parallel_with_pool_builder<B>(
+    specs: &[String],
+    mp: &ktstr::cli::FetchProgress,
+    include_eol: bool,
+    build_pool: B,
+) -> Result<Vec<(String, PathBuf)>, String>
+where
+    B: FnOnce(usize) -> Result<rayon::ThreadPool, String>,
+{
+    let work = prepare_kernel_resolve_work(specs, include_eol)?;
+    resolve_prepared_kernel_work_with_pool_builder(
+        work,
+        ktstr::cli::resolve_kernel_parallelism(),
+        build_pool,
+        |work| resolve_prepared_kernel_work(work, mp),
+    )
+}
+
+/// Resolve an already-expanded work vector under a private, work-sized pool.
+///
+/// Zero or one item runs directly on the caller and never invokes
+/// `ThreadPoolBuilder`. For larger vectors the private pool width is
+/// `min(configured_limit, work.len())`; this is the load-bearing invariant that
+/// prevents a one-kernel invocation on a 192-CPU host from creating 192 idle
+/// rayon workers. A pool-construction failure remains wholly sequential and
+/// never touches Rayon's process-global pool.
+fn resolve_prepared_kernel_work_with_pool_builder<B, R>(
+    work: Vec<KernelResolveWork>,
+    configured_limit: usize,
+    build_pool: B,
+    resolve: R,
+) -> Result<Vec<(String, PathBuf)>, String>
+where
+    B: FnOnce(usize) -> Result<rayon::ThreadPool, String>,
+    R: Fn(KernelResolveWork) -> Result<(String, PathBuf), String> + Sync,
+{
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-    // Cap rayon parallelism via a bounded ThreadPool installed
-    // ONLY for this resolve pipeline. Without the cap, an
-    // operator passing `--kernel A --kernel B ... --kernel Z`
-    // (10+ specs) would saturate the global rayon pool with
-    // simultaneous git_clone + tarball downloads. Each download
-    // / clone is network-bound and largely cooperative on local
-    // CPU, but the spawn cost (rayon worker steal-and-park,
-    // tempdir creation, gix or reqwest init) compounds in
-    // proportion to spec count, and a contended local network
-    // (the kernel.org CDN's per-IP throttle, a developer's home
-    // ISP, a CI runner's shared NIC) degrades when too many
-    // streams overlap.
-    //
-    // The cap defaults to `available_parallelism()` — the host's
-    // logical CPU count, std-lib provided so no extra dependency
-    // is pulled in. Saturating local parallelism is the right
-    // ceiling: download streams shouldn't outnumber the threads
-    // the host can drive without thrashing. (Concurrent builds are
-    // NOT serialized against each other — the LLC flock is shared
-    // (LOCK_SH) — but `make -j$(nproc)` already saturates CPU, so
-    // additional in-flight downloads wouldn't speed the builds up.)
-    //
-    // Operators can override the cap via the
-    // `KTSTR_KERNEL_PARALLELISM` env var (see
-    // [`ktstr::KTSTR_KERNEL_PARALLELISM_ENV`]) — useful when the
-    // default is wrong for the host: a fast NIC + slow CPU
-    // benefits from more in-flight downloads; a contended CI
-    // runner with concurrent jobs benefits from a lower cap to
-    // leave bandwidth for siblings. Parsing rules and fallback
-    // behavior live in [`ktstr::cli::resolve_kernel_parallelism`]
-    // so a typoed export (`=abc`, `=0`) silently degrades to the
-    // host-CPU default rather than disabling parallelism.
-    //
-    // Bounded ThreadPool via `pool.install(|| ...)` scopes the
-    // cap to this pipeline only — the global rayon pool is
-    // unaffected, so any other rayon-using code in the same
-    // process (test parallelism in nextest's harness, polars'
-    // groupby, etc.) keeps its own width. Falls back to the
-    // global pool if `ThreadPoolBuilder::build` fails (e.g. on
-    // a host that's already maxed its thread limits) — better
-    // to run the resolve under the default global pool than
-    // bail with a cap-construction error that has nothing to
-    // do with the user's `--kernel` input.
-    let max_threads = ktstr::cli::resolve_kernel_parallelism();
-    let bounded_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(max_threads)
-        .build()
-        .ok();
+    let width = configured_limit.max(1).min(work.len());
+    if width <= 1 {
+        return work.into_iter().map(resolve).collect();
+    }
 
-    let resolve_in_pool = || -> Result<Vec<(String, PathBuf)>, String> {
-        specs
-            .into_par_iter()
-            .filter_map(|raw| {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            })
-            .flat_map_iter(|trimmed| resolve_one_spec(trimmed, mp, include_eol).into_iter())
-            .collect::<Result<Vec<_>, _>>()
-    };
-    match bounded_pool {
-        Some(pool) => pool.install(resolve_in_pool),
-        None => resolve_in_pool(),
+    match build_pool(width) {
+        Ok(pool) => {
+            // Collect every result before applying `Result`'s ordered
+            // short-circuit. Rayon's `FromParallelIterator<Result<...>>`
+            // cancels outstanding work after the first error it observes,
+            // which makes the surfaced error completion-order dependent and
+            // can leave later Range children entirely unattempted. The
+            // indexed parallel iterator preserves input slots; the sequential
+            // collect below therefore reports the first input-ordered error
+            // after every prepared kernel has finished.
+            let results: Vec<Result<(String, PathBuf), String>> =
+                pool.install(|| work.into_par_iter().map(&resolve).collect());
+            results.into_iter().collect()
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                width,
+                work_items = work.len(),
+                "rayon ThreadPoolBuilder failed; falling back to sequential kernel resolution"
+            );
+            work.into_iter().map(resolve).collect()
+        }
     }
 }
 
@@ -709,7 +717,7 @@ pub(crate) fn kernel_build(
             let total = versions.len();
             let mut failures: Vec<(String, String)> = Vec::new();
             for (i, ver) in versions.iter().enumerate() {
-                eprintln!("cargo ktstr: [{}/{total}] kernel build {ver}", i + 1);
+                ktstr::ktstr_status!("cargo ktstr: [{}/{total}] kernel build {ver}", i + 1);
                 if let Err(e) = kernel_build_one(
                     Some(ver.clone()),
                     None,
@@ -719,7 +727,7 @@ pub(crate) fn kernel_build(
                     extra_content.as_deref(),
                     skip_sha256,
                 ) {
-                    eprintln!("cargo ktstr: {ver}: {e}");
+                    ktstr::ktstr_status!("cargo ktstr: {ver}: {e}");
                     failures.push((ver.clone(), e));
                 }
             }
@@ -792,7 +800,7 @@ pub(crate) fn kernel_build(
                 extra_content.as_deref(),
             )
             .map_err(|e| format!("build git+{url}#{git_ref}: {e:#}"))?;
-            eprintln!("cargo ktstr: kernel cached at {}", dir.display());
+            ktstr::ktstr_status!("cargo ktstr: kernel cached at {}", dir.display());
             Ok(())
         }
         Some(KernelId::CacheKey(key)) => Err(format!(
@@ -823,7 +831,7 @@ pub(crate) fn kernel_build(
                 _ => unreachable!("arm guarded to Package | Distro"),
             }
             .map_err(|e| format!("acquire --kernel {id}: {e:#}"))?;
-            eprintln!("cargo ktstr: prebuilt kernel cached at {}", dir.display());
+            ktstr::ktstr_status!("cargo ktstr: prebuilt kernel cached at {}", dir.display());
             Ok(())
         }
     }
@@ -892,8 +900,8 @@ fn kernel_build_one(
             ktstr::cache_key_suffix_with_extra(extra_kconfig),
         );
         if !force && let Some(entry) = cache_lookup(&cache, &cache_key) {
-            eprintln!("cargo ktstr: cached kernel found: {}", entry.path.display());
-            eprintln!("cargo ktstr: use --force to rebuild");
+            ktstr::ktstr_status!("cargo ktstr: cached kernel found: {}", entry.path.display());
+            ktstr::ktstr_status!("cargo ktstr: use --force to rebuild");
             return Ok(());
         }
         let result = fetch::download_tarball(
@@ -932,8 +940,8 @@ fn kernel_build_one(
         && !acquired.is_dirty
         && let Some(entry) = cache_lookup(&cache, &acquired.cache_key)
     {
-        eprintln!("cargo ktstr: cached kernel found: {}", entry.path.display());
-        eprintln!("cargo ktstr: use --force to rebuild");
+        ktstr::ktstr_status!("cargo ktstr: cached kernel found: {}", entry.path.display());
+        ktstr::ktstr_status!("cargo ktstr: use --force to rebuild");
         return Ok(());
     }
 
@@ -971,6 +979,9 @@ fn cache_lookup(cache: &CacheDir, cache_key: &str) -> Option<CacheEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const POOL_FAILURE_THREAD_PROBE_ENV: &str = "KTSTR_KERNEL_POOL_FAILURE_THREAD_PROBE";
+    const POOL_FAILURE_THREAD_PROBE_MARKER: &str = "kernel-pool-failure-thread-probe-ok";
 
     // ---------------------------------------------------------------
     // format_built_age — cache-hit log line age suffix
@@ -1146,64 +1157,259 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // resolve_versions_parallel — intra-range concurrency contract
+    // prepared kernel work — exact work-sized concurrency contract
     // ---------------------------------------------------------------
-    //
-    // The Range arm of `resolve_one_spec` resolves expanded versions
-    // through this helper. Its two guarantees — output order == input
-    // order, and every version attempted (no inner short-circuit) —
-    // are what the doc asserts and what a downstream `resolved[0] ->
-    // KTSTR_KERNEL` choice relies on. Real Range resolves need network
-    // + build, so the per-version resolver is injected here to exercise
-    // the concurrency contract in isolation.
 
-    /// `Vec::into_par_iter` is indexed, so `collect` restores input
-    /// order regardless of completion order. A regression that swapped
-    /// the helper to an unindexed adaptor (e.g. `par_bridge`) would
-    /// shuffle the output and fail this.
+    fn fake_kernel_work(version: impl Into<String>) -> KernelResolveWork {
+        KernelResolveWork {
+            id: ktstr::kernel_path::KernelId::Version(version.into()),
+            range_version: None,
+        }
+    }
+
+    fn fake_kernel_resolve(
+        work: KernelResolveWork,
+    ) -> Result<(String, std::path::PathBuf), String> {
+        match work.id {
+            ktstr::kernel_path::KernelId::Version(version) => {
+                let path = std::path::PathBuf::from(format!("/fake/{version}"));
+                Ok((version, path))
+            }
+            id => panic!("unexpected fake kernel work: {id:?}"),
+        }
+    }
+
+    /// Range expansion happens before pool construction and contributes one
+    /// work item per version. Empty specs disappear without consuming a slot,
+    /// and peers retain their input order around the expanded Range.
     #[test]
-    fn resolve_versions_parallel_preserves_input_order() {
-        let versions: Vec<String> = (0..64).map(|i| format!("6.{i}")).collect();
-        let out = resolve_versions_parallel(versions.clone(), |ver| {
-            Ok((
-                ver.to_string(),
-                std::path::PathBuf::from(format!("/fake/{ver}")),
-            ))
-        });
-        let labels: Vec<String> = out.into_iter().map(|r| r.unwrap().0).collect();
+    fn prepare_kernel_work_flattens_ranges_before_pool_sizing() {
+        let specs = vec![
+            "   ".to_string(),
+            " 6.10..6.12 ".to_string(),
+            " 6.14.2 ".to_string(),
+        ];
+        let work = prepare_kernel_resolve_work_with(&specs, |start, end| {
+            assert_eq!((start, end), ("6.10", "6.12"));
+            Ok(vec![
+                "6.10.9".to_string(),
+                "6.11.8".to_string(),
+                "6.12.7".to_string(),
+            ])
+        })
+        .expect("prepare flattened kernel work");
+
+        let labels: Vec<(String, Option<String>)> = work
+            .into_iter()
+            .map(|work| match work.id {
+                ktstr::kernel_path::KernelId::Version(version) => (version, work.range_version),
+                id => panic!("unexpected prepared kernel id: {id:?}"),
+            })
+            .collect();
         assert_eq!(
-            labels, versions,
-            "parallel resolve must return results in input (version) order"
+            labels,
+            vec![
+                ("6.10.9".to_string(), Some("6.10.9".to_string())),
+                ("6.11.8".to_string(), Some("6.11.8".to_string())),
+                ("6.12.7".to_string(), Some("6.12.7".to_string())),
+                ("6.14.2".to_string(), None),
+            ]
         );
     }
 
-    /// The helper's `collect` gathers EVERY version's `Result` — it
-    /// does NOT short-circuit on the first Err (that is the caller's
-    /// outer `collect::<Result<_, _>>`'s job). So a failing version
-    /// leaves all N resolves attempted and its Err at its input index.
+    /// Zero and one actual item stay on the caller and never construct a
+    /// private pool, independent of the configured host-sized cap.
     #[test]
-    fn resolve_versions_parallel_attempts_every_version_and_keeps_error_position() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let versions: Vec<String> = (0..32).map(|i| format!("6.{i}")).collect();
-        let attempts = AtomicUsize::new(0);
-        let out = resolve_versions_parallel(versions.clone(), |ver| {
-            attempts.fetch_add(1, Ordering::Relaxed);
-            if ver == "6.7" {
-                Err(format!("boom {ver}"))
-            } else {
-                Ok((ver.to_string(), std::path::PathBuf::from(ver)))
-            }
-        });
+    fn prepared_kernel_work_zero_and_one_are_caller_sequential() {
+        let empty = resolve_prepared_kernel_work_with_pool_builder(
+            Vec::new(),
+            192,
+            |_| panic!("empty work must not build a pool"),
+            fake_kernel_resolve,
+        )
+        .expect("empty resolve");
+        assert!(empty.is_empty());
+
+        let caller = std::thread::current().id();
+        let one = resolve_prepared_kernel_work_with_pool_builder(
+            vec![fake_kernel_work("6.14.2")],
+            192,
+            |_| panic!("single work item must not build a pool"),
+            |work| {
+                assert_eq!(
+                    std::thread::current().id(),
+                    caller,
+                    "single kernel escaped onto a worker"
+                );
+                fake_kernel_resolve(work)
+            },
+        )
+        .expect("single resolve");
+        assert_eq!(one[0].0, "6.14.2");
+    }
+
+    /// The pool width is bounded by actual prepared work, not the host CPU
+    /// count. Failure to create that exact pool stays sequential.
+    #[test]
+    fn prepared_kernel_work_pool_width_is_bounded_by_actual_items() {
+        let requested_threads = std::cell::Cell::new(0);
+        let work: Vec<_> = (0..3)
+            .map(|index| fake_kernel_work(format!("6.{index}")))
+            .collect();
+        let out = resolve_prepared_kernel_work_with_pool_builder(
+            work,
+            192,
+            |threads| {
+                requested_threads.set(threads);
+                Err("forced pool build failure".to_string())
+            },
+            fake_kernel_resolve,
+        )
+        .expect("sequential fallback resolves all work");
+        assert_eq!(requested_threads.get(), 3);
         assert_eq!(
-            attempts.load(Ordering::Relaxed),
-            versions.len(),
-            "every version must be attempted; the inner collect does not short-circuit"
+            out.into_iter().map(|(label, _)| label).collect::<Vec<_>>(),
+            vec!["6.0", "6.1", "6.2"]
         );
-        assert_eq!(out.len(), versions.len());
+    }
+
+    /// `Vec::into_par_iter` is indexed, so the real private pool restores
+    /// input order regardless of completion order.
+    #[test]
+    fn prepared_kernel_work_parallel_pool_preserves_input_order() {
+        let versions: Vec<String> = (0..32).map(|index| format!("6.{index}")).collect();
+        let work = versions.iter().cloned().map(fake_kernel_work).collect();
+        let out = resolve_prepared_kernel_work_with_pool_builder(
+            work,
+            4,
+            |threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .map_err(|error| error.to_string())
+            },
+            fake_kernel_resolve,
+        )
+        .expect("parallel fake resolve");
+        assert_eq!(
+            out.into_iter().map(|(label, _)| label).collect::<Vec<_>>(),
+            versions
+        );
+    }
+
+    /// Parallel failures retain the historical Range contract: every prepared
+    /// child is attempted, and the first error in input order wins even when a
+    /// later error completes first.
+    #[test]
+    fn prepared_kernel_work_parallel_errors_attempt_all_and_report_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let work: Vec<_> = (0..32)
+            .map(|index| fake_kernel_work(format!("6.{index}")))
+            .collect();
+        let attempted = AtomicUsize::new(0);
+        let error = resolve_prepared_kernel_work_with_pool_builder(
+            work,
+            4,
+            |threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .map_err(|error| error.to_string())
+            },
+            |work| {
+                attempted.fetch_add(1, Ordering::Relaxed);
+                let ktstr::kernel_path::KernelId::Version(version) = work.id else {
+                    unreachable!("fixture contains only Version work")
+                };
+                match version.as_str() {
+                    "6.3" => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Err("first-input-error".to_string())
+                    }
+                    "6.20" => Err("later-fast-error".to_string()),
+                    _ => Ok((version, PathBuf::from("/fake"))),
+                }
+            },
+        )
+        .expect_err("two prepared kernels fail");
+
+        assert_eq!(attempted.load(Ordering::Relaxed), 32);
+        assert_eq!(error, "first-input-error");
+    }
+
+    /// Exercise the real outer filtering / validation / error path with
+    /// a deterministically failed pool builder in an isolated process.
+    /// The child task count catches any fallback to a global parallel
+    /// iterator without depending on test order in this large binary.
+    #[test]
+    fn resolve_specs_pool_build_failure_is_sequential() {
+        if std::env::var_os(POOL_FAILURE_THREAD_PROBE_ENV).is_some() {
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(POOL_FAILURE_THREAD_PROBE_ENV, "1")
+            .arg("--exact")
+            .arg("kernel::tests::resolve_specs_pool_build_failure_is_sequential_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .output()
+            .expect("spawn isolated kernel resolver pool-failure probe");
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(
-            out.iter().enumerate().all(|(i, r)| (i == 7) == r.is_err()),
-            "only the 6.7 slot (input index 7) is Err; order preserved"
+            output.status.success(),
+            "isolated kernel resolver pool-failure probe failed:\n{transcript}"
         );
+        assert!(
+            transcript.contains(POOL_FAILURE_THREAD_PROBE_MARKER),
+            "isolated helper did not run (wrong libtest exact name?):\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn resolve_specs_pool_build_failure_is_sequential_child() {
+        if std::env::var_os(POOL_FAILURE_THREAD_PROBE_ENV).is_none() {
+            return;
+        }
+        let work = vec![fake_kernel_work("6.14.1"), fake_kernel_work("6.14.2")];
+        let requested_threads = std::cell::Cell::new(0);
+        let caller = std::thread::current().id();
+        let task_count = || {
+            std::fs::read_dir("/proc/self/task")
+                .expect("read /proc/self/task")
+                .count()
+        };
+        let before = task_count();
+        let resolved = resolve_prepared_kernel_work_with_pool_builder(
+            work,
+            192,
+            |threads| {
+                requested_threads.set(threads);
+                Err("forced pool build failure".to_string())
+            },
+            |work| {
+                assert_eq!(
+                    std::thread::current().id(),
+                    caller,
+                    "pool failure fallback escaped onto a worker"
+                );
+                fake_kernel_resolve(work)
+            },
+        )
+        .expect("pool failure must fall back to sequential resolution");
+        let after = task_count();
+        assert_eq!(requested_threads.get(), 2);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(
+            after, before,
+            "failed bounded-pool construction initialized retained global workers: \
+             before={before}, after={after}"
+        );
+        eprintln!("{POOL_FAILURE_THREAD_PROBE_MARKER}");
     }
 
     // ---------------------------------------------------------------

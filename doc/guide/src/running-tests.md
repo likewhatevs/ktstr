@@ -57,10 +57,11 @@ More patterns:
 ## Test names and variants {#test-name-shapes}
 
 Tests registered through `#[ktstr_test]` show up in nextest output
-under one of four prefixes:
+under these name shapes:
 
-- `ktstr/{name}` — single-kernel run (or any `host_only` test, which
-  never boots a VM and so never multiplies across kernels).
+- `ktstr/{name}` — single-kernel VM run.
+- `host/{name}` — a `host_only` test. It never boots a VM and never
+  multiplies across kernels.
 - `ktstr/{name}/{kernel}` — one case per (test × kernel) when
   `--kernel` resolves to two or more kernels.
 - `gauntlet/{name}/{preset}` — one case per topology preset
@@ -83,12 +84,19 @@ This is what those names look like in a real run:
 
 <pre>
 ...
-ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/smt-3llc
-ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/tiny-1llc
-ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/tiny-2llc
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/4cpu-2llc-nosmt
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/8cpu-2llc-smt
+ktstr::worktype_coverage_fork_gauntlet_e2e gauntlet/worktype_fork_gauntlet_covers_all_arms/9cpu-3llc-nosmt
 </pre></div>
 
-Filter by prefix with `-E 'test(/^ktstr/)'` or `-E 'test(/^gauntlet/)'`.
+Filter by prefix with `-E 'test(/^ktstr/)'`, `-E 'test(/^host/)'`, or
+`-E 'test(/^gauntlet/)'`.
+
+The distinct `host/` prefix is also an admission identity. `cargo ktstr`
+keeps ordinary host tests CPU-bounded while allowing all cheap VM-resource
+waiters to reach ktstr's topology scheduler. Older ktstr releases listed
+host-only entries under the VM namespace; full-name filters for those entries
+should use `host/` now.
 
 > [!TIP]
 > `test(NAME)` is a substring match; the exact-match form `test(=NAME)`

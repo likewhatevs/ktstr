@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::cache::KernelSource;
@@ -36,6 +36,8 @@ use crate::distro::extract::{ExtractedKernel, extract_tar, extract_tar_matching}
 const GKE_RELEASE_NOTES_URL: &str =
     "https://docs.cloud.google.com/kubernetes-engine/docs/release-notes";
 const COS_TOOLS_BUCKET: &str = "cos-tools";
+const GKE_RESOLUTION_CACHE_VERSION: &str = "v1";
+const GKE_ARTIFACT_BASENAMES: [&str; 3] = ["vmlinux", "kernel-headers.tgz", "kernel-src.tar.gz"];
 
 const MODULE_MAKEFILE: &str = "\
 ccflags-y += -DCONFIG_VIRTIO_MMIO_CMDLINE_DEVICES
@@ -83,7 +85,7 @@ const REQUIRED_BUILTINS: &[&str] = &[
     "CONFIG_SERIAL_8250_CONSOLE",
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct GkeImage {
     milestone: u32,
     build: u32,
@@ -108,13 +110,24 @@ impl GkeImage {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct GkeArtifact {
     name: String,
     generation: String,
     size: u64,
     md5_base64: String,
     download_url: String,
+}
+
+/// One indivisible, validated GKE metadata lookup result.
+///
+/// Persisting the image and all three generation-pinned objects
+/// together prevents a fallback from combining an older promoted image
+/// with any freshly resolved artifact identity (or vice versa).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct GkeResolution {
+    image: GkeImage,
+    artifacts: [GkeArtifact; 3],
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,14 +166,17 @@ fn parse_release_notes(notes: &str, milestone: Option<u32>) -> Result<GkeImage> 
     })
 }
 
-fn resolve_promoted_image(milestone: Option<&str>) -> Result<GkeImage> {
-    let milestone = milestone
+fn parse_milestone_selector(milestone: Option<&str>) -> Result<Option<u32>> {
+    milestone
         .map(|value| {
             value
                 .parse::<u32>()
                 .with_context(|| format!("parse GKE COS milestone {value:?}"))
         })
-        .transpose()?;
+        .transpose()
+}
+
+fn resolve_promoted_image(milestone: Option<u32>) -> Result<GkeImage> {
     let bytes =
         crate::fetch::fetch_metadata_bytes(GKE_RELEASE_NOTES_URL, "fetch GKE release notes")
             .with_context(|| "download official GKE release notes")?;
@@ -181,6 +197,13 @@ fn encode_gcs_object_name(name: &str) -> String {
         }
     }
     encoded
+}
+
+fn gcs_download_url(object_name: &str, generation: &str) -> String {
+    let encoded = encode_gcs_object_name(object_name);
+    format!(
+        "https://storage.googleapis.com/download/storage/v1/b/{COS_TOOLS_BUCKET}/o/{encoded}?generation={generation}&alt=media"
+    )
 }
 
 fn parse_gcs_metadata(bytes: &[u8], expected_name: &str) -> Result<GkeArtifact> {
@@ -209,11 +232,7 @@ fn parse_gcs_metadata(bytes: &[u8], expected_name: &str) -> Result<GkeArtifact> 
         "GCS object {expected_name} md5Hash decoded to {} bytes, expected 16",
         md5.len()
     );
-    let encoded = encode_gcs_object_name(expected_name);
-    let download_url = format!(
-        "https://storage.googleapis.com/download/storage/v1/b/{COS_TOOLS_BUCKET}/o/{encoded}?generation={}&alt=media",
-        metadata.generation
-    );
+    let download_url = gcs_download_url(expected_name, &metadata.generation);
     Ok(GkeArtifact {
         name: metadata.name,
         generation: metadata.generation,
@@ -232,13 +251,81 @@ fn resolve_artifact(object_name: &str) -> Result<GkeArtifact> {
     parse_gcs_metadata(&bytes, object_name)
 }
 
-fn resolve_artifacts(image: GkeImage) -> Result<[GkeArtifact; 3]> {
+fn artifact_object_names(image: GkeImage) -> [String; 3] {
     let prefix = image.board_prefix();
+    GKE_ARTIFACT_BASENAMES.map(|basename| format!("{prefix}/{basename}"))
+}
+
+fn resolve_artifacts(image: GkeImage) -> Result<[GkeArtifact; 3]> {
+    let [vmlinux, headers, source] = artifact_object_names(image);
     Ok([
-        resolve_artifact(&format!("{prefix}/vmlinux"))?,
-        resolve_artifact(&format!("{prefix}/kernel-headers.tgz"))?,
-        resolve_artifact(&format!("{prefix}/kernel-src.tar.gz"))?,
+        resolve_artifact(&vmlinux)?,
+        resolve_artifact(&headers)?,
+        resolve_artifact(&source)?,
     ])
+}
+
+fn resolution_lookup_key(milestone: Option<u32>) -> String {
+    let selector = milestone
+        .map(|value| format!("milestone-{value}"))
+        .unwrap_or_else(|| "latest".to_string());
+    format!("gke-resolution/{GKE_RESOLUTION_CACHE_VERSION}/{selector}/x86_64")
+}
+
+fn validate_resolution(resolution: &GkeResolution, requested_milestone: Option<u32>) -> Result<()> {
+    let image = resolution.image;
+    ensure!(
+        (10..=999).contains(&image.milestone),
+        "cached GKE image has invalid COS milestone {}",
+        image.milestone
+    );
+    if let Some(requested) = requested_milestone {
+        ensure!(
+            image.milestone == requested,
+            "cached GKE image {} does not match requested COS milestone {requested}",
+            image.image_name()
+        );
+    }
+
+    for (artifact, expected_name) in resolution
+        .artifacts
+        .iter()
+        .zip(artifact_object_names(image))
+    {
+        ensure!(
+            artifact.name == expected_name,
+            "cached GKE artifact order/name mismatch: expected {expected_name:?}, got {:?}",
+            artifact.name
+        );
+        ensure!(
+            !artifact.generation.is_empty()
+                && artifact
+                    .generation
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit()),
+            "cached GKE artifact {expected_name} has invalid generation {:?}",
+            artifact.generation
+        );
+        ensure!(
+            artifact.size > 0,
+            "cached GKE artifact {expected_name} is empty"
+        );
+        let md5 = BASE64_STANDARD
+            .decode(&artifact.md5_base64)
+            .with_context(|| format!("decode cached GCS md5Hash for {expected_name}"))?;
+        ensure!(
+            md5.len() == 16,
+            "cached GKE artifact {expected_name} md5Hash decoded to {} bytes, expected 16",
+            md5.len()
+        );
+        let expected_url = gcs_download_url(&expected_name, &artifact.generation);
+        ensure!(
+            artifact.download_url == expected_url,
+            "cached GKE artifact {expected_name} download URL is not its exact HTTPS \
+             generation-pinned GCS URL"
+        );
+    }
+    Ok(())
 }
 
 fn cache_key(image: GkeImage, artifacts: &[GkeArtifact]) -> String {
@@ -420,8 +507,24 @@ pub(crate) fn acquire_gke_kernel(
         );
     }
 
-    let image = resolve_promoted_image(milestone)?;
-    let artifacts = resolve_artifacts(image)?;
+    let requested_milestone = parse_milestone_selector(milestone)?;
+    let resolution_key = resolution_lookup_key(requested_milestone);
+    let resolution = crate::lookup_cache::last_known_good(
+        &resolution_key,
+        || {
+            let image = resolve_promoted_image(requested_milestone)?;
+            let artifacts = resolve_artifacts(image)?;
+            Ok(GkeResolution { image, artifacts })
+        },
+        |resolution| validate_resolution(resolution, requested_milestone),
+    )
+    .with_context(|| {
+        let selector = requested_milestone
+            .map(|value| format!("COS milestone {value}"))
+            .unwrap_or_else(|| "latest promoted COS image".to_string());
+        format!("resolve official GKE metadata for {selector}")
+    })?;
+    let GkeResolution { image, artifacts } = resolution;
     let source = &artifacts[2];
     let key = cache_key(image, &artifacts);
     let cache = crate::cache::CacheDir::new()?;
@@ -527,6 +630,34 @@ pub(crate) fn acquire_gke_kernel(
 mod tests {
     use super::*;
 
+    fn resolution_fixture() -> GkeResolution {
+        let image = GkeImage {
+            milestone: 129,
+            build: 19506,
+            patch: 224,
+            revision: 80,
+        };
+        let prefix = image.board_prefix();
+        let artifact = |basename: &str, generation: &str, size| {
+            let name = format!("{prefix}/{basename}");
+            GkeArtifact {
+                download_url: gcs_download_url(&name, generation),
+                name,
+                generation: generation.to_string(),
+                size,
+                md5_base64: "EFRgfQGcG6lmUe4w6b9y1A==".to_string(),
+            }
+        };
+        GkeResolution {
+            image,
+            artifacts: [
+                artifact("vmlinux", "1782777210762594", 378_632_832),
+                artifact("kernel-headers.tgz", "1782777210762595", 24_000_000),
+                artifact("kernel-src.tar.gz", "1782777210762596", 220_000_000),
+            ],
+        }
+    }
+
     #[test]
     fn release_notes_choose_latest_promoted_image() {
         let notes = r#"
@@ -584,6 +715,92 @@ mod tests {
         let bad = json.replace("EFRgfQGcG6lmUe4w6b9y1A==", "AA==");
         assert!(parse_gcs_metadata(bad.as_bytes(), name).is_err());
         assert!(parse_gcs_metadata(json.as_bytes(), "other/object").is_err());
+    }
+
+    #[test]
+    fn resolution_lookup_key_separates_channel_and_architecture() {
+        assert_eq!(
+            resolution_lookup_key(None),
+            "gke-resolution/v1/latest/x86_64"
+        );
+        assert_eq!(
+            resolution_lookup_key(Some(129)),
+            "gke-resolution/v1/milestone-129/x86_64"
+        );
+        assert_ne!(
+            resolution_lookup_key(None),
+            resolution_lookup_key(Some(129))
+        );
+        assert_ne!(
+            resolution_lookup_key(Some(128)),
+            resolution_lookup_key(Some(129))
+        );
+        assert_eq!(
+            resolution_lookup_key(parse_milestone_selector(Some("0129")).unwrap()),
+            resolution_lookup_key(Some(129)),
+            "equivalent numeric selectors must share one stable lookup key"
+        );
+        assert!(parse_milestone_selector(Some("latest")).is_err());
+    }
+
+    #[test]
+    fn resolution_validator_pins_the_complete_generation_plan() {
+        let baseline = resolution_fixture();
+        validate_resolution(&baseline, None).unwrap();
+        validate_resolution(&baseline, Some(129)).unwrap();
+        assert!(validate_resolution(&baseline, Some(128)).is_err());
+
+        let mut invalid_milestone = baseline.clone();
+        invalid_milestone.image.milestone = 9;
+        assert!(validate_resolution(&invalid_milestone, None).is_err());
+
+        let image_mutations: [fn(&mut GkeImage); 3] = [
+            |image: &mut GkeImage| image.build += 1,
+            |image: &mut GkeImage| image.patch += 1,
+            |image: &mut GkeImage| image.revision += 1,
+        ];
+        for mutate in image_mutations {
+            let mut changed = baseline.clone();
+            mutate(&mut changed.image);
+            assert!(
+                validate_resolution(&changed, None).is_err(),
+                "every image version field must agree with the artifact plan"
+            );
+        }
+
+        let mut wrong_name = baseline.clone();
+        wrong_name.artifacts[0].name.push_str(".old");
+        assert!(validate_resolution(&wrong_name, None).is_err());
+
+        let mut wrong_order = baseline.clone();
+        wrong_order.artifacts.swap(0, 1);
+        assert!(validate_resolution(&wrong_order, None).is_err());
+
+        for generation in ["", "not-numeric"] {
+            let mut bad_generation = baseline.clone();
+            bad_generation.artifacts[0].generation = generation.to_string();
+            assert!(validate_resolution(&bad_generation, None).is_err());
+        }
+
+        let mut empty = baseline.clone();
+        empty.artifacts[0].size = 0;
+        assert!(validate_resolution(&empty, None).is_err());
+
+        for md5 in ["not-base64", "AA=="] {
+            let mut bad_md5 = baseline.clone();
+            bad_md5.artifacts[0].md5_base64 = md5.to_string();
+            assert!(validate_resolution(&bad_md5, None).is_err());
+        }
+
+        let mut non_https = baseline.clone();
+        non_https.artifacts[0].download_url = non_https.artifacts[0]
+            .download_url
+            .replacen("https:", "http:", 1);
+        assert!(validate_resolution(&non_https, None).is_err());
+
+        let mut mismatched_generation = baseline;
+        mismatched_generation.artifacts[0].generation = "1782777210762597".to_string();
+        assert!(validate_resolution(&mismatched_generation, None).is_err());
     }
 
     #[test]

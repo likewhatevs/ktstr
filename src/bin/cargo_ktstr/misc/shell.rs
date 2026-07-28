@@ -191,11 +191,18 @@ pub(crate) fn run_shell(
         // documented on the function — no concurrent env readers.
         unsafe { std::env::set_var(ktstr::KTSTR_CPU_CAP_ENV, cap.to_string()) };
     }
-    // Parse the human-readable disk size into a DiskConfig before the
-    // KVM probe so a bad string surfaces at CLI-argument time, not
-    // mid-VM-setup. `parse_disk_arg` returns `Ok(None)` when the
-    // attribute is absent and applies `DiskConfig::default()` for
-    // every knob except `capacity_mib` when present.
+    // Validate every directly supplied VM-shape argument before probing the
+    // host. A malformed topology or disk must remain the primary diagnostic
+    // even on a machine without /dev/kvm.
+    let parsed_topology = if test.is_none() {
+        Some(cli::parse_topology_string(&topology).map_err(|e| format!("{e:#}"))?)
+    } else {
+        None
+    };
+    // Parse the human-readable disk size into a DiskConfig before the KVM
+    // probe. `parse_disk_arg` returns `Ok(None)` when the attribute is absent
+    // and applies `DiskConfig::default()` for every knob except
+    // `capacity_mib` when present.
     let disk_cfg = cli::parse_disk_arg(disk.as_deref()).map_err(|e| format!("{e:#}"))?;
     cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     // No `--kernel`: default to the cwd when it is a kernel source
@@ -251,13 +258,10 @@ pub(crate) fn run_shell(
         // `N` from the operator's `-i` flags. Both UNION into the
         // VM. Always emitted (even when both are 0) so the operator
         // immediately sees an accidentally-dropped include.
-        eprintln!(
-            "{}",
-            format_test_banner(name, &desc, mem, include_files.len()),
-        );
+        ktstr::cli::print_status_line(&format_test_banner(name, &desc, mem, include_files.len()));
         if desc.scheduler_kind == ktstr::test_support::SchedulerKind::KernelBuiltin {
             if desc.scheduler_enable_cmds.is_empty() {
-                eprintln!(
+                ktstr::ktstr_status!(
                     "ktstr shell: scheduler '{}' is KernelBuiltin with no enable cmds \
                      declared — drop-to-shell will run under the kernel default; \
                      refer to the test's #[ktstr_test(...)] attributes for sysctl \
@@ -265,7 +269,7 @@ pub(crate) fn run_shell(
                     desc.scheduler_name,
                 );
             } else {
-                eprintln!(
+                ktstr::ktstr_status!(
                     "ktstr shell: scheduler '{}' is KernelBuiltin — running {} enable \
                      cmd(s) before drop-to-shell and {} disable cmd(s) on shell exit. \
                      You can manually re-disable inside busybox if you want to inspect \
@@ -276,7 +280,7 @@ pub(crate) fn run_shell(
                 );
             }
         } else if desc.scheduler_kind != ktstr::test_support::SchedulerKind::Eevdf {
-            eprintln!(
+            ktstr::ktstr_status!(
                 "ktstr shell: repro the workload by invoking the scheduler binary \
                  inside the guest (e.g. /bin/{}) — its sched_args are encoded in \
                  the test source; this v1 doesn't stage the scheduler binary \
@@ -300,7 +304,8 @@ pub(crate) fn run_shell(
             desc.scheduler_disable_cmds,
         )
     } else {
-        let (n, l, c, t) = cli::parse_topology_string(&topology).map_err(|e| format!("{e:#}"))?;
+        let (n, l, c, t) = parsed_topology
+            .expect("a shell invocation without --test validates its explicit topology");
         (
             n,
             l,

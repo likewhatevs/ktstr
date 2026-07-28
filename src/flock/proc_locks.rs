@@ -5,29 +5,39 @@
 //! lockfile path via [`super::mountinfo`]; this module owns the
 //! /proc/locks side of the pipeline.
 //!
-//! Two API tiers for batched callers:
+//! [`read_holders`] is the one-shot entry point: it reads
+//! `/proc/self/mountinfo` and `/proc/locks`, then returns the [`HolderInfo`]
+//! list for one lockfile. Callers with only a path use it (the `ktstr locks`
+//! observational scan and the cache EWOULDBLOCK peer-holder lookup); admission
+//! placement does NOT — it derives holder counts from the registry aggregate.
 //!
-//!  - [`read_holders`] — one-shot, reads both `/proc/self/mountinfo`
-//!    and `/proc/locks` itself. Use when looking up one lockfile.
-//!  - [`read_holders_with_mountinfo`] — accepts pre-read mountinfo.
-//!    Use when scanning N lockfiles in one pass (e.g.
-//!    `acquire_llc_plan`'s DISCOVER phase) so mountinfo is read once
-//!    per batch.
-//!
-//! Both ultimately call [`read_holders_for_needle`], which scans
-//! `/proc/locks` exactly once and returns one [`HolderInfo`] per
-//! matching PID. The pure parser seam
-//! [`parse_flock_pids_for_needle`] is exposed so tests can feed
-//! synthetic `/proc/locks` fixtures (POSIX / OFDLCK / FLOCK
-//! interleavings, malformed lines) without touching the real
-//! filesystem.
+//! The pure parser seam [`parse_flock_pids_for_needle`] is exposed so tests
+//! can feed synthetic `/proc/locks` fixtures (POSIX / OFDLCK / FLOCK
+//! interleavings, malformed lines) without touching the real filesystem.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 use super::HolderInfo;
 use super::holder::holder_info_for_pid;
-use super::mountinfo::{needle_from_path, needle_from_path_with_mountinfo};
+use super::mountinfo::needle_from_path;
+
+fn read_proc_locks(context: &'static str) -> Result<String> {
+    #[cfg(test)]
+    PROC_LOCKS_READS.with(|count| count.set(count.get().saturating_add(1)));
+    std::fs::read_to_string("/proc/locks").with_context(|| context)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROC_LOCKS_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn proc_locks_read_count_for_tests() -> usize {
+    PROC_LOCKS_READS.with(std::cell::Cell::get)
+}
 
 /// Parse `/proc/locks` and return [`HolderInfo`] entries for every
 /// process holding an advisory `FLOCK` matching `needle`.
@@ -38,11 +48,8 @@ use super::mountinfo::{needle_from_path, needle_from_path_with_mountinfo};
 /// `(major, minor)` via `/proc/self/mountinfo` and `inode` via
 /// `stat().st_ino`. Used by path-only callers ([`read_holders`],
 /// the `ktstr locks` observational scan, and the EWOULDBLOCK-branch
-/// peer-holder lookup in `src/cache/cache_dir.rs`).
-/// `acquire_llc_plan`'s DISCOVER
-/// phase uses [`super::mountinfo::needle_from_path_with_mountinfo`]
-/// instead so the mountinfo read amortizes across every LLC in one
-/// invocation.
+/// peer-holder lookup in `src/cache/cache_dir.rs`). `acquire_llc_plan`
+/// derives holder occupancy from the registry aggregate, not this scan.
 ///
 /// Best-effort: returns `Ok(vec![])` when no /proc/locks entry
 /// matches the needle, and propagates only the hard `/proc/locks`
@@ -54,31 +61,19 @@ use super::mountinfo::{needle_from_path, needle_from_path_with_mountinfo};
 /// overflow. A cmdline read failure is non-fatal — the entry
 /// carries `"<cmdline unavailable>"` so the pid still surfaces.
 pub(super) fn read_holders_for_needle(needle: &str) -> Result<Vec<HolderInfo>> {
-    use anyhow::Context;
-    use std::fs;
-
-    let contents = fs::read_to_string("/proc/locks")
-        .with_context(|| "read /proc/locks for lockfile holder lookup")?;
+    let contents = read_proc_locks("read /proc/locks for lockfile holder lookup")?;
     Ok(read_holders_from_contents(&contents, needle))
 }
 
 /// Content-based seam behind [`read_holders_for_needle`]. Takes
-/// already-read `/proc/locks` `contents` plus the match `needle` and
-/// returns the [`HolderInfo`] vector. Skips the `/proc/locks` read so
-/// a caller with N needles (e.g. `acquire_llc_plan`'s DISCOVER phase,
-/// which visits every host LLC's lockfile) can read `/proc/locks`
-/// ONCE and call this N times instead of re-reading the same file
-/// per iteration — the per-LLC scan was O(N) file reads against a
-/// kernel-synthesized text source that is already consistent across
-/// the whole batch.
+/// already-read `/proc/locks` `contents` plus one match `needle` and
+/// returns the [`HolderInfo`] vector.
 ///
 /// Thin shell over [`parse_flock_pids_for_needle`]: the latter
 /// filters `/proc/locks` lines to the matching FLOCK PIDs; this
 /// function adds the per-PID cmdline lookup via
 /// [`super::holder::holder_info_for_pid`] that the
-/// [`read_holders_for_needle`] caller expects. Extracted so batched
-/// callers and the per-needle wrapper both key against the same seam
-/// rather than duplicating the `.into_iter().map()` plumbing.
+/// [`read_holders_for_needle`] caller expects.
 pub(super) fn read_holders_from_contents(contents: &str, needle: &str) -> Vec<HolderInfo> {
     let pids = parse_flock_pids_for_needle(contents, needle);
     pids.into_iter().map(holder_info_for_pid).collect()
@@ -101,29 +96,8 @@ pub(super) fn read_holders_from_contents(contents: &str, needle: &str) -> Vec<Ho
 pub(crate) fn parse_flock_pids_for_needle(contents: &str, needle: &str) -> Vec<u32> {
     let mut pids: Vec<u32> = Vec::new();
     for line in contents.lines() {
-        // Expected format (after the id colon):
-        //   "1: FLOCK ADVISORY WRITE 12345 08:02:1234 0 EOF"
-        // POSIX / OFDLCK lines have the same pid + dev_inode slot
-        // shape but a different lock_type keyword in the second
-        // field — filter them out here.
-        let mut fields = line.split_whitespace();
-        // Skip the "N:" id.
-        let _id = fields.next();
-        let lock_type = fields.next();
-        if lock_type != Some("FLOCK") {
+        let Some((pid, dev_inode)) = parse_held_flock(line) else {
             continue;
-        }
-        // advisory/mandatory
-        let _adv = fields.next();
-        // READ/WRITE
-        let _mode = fields.next();
-        let pid = match fields.next().and_then(|s| s.parse::<u32>().ok()) {
-            Some(p) => p,
-            None => continue,
-        };
-        let dev_inode = match fields.next() {
-            Some(s) => s,
-            None => continue,
         };
         if dev_inode == needle && !pids.contains(&pid) {
             pids.push(pid);
@@ -132,16 +106,53 @@ pub(crate) fn parse_flock_pids_for_needle(contents: &str, needle: &str) -> Vec<u
     pids
 }
 
+/// Return `(pid, dev:inode)` for a held FLOCK line.
+///
+/// Waiting flock entries contain an extra `->` field after the lock
+/// id, so their second token is not `FLOCK` and they are intentionally
+/// ignored: holder diagnostics and placement must describe current
+/// holders, not queued contenders.
+fn parse_held_flock(line: &str) -> Option<(u32, &str)> {
+    parse_held_flock_with_mode(line).map(|(pid, _mode, dev_inode)| (pid, dev_inode))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldFlockMode {
+    Shared,
+    Exclusive,
+    /// A future kernel mode token is conservatively incompatible with both
+    /// SH and EX requesters rather than being misreported as free.
+    Unknown,
+}
+
+/// Return `(pid, mode, dev:inode)` for one held FLOCK line.
+fn parse_held_flock_with_mode(line: &str) -> Option<(u32, HeldFlockMode, &str)> {
+    // Expected format:
+    //   "1: FLOCK ADVISORY WRITE 12345 08:02:1234 0 EOF"
+    // POSIX / OFDLCK lines have the same pid + dev_inode slots but a
+    // different lock_type keyword in the second field.
+    let mut fields = line.split_whitespace();
+    let _id = fields.next()?;
+    if fields.next()? != "FLOCK" {
+        return None;
+    }
+    let _advisory = fields.next()?;
+    let mode = match fields.next()? {
+        "READ" => HeldFlockMode::Shared,
+        "WRITE" => HeldFlockMode::Exclusive,
+        _ => HeldFlockMode::Unknown,
+    };
+    let pid = fields.next()?.parse::<u32>().ok()?;
+    let dev_inode = fields.next()?;
+    Some((pid, mode, dev_inode))
+}
+
 /// Path-only adapter over [`read_holders_for_needle`]. Computes the
 /// needle via [`super::mountinfo::needle_from_path`] and forwards.
 /// This is the stable entry point for callers that only have a
 /// lockfile path — cache EWOULDBLOCK diagnostics and `ktstr locks`.
-///
-/// `acquire_llc_plan`'s DISCOVER phase does NOT call this adapter —
-/// it threads a pre-read `/proc/self/mountinfo` through
-/// [`read_holders_with_mountinfo`] so the whole per-LLC walk reads
-/// mountinfo exactly once per plan invocation. See
-/// [`super::mountinfo::needle_from_path_with_mountinfo`] for the seam.
+/// `acquire_llc_plan` derives holder occupancy from the registry
+/// aggregate instead of this `/proc/locks` scan.
 ///
 /// Propagates stat failures on the path (context: "stat lockfile …
 /// for holder lookup") and mountinfo failures ("resolve kernel
@@ -151,28 +162,9 @@ pub(crate) fn read_holders(path: &Path) -> Result<Vec<HolderInfo>> {
     read_holders_for_needle(&needle)
 }
 
-/// Variant of [`read_holders`] that accepts pre-read
-/// `/proc/self/mountinfo` contents. Used by callers that walk a
-/// batch of lockfiles in one invocation (e.g.
-/// `acquire_llc_plan`'s DISCOVER phase, which visits every LLC's
-/// lockfile) and want to amortize the mountinfo read across the
-/// whole batch instead of re-reading per lockfile.
-///
-/// Semantically identical to [`read_holders`] — the same needle
-/// format, the same /proc/locks scan, the same HolderInfo shape —
-/// just with the mountinfo text supplied by the caller rather than
-/// read inside this function.
-pub(crate) fn read_holders_with_mountinfo(path: &Path, mountinfo: &str) -> Result<Vec<HolderInfo>> {
-    let needle = needle_from_path_with_mountinfo(path, mountinfo)?;
-    read_holders_for_needle(&needle)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flock::FlockMode;
-    use crate::flock::mountinfo::read_mountinfo;
-    use crate::flock::primitives::try_flock;
 
     /// [`parse_flock_pids_for_needle`] skips `POSIX` and `OFDLCK`
     /// lines and matches only `FLOCK` lines whose dev:inode triple
@@ -252,12 +244,9 @@ mod tests {
     }
 
     /// [`read_holders_from_contents`] preserves the HolderInfo shape
-    /// for matching FLOCK lines. This is the batched-read seam used
-    /// by callers that have N needles and want to read `/proc/locks`
-    /// exactly once across the batch — the function must return one
-    /// [`HolderInfo`] per matching PID in the same order the parser
-    /// produces them. `holder_info_for_pid` reads our own cmdline so
-    /// we can assert the PID half deterministically on any host.
+    /// for a single matching needle. `holder_info_for_pid` reads our
+    /// own cmdline so we can assert the PID half deterministically on
+    /// any host.
     #[test]
     fn read_holders_from_contents_returns_holder_info_per_matching_pid() {
         let our_pid = std::process::id();
@@ -306,71 +295,5 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].pid, b[0].pid);
         assert_eq!(a[0].cmdline, b[0].cmdline);
-    }
-
-    /// [`read_holders_for_needle`] with an impossible needle returns
-    /// an empty Vec. Exercises the /proc/locks read path on any
-    /// Linux host without requiring specific lockfile state. The
-    /// needle format is `{major:02x}:{minor:02x}:{inode}`; pick
-    /// values guaranteed-not-to-exist (major=ff, minor=ff, inode
-    /// larger than any real inode at test time).
-    #[test]
-    fn read_holders_for_needle_no_match_returns_empty() {
-        // u64 max inode, max 8-bit major:minor pair. No real
-        // /proc/locks entry will match this.
-        let needle = "ff:ff:18446744073709551615";
-        let holders = read_holders_for_needle(needle)
-            .expect("/proc/locks read must succeed on any Linux host");
-        assert!(
-            holders.is_empty(),
-            "impossible needle must not match any holder: {holders:?}"
-        );
-    }
-
-    /// Holder-list equivalence under a live flock.
-    ///
-    /// Beyond "both needles are equal strings," the full
-    /// `/proc/locks` scan must surface the same [`HolderInfo`]
-    /// set via both the cached batch API
-    /// ([`read_holders_with_mountinfo`]) and the one-shot API
-    /// ([`read_holders`]) for a lockfile we actually hold. A
-    /// regression where the cached path e.g. canonicalizes
-    /// differently (altering the mount-point prefix match) would
-    /// surface here: the needles would still be valid triples but
-    /// point at different (major, minor) for the same path, and
-    /// exactly one of the two scans would find our pid.
-    #[test]
-    fn read_holders_cached_mountinfo_equals_uncached() {
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().expect("tempdir");
-        let path = tmp.path().join("cache-holder-equivalence.lock");
-
-        let fd = try_flock(&path, FlockMode::Exclusive)
-            .expect("try_flock must succeed on fresh tempfile")
-            .expect("EX must acquire on clean pool");
-
-        // Uncached: inline mountinfo read per call.
-        let uncached = read_holders(&path).expect("uncached holders");
-
-        // Cached: read mountinfo once, pass through.
-        let mountinfo = read_mountinfo().expect("read mountinfo");
-        let cached = read_holders_with_mountinfo(&path, &mountinfo).expect("cached holders");
-
-        // /proc/locks race-safety: holder sets can drift between two
-        // scans on a loaded host (peer exits, a separate test flock
-        // created/released). Pin the invariant we actually care
-        // about: OUR pid appears in BOTH sets.
-        let our_pid = std::process::id();
-        assert!(
-            uncached.iter().any(|h| h.pid == our_pid),
-            "our pid {our_pid} must appear in uncached holders {uncached:?}",
-        );
-        assert!(
-            cached.iter().any(|h| h.pid == our_pid),
-            "our pid {our_pid} must appear in cached holders {cached:?}",
-        );
-
-        drop(fd);
     }
 }

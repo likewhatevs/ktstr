@@ -66,6 +66,28 @@ impl std::fmt::Display for SchedulerBuildRefused {
 
 impl std::error::Error for SchedulerBuildRefused {}
 
+/// Marker attached to host-framework failures which occur after a VM run has
+/// started (for example, immutable scheduler CAS coordination or cast-analysis
+/// mapping failure).
+///
+/// These are neither guest behavior nor host-capacity outcomes. Dispatch must
+/// hard-fail them before resource skip classification or `expect_err`
+/// inversion can reinterpret the result.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FrameworkInfrastructureFailure;
+
+impl std::fmt::Display for FrameworkInfrastructureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ktstr framework infrastructure failed \
+             (resource classification and expect_err inversion bypassed)"
+        )
+    }
+}
+
+impl std::error::Error for FrameworkInfrastructureFailure {}
+
 /// Marker error type attached as `anyhow::Context` to the failure
 /// `Err` produced by `run_ktstr_test_inner_impl` when a host-side
 /// `post_vm` / `post_vm_unconditional` callback returned `Err`

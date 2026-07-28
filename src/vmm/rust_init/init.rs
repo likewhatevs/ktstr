@@ -24,6 +24,30 @@ pub(crate) fn verifier_cleanup_state_confirmed(
     state == Some(crate::scenario::ops::ScxState::Enabled)
 }
 
+/// Lifecycle boundary emitted immediately after the dispatched workload
+/// returns and before Phase 6 can block on scheduler or artifact cleanup.
+///
+/// Ordinary scenarios publish their own `ScenarioEnd` (with real elapsed and
+/// iteration telemetry) from the scenario driver, so init only pauses their
+/// workload clock here. A verifier probe has no scenario driver: its
+/// `WorkloadDispatched` event advanced the host ledger to Body, and init must
+/// close that Body explicitly. Leaving it paused in Body makes both progress
+/// watchdog tiers structurally infinite and can turn any later teardown
+/// transport stall into an immortal cell under a verifier storm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostWorkloadBoundary {
+    ScenarioPause,
+    ScenarioEndThenPause,
+}
+
+pub(crate) const fn post_workload_boundary(verifier_workload: bool) -> PostWorkloadBoundary {
+    if verifier_workload {
+        PostWorkloadBoundary::ScenarioEndThenPause
+    } else {
+        PostWorkloadBoundary::ScenarioPause
+    }
+}
+
 /// AP-bring-up-gap check with a host-controlled fault-injection hook.
 ///
 /// The production verdict is [`all_possible_cpus_online`] — a pure
@@ -152,6 +176,44 @@ fn maybe_inject_teardown_wedge_fault() {
         }
         _ => unreachable!("mode validated before teardown barrier"),
     }
+}
+
+/// One absolute budget shared by probe Phase A and the host's exact
+/// probe-counter decoder readiness edge.
+///
+/// The guest publishes a finite-wait boundary before either prerequisite.
+/// Sharing the deadline prevents the two sequential waits from silently
+/// becoming 2×75 seconds.
+const PROBE_DUMP_READINESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(75);
+
+fn fail_probe_dump_prerequisite(
+    reason: &str,
+    readiness_generation: Option<u64>,
+    probe_phase_a: Option<&crate::test_support::ProbePhaseAState>,
+) -> ! {
+    if let Some(generation) = readiness_generation
+        && !crate::vmm::guest_comms::finish_readiness_wait(
+            crate::vmm::wire::ReadinessWaitKind::ProbeDump,
+            generation,
+        )
+    {
+        tracing::error!(
+            generation,
+            "ktstr-init: failed to publish probe-dump readiness Finished boundary"
+        );
+    }
+    tracing::error!("ktstr-init: {reason}");
+    crate::vmm::guest_comms::send_lifecycle(
+        crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+        reason,
+    );
+    crate::vmm::guest_comms::send_exit(1);
+    let drain = probe_phase_a.map(|pa| ProbeDrain {
+        stop: pa.pipeline.stop.clone(),
+        output_done: pa.pipeline.output_done.clone(),
+    });
+    drain_probe_pipeline(drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
+    force_reboot();
 }
 
 /// Full guest init lifecycle. Called from the ctor when PID 1 is
@@ -285,7 +347,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let t_subscriber = t0.elapsed();
 
     // Verify initramfs extraction completed. The sentinel file is the
-    // last entry written by build_initramfs_base — its absence means
+    // last entry written by the base builder — its absence means
     // the kernel ran out of memory during cpio extraction. The memory
     // formula should prevent this; hitting it indicates an estimation bug.
     if !Path::new("/.ktstr_init_ok").exists() {
@@ -684,14 +746,119 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // calling it while the probe thread is live is UB on Linux.
     crate::test_support::propagate_rust_env_from_cmdline();
 
+    let probe_dump_ready_gate =
+        crate::vmm::rust_init::cmdline_val("KTSTR_AWAIT_PROBE_DUMP_READY").as_deref() == Some("1");
+    let probe_phase_a_deadline = std::time::Instant::now() + PROBE_DUMP_READINESS_BUDGET;
+    // Transfer ordinary-watchdog progress ownership before Phase A can block.
+    // The same generation remains active through the exact host decoder wait.
+    let probe_dump_readiness_generation = if probe_dump_ready_gate {
+        match crate::vmm::guest_comms::begin_readiness_wait(
+            crate::vmm::wire::ReadinessWaitKind::ProbeDump,
+        ) {
+            Some(generation) => Some(generation),
+            None => fail_probe_dump_prerequisite(
+                "probe dump readiness Started boundary was not delivered",
+                None,
+                None,
+            ),
+        }
+    } else {
+        None
+    };
+
     // Phase 2b: Probe Phase A (before scheduler starts).
-    // Attaches kprobes + trigger + kernel fexit so the one-shot
-    // sched_ext_exit tracepoint is captured even if the scheduler
+    // Attaches kprobes + the kernel-selected exit trigger so an
+    // accepted scheduler error is captured even if the scheduler
     // crashes immediately on startup.
     let _s_phase2b = tracing::debug_span!("phase2b_probe_phase_a").entered();
-    let probe_phase_a = crate::test_support::start_probe_phase_a(&args);
+    let probe_phase_a =
+        match crate::test_support::start_probe_phase_a(&args, probe_phase_a_deadline) {
+            Ok(state) => state,
+            Err(error) => {
+                fail_probe_dump_prerequisite(&error, probe_dump_readiness_generation, None)
+            }
+        };
     let probes_active = probe_phase_a.is_some();
     drop(_s_phase2b);
+
+    if probe_dump_ready_gate && probe_phase_a.is_none() {
+        fail_probe_dump_prerequisite(
+            "probe dump readiness requires a Phase-A probe stack",
+            probe_dump_readiness_generation,
+            None,
+        );
+    }
+
+    // Bring up the host→guest control reader before scheduler spawn. The
+    // attach-attempt watchdog returns its generation-tagged cancellation over
+    // hvc0, so starting this reader after attach would leave the boot attempt
+    // unable to receive the same service-budget decision used by lifecycle
+    // Ops.
+    let _s_phase2c = tracing::debug_span!("phase2c_control_readers").entered();
+    let (trace_stop, trace_handle) = start_trace_pipe();
+    let hvc0_probe_drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
+        stop: pa.pipeline.stop.clone(),
+        output_done: pa.pipeline.output_done.clone(),
+    });
+    let vc_poll_stop = match start_hvc0_poll(trace_stop.clone(), hvc0_probe_drain) {
+        Ok(stop) => stop,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "ktstr-init: host control reader could not start"
+            );
+            if probe_dump_ready_gate {
+                fail_probe_dump_prerequisite(
+                    "host control reader could not start for probe dump readiness",
+                    probe_dump_readiness_generation,
+                    probe_phase_a.as_ref(),
+                );
+            }
+            crate::vmm::guest_comms::send_exit(1);
+            force_reboot();
+        }
+    };
+    drop(_s_phase2c);
+
+    // An explicitly opted-in diagnostic test may arm a
+    // scheduler-relative failure timer (for example
+    // `--stall-after=1`) and then require the resulting dump to carry
+    // the probe's per-CPU counters. Accessor adoption alone is too
+    // weak, and a wait inside the test body is too late: both happen
+    // after the scheduler process has started its timer. Hold Phase 3
+    // here until the host has run the exact dump decoder successfully
+    // over `probe_bp.bss` and its full `ktstr_pcpu_counters` slab.
+    //
+    // The host edge is independent of scheduler launch: Probe Phase A
+    // above has already loaded the probe object, and the freeze
+    // coordinator builds its accessor from guest kernel state. The
+    // hvc0 reader is also already live, and its latch is sticky, so an
+    // edge published before this point returns immediately.
+    if probe_dump_ready_gate {
+        tracing::debug!("waiting for full probe-dump readiness before scheduler launch");
+        let ready =
+            crate::vmm::rust_init::probe_dump_ready_latch().wait_until(probe_phase_a_deadline);
+        if !ready {
+            fail_probe_dump_prerequisite(
+                "probe dump readiness timed out before scheduler launch",
+                probe_dump_readiness_generation,
+                probe_phase_a.as_ref(),
+            );
+        }
+        let generation = probe_dump_readiness_generation
+            .expect("the exact probe dump gate opened a readiness generation");
+        if !crate::vmm::guest_comms::finish_readiness_wait(
+            crate::vmm::wire::ReadinessWaitKind::ProbeDump,
+            generation,
+        ) {
+            fail_probe_dump_prerequisite(
+                "probe dump readiness Finished boundary was not delivered",
+                Some(generation),
+                probe_phase_a.as_ref(),
+            );
+        }
+        tracing::debug!("full probe-dump decoder ready; starting scheduler");
+    }
 
     // Phase 3: Cgroup parent + Scheduler.
     // Create the cgroup parent directory before starting the scheduler
@@ -722,61 +889,57 @@ pub(crate) fn ktstr_guest_init() -> ! {
         stop: pa.pipeline.stop.clone(),
         output_done: pa.pipeline.output_done.clone(),
     });
-    let (mut sched_child, sched_log_path) = start_scheduler(probe_drain);
-    drop(_s_phase3);
+    let declared_boot_scheduler = crate::test_support::extract_test_fn_arg(&args)
+        .and_then(crate::test_support::find_test)
+        .map(|entry| &entry.scheduler.binary)
+        .filter(|scheduler| scheduler.has_bpf_scheduler());
+    install_boot_scheduler(declared_boot_scheduler);
 
-    // Phase 4: hvc0 polling + trace pipe (background threads).
-    let _s_phase4 = tracing::debug_span!("phase4_vc_poll").entered();
-    let (trace_stop, trace_handle) = start_trace_pipe();
-    // Thread the probe pipeline's `stop` + `output_done` into the hvc0 poll
-    // loop so its graceful-shutdown (watchdog soft-shutdown) handler can drain
-    // captured crash-arg probe output (emitted over the virtio bulk port via
-    // the stdout forwarder) before the guest reboots — the only drain site for
-    // a repro scenario that hangs inside the test function.
-    let hvc0_probe_drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
-        stop: pa.pipeline.stop.clone(),
-        output_done: pa.pipeline.output_done.clone(),
-    });
-    let vc_poll_stop = start_hvc0_poll(trace_stop.clone(), hvc0_probe_drain);
-    drop(_s_phase4);
-
-    // Phase 4b: Scheduler death monitor.
-    // Spawn a thread that blocks on the scheduler pidfd plus a stop eventfd.
-    // If the scheduler exits during the test, pidfd readiness is authoritative
-    // (including while the child is a zombie) and the thread writes
-    // MSG_TYPE_SCHED_EXIT via the bulk port so the host detects the death
-    // without waiting for the watchdog.
-    //
-    // When probes are active, `suppress_sched_log` suppresses only the
-    // bulk-port scheduler-log dump (the monitor waits on the probe's
-    // output_done instead, keeping the VM alive for the probe to emit its
-    // payload); the probe pipeline handles crash detection via
-    // tp_btf/sched_ext_exit. The SCHED_EXIT signal is gated independently by
-    // the stop flag (host-initiated kill), not by this flag.
+    // Monitor construction reads this immutable boot context, so publish it
+    // before spawning the scheduler whose pending monitor will consume it.
     let suppress_sched_log = Arc::new(AtomicBool::new(probes_active));
     let probe_output_done = probe_phase_a
         .as_ref()
         .map(|pa| pa.pipeline.output_done.clone());
-    // Install the boot-time scheduler-exit monitor handle into
-    // the module-level slot via `install_initial_sched_exit_monitor`
-    // so the scheduler-lifecycle Op dispatcher in
-    // `src/scenario/ops/mod.rs` can swap the monitor across
-    // Op::AttachScheduler / DetachScheduler / RestartScheduler /
-    // ReplaceScheduler. The earlier local-binding pattern held
-    // the SchedExitStop in this stack frame, which made it
-    // unreachable from the Op dispatch path. The shutdown cascade
-    // below calls `stop_sched_exit_monitor` instead of the
-    // pre-refactor local `stop_and_join`. Cloning the Arcs is
-    // cheap and the boot start_sched_exit_monitor call retains
-    // its original semantics — the only difference is the
-    // ownership chain after spawn.
-    let boot_stop = start_sched_exit_monitor(
-        sched_child.as_ref().map(|c| c.id()),
-        sched_log_path.as_deref(),
-        suppress_sched_log.clone(),
-        probe_output_done.clone(),
-    );
-    install_initial_sched_exit_monitor(boot_stop, suppress_sched_log, probe_output_done);
+    install_sched_exit_monitor_context(suppress_sched_log, probe_output_done);
+
+    let mut spawned_scheduler = start_scheduler(probe_drain);
+
+    if let Some(spawned) = spawned_scheduler.as_mut() {
+        let mut owner = lock_scheduler_process_owner();
+        if let Err(error) =
+            commit_spawned_scheduler(&mut owner, spawned, declared_boot_scheduler, || {
+                crate::vmm::guest_comms::send_lifecycle_required(
+                    crate::vmm::wire::LifecyclePhase::SchedulerAttached,
+                    "",
+                )
+            })
+        {
+            tracing::error!(
+                error = %error,
+                "ktstr-init: scheduler owner handoff failed"
+            );
+            // A pending monitor deliberately cannot publish or drain a process
+            // which never committed. commit_spawned_scheduler has already
+            // exact-signaled it and performed the bounded reap attempt, so
+            // preserve its verifier/startup diagnostics before reboot.
+            let _ = dump_sched_output_before_terminal(&spawned.log_path);
+            crate::vmm::guest_comms::send_lifecycle(
+                crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+                "scheduler owner handoff failed",
+            );
+            crate::vmm::guest_comms::send_exit(1);
+            let drain = probe_phase_a.as_ref().map(|pa| ProbeDrain {
+                stop: pa.pipeline.stop.clone(),
+                output_done: pa.pipeline.output_done.clone(),
+            });
+            drain_probe_pipeline(drain.as_ref(), crate::test_support::PROBE_DRAIN_GRACE);
+            force_reboot();
+        }
+        drop(owner);
+    }
+    drop(spawned_scheduler);
+    drop(_s_phase3);
 
     // Phase 5: Dispatch.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
@@ -857,10 +1020,11 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // disable the scheduler while the tracer is still loading and lose the
     // auto-repro artifact. The readiness wait is event-driven on wprof's
     // existing stderr + pidfd and adds no guest thread or polling wake.
+    let verifier_workload = crate::test_support::is_verifier_workload(&args);
+    let workload_started_at = std::time::Instant::now();
     crate::vmm::guest_comms::send_scenario_start();
 
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-    let verifier_workload = crate::test_support::is_verifier_workload(&args);
     let mut code = if !dispatch_ready {
         eprintln!(
             "ktstr-init: workload not dispatched because required instrumentation readiness failed"
@@ -873,7 +1037,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // the same edge. Exit 0 only for that contract so the host can
         // reject an attach-then-crash run even if historical lifecycle
         // frames survive in the drain.
-        if super::verifier_workload::run_and_confirm_dispatch(sched_child.as_mut()) {
+        if super::verifier_workload::run_and_confirm_dispatch() {
             0
         } else {
             1
@@ -888,9 +1052,23 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // SIG_DFL through that cleanup; restoring SIG_IGN here would auto-reap
     // the child and collapse "we killed it" and "it died on its own" into
     // the same ECHILD result.
-    if !verifier_workload {
+    if post_workload_boundary(verifier_workload) == PostWorkloadBoundary::ScenarioEndThenPause {
+        let elapsed_ms =
+            u64::try_from(workload_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Verifier dispatch has no scenario driver to publish the terminal
+        // boundary. Close Body before any Phase-6 operation can wait on
+        // scheduler exit, stream drain, or virtio backpressure; the host's
+        // Teardown budgets then own every remaining wait.
+        crate::vmm::guest_comms::send_scenario_end(elapsed_ms, 0);
+    } else {
+        // Verifier cleanup needs the scheduler's real wait status to prove
+        // that the process survived until our intentional SIGKILL. Ordinary
+        // scenario cleanup can restore the auto-reap behavior now.
         unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
     }
+    // Stop periodic workload-time capture during cleanup on both paths. For a
+    // verifier this follows ScenarioEnd and cannot regress the forward-only
+    // Teardown lifecycle stage.
     crate::vmm::guest_comms::send_scenario_pause();
 
     #[cfg(feature = "wprof")]
@@ -914,42 +1092,20 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 6: Scheduler cleanup.
     let _s_phase6 = tracing::debug_span!("phase6_cleanup").entered();
 
-    // Stop the sched-exit monitor BEFORE killing the scheduler.
-    // Without this ordering, child.kill() makes the scheduler pidfd readable
-    // (even while SIGCHLD=SIG_DFL leaves a zombie and `/proc/{pid}` still
-    // exists). The monitor can then emit MSG_TYPE_SCHED_EXIT on the bulk
-    // port, the host promotes kill=true, and the BSP exits with ExternalKill
-    // before the guest reaches send_exit — producing exit_code=-1 on an
-    // otherwise clean run.
-    //
-    // `stop_and_join` sets stop=true (Release), writes the wake
-    // eventfd to drop poll wake latency from 250 ms to microseconds, then
-    // joins the monitor thread. After `poll(2)` returns, the monitor checks
-    // the stop flag before sending a frame. A scheduler-exit edge that
-    // preceded or raced the stop is preserved in the returned bool (and a
-    // frame may already have been sent), so verifier cleanup fails closed.
-    // After the join, the subsequent child.kill() cannot generate a new
-    // MSG_TYPE_SCHED_EXIT frame.
-    // Stop the live sched_exit_monitor (whichever scheduler PID it
-    // was last installed for — boot or post-Op::Replace) before
-    // tearing down the scheduler child below. The slot may be
-    // empty if the test ran Op::DetachScheduler without a
-    // re-attach; the helper handles that case as a no-op.
-    let scheduler_exit_observed = stop_sched_exit_monitor();
+    // Take the one coherent latest-generation owner. After Replace/Restart
+    // this is the replacement child, its original pidfd, matching log/spec,
+    // and its monitor—not the stale boot process.
+    let mut scheduler_process = take_current_scheduler_process();
+    let scheduler_exit_observed = scheduler_process
+        .as_mut()
+        .is_some_and(CurrentSchedulerProcess::stop_monitor);
     let scheduler_already_dead = if verifier_workload && code == 0 {
-        match sched_child.as_mut() {
-            Some(child) => match child.try_wait() {
-                Ok(Some(status)) => {
+        match scheduler_process.as_ref() {
+            Some(process) => match process.is_alive() {
+                Ok(alive) => !alive,
+                Err(error) => {
                     tracing::warn!(
-                        ?status,
-                        "verifier workload: scheduler exited before cleanup boundary"
-                    );
-                    true
-                }
-                Ok(None) => false,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
+                        error = %error,
                         "verifier workload: could not confirm scheduler liveness at cleanup boundary"
                     );
                     true
@@ -976,7 +1132,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
         code = 1;
     }
 
-    if let Some(ref mut child) = sched_child {
+    if let Some(process) = scheduler_process.as_mut() {
         // On a crash the scheduler is shutting down and flushing its
         // userspace diagnostics to its stderr log. Give it a brief
         // BOUNDED grace to finish writing and exit on its own BEFORE the
@@ -995,23 +1151,24 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // holds); the grace returns early the moment the scheduler exits,
         // and is bounded (`SCHED_KILL_GRACE`) so a userspace hang can't
         // wedge teardown.
-        let sched_crashed =
-            crate::vmm::rust_init::sched_pid().is_some() && crate::scenario::ops::scx_down();
+        let sched_crashed = crate::scenario::ops::scx_down();
         if verifier_workload && code == 0 && sched_crashed {
             tracing::warn!(
                 "verifier workload: sched_ext disabled after the cleanup-boundary check"
             );
             code = 1;
         }
-        let grace_status = if scx_dump_started_latch().is_set() || sched_crashed {
-            reap_child_bounded_status(child, SCHED_KILL_GRACE)
+        let grace_reap = if scx_dump_started_latch().is_set() || sched_crashed {
+            Some(process.reap_bounded_status(SCHED_KILL_GRACE))
         } else {
             None
         };
-        let exited_in_grace = grace_status.is_some();
+        let exited_in_grace = grace_reap
+            .as_ref()
+            .is_some_and(SchedulerReapOutcome::is_terminal);
         if verifier_workload && code == 0 && exited_in_grace {
             tracing::warn!(
-                status = ?grace_status,
+                outcome = ?grace_reap,
                 "verifier workload: scheduler exited during pre-cleanup crash grace"
             );
             code = 1;
@@ -1033,12 +1190,13 @@ pub(crate) fn ktstr_guest_init() -> ! {
                 );
                 code = 1;
             }
-            let kill_sent = match child.kill() {
-                Ok(()) => true,
-                Err(e) => {
+            let kill_sent = match process.send_signal(libc::SIGKILL) {
+                Ok(PidfdSignalOutcome::Delivered) => true,
+                Ok(PidfdSignalOutcome::AlreadyExited) => false,
+                Err(error) => {
                     if verifier_workload && code == 0 {
                         tracing::warn!(
-                            error = %e,
+                            error = %error,
                             "verifier workload: scheduler was not live at cleanup kill boundary"
                         );
                     }
@@ -1051,13 +1209,22 @@ pub(crate) fn ktstr_guest_init() -> ! {
             // The bound caps the rare case where the process can't take its
             // pending SIGKILL promptly; the VM reboot below reaps any
             // straggler, so cap the wait rather than risk blocking teardown.
-            let terminal_status = reap_child_bounded_status(child, SCHED_REAP_TIMEOUT);
-            if terminal_status.is_none() {
-                tracing::warn!(
-                    ?SCHED_REAP_TIMEOUT,
-                    "scheduler did not exit within the reap bound after SIGKILL \
-                     (still uninterruptible — unexpected); leaving it for VM reboot to reap"
-                );
+            let terminal_reap = process.reap_bounded_status(SCHED_REAP_TIMEOUT);
+            match &terminal_reap {
+                SchedulerReapOutcome::TimedOut => {
+                    tracing::warn!(
+                        ?SCHED_REAP_TIMEOUT,
+                        "scheduler did not exit within the reap bound after SIGKILL \
+                         (still uninterruptible — unexpected); leaving it for VM reboot to reap"
+                    );
+                }
+                SchedulerReapOutcome::ObserverError(error) => {
+                    tracing::warn!(
+                        %error,
+                        "scheduler reap lost exact pidfd observation after SIGKILL"
+                    );
+                }
+                SchedulerReapOutcome::Status(_) | SchedulerReapOutcome::TerminalWithoutStatus => {}
             }
             // A successful kill(2) call is not enough: Linux accepts signals
             // for zombies. Require the wait status produced by our SIGKILL,
@@ -1065,19 +1232,17 @@ pub(crate) fn ktstr_guest_init() -> ! {
             // from one that exited just before cleanup and remained a zombie.
             if verifier_workload
                 && code == 0
-                && !verifier_cleanup_kill_confirmed(kill_sent, terminal_status.as_ref())
+                && !verifier_cleanup_kill_confirmed(kill_sent, terminal_reap.status())
             {
                 tracing::warn!(
                     kill_sent,
-                    status = ?terminal_status,
+                    outcome = ?terminal_reap,
                     "verifier workload: scheduler did not survive until intentional cleanup kill"
                 );
                 code = 1;
             }
         }
-        if let Some(ref log_path) = sched_log_path {
-            dump_sched_output(log_path);
-        }
+        let _ = dump_sched_output_before_terminal(&process.log_path);
     }
     if verifier_workload {
         unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
@@ -1087,8 +1252,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
 
     // Phase 6b: probe finalisation. Now that the scheduler is
     // killed and `/sched_disable` has run, the kernel's
-    // `scx_disable_irq_workfn` path runs `scx_claim_exit` which
-    // fires `trace_sched_ext_exit`. The probe's tp_btf listener is
+    // sched_ext disable path has crossed the kernel-selected
+    // error hook. The probe's listener is
     // STILL attached at this point because
     // [`crate::test_support::probe::publish_result_and_collect`]
     // stashed the probe stop+handle into a deferred slot rather
@@ -1128,9 +1293,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
     }
 
     // Stop remaining background threads.
-    if let Some(ref stop) = vc_poll_stop {
-        stop.store(true, Ordering::Release);
-    }
+    vc_poll_stop.store(true, Ordering::Release);
     stats_relay_stop.signal_stop();
 
     // Flush COM1 trace data before reboot. The reader thread runs on

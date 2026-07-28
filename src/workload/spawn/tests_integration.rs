@@ -246,6 +246,48 @@ fn spawn_start_collect_integration() {
 /// partitions the run and survives the host fold into per-cgroup buckets.
 #[test]
 fn backdrop_worker_phase_slices_partition_and_fold() {
+    fn wait_for_publication_wave(
+        handle: &WorkloadHandle,
+        previous: &[u64],
+        context: &str,
+    ) -> Vec<u64> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let current = handle.snapshot_iterations();
+            if current
+                .iter()
+                .zip(previous)
+                .all(|(current, previous)| current > previous)
+            {
+                return current;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{context}: workers did not publish another iteration wave; \
+                 previous={previous:?}, current={current:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn advance_and_observe_epoch(handle: &WorkloadHandle, epoch: u32, published: &mut Vec<u64>) {
+        handle.set_phase_epoch(epoch);
+
+        // `iter_slot` is published immediately before the phase-epoch load in
+        // the worker loop. Three subsequent publication waves close both
+        // boundary races: a first wave may have been stored just before the
+        // parent broadcast, and the first post-broadcast store may be visible
+        // just before that worker loads the epoch. By the following wave the
+        // intervening epoch load has necessarily completed on every worker.
+        for wave in 1..=3 {
+            *published = wait_for_publication_wave(
+                handle,
+                published,
+                &format!("epoch {epoch} acknowledgement wave {wave}"),
+            );
+        }
+    }
+
     let config = WorkloadConfig {
         num_workers: 2,
         affinity: AffinityIntent::Inherit,
@@ -255,18 +297,15 @@ fn backdrop_worker_phase_slices_partition_and_fold() {
     };
     let mut h = WorkloadHandle::spawn(&config).unwrap();
     h.start();
-    // BASELINE (epoch 0) work, then two real phases, then the inter-step
-    // gap sentinel. CPU-bound SpinWait polls the epoch every ~1024 spins,
-    // so 150ms per window is ample for both workers to observe each
-    // transition and accumulate work in every phase.
-    let dwell = Duration::from_millis(150);
-    std::thread::sleep(dwell);
-    h.set_phase_epoch(1);
-    std::thread::sleep(dwell);
-    h.set_phase_epoch(2);
-    std::thread::sleep(dwell);
-    h.set_phase_epoch(u32::MAX);
-    std::thread::sleep(Duration::from_millis(40));
+    // Drive boundaries by observed worker service, not fixed wall dwell.
+    // This preserves the production broadcast semantics while making the
+    // test deterministic when a colocated nextest storm deschedules one
+    // worker for longer than an otherwise-generous sleep.
+    let mut published = h.snapshot_iterations();
+    published = wait_for_publication_wave(&h, &published, "baseline progress");
+    advance_and_observe_epoch(&h, 1, &mut published);
+    advance_and_observe_epoch(&h, 2, &mut published);
+    advance_and_observe_epoch(&h, u32::MAX, &mut published);
     let reports = h.stop_and_collect();
     assert_eq!(reports.len(), 2);
 
@@ -347,6 +386,57 @@ fn backdrop_worker_phase_slices_partition_and_fold() {
             b.step_index,
         );
     }
+}
+
+#[test]
+fn backdrop_timer_worker_finalizes_phase_published_before_start() {
+    let config = WorkloadConfig {
+        num_workers: 1,
+        affinity: AffinityIntent::Inherit,
+        work_type: WorkType::TimerLatency { interval_us: 1_000 },
+        sched_policy: SchedPolicy::Normal,
+        signal_first_iteration: true,
+        ..Default::default()
+    };
+    let mut h = WorkloadHandle::spawn(&config).unwrap();
+
+    // Reproduce a saturated guest whose worker does not run until after
+    // StepStart. It initializes directly in epoch 1 and therefore observes no
+    // transition before shutdown. The final drain must still publish the
+    // measured epoch instead of retaining only whole-run timer samples.
+    h.set_phase_epoch(1);
+    h.start();
+    assert!(
+        h.wait_first_iteration_all(Instant::now() + Duration::from_secs(10), 1),
+        "the timer worker must reach its first counted iteration"
+    );
+    let reports = h.stop_and_collect();
+    assert_eq!(reports.len(), 1);
+
+    let report = &reports[0];
+    assert!(
+        report.timer_sample_total > 0,
+        "fixture must produce whole-run timer samples"
+    );
+    assert_eq!(
+        report.phase_slices.len(),
+        1,
+        "an already-active measured epoch must be finalized without a prior transition"
+    );
+    let slice = &report.phase_slices[0];
+    assert_eq!(slice.phase_epoch, 1);
+    assert_eq!(
+        slice.iterations, report.iterations,
+        "one measured epoch must retain every whole-run iteration"
+    );
+    assert_eq!(
+        slice.timer_sample_total, report.timer_sample_total,
+        "one measured epoch must retain every whole-run timer sample"
+    );
+    assert!(
+        slice.timer_sample_total > 0,
+        "the measured phase must retain TimerLatency samples"
+    );
 }
 
 #[test]

@@ -148,23 +148,11 @@ fn drain_wprof_stderr(
 
 #[cfg(feature = "wprof")]
 fn wait_wprof_evented(
-    child: &mut std::process::Child,
+    pidfd: &OwnedFd,
     child_stderr: &mut std::process::ChildStderr,
     startup: &mut WprofStartupSignal,
     timeout: std::time::Duration,
 ) -> WprofWait {
-    let pid = child.id() as libc::pid_t;
-    // SAFETY: pidfd_open(2) on this thread's live child, flags 0. The returned
-    // descriptor is wrapped in OwnedFd immediately below.
-    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) as libc::c_int };
-    if raw_pidfd < 0 {
-        startup.finish_unready();
-        return WprofWait::Failed;
-    }
-    // SAFETY: raw_pidfd is a newly-created owned descriptor and is consumed
-    // exactly once by this OwnedFd.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
-
     if let Err(e) = set_nonblocking(child_stderr.as_raw_fd()) {
         eprintln!("ktstr: failed to make wprof stderr evented: {e}");
         startup.finish_unready();
@@ -339,23 +327,22 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<WprofCapture> {
                 // and reboots within the host's grace. On the cap the trace
                 // is dropped (loudly) and teardown proceeds — a clean
                 // failure, never a hang. Mirrors `reap_child_bounded`.
-                let mut child = match std::process::Command::new("/bin/wprof")
+                let mut command = std::process::Command::new("/bin/wprof");
+                command
                     .args(&cmd_args)
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                {
-                    Ok(c) => c,
+                    .stderr(std::process::Stdio::piped());
+                let (mut child, pidfd) = match spawn_with_pidfd(&mut command) {
+                    Ok(process) => process,
                     Err(e) => {
                         startup.finish_unready();
-                        tracing::warn!(%e, "spawn /bin/wprof failed");
+                        tracing::warn!(%e, "spawn /bin/wprof with exact pidfd failed");
                         return None;
                     }
                 };
                 let Some(mut child_stderr) = child.stderr.take() else {
                     startup.finish_unready();
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = terminate_scheduler_via_pidfd(&mut child, &pidfd);
                     return None;
                 };
                 // Determine wprof's exit disposition, then ship the trace on
@@ -371,9 +358,8 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<WprofCapture> {
                 // secondary wait, then SIGKILL, so a nearly-done emit is not
                 // truncated. This is the reliability backstop; it perturbs no
                 // scheduling priority.
-                let pid = child.id() as libc::pid_t;
                 match wait_wprof_evented(
-                    &mut child,
+                    &pidfd,
                     &mut child_stderr,
                     &mut startup,
                     deadline,
@@ -393,14 +379,9 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<WprofCapture> {
                             "ktstr: wprof exceeded {deadline:?}; SIGTERM to let its \
                              emit flush, then reap"
                         );
-                        // SAFETY: `pid` is this thread's own child; SIGTERM to a
-                        // live pid is well-defined and ESRCH on an already-reaped
-                        // pid is harmless (return value dropped).
-                        unsafe {
-                            libc::kill(pid, libc::SIGTERM);
-                        }
+                        let _ = pidfd_send_signal(&pidfd, libc::SIGTERM);
                         match wait_wprof_evented(
-                            &mut child,
+                            &pidfd,
                             &mut child_stderr,
                             &mut startup,
                             std::time::Duration::from_secs(8),
@@ -409,16 +390,16 @@ pub(crate) fn spawn_wprof_if_configured() -> Option<WprofCapture> {
                                 let _ = child.wait();
                             }
                             _ => {
-                                let _ = child.kill();
-                                let _ = child.wait();
+                                let _ = terminate_scheduler_via_pidfd(&mut child, &pidfd);
                             }
                         }
                     }
                     WprofWait::Failed => {
-                        if !matches!(child.try_wait(), Ok(Some(_))) {
-                            let _ = child.kill();
+                        if !matches!(pidfd_is_alive(&pidfd), Ok(false)) {
+                            let _ = terminate_scheduler_via_pidfd(&mut child, &pidfd);
+                        } else {
+                            let _ = child.wait();
                         }
-                        let _ = child.wait();
                     }
                 }
                 match std::fs::read("/tmp/wprof.pb") {

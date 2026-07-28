@@ -38,6 +38,7 @@ jobs:
   # overrides RUSTFLAGS for the linker (see below).
   lint:
     runs-on: [ktstr-x64]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
@@ -49,6 +50,7 @@ jobs:
 
   compile-fail:
     runs-on: [ktstr-x64]
+    timeout-minutes: 30
     # Match the self-hosted test jobs' linker (clang + mold) — the
     # default linker is untested on these runners, and compile-fail
     # links the full test harness. This overrides .cargo/config.toml's
@@ -66,7 +68,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.138
       - run: just compile-fail
       # ktstr-macros host unit tests — host-side + needs cargo-nextest
       # (installed above), so they ride the compile-fail job rather than
@@ -94,6 +96,7 @@ jobs:
   # — the verify script does NOT run tests, only the prod-side build).
   devdep-isolation:
     runs-on: [ktstr-x64]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.0
       - name: Provision Rust toolchain
@@ -106,6 +109,7 @@ jobs:
 
   docs-link-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: ./.github/actions/setup
@@ -116,12 +120,15 @@ jobs:
 
   test-x64:
     runs-on: [ktstr-x64]
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         kernel-version: ['6.14', '7.1']
         features: ['', 'wprof']
     env:
+      KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
+      KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-test-x64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v7.0.0
@@ -132,13 +139,39 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
-      - run: just kernel-build ${{ matrix.kernel-version }}
-      - run: just test ${{ matrix.kernel-version }} ${{ matrix.features }}
+          tool: cargo-nextest@0.9.138
+      - name: Run ktstr tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+          just test "${{ matrix.kernel-version }}" "${{ matrix.features }}" 2>&1 \
+            | tee "${KTSTR_BUILD_DIAGNOSTICS_DIR}/nextest-transcript.log"
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - if: ${{ !cancelled() }}
-        run: just stats
+        run: just stats ${{ matrix.features }}
+      - name: Upload cargo-ktstr build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: cargo-diagnostics-x64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
+          path: |
+            ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+            target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload ktstr failure dumps
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: failure-dumps-x64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.repro.probe-payload.partial.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.snapshot.*.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v7.0.0
@@ -149,6 +182,7 @@ jobs:
 
   test-arm64:
     runs-on: [ktstr-arm64]
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -156,6 +190,8 @@ jobs:
         features: ['', 'wprof']
     env:
       CARGO_BUILD_JOBS: "32"
+      KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
+      KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-test-arm64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v7.0.0
@@ -166,13 +202,39 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
-      - run: just kernel-build ${{ matrix.kernel-version }}
-      - run: just test ${{ matrix.kernel-version }} ${{ matrix.features }}
+          tool: cargo-nextest@0.9.138
+      - name: Run ktstr tests
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+          just test "${{ matrix.kernel-version }}" "${{ matrix.features }}" 2>&1 \
+            | tee "${KTSTR_BUILD_DIAGNOSTICS_DIR}/nextest-transcript.log"
       - if: ${{ !cancelled() }}
         run: just sccache-stats
       - if: ${{ !cancelled() }}
-        run: just stats
+        run: just stats ${{ matrix.features }}
+      - name: Upload cargo-ktstr build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: cargo-diagnostics-arm64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}
+          path: |
+            ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+            target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload ktstr failure dumps
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: failure-dumps-arm64-${{ matrix.kernel-version }}-${{ matrix.features || 'base' }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.repro.probe-payload.partial.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.snapshot.*.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v7.0.0
@@ -191,6 +253,7 @@ jobs:
   # arches' metadata regardless of the host arch (metadata-only), so a
   # single runner already spans x86_64 + aarch64.
   distro-resolve:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -205,7 +268,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.138
       - run: just test-distro-resolve
 
   # Full acquire+boot e2e (Layer 2): `kernel build --kernel <spec>` then
@@ -220,6 +283,7 @@ jobs:
   # zero network. SteamOS is x86_64-only (Valve ships no other arch).
   distro-boot-x64:
     runs-on: [ktstr-x64]
+    timeout-minutes: 90
     env:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
@@ -231,7 +295,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.138
       # Build the kernel the hermetic local-package boot repacks.
       - run: just kernel-build 6.14
       - run: just distro-boot fedora 'fc[0-9]'
@@ -243,6 +307,7 @@ jobs:
 
   distro-boot-arm64:
     runs-on: [ktstr-arm64]
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: "32"
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
@@ -255,7 +320,7 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.138
       - run: just kernel-build 6.14
       - run: just distro-boot fedora 'fc[0-9]'
       - run: just distro-boot ubuntu generic
@@ -264,7 +329,10 @@ jobs:
 
   coverage-x64:
     runs-on: [ktstr-x64]
+    timeout-minutes: 90
     env:
+      KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
+      KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-coverage-x64
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v7.0.0
@@ -275,11 +343,38 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-llvm-cov,cargo-nextest
-      - run: just kernel-build 7.1
-      - run: just coverage 7.1 wprof
+          tool: cargo-llvm-cov,cargo-nextest@0.9.138
+      - name: Run ktstr coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+          just coverage 7.1 wprof 2>&1 \
+            | tee "${KTSTR_BUILD_DIAGNOSTICS_DIR}/nextest-transcript.log"
       - if: ${{ !cancelled() }}
         run: just sccache-stats
+      - name: Upload cargo-ktstr build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: cargo-diagnostics-coverage-x64
+          path: |
+            ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+            target/nextest/ci/junit.xml
+            target/llvm-cov-target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload ktstr failure dumps
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: failure-dumps-coverage-x64-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.repro.probe-payload.partial.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.snapshot.*.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7.0.0
         with:
@@ -289,8 +384,11 @@ jobs:
 
   coverage-arm64:
     runs-on: [ktstr-arm64]
+    timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: "32"
+      KTSTR_BUILD_DIAGNOSTICS_DIR: ${{ github.workspace }}/target/ktstr-build-diagnostics
+      KTSTR_SIDECAR_DIR: ${{ github.workspace }}/target/ktstr-ci-artifacts/${{ github.run_id }}-${{ github.run_attempt }}-coverage-arm64
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v7.0.0
@@ -301,11 +399,38 @@ jobs:
       - run: cargo install just
       - uses: taiki-e/install-action@v2.83.3
         with:
-          tool: cargo-llvm-cov,cargo-nextest
-      - run: just kernel-build 7.1
-      - run: just coverage 7.1 wprof
+          tool: cargo-llvm-cov,cargo-nextest@0.9.138
+      - name: Run ktstr coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+          just coverage 7.1 wprof 2>&1 \
+            | tee "${KTSTR_BUILD_DIAGNOSTICS_DIR}/nextest-transcript.log"
       - if: ${{ !cancelled() }}
         run: just sccache-stats
+      - name: Upload cargo-ktstr build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: cargo-diagnostics-coverage-arm64
+          path: |
+            ${{ env.KTSTR_BUILD_DIAGNOSTICS_DIR }}
+            target/nextest/ci/junit.xml
+            target/llvm-cov-target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload ktstr failure dumps
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: failure-dumps-coverage-arm64-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.failure-dump.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.repro.probe-payload.partial.json
+            ${{ env.KTSTR_SIDECAR_DIR }}/*.snapshot.*.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7.0.0
         with:

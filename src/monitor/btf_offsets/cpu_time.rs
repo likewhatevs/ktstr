@@ -153,7 +153,7 @@ const _: () = {
 /// `collect_per_cpu_time` leaves
 /// `super::super::dump::PerCpuTimeStats::iowait_sleeptime_ns` as `None`
 /// (no fallback source).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct CpuTimeOffsets {
     /// Offset of `cpustat[]` (the `u64[NR_STATS]` array) within
     /// `struct kernel_cpustat`. Resolved via BTF rather than

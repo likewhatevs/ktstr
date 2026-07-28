@@ -82,7 +82,9 @@
 //! `tests::or_u32_rmw_anchors_inside_dispatch_one_write` doc-grep
 //! regression test together enforce the pattern at the source level.
 
-use crate::monitor::btf_offsets::{find_struct, nested_member_byte_offset};
+use crate::monitor::btf_offsets::{
+    find_struct, nested_member_byte_offset, nested_member_offset_and_width,
+};
 use crate::monitor::guest::GuestKernel;
 use crate::monitor::idr::translate_any_kva;
 use crate::vmm::wire::{
@@ -791,6 +793,12 @@ fn dispatch_per_cpu_field_read(
 /// after `pid_max` ≈ 2^22 entries).
 const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 
+#[derive(Clone, Copy)]
+struct IntegerField {
+    offset: usize,
+    width: usize,
+}
+
 /// BTF-derived byte offsets needed by the 8-layer task validation in
 /// [`validate_task_for_field_op`] plus the per-thread walker in
 /// [`find_task_by_pid`]. Resolved once per `TaskField` dispatch via
@@ -800,18 +808,21 @@ const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 /// linkage).
 ///
 /// Field semantics:
-/// - `pid`: `task_struct.pid` (`pid_t`, kernel-side `int` = 4 bytes,
+/// - `pid`: `task_struct.pid` (`pid_t`, kernel-side integer,
 ///   `include/linux/sched.h`). L1 pid-equality check.
-/// - `start_time`: `task_struct.start_time` (`u64`, ns since boot)
+/// - `start_time`: `task_struct.start_time` (integer, ns since boot)
 ///   at `include/linux/sched.h:1134`. Set ONCE at fork by
 ///   `copy_process` via `ktime_get_ns()`. L2 anti-PID-reuse identity
 ///   check.
-/// - `state`: `task_struct.__state` (`unsigned int` = 4 bytes) at
+/// - `state`: `task_struct.__state` (integer) at
 ///   `include/linux/sched.h:828`. L3 `state & TASK_DEAD` bit-test.
-/// - `on_rq`: `task_struct.on_rq` (`int` = 4 bytes) at
+/// - `on_rq`: `task_struct.on_rq` (integer) at
 ///   `include/linux/sched.h:864`. NOT in `sched_entity` — directly
-///   on task_struct. Per `task_on_rq_queued` semantics the value is
-///   0 when the task is sleeping (the L4 invariant).
+///   on task_struct. Its width changed from `int` to `u8` in newer
+///   kernels, so the dispatcher retains the BTF-declared width instead
+///   of reading through adjacent byte fields. Per `task_on_rq_queued`
+///   semantics the value is 0 when the task is sleeping (the L4
+///   invariant).
 /// - `scx_dsq`: `task_struct.scx.dsq` (`struct scx_dispatch_q *` =
 ///   8 bytes) — nested through `task_struct.scx` + offset of `dsq`
 ///   in `sched_ext_entity` (`include/linux/sched/ext.h:188`). NULL
@@ -827,7 +838,7 @@ const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 ///   (`const struct sched_class *` = 8 bytes) at sched.h:878.
 ///   Pointer identity-compared against `ext_sched_class` KVA for
 ///   the L6 SCX-only check.
-/// - `start_boottime`: `task_struct.start_boottime` (`u64` = 8 bytes)
+/// - `start_boottime`: `task_struct.start_boottime` (integer)
 ///   at sched.h:1137 ("Boot based time in nsecs"). Set by `copy_process`
 ///   at fork via `ktime_get_boottime_ns()`. L8 anti-slab-recycle.
 /// - `tasks`: `task_struct.tasks` (`struct list_head` = 16 bytes,
@@ -843,14 +854,14 @@ const START_TIME_PROC_TICK_NS: u64 = 10_000_000;
 ///   sched.h:1101. Per-task linkage into `signal->thread_head`.
 ///   Used by the per-thread walker for `container_of` math.
 struct TaskValidationOffsets {
-    pid: usize,
-    start_time: usize,
-    state: usize,
-    on_rq: usize,
+    pid: IntegerField,
+    start_time: IntegerField,
+    state: IntegerField,
+    on_rq: IntegerField,
     scx_dsq: usize,
     scx_runnable_node: usize,
     sched_class: usize,
-    start_boottime: usize,
+    start_boottime: IntegerField,
     tasks: usize,
     signal: usize,
     signal_thread_head: usize,
@@ -868,19 +879,29 @@ impl TaskValidationOffsets {
             nested_member_byte_offset(btf, &task_struct_t, path)
                 .map_err(|e| format!("BTF: task_struct.{path} offset: {e:#}"))
         };
+        let task_integer = |path: &str| -> Result<IntegerField, String> {
+            let (offset, width) = nested_member_offset_and_width(btf, &task_struct_t, path)
+                .ok_or_else(|| {
+                    format!(
+                        "BTF: task_struct.{path} must resolve to a byte-aligned, \
+                         non-bitfield integer"
+                    )
+                })?;
+            Ok(IntegerField { offset, width })
+        };
         let (signal_struct_t, _) = find_struct(btf, "signal_struct")
             .map_err(|e| format!("BTF: 'struct signal_struct' lookup: {e:#}"))?;
         let signal_thread_head = nested_member_byte_offset(btf, &signal_struct_t, "thread_head")
             .map_err(|e| format!("BTF: signal_struct.thread_head offset: {e:#}"))?;
         Ok(Self {
-            pid: task_resolve("pid")?,
-            start_time: task_resolve("start_time")?,
-            state: task_resolve("__state")?,
-            on_rq: task_resolve("on_rq")?,
+            pid: task_integer("pid")?,
+            start_time: task_integer("start_time")?,
+            state: task_integer("__state")?,
+            on_rq: task_integer("on_rq")?,
             scx_dsq: task_resolve("scx.dsq")?,
             scx_runnable_node: task_resolve("scx.runnable_node")?,
             sched_class: task_resolve("sched_class")?,
-            start_boottime: task_resolve("start_boottime")?,
+            start_boottime: task_integer("start_boottime")?,
             tasks: task_resolve("tasks")?,
             signal: task_resolve("signal")?,
             signal_thread_head,
@@ -939,7 +960,7 @@ fn find_task_by_pid(
 ) -> Result<u64, String> {
     let mem = kernel.mem();
     let walk = kernel.walk_context();
-    let pid_off = offs.pid;
+    let pid_field = offs.pid;
     let tasks_off = offs.tasks;
 
     // init_task.tasks anchor lives in .data (init_task is a static
@@ -1036,8 +1057,8 @@ fn find_task_by_pid(
             ));
         };
 
-        let leader_pid = mem.read_u32(leader_pa, pid_off);
-        if leader_pid == target_pid {
+        let leader_pid = read_validation_integer(mem, leader_pa, "pid", pid_field)?;
+        if leader_pid == u64::from(target_pid) {
             return Ok(leader_kva);
         }
 
@@ -1091,14 +1112,14 @@ fn find_pid_in_thread_group(
     kernel: &GuestKernel,
     leader_pa: u64,
     leader_kva: u64,
-    leader_pid: u32,
+    leader_pid: u64,
     offs: &TaskValidationOffsets,
     target_pid: u32,
     visited: &mut u32,
 ) -> Result<Option<u64>, String> {
     let mem = kernel.mem();
     let walk = kernel.walk_context();
-    let pid_off = offs.pid;
+    let pid_field = offs.pid;
     let signal_off = offs.signal;
     let signal_thread_head_off = offs.signal_thread_head;
     let thread_node_off = offs.thread_node;
@@ -1170,8 +1191,8 @@ fn find_pid_in_thread_group(
                         continue;
                     };
 
-                    let thread_pid = mem.read_u32(thread_pa, pid_off);
-                    if thread_pid == target_pid {
+                    let thread_pid = read_validation_integer(mem, thread_pa, "pid", pid_field)?;
+                    if thread_pid == u64::from(target_pid) {
                         return Ok(Some(thread_kva));
                     }
                 }
@@ -1221,6 +1242,32 @@ fn thread_pa_or_node(
         task_pa + thread_node_off as u64
     } else {
         translate_any_kva(mem, cr3_pa, page_offset, thread_node_kva, l5, tcr_el1).unwrap_or(0)
+    }
+}
+
+/// Read a BTF-described integer validation member without extending the read
+/// into an adjacent field.
+///
+/// Kernel validation fields have changed scalar widths across releases (most
+/// notably `task_struct.on_rq`, which moved from `int` to `u8`). GuestMem's
+/// naturally sized volatile scalar readers cover every ordinary BTF integer
+/// width. Reject any unusual width explicitly rather than guessing and
+/// accidentally incorporating neighbouring state into a safety decision.
+fn read_validation_integer(
+    mem: &crate::monitor::reader::GuestMem,
+    task_pa: u64,
+    field_name: &str,
+    field: IntegerField,
+) -> Result<u64, String> {
+    match field.width {
+        1 => Ok(u64::from(mem.read_u8(task_pa, field.offset))),
+        2 => Ok(u64::from(mem.read_u16(task_pa, field.offset))),
+        4 => Ok(u64::from(mem.read_u32(task_pa, field.offset))),
+        8 => Ok(mem.read_u64(task_pa, field.offset)),
+        width => Err(format!(
+            "validate_task: task_struct.{field_name} has unsupported BTF integer \
+             width={width} bytes (supported widths: 1, 2, 4, 8)"
+        )),
     }
 }
 
@@ -1313,8 +1360,8 @@ fn validate_task_for_field_op(
     let mem = kernel.mem();
 
     // L1: pid match (anti slab-recycle + walker sanity).
-    let pid = mem.read_u32(task_pa, offs.pid);
-    if pid != target_pid {
+    let pid = read_validation_integer(mem, task_pa, "pid", offs.pid)?;
+    if pid != u64::from(target_pid) {
         return Err(format!(
             "validate_task: pid mismatch at task_pa={task_pa:#x} — read pid={pid}, \
              expected {target_pid} (likely slab-recycle since walker found this task)"
@@ -1332,7 +1379,7 @@ fn validate_task_for_field_op(
     // a 10ms window (conservative max for CLK_TCK >= 100), which
     // still rejects PID-recycled tasks whose start_time falls
     // well outside that range under normal scheduling pressure.
-    let observed_start_time = mem.read_u64(task_pa, offs.start_time);
+    let observed_start_time = read_validation_integer(mem, task_pa, "start_time", offs.start_time)?;
     let skew = observed_start_time.saturating_sub(expected_start_time_ns);
     if observed_start_time < expected_start_time_ns || skew >= START_TIME_PROC_TICK_NS {
         return Err(format!(
@@ -1345,8 +1392,8 @@ fn validate_task_for_field_op(
     }
 
     // L3: lifetime (TASK_DEAD bit not set).
-    let state = mem.read_u32(task_pa, offs.state);
-    if state & TASK_DEAD != 0 {
+    let state = read_validation_integer(mem, task_pa, "__state", offs.state)?;
+    if state & u64::from(TASK_DEAD) != 0 {
         return Err(format!(
             "validate_task: task pid={target_pid} is TASK_DEAD (state={state:#x}); \
              mid-teardown task fields unsafe to write"
@@ -1354,7 +1401,7 @@ fn validate_task_for_field_op(
     }
 
     // L4: runqueue safety (on_rq == 0).
-    let on_rq = mem.read_u32(task_pa, offs.on_rq);
+    let on_rq = read_validation_integer(mem, task_pa, "on_rq", offs.on_rq)?;
     if on_rq != 0 {
         return Err(format!(
             "validate_task: task pid={target_pid} is on_rq={on_rq} (TASK_ON_RQ_QUEUED \
@@ -1426,7 +1473,8 @@ fn validate_task_for_field_op(
     // for this check.
     //
     // L8: anti slab-recycle via start_boottime.
-    let start_boottime = mem.read_u64(task_pa, offs.start_boottime);
+    let start_boottime =
+        read_validation_integer(mem, task_pa, "start_boottime", offs.start_boottime)?;
     if start_boottime == 0 {
         return Err(format!(
             "validate_task: task pid={target_pid} start_boottime=0 — possibly a \

@@ -1,9 +1,9 @@
 //! `KTSTR_CARGO_TEST_MODE` env-var contract. Single read-helper
 //! shared by `test_support` (gauntlet emission, scheduler PATH
-//! lookup), `vmm::host_topology` (LLC / per-CPU flock bypass), and
-//! `vmm::initramfs_cache` (SHM cache bypass). Living at the crate
-//! root keeps the contract in one place without pulling a
-//! `test_support` dependency into vmm-side production code.
+//! lookup) and the vmm side (`host_topology`'s LLC / per-CPU flock
+//! bypass, `builder`'s matching overcommit-warning suppression).
+//! Living at the crate root keeps the contract in one place without
+//! pulling a `test_support` dependency into vmm-side production code.
 
 /// True when `KTSTR_CARGO_TEST_MODE` is set to a NON-EMPTY value.
 ///
@@ -11,23 +11,21 @@
 /// (typically `KTSTR_KERNEL=... KTSTR_CARGO_TEST_MODE=1 cargo test
 /// -- some_test`). When active, the harness:
 ///
-/// 1. Skips the cross-process initramfs SHM cache and builds the
-///    initramfs inline per VM run (no `shm_open`, no `flock`-based
-///    builder election; the process-local HashMap still memoises).
-/// 2. Skips host-topology LLC / per-CPU flock acquisition — tests
+/// 1. Skips host-topology LLC / per-CPU flock acquisition — tests
 ///    run on whatever CPUs the OS schedules them onto. No
 ///    peer-coordination flocks are taken; perf-mode behavior is
 ///    governed separately by
 ///    `crate::test_support::runtime::no_perf_mode_active` and is
-///    NOT toggled by this flag.
-/// 3. Skips gauntlet variant expansion in nextest discovery —
+///    NOT toggled by this flag. The builder's would-be-overcommit
+///    warning is suppressed to match, since no budget is enforced.
+/// 2. Skips gauntlet variant expansion in nextest discovery —
 ///    each `#[ktstr_test]` runs once with its declared topology.
 ///    No multi-kernel fan-out via `KTSTR_KERNEL_LIST`.
-/// 4. Resolves `SchedulerSpec::Discover(name)` via a `$PATH` lookup
+/// 3. Resolves `SchedulerSpec::Discover(name)` via a `$PATH` lookup
 ///    (before the workspace build) so a user can install scx_layered
 ///    on PATH and run their test without driving the cargo-ktstr
 ///    build pipeline.
-/// 5. Suppresses the early-dispatch coverage-gap warnings that fire
+/// 4. Suppresses the early-dispatch coverage-gap warnings that fire
 ///    under bare `cargo test` when a binary registers real
 ///    `#[ktstr_test]` entries OR `declare_scheduler!` declarations
 ///    (warning that gauntlet variants won't fan out and verifier
@@ -52,8 +50,8 @@ mod tests {
     /// `KTSTR_CARGO_TEST_MODE=1` (any non-empty value) flips the
     /// flag to true. Pins the activation contract against the
     /// dispatch sites that gate gauntlet emission, scheduler PATH
-    /// lookup, initramfs-cache SHM bypass, and host-topology flock
-    /// bypass on this exact predicate.
+    /// lookup, and host-topology flock bypass on this exact
+    /// predicate.
     #[test]
     fn cargo_test_mode_active_set_non_empty() {
         let _lock = lock_env();
@@ -74,8 +72,8 @@ mod tests {
         assert!(
             !cargo_test_mode_active(),
             "empty-string KTSTR_CARGO_TEST_MODE must NOT activate; \
-             treating it as truthy would silently degrade SHM / \
-             flock coordination on a stray `--env` pass-through"
+             treating it as truthy would silently degrade flock \
+             coordination on a stray `--env` pass-through"
         );
     }
 

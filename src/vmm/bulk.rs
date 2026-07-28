@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use zerocopy::FromBytes;
 
-use super::wire::{FRAME_HEADER_SIZE, ShmMessage};
+use super::wire::{FRAME_HEADER_SIZE, MsgType, ShmMessage};
 
 /// Per-frame payload cap enforced by the host assembler.
 ///
@@ -144,6 +144,33 @@ pub struct HostAssembler {
     buf: Vec<u8>,
 }
 
+/// Locate the next self-authenticating frame boundary after a writer abandoned
+/// a positive partial write. Candidates must use a known FourCC, have the
+/// reserved field clear, fit the production payload cap, be fully buffered,
+/// and carry a matching CRC. Those checks let a fresh retry recover the stream
+/// without an out-of-band reset marker.
+pub(crate) fn find_next_valid_frame(buf: &[u8], from: usize) -> Option<usize> {
+    let last = buf.len().checked_sub(FRAME_HEADER_SIZE)?;
+    for start in from..=last {
+        let header_end = start + FRAME_HEADER_SIZE;
+        let frame = ShmMessage::read_from_bytes(&buf[start..header_end]).ok()?;
+        if frame._pad != 0
+            || frame.length > MAX_BULK_FRAME_PAYLOAD
+            || MsgType::from_wire(frame.msg_type).is_none()
+        {
+            continue;
+        }
+        let payload_end = header_end.checked_add(frame.length as usize)?;
+        if payload_end > buf.len() {
+            continue;
+        }
+        if crc32fast::hash(&buf[header_end..payload_end]) == frame.crc32 {
+            return Some(start);
+        }
+    }
+    None
+}
+
 impl HostAssembler {
     /// Construct a fresh assembler with an empty buffer.
     pub fn new() -> Self {
@@ -172,20 +199,45 @@ impl HostAssembler {
             };
             let payload_len = frame.length as usize;
             let payload_end = hdr_end.saturating_add(payload_len);
+            if frame.length > MAX_BULK_FRAME_PAYLOAD {
+                if let Some(next) = find_next_valid_frame(&self.buf, consumed + 1) {
+                    tracing::warn!(
+                        abandoned = next - consumed,
+                        next,
+                        msg_type = frame.msg_type,
+                        length = frame.length,
+                        "bulk assembler: resynchronized after an oversized/abandoned prefix"
+                    );
+                    consumed = next;
+                    continue;
+                }
+                // Preserve an incomplete prefix until a future feed supplies
+                // either its advertised bytes or a complete retry frame.
+                if payload_end > self.buf.len() {
+                    break;
+                }
+                eprintln!(
+                    "bulk assembler: dropping oversized frame; resyncing (msg_type={} length={} cap={})",
+                    frame.msg_type, frame.length, MAX_BULK_FRAME_PAYLOAD
+                );
+                resync = true;
+                break;
+            }
             if payload_end > self.buf.len() {
-                // Incomplete payload — wait for more bytes. Defer the
-                // cap check below until we have observed the full
-                // frame: a partial header arriving via split writev
-                // (the writer's `write_to_bulk_port` emits two iovecs
-                // and the kernel virtio_console driver's
-                // `port_fops_write` may flush them on separate trips
-                // through the device's `port1_tx_buf`) cannot be
-                // distinguished from a corrupt header until the
-                // payload bytes either arrive or fail to. Resyncing
-                // here would discard a legitimate large frame whose
-                // header happens to drain before the rest of its
-                // bytes; legitimate frames have `length` ≤ cap so
-                // the post-completion check will accept them.
+                // A valid retry frame following an abandoned positive prefix
+                // is stronger evidence than this incomplete leading header.
+                // If none is complete yet, retain all bytes for the next feed.
+                if let Some(next) = find_next_valid_frame(&self.buf, consumed + 1) {
+                    tracing::warn!(
+                        abandoned = next - consumed,
+                        next,
+                        msg_type = frame.msg_type,
+                        length = frame.length,
+                        "bulk assembler: resynchronized past an incomplete abandoned frame"
+                    );
+                    consumed = next;
+                    continue;
+                }
                 break;
             }
             // Hostile-guest covert-channel guard: `_pad` is reserved and
@@ -205,26 +257,6 @@ impl HostAssembler {
                     frame.msg_type, frame.length, frame._pad
                 );
             }
-            if frame.length > MAX_BULK_FRAME_PAYLOAD {
-                // Hostile-guest defense: an announced length above
-                // the cap (4 GiB max via u32) cannot be a legitimate
-                // frame — the largest real producer is a wprof trace
-                // chunk, which `guest_comms::send_wprof_trace` splits at
-                // exactly MAX_BULK_FRAME_PAYLOAD so its frames land AT
-                // the cap and never above it; no producer emits a frame
-                // larger than the cap. We have now seen every byte the
-                // header claimed; drop the entire buffer (header +
-                // payload + any trailing residue) and resync. The
-                // announced length cannot be trusted to advance past
-                // the bogus payload, so partial bytes after this
-                // frame are also unparsable.
-                eprintln!(
-                    "bulk assembler: dropping oversized frame; resyncing (msg_type={} length={} cap={})",
-                    frame.msg_type, frame.length, MAX_BULK_FRAME_PAYLOAD
-                );
-                resync = true;
-                break;
-            }
             // Materialise the payload as `Arc<[u8]>` so any clone of
             // the `Arc` (or of the whole `BulkMessage`) is an O(1)
             // refcount bump rather than a heap allocation + memcpy.
@@ -240,6 +272,21 @@ impl HostAssembler {
             let computed = crc32fast::hash(&payload);
             let crc_ok = computed == frame.crc32;
             if !crc_ok {
+                if let Some(next) = find_next_valid_frame(&self.buf, consumed + 1)
+                    && next < payload_end
+                {
+                    tracing::warn!(
+                        abandoned = next - consumed,
+                        next,
+                        msg_type = frame.msg_type,
+                        length = frame.length,
+                        expected_crc = frame.crc32,
+                        computed_crc = computed,
+                        "bulk assembler: CRC mismatch exposed an abandoned partial frame; resynchronized"
+                    );
+                    consumed = next;
+                    continue;
+                }
                 // Surface the per-frame CRC mismatch for diagnostics.
                 // Mirrors `parse_tlv_stream`, which writes the same
                 // observation into `ShmEntry::crc_ok`. Downstream
@@ -320,7 +367,10 @@ impl HostAssembler {
 
 #[cfg(test)]
 mod tests {
-    use super::super::wire::{MSG_TYPE_EXIT, MSG_TYPE_STIMULUS};
+    use super::super::wire::{
+        AttachAttemptEvent, AttachAttemptKind, AttachAttemptTransition, MSG_TYPE_ATTACH_ATTEMPT,
+        MSG_TYPE_EXIT, MSG_TYPE_SCHED_STDERR, MSG_TYPE_SCHED_STDOUT, MSG_TYPE_STIMULUS,
+    };
     use super::*;
     use zerocopy::IntoBytes;
 
@@ -381,6 +431,52 @@ mod tests {
         assert_eq!(r2.messages.len(), 1, "completing bytes must yield 1 frame");
         assert_eq!(&*r2.messages[0].payload, b"payload-data");
         assert_eq!(a.pending(), 0);
+    }
+
+    #[test]
+    fn abandoned_partial_write_resynchronizes_at_lifecycle_retry() {
+        let mut assembler = HostAssembler::new();
+        let abandoned = frame_bytes(MSG_TYPE_SCHED_STDOUT, &[0x5a; 128]);
+        let event = AttachAttemptEvent {
+            transition: AttachAttemptTransition::Finished,
+            kind: AttachAttemptKind::Boot,
+            generation: 0x1234_5678_9abc_def0,
+        };
+        let retry = frame_bytes(MSG_TYPE_ATTACH_ATTEMPT, &event.to_payload());
+
+        let mut stream = abandoned[..FRAME_HEADER_SIZE + 11].to_vec();
+        stream.extend_from_slice(&retry);
+        let output = assembler.feed(&stream);
+
+        assert_eq!(output.messages.len(), 1);
+        assert_eq!(output.messages[0].msg_type, MSG_TYPE_ATTACH_ATTEMPT);
+        assert_eq!(&*output.messages[0].payload, event.to_payload());
+        assert!(output.messages[0].crc_ok);
+        assert_eq!(assembler.pending(), 0);
+    }
+
+    #[test]
+    fn split_lifecycle_retry_resynchronizes_after_later_feed() {
+        let mut assembler = HostAssembler::new();
+        let abandoned = frame_bytes(MSG_TYPE_SCHED_STDERR, &[0xa5; 256]);
+        let event = AttachAttemptEvent {
+            transition: AttachAttemptTransition::Settled,
+            kind: AttachAttemptKind::Replace,
+            generation: 99,
+        };
+        let retry = frame_bytes(MSG_TYPE_ATTACH_ATTEMPT, &event.to_payload());
+        let split = retry.len() / 2;
+
+        let mut first = abandoned[..FRAME_HEADER_SIZE + 7].to_vec();
+        first.extend_from_slice(&retry[..split]);
+        assert!(assembler.feed(&first).messages.is_empty());
+
+        let output = assembler.feed(&retry[split..]);
+        assert_eq!(output.messages.len(), 1);
+        assert_eq!(output.messages[0].msg_type, MSG_TYPE_ATTACH_ATTEMPT);
+        assert_eq!(&*output.messages[0].payload, event.to_payload());
+        assert!(output.messages[0].crc_ok);
+        assert_eq!(assembler.pending(), 0);
     }
 
     /// Partial header (fewer than 16 bytes) yields no message and

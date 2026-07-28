@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::sync::MutexExt;
-use crate::test_support::Scheduler;
+use crate::test_support::{Scheduler, SchedulerJson, SchedulerSpec};
 
 // ---------------------------------------------------------------
 // is_test_sentinel — convention-based sentinel-name predicate
@@ -151,7 +151,7 @@ fn run_gauntlet_test_rejects_unknown_test_name() {
     // Well-formed two-part name whose test is not registered
     // in KTSTR_TESTS. Returns 1 via the find_test None branch,
     // never reaching preset lookup or VM spawn.
-    let exit = run_gauntlet_test("__not_a_test__/tiny-1llc");
+    let exit = run_gauntlet_test("__not_a_test__/4cpu-1llc-nosmt");
     assert_eq!(exit, 1);
 }
 
@@ -746,11 +746,11 @@ fn filter_rejects_when_no_declared_spec_matches() {
 
 #[test]
 fn format_empty_kernel_list_error_names_cell_and_dispatcher() {
-    let s = format_empty_kernel_list_error("verifier/sched_foo/kernel_6_14_2/tiny-1llc");
+    let s = format_empty_kernel_list_error("verifier/sched_foo/kernel_6_14_2/4cpu-1llc-nosmt");
     // Cell name appears verbatim so the operator can grep their
     // own invocation for the failing cell.
     assert!(
-        s.contains("verifier/sched_foo/kernel_6_14_2/tiny-1llc"),
+        s.contains("verifier/sched_foo/kernel_6_14_2/4cpu-1llc-nosmt"),
         "missing cell name in: {s}",
     );
     // Root cause is named explicitly.
@@ -770,7 +770,7 @@ fn format_empty_kernel_list_error_names_cell_and_dispatcher() {
 fn format_unknown_kernel_label_error_lists_present_labels_and_both_fix_paths() {
     let present = vec!["kernel_6_14_2", "kernel_6_15_0"];
     let s = format_unknown_kernel_label_error(
-        "verifier/sched_foo/kernel_7_0_0/tiny-1llc",
+        "verifier/sched_foo/kernel_7_0_0/4cpu-1llc-nosmt",
         "kernel_7_0_0",
         "sched_foo",
         &present,
@@ -778,7 +778,7 @@ fn format_unknown_kernel_label_error_lists_present_labels_and_both_fix_paths() {
     // Cell name + missing label appear so operators see exactly
     // which lookup failed.
     assert!(
-        s.contains("verifier/sched_foo/kernel_7_0_0/tiny-1llc"),
+        s.contains("verifier/sched_foo/kernel_7_0_0/4cpu-1llc-nosmt"),
         "missing cell name: {s}",
     );
     // Debug-formatted missing label (`{kernel_label:?}` produces
@@ -808,7 +808,12 @@ fn format_unknown_kernel_label_error_empty_present_renders_empty_brackets() {
     // (string equality drifted) but the present slice the caller
     // assembles is empty — still surfaces the bracket pair so the
     // diagnostic format is uniform with the non-empty case.
-    let s = format_unknown_kernel_label_error("verifier/foo/kernel_x/tiny", "kernel_x", "foo", &[]);
+    let s = format_unknown_kernel_label_error(
+        "verifier/foo/kernel_x/4cpu-1llc-nosmt",
+        "kernel_x",
+        "foo",
+        &[],
+    );
     assert!(
         s.contains("Present labels: []"),
         "missing empty brackets: {s}"
@@ -821,7 +826,7 @@ fn format_unknown_kernel_label_error_joins_present_with_comma_space() {
     // to match the `present.join(", ")` contract.
     let present = vec!["a", "b", "c"];
     let s = format_unknown_kernel_label_error(
-        "verifier/foo/kernel_x/tiny",
+        "verifier/foo/kernel_x/4cpu-1llc-nosmt",
         "kernel_x",
         "foo",
         &present,
@@ -1009,8 +1014,9 @@ fn strip_kernel_suffix_single_kernel_passthrough() {
         sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
         kernel_dir: PathBuf::from("/a"),
     }];
-    let (stripped, entry) = strip_kernel_suffix("gauntlet/eevdf/2llc", &kernel_list).unwrap();
-    assert_eq!(stripped, "gauntlet/eevdf/2llc");
+    let (stripped, entry) =
+        strip_kernel_suffix("gauntlet/eevdf/4cpu-2llc-nosmt", &kernel_list).unwrap();
+    assert_eq!(stripped, "gauntlet/eevdf/4cpu-2llc-nosmt");
     assert!(entry.is_none());
 
     let (stripped, entry) = strip_kernel_suffix("ktstr/eevdf", &[]).unwrap();
@@ -1035,13 +1041,13 @@ fn strip_kernel_suffix_multi_kernel_peels_suffix() {
         },
     ];
     let (stripped, entry) =
-        strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_14_2", &kernel_list).unwrap();
-    assert_eq!(stripped, "gauntlet/eevdf/2llc");
+        strip_kernel_suffix("gauntlet/eevdf/4cpu-2llc-nosmt/kernel_6_14_2", &kernel_list).unwrap();
+    assert_eq!(stripped, "gauntlet/eevdf/4cpu-2llc-nosmt");
     assert_eq!(entry.unwrap().kernel_dir, PathBuf::from("/a"));
 
     let (stripped, entry) =
-        strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_15_0", &kernel_list).unwrap();
-    assert_eq!(stripped, "gauntlet/eevdf/2llc");
+        strip_kernel_suffix("gauntlet/eevdf/4cpu-2llc-nosmt/kernel_6_15_0", &kernel_list).unwrap();
+    assert_eq!(stripped, "gauntlet/eevdf/4cpu-2llc-nosmt");
     assert_eq!(entry.unwrap().kernel_dir, PathBuf::from("/b"));
 }
 
@@ -1064,7 +1070,7 @@ fn strip_kernel_suffix_multi_kernel_missing_suffix_errors() {
             kernel_dir: PathBuf::from("/b"),
         },
     ];
-    let err = strip_kernel_suffix("gauntlet/eevdf/2llc", &kernel_list)
+    let err = strip_kernel_suffix("gauntlet/eevdf/4cpu-2llc-nosmt", &kernel_list)
         .expect_err("missing suffix in multi-kernel mode must error");
     assert!(
         err.contains("no recognised kernel suffix"),
@@ -1090,14 +1096,14 @@ fn strip_kernel_suffix_does_not_peel_preset_segment() {
             kernel_dir: PathBuf::from("/b"),
         },
     ];
-    // The preset name is `2llc`, NOT `kernel_6_14_2` — the
+    // The preset name is `4cpu-2llc-nosmt`, NOT `kernel_6_14_2` — the
     // peeler must require an EXACT match against a known
     // sanitized label, not just any `/<word>` ending.
     let (stripped, entry) =
-        strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_14_2", &kernel_list).unwrap();
+        strip_kernel_suffix("gauntlet/eevdf/4cpu-2llc-nosmt/kernel_6_14_2", &kernel_list).unwrap();
     // Stripped name still contains both of the original path
-    // segments (eevdf, 2llc).
-    assert_eq!(stripped, "gauntlet/eevdf/2llc");
+    // segments (eevdf, 4cpu-2llc-nosmt).
+    assert_eq!(stripped, "gauntlet/eevdf/4cpu-2llc-nosmt");
     assert!(entry.is_some());
 }
 
@@ -1201,7 +1207,7 @@ fn host_only_listing_stub(
 /// double-fire.
 const HOST_ONLY_LISTING_NAME: &str = "__unit_test_host_only_listing__";
 
-#[linkme::distributed_slice(KTSTR_TESTS)]
+#[crate::ktstr_test_entry]
 static __HOST_ONLY_LISTING_ENTRY: KtstrTestEntry = KtstrTestEntry {
     name: HOST_ONLY_LISTING_NAME,
     func: host_only_listing_stub,
@@ -1235,7 +1241,7 @@ fn host_only_listing_lines(captured: &[u8]) -> Vec<String> {
 
 /// `list_tests_all` in multi-kernel mode emits exactly ONE line
 /// for a `host_only` entry, with NO `/kernel_…` suffix. Pins the
-/// `if entry.host_only { println!("ktstr/{}: test", entry.name); }`
+/// `if entry.host_only { println!("host/{}: test", entry.name); }`
 /// branch at the top of `list_tests_all` against a regression
 /// that fell through into the kernel-suffix loop. A regression
 /// would yield 2 matches (one per kernel) and at least one line
@@ -1272,12 +1278,12 @@ fn list_tests_all_host_only_skips_kernel_suffix_under_multi_kernel() {
         n = lines.len(),
     );
     let line = &lines[0];
-    // Expected exact form (mirrors the `println!("ktstr/{}: test", entry.name)`
+    // Expected exact form (mirrors the `println!("host/{}: test", entry.name)`
     // in the host_only branch of `list_tests_all`).
     assert_eq!(
         line,
-        &format!("ktstr/{HOST_ONLY_LISTING_NAME}: test"),
-        "host_only line must be `ktstr/<name>: test` with no kernel suffix",
+        &format!("host/{HOST_ONLY_LISTING_NAME}: test"),
+        "host_only line must be `host/<name>: test` with no kernel suffix",
     );
     // Belt-and-suspenders: neither sanitized kernel label appears
     // anywhere on the line, even as a substring.
@@ -1295,22 +1301,24 @@ fn list_tests_all_host_only_skips_kernel_suffix_under_multi_kernel() {
 /// `list_tests_budget` against the same regression class as the
 /// `list_tests_all` sibling.
 ///
-/// Budget is set generously (10000 secs) so the greedy selector
-/// in `crate::budget::select` picks every distinct-feature
-/// candidate including this fixture (the `HOST_ONLY_SHIFT` bit
-/// in `extract_features` makes the host_only entry's feature set
-/// uniquely contributory — see `budget::extract_features`).
-/// The selector prints to stdout AND `eprintln!`s a summary
-/// line to stderr; only stdout is captured here, so the stderr
-/// summary lands on the test runner's normal stderr.
+/// Candidate construction is tested directly: whether the global greedy
+/// selector chooses this fixture legitimately depends on which other tests
+/// are linked into the binary and must not affect this naming contract.
 #[test]
 fn list_tests_budget_host_only_skips_kernel_suffix_under_multi_kernel() {
-    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
-    let _env_lock = lock_env();
-    let _kernel_list = EnvVarGuard::set(crate::KTSTR_KERNEL_LIST_ENV, TWO_KERNEL_LIST);
-
-    let (_, captured) = capture_stdout(|| list_tests_budget(false, 10_000.0));
-    let lines = host_only_listing_lines(&captured);
+    let mut candidates = Vec::new();
+    push_budget_base_candidates(
+        &mut candidates,
+        &__HOST_ONLY_LISTING_ENTRY,
+        false,
+        false,
+        &__HOST_ONLY_LISTING_ENTRY.topology,
+        &["kernel_6_14_2", "kernel_6_15_0"],
+    );
+    let lines = candidates
+        .into_iter()
+        .map(|candidate| candidate.name)
+        .collect::<Vec<_>>();
 
     assert_eq!(
         lines.len(),
@@ -1322,8 +1330,8 @@ fn list_tests_budget_host_only_skips_kernel_suffix_under_multi_kernel() {
     let line = &lines[0];
     assert_eq!(
         line,
-        &format!("ktstr/{HOST_ONLY_LISTING_NAME}: test"),
-        "host_only candidate name must be `ktstr/<name>: test` with no kernel suffix",
+        &format!("host/{HOST_ONLY_LISTING_NAME}: test"),
+        "host_only candidate name must be `host/<name>: test` with no kernel suffix",
     );
     assert!(
         !line.contains("kernel_6_14_2") && !line.contains("kernel_6_15_0"),
@@ -1344,9 +1352,9 @@ fn list_tests_budget_host_only_skips_kernel_suffix_under_multi_kernel() {
 // cargo-ktstr resolver that produces `KTSTR_KERNEL_LIST` is
 // not on the cargo-test path.
 
-/// Under `KTSTR_CARGO_TEST_MODE=1`, `list_tests_all` emits
-/// exactly one `ktstr/{name}: test` line per registered entry
-/// — no `gauntlet/...` lines. Pins the gauntlet-skip branch.
+/// Under `KTSTR_CARGO_TEST_MODE=1`, `list_tests_all` emits exactly one
+/// `ktstr/{name}: test` line per VM entry or `host/{name}: test` line per
+/// host-only entry — no `gauntlet/...` lines. Pins the gauntlet-skip branch.
 #[test]
 fn list_tests_all_cargo_test_mode_skips_gauntlet() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
@@ -1420,7 +1428,7 @@ fn result_to_exit_code_inconclusive_maps_to_distinct_code() {
 fn final_outcome_projects_to_result_to_exit_code() {
     use crate::assert::{AssertDetail, AssertResult, DetailKind};
     type ResultBuilder = fn() -> Result<AssertResult>;
-    let cases: [(ResultBuilder, &str); 9] = [
+    let cases: [(ResultBuilder, &str); 10] = [
         (|| Ok(AssertResult::pass()), "ok_pass"),
         (|| Ok(AssertResult::skip("skip reason")), "ok_skip"),
         (
@@ -1454,6 +1462,13 @@ fn final_outcome_projects_to_result_to_exit_code() {
         (
             || Err(anyhow::anyhow!("f").context(crate::test_support::eval::SchedulerBuildRefused)),
             "err_scheduler_build_refused",
+        ),
+        (
+            || {
+                Err(anyhow::anyhow!("f")
+                    .context(crate::test_support::eval::FrameworkInfrastructureFailure))
+            },
+            "err_framework_infrastructure",
         ),
         (
             || Err(anyhow::anyhow!("f").context(crate::test_support::eval::SurvivesStormViolated)),
@@ -1604,9 +1619,10 @@ fn result_to_exit_code_cpu_budget_unsatisfiable_fails_even_under_expect_err() {
 /// host-insufficiency: `classify_host_error` maps it to `HostClass::Skip`
 /// (default), which `err_to_exit_code` routes to EXIT_PASS — and because
 /// the host-class match precedes the `expect_err` inversion, BOTH polarities
-/// skip. Under nextest the plain `#[test]` wrapper is suppressed, so an
-/// entry dispatches as `ktstr/{name}` via `run_named_test` ->
-/// `err_to_exit_code`; this means a developer running `cargo nextest run`,
+/// skip. Under nextest the plain `#[test]` wrapper is suppressed, so a VM
+/// entry dispatches as `ktstr/{name}` (and a host-only entry as
+/// `host/{name}`) via `run_named_test` -> `err_to_exit_code`; this means a
+/// developer running `cargo nextest run`,
 /// or `cargo ktstr test` without `--kernel`, on a kernel-less host gets a
 /// clean skip rather than a hard fail on every entry. (A requested
 /// `--kernel` that fails to build bails in cargo-ktstr before nextest
@@ -2208,6 +2224,26 @@ fn result_to_exit_code_scheduler_build_refused_through_nested_context_routes_to_
     );
 }
 
+/// A framework/CAS failure is outside the guest verdict domain: even an
+/// `expect_err` reproducer must fail instead of accepting infrastructure
+/// breakage as its expected scheduler failure.
+#[test]
+fn result_to_exit_code_framework_infrastructure_failure_bypasses_expect_err() {
+    let err = Err(
+        anyhow::Error::new(crate::vmm::host_topology::TopologyInsufficient {
+            reason: "injected underlying capacity-looking errno".into(),
+        })
+        .context("injected MAP_PRIVATE prepared-initrd overlay failure")
+        .context(crate::test_support::eval::FrameworkInfrastructureFailure)
+        .context("run ktstr_test VM"),
+    );
+    assert_eq!(
+        result_to_exit_code(err, true, false),
+        EXIT_FAIL,
+        "framework marker must hard-fail before host skip classification or expect_err inversion"
+    );
+}
+
 // -- result_to_exit_code: PostVmAssertionFailure marker tests --
 //
 // Pin the dispatch-side verdict the PostVmAssertionFailure arm
@@ -2592,6 +2628,63 @@ fn verifier_topology_unsupported_classifier_is_typed_and_chain_aware() {
     )));
 }
 
+/// A non-owner exact dispatch stops before both the VM-launch callback and the
+/// deterministic result writer. This is the execution-side half of
+/// cross-binary ownership: even a stale/hand-crafted nextest dispatch cannot
+/// race the elected binary's record.
+#[test]
+fn verifier_non_owner_dispatch_cannot_launch_or_write_a_record() {
+    use crate::test_support::test_helpers::{EnvVarGuard, capture_stderr, lock_env};
+
+    let _env_lock = lock_env();
+    let result_dir = tempfile::tempdir().expect("result dir");
+    let _results = EnvVarGuard::set(
+        crate::KTSTR_VERIFIER_RESULT_DIR_ENV,
+        result_dir.path().as_os_str(),
+    );
+    let launched = std::cell::Cell::new(false);
+    let (code, captured) = capture_stderr(|| {
+        run_verifier_cell_after_ownership(
+            "verifier/shared/kernel/topology",
+            Ok(None),
+            |_, _, _, _| {
+                launched.set(true);
+                0
+            },
+        )
+    });
+
+    assert_eq!(code, 1);
+    assert!(!launched.get(), "the non-owner must not enter VM execution");
+    assert_eq!(
+        std::fs::read_dir(result_dir.path())
+            .expect("read result dir")
+            .count(),
+        0,
+        "the non-owner must not create or replace the elected cell's record",
+    );
+    let stderr = String::from_utf8(captured).expect("stderr is utf-8");
+    assert!(stderr.contains("refusing non-owner exact-cell dispatch"));
+}
+
+#[test]
+fn exact_dispatch_selects_parent_identity_after_same_name_non_emitter() {
+    let non_emitting =
+        Scheduler::named("shared").binary(SchedulerSpec::Discover("fixture_not_in_workspace"));
+    let selected =
+        Scheduler::named("shared").binary(SchedulerSpec::Discover("real_workspace_member"));
+    let selected_json = SchedulerJson::from_scheduler(&selected);
+
+    let resolved =
+        select_verifier_scheduler_from([&non_emitting, &selected], "shared", Some(&selected_json))
+            .expect("resolve the parent-selected declaration");
+    assert_eq!(
+        SchedulerJson::from_scheduler(resolved),
+        selected_json,
+        "exact dispatch must not fall back to the first same-name registration",
+    );
+}
+
 /// A name lacking the `verifier/` prefix exits 1 with the
 /// missing-prefix diagnostic. Pins the strip_prefix None arm.
 #[test]
@@ -2708,7 +2801,7 @@ fn perf_skip_listing_stub(
 const PERF_MODE_SKIP_NAME: &str = "__unit_test_perf_mode_skip__";
 const PERF_ONLY_SKIP_NAME: &str = "__unit_test_perf_only_skip__";
 
-#[linkme::distributed_slice(KTSTR_TESTS)]
+#[crate::ktstr_test_entry]
 static __PERF_MODE_SKIP_ENTRY: KtstrTestEntry = KtstrTestEntry {
     name: PERF_MODE_SKIP_NAME,
     func: perf_skip_listing_stub,
@@ -2716,7 +2809,7 @@ static __PERF_MODE_SKIP_ENTRY: KtstrTestEntry = KtstrTestEntry {
     ..KtstrTestEntry::DEFAULT
 };
 
-#[linkme::distributed_slice(KTSTR_TESTS)]
+#[crate::ktstr_test_entry]
 static __PERF_ONLY_SKIP_ENTRY: KtstrTestEntry = KtstrTestEntry {
     name: PERF_ONLY_SKIP_NAME,
     func: perf_skip_listing_stub,
@@ -2897,18 +2990,29 @@ fn list_tests_budget_valid_routes_to_budget_lister() {
 // ---------------------------------------------------------------
 
 #[test]
+fn identical_local_scheduler_registrations_claim_one_cell_set() {
+    let mut emitted = std::collections::HashSet::new();
+    assert!(claim_verifier_scheduler_name(&mut emitted, "shared"));
+    assert!(
+        !claim_verifier_scheduler_name(&mut emitted, "shared"),
+        "a repeated registration in the elected binary must not list its matrix twice",
+    );
+    assert!(claim_verifier_scheduler_name(&mut emitted, "unique"));
+}
+
+#[test]
 fn verifier_named_topology_exclusion_does_not_change_gauntlet_constraints() {
     let presets = crate::gauntlet::gauntlet_presets();
     let excluded = presets
         .iter()
-        .find(|p| p.name == "medium-4llc-nosmt")
+        .find(|p| p.name == "32cpu-4llc-nosmt")
         .expect("named verifier exclusion fixture preset");
     let retained = presets
         .iter()
-        .find(|p| p.name == "medium-8llc-nosmt")
+        .find(|p| p.name == "64cpu-8llc-nosmt")
         .expect("retained verifier fixture preset");
     let sched = Scheduler::named("verifier_exclusion_fixture")
-        .verifier_exclude_topologies(&["medium-4llc-nosmt"]);
+        .verifier_exclude_topologies(&["32cpu-4llc-nosmt"]);
 
     assert!(
         sched.constraints.accepts_verifier(&excluded.topology),
@@ -3039,8 +3143,9 @@ fn run_verifier_cell_unknown_scheduler_exits_one() {
     let (code, captured) = capture_stderr(|| {
         // Banner goes to stdout; swallow it so only the diagnostic
         // is examined. The 3 parts are sched/kernel/preset.
-        let (code, _stdout) =
-            capture_stdout(|| run_verifier_cell("verifier/__no_such_sched__/kernel_x/tiny-1llc"));
+        let (code, _stdout) = capture_stdout(|| {
+            run_verifier_cell("verifier/__no_such_sched__/kernel_x/4cpu-1llc-nosmt")
+        });
         code
     });
     assert_eq!(code, 1, "unknown scheduler cell must exit 1");
@@ -3109,6 +3214,24 @@ fn run_host_only_test_passing_entry_exits_zero() {
     );
 }
 
+/// The generated `host/<name>` namespace must route through the same
+/// host-only wrapper. This pins the execution half of the listing-name
+/// change: accepting `host/` during discovery without stripping it here
+/// would make every generated host case fail as an unknown test.
+#[test]
+fn run_named_test_accepts_host_only_namespace() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let _env_lock = lock_env();
+    let _parent = EnvVarGuard::remove(crate::KTSTR_HOST_CGROUP_PARENT_ENV);
+    let _walk = EnvVarGuard::remove(crate::KTSTR_CGROUP_WALK_ROOT_ENV);
+
+    assert_eq!(
+        run_named_test(&format!("host/{HOST_ONLY_LISTING_NAME}")),
+        0,
+        "host/<name> must dispatch the registered host-only entry without a VM",
+    );
+}
+
 // ---------------------------------------------------------------
 // run_gauntlet_test — topo derivation reached before skip gate
 // ---------------------------------------------------------------
@@ -3135,12 +3258,12 @@ fn run_gauntlet_test_perf_mode_entry_derives_topo_then_skips() {
     let sidecar_dir = tempfile::tempdir().expect("create sidecar tempdir");
     let _sidecar = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, sidecar_dir.path());
 
-    // `tiny-1llc` is the first gauntlet preset (the first tuple in
+    // `4cpu-1llc-nosmt` is the first gauntlet preset (the first tuple in
     // `gauntlet::gauntlet_presets()`) — a
     // real preset so the preset-lookup guard passes and topo
     // derivation runs.
     let (code, captured) =
-        capture_stderr(|| run_gauntlet_test(&format!("{PERF_MODE_SKIP_NAME}/tiny-1llc")));
+        capture_stderr(|| run_gauntlet_test(&format!("{PERF_MODE_SKIP_NAME}/4cpu-1llc-nosmt")));
     assert_eq!(
         code, 0,
         "perf_mode gauntlet variant under --no-perf-mode must skip → exit 0 \
@@ -3183,9 +3306,9 @@ fn is_ignored_honors_registered_flag_and_demo_convention() {
 /// `ktstr_list_only` (whose body is
 /// `args.iter().any(|a| a == "--ignored")` then `list_tests(ignored_only)`)
 /// reads argv for
-/// `--ignored`, then delegates to `list_tests`, which prints the
-/// `ktstr/{name}: test` names to stdout and RETURNS (unlike
-/// `ktstr_main`, which `process::exit`s). Pins the
+/// `--ignored`, then delegates to `list_tests`, which prints generated
+/// `ktstr/{name}: test` and `host/{name}: test` names to stdout and RETURNS
+/// (unlike `ktstr_main`, which `process::exit`s). Pins the
 /// return-don't-exit listing entry point against a regression that
 /// routed it through the exiting handler. The bucket
 /// (`--ignored`-only vs all) is read from the test process's own
@@ -3200,7 +3323,7 @@ fn ktstr_list_only_prints_test_names_and_returns() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
     let _env_lock = lock_env();
     // Single-kernel listing + no budget filtering so the plain
-    // `ktstr/{name}: test` shape is emitted for the host_only fixture.
+    // `host/{name}: test` shape is emitted for the host_only fixture.
     let _kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
     let _budget = EnvVarGuard::remove(crate::KTSTR_BUDGET_SECS_ENV);
     let _cargo = EnvVarGuard::remove(crate::KTSTR_CARGO_TEST_MODE_ENV);
@@ -3214,7 +3337,7 @@ fn ktstr_list_only_prints_test_names_and_returns() {
 
     let (_, captured) = capture_stdout(ktstr_list_only);
     let stdout = std::str::from_utf8(&captured).expect("utf-8");
-    let want = format!("ktstr/{HOST_ONLY_LISTING_NAME}: test");
+    let want = format!("host/{HOST_ONLY_LISTING_NAME}: test");
     if ignored_only {
         // Ignored-only bucket: the non-ignored host_only fixture
         // must NOT appear; the function still returned (no exit).
@@ -3225,7 +3348,7 @@ fn ktstr_list_only_prints_test_names_and_returns() {
         );
     } else {
         // All-tests bucket: the registered host_only fixture must
-        // appear with its bare `ktstr/<name>: test` form.
+        // appear with its bare `host/<name>: test` form.
         assert!(
             stdout.contains(&want),
             "ktstr_list_only must print the registered host_only fixture's \

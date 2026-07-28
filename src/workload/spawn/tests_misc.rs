@@ -460,12 +460,17 @@ fn pathology_phase_alu_hot_zero_duration_is_noop() {
             },
             rest: vec![WorkPhase::Spin(Duration::from_millis(20))],
         },
+        park_after_iterations: Some(1),
+        signal_first_iteration: true,
         ..Default::default()
     };
     let mut h = WorkloadHandle::spawn(&cfg)
         .expect("WorkPhase::AluHot ZERO duration must spawn (no validation rejection)");
     h.start();
-    std::thread::sleep(Duration::from_millis(80));
+    assert!(
+        h.wait_first_iteration_all(Instant::now() + Duration::from_secs(30), cfg.num_workers),
+        "worker must complete the Sequence iteration before the test stops it",
+    );
     let reports = h.stop_and_collect();
     assert_eq!(reports.len(), 1);
     // The Spin phase that follows the ZERO AluHot must run —
@@ -531,11 +536,16 @@ fn pathology_alu_hot_populates_iteration_costs() {
         work_type: WorkType::AluHot {
             width: AluWidth::Scalar,
         },
+        park_after_iterations: Some(1),
+        signal_first_iteration: true,
         ..Default::default()
     };
     let mut h = WorkloadHandle::spawn(&cfg).expect("AluHot must spawn");
     h.start();
-    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        h.wait_first_iteration_all(Instant::now() + Duration::from_secs(30), cfg.num_workers),
+        "AluHot worker must complete an iteration before the test stops it",
+    );
     let reports = h.stop_and_collect();
     assert_eq!(reports.len(), 1);
     let r = &reports[0];
@@ -559,11 +569,16 @@ fn pathology_smt_sibling_spin_iterates() {
     let cfg = WorkloadConfig {
         num_workers: 2,
         work_type: WorkType::SmtSiblingSpin,
+        park_after_iterations: Some(1),
+        signal_first_iteration: true,
         ..Default::default()
     };
     let mut h = WorkloadHandle::spawn(&cfg).expect("SmtSiblingSpin must spawn");
     h.start();
-    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        h.wait_first_iteration_all(Instant::now() + Duration::from_secs(30), cfg.num_workers),
+        "every SmtSiblingSpin worker must complete an iteration before the test stops it",
+    );
     let reports = h.stop_and_collect();
     assert_eq!(reports.len(), 2);
     for r in &reports {

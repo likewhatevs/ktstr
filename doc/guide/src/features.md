@@ -22,10 +22,12 @@ lifecycle: boot, attach, scenario, collect, teardown. See
 
 ### Fast boot
 
-The initramfs base (test binary + busybox + shared libraries) is
-LZ4-compressed and cached in shared memory; concurrent VMs COW-map the
-cached base instead of rebuilding it, so boot is dominated by kernel
-init, not initramfs preparation. Measured on a 64-CPU host:
+Initramfs base, payload, and module parts are compressed once per
+content-addressed recipe and stored in a persistent regular-file cache.
+Concurrent VMs privately COW-map the cached ranges instead of rebuilding or
+copying them, so boot is dominated by kernel init rather than initramfs
+preparation. This applies to every supported initrd compression format.
+Measured on a 64-CPU host:
 
 <div class="kt-kpis">
 <div class="kt-kpi"><strong>55.583µs</strong><span>initramfs spawn</span></div>
@@ -111,7 +113,7 @@ guest memory. Topology is a real verification axis: values baked into
 `.rodata` (like CPU counts) change what the verifier explores, so a
 scheduler can attach on one topology and be rejected on another.
 
-<!-- captured: cargo ktstr verifier --kernel <local sched_ext dev tree> --test docs_real_scheds tiny-1llc tiny-2llc odd-3llc smt-2llc | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
+<!-- captured: cargo ktstr verifier --kernel <local sched_ext dev tree> --test docs_real_scheds 4cpu-1llc-nosmt 4cpu-2llc-nosmt 9cpu-3llc-nosmt 8cpu-2llc-smt | ktstr 0.23.0 | kernel sched_ext-for-7.2 b4dc42d2 -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cargo ktstr verifier --kernel ../linux --test my_schedulers</span></div>
 
 <pre>verifier verified_insns (per scheduler; rows: kernel, cols: BPF program, cell: range across topologies):
@@ -123,43 +125,43 @@ scx_p2dq:
 verifier results (per scheduler; rows: topology, cols: kernel):
 
 scx_bpfland: 4 ✅  0 ❌
-┌───────────┬──────────────┐
-│ topology  │ kernel_local │
-╞═══════════╪══════════════╡
-│ odd-3llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ smt-2llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-1llc │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-2llc │ <span class="t-grn">✓</span>            │
-└───────────┴──────────────┘
+┌─────────────────┬──────────────┐
+│ topology        │ kernel_local │
+╞═════════════════╪══════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 8cpu-2llc-smt   │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 9cpu-3llc-nosmt │ <span class="t-grn">✓</span>            │
+└─────────────────┴──────────────┘
 
 scx_lavd: 0 ✅  <span class="t-red">4 ❌</span>
-┌───────────┬──────────────┐
-│ topology  │ kernel_local │
-╞═══════════╪══════════════╡
-│ odd-3llc  │ <span class="t-red">✗</span>            │
-├───────────┼──────────────┤
-│ smt-2llc  │ <span class="t-red">✗</span>            │
-├───────────┼──────────────┤
-│ tiny-1llc │ <span class="t-red">✗</span>            │
-├───────────┼──────────────┤
-│ tiny-2llc │ <span class="t-red">✗</span>            │
-└───────────┴──────────────┘
+┌─────────────────┬──────────────┐
+│ topology        │ kernel_local │
+╞═════════════════╪══════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-red">✗</span>            │
+├─────────────────┼──────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-red">✗</span>            │
+├─────────────────┼──────────────┤
+│ 8cpu-2llc-smt   │ <span class="t-red">✗</span>            │
+├─────────────────┼──────────────┤
+│ 9cpu-3llc-nosmt │ <span class="t-red">✗</span>            │
+└─────────────────┴──────────────┘
 
 scx_p2dq: 4 ✅  0 ❌
-┌───────────┬──────────────┐
-│ topology  │ kernel_local │
-╞═══════════╪══════════════╡
-│ odd-3llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ smt-2llc  │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-1llc │ <span class="t-grn">✓</span>            │
-├───────────┼──────────────┤
-│ tiny-2llc │ <span class="t-grn">✓</span>            │
-└───────────┴──────────────┘</pre></div>
+┌─────────────────┬──────────────┐
+│ topology        │ kernel_local │
+╞═════════════════╪══════════════╡
+│ 4cpu-1llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 4cpu-2llc-nosmt │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 8cpu-2llc-smt   │ <span class="t-grn">✓</span>            │
+├─────────────────┼──────────────┤
+│ 9cpu-3llc-nosmt │ <span class="t-grn">✓</span>            │
+└─────────────────┴──────────────┘</pre></div>
 
 That sweep is real: on this development kernel `scx_bpfland` and
 `scx_p2dq` verify, attach, and dispatch on all four topologies, while
@@ -172,7 +174,7 @@ in kernel or module BTFs`). See
 On rejection, the log is cycle-collapsed — repeated loop-unrolling
 iterations are deduplicated so the offending access is readable:
 
-<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_broken --test verifier_pipeline tiny-1llc | ktstr 0.23.0 | kernel 7.0.14 -->
+<!-- captured: cargo ktstr verifier --kernel 7.0 --scheduler ktstr_broken --test verifier_pipeline 4cpu-1llc-nosmt | ktstr 0.23.0 | kernel 7.0.14 -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">cycle-collapsed verifier rejection</span></div>
 
 <pre><span class="t-red">Global function ktstr_dispatch() doesn't return scalar. Only those are supported.</span>
@@ -305,11 +307,11 @@ probes attached along the crash path — decoded function arguments and
 struct state at each call site, `→` arrows marking entry-to-exit
 changes:
 
-<!-- captured: cargo ktstr test (ktstr/bpf_crash_auto_repro_e2e) — prior-run sample preserved from running-tests/auto-repro.md | ktstr 0.23.0 | kernel with the sched_ext_exit tracepoint -->
+<!-- captured: cargo ktstr test (ktstr/bpf_crash_auto_repro_e2e) — prior-run sample preserved from running-tests/auto-repro.md | ktstr 0.23.0 | kernel with the scheduler-exit probe trigger -->
 <div class="kt-term"><div class="kt-term-bar"><span class="kt-term-title">auto-repro probe excerpt</span></div>
 
 <pre>
-do_enqueue_task                                               kernel/sched/ext.c
+enqueue_task_scx                                              kernel/sched/ext.c
   rq *rq
     cpu         1
   task_struct *p
@@ -319,7 +321,10 @@ do_enqueue_task                                               kernel/sched/ext.c
 ...
     <span class="t-grn">scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED</span></pre></div>
 
-On by default; requires a kernel with the `sched_ext_exit` tracepoint.
+On by default. ktstr selects the kernel's native scheduler-exit hook:
+`tp_btf/sched_ext_exit` on the newest kernels,
+a raw `scx_vexit` entry/return pair on the preceding generation, or filtered
+`fentry/scx_dump_state` on global-era kernels.
 See [Auto-Repro](running-tests/auto-repro.md).
 
 ### Interactive shell
@@ -359,7 +364,7 @@ See [ctprof](reference/ctprof.md).
 | CI-tested series | 6.14 and 7.1, on x86_64 and aarch64, every push |
 | Watchdog-timeout override | 7.1+ via BTF (`scx_sched.watchdog_timeout`); older kernels via the static `scx_watchdog_timeout` symbol |
 | sched_ext event counters | 6.16+ (two BTF layouts); sampling is disabled when neither is present |
-| Auto-repro probe trigger | kernels with the `sched_ext_exit` tracepoint |
+| Auto-repro probe trigger | `sched_ext_exit` typed tracepoint (newest), raw `scx_vexit` entry/return pair (preceding generation), or two-argument `scx_dump_state` (global era) |
 
 Outside the CI-tested series, the monitor degrades feature by feature
 rather than failing: tests still run, and unavailable capabilities are

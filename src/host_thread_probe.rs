@@ -532,8 +532,6 @@ macro_rules! tsd_mangle_prefix {
     };
 }
 
-#[allow(dead_code)]
-const TSD_MANGLE_PREFIX: &str = tsd_mangle_prefix!();
 const ALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_allocated");
 const DEALLOCATED_FIELD: &str = concat!(tsd_mangle_prefix!(), "thread_deallocated");
 
@@ -777,127 +775,6 @@ fn extract_pt_tls_layout(elf: &Elf<'_>) -> Result<(u64, u64)> {
     let rounded = round_up_pow2(tls_hdr.p_memsz, align)
         .ok_or_else(|| anyhow!("PT_TLS size arithmetic overflow"))?;
     Ok((rounded, align))
-}
-
-/// Resolve the byte offsets of `thread_allocated` and
-/// `thread_deallocated` inside `struct tsd_s` by walking DWARF on
-/// the target ELF, or on an external debuginfo file discovered via
-/// `.gnu_debuglink` / `NT_GNU_BUILD_ID` when the target is stripped.
-#[allow(dead_code)]
-fn resolve_field_offsets(elf_path: &Path) -> Result<CounterOffsets> {
-    let data = fs::read(elf_path)
-        .with_context(|| format!("re-read {} for DWARF inspection", elf_path.display()))?;
-    let elf = Elf::parse(&data).with_context(|| format!("parse ELF {}", elf_path.display()))?;
-
-    if section_is_populated(&elf, &data, ".debug_info") {
-        return resolve_field_offsets_from_bytes(&data, elf_path);
-    }
-
-    let debuglink = read_gnu_debuglink(&elf, &data);
-    let build_id = read_build_id(&elf, &data);
-    let debuglink_name = debuglink.as_ref().map(|(n, _)| n.as_str());
-    let build_id_hex = build_id.as_deref();
-
-    let candidates = candidate_debuginfo_paths(elf_path, debuglink_name, build_id_hex);
-    if candidates.is_empty() {
-        // Distinguish "no pointer at all" from "pointer present but
-        // rejected as unsafe": all three cases reach the
-        // empty-candidates branch, but the operator's remediation
-        // differs. Genuinely-absent debuginfo asks them to rebuild
-        // with `-g` / install -dbg; an unsafe `.gnu_debuglink` or
-        // build-id asks them to investigate why their toolchain
-        // emitted malformed metadata (which only happens with a
-        // hostile or corrupt ELF, since binutils itself rejects
-        // path-bearing debuglink names per
-        // `bfd/opncls.c::bfd_get_debug_link_info` and
-        // `read_build_id` always emits clean lowercase hex).
-        //
-        // The order below matters for the diagnostic:
-        // unsafe-debuglink and unsafe-build-id are independent
-        // failure surfaces, so we surface whichever fired and let
-        // the operator chase that lead first. A future caller that
-        // poisons both at once will see only the debuglink message;
-        // that's acceptable because both pointers being malformed
-        // is one underlying cause (caller bypassed the parsers).
-        if let Some(name) = debuglink_name
-            && !debuglink_name_is_safe(name)
-        {
-            anyhow::bail!(
-                "{} has no populated .debug_info and its \
-                 .gnu_debuglink filename `{}` was rejected as unsafe \
-                 (carries path separators, NUL bytes, or `.`/`..` \
-                 traversal forms). A well-formed `.gnu_debuglink` \
-                 holds only a bare basename. Inspect the target ELF \
-                 with `objdump --section .gnu_debuglink` to confirm \
-                 the on-disk content is what your toolchain emitted; \
-                 if it is, the toolchain is broken or the ELF was \
-                 tampered with.",
-                elf_path.display(),
-                name,
-            );
-        }
-        if let Some(hex) = build_id_hex
-            && hex.len() >= 2
-            && !build_id_hex_is_safe(hex)
-        {
-            anyhow::bail!(
-                "{} has no populated .debug_info and its \
-                 NT_GNU_BUILD_ID hex `{}` was rejected as unsafe \
-                 (must be even-length lowercase hex per \
-                 `read_build_id`'s output format; uppercase, \
-                 non-hex bytes, path separators, NUL bytes, or odd \
-                 length all fail the gate). Inspect the target ELF \
-                 with `readelf -n` to confirm the on-disk note is \
-                 what your toolchain emitted; if it is, the \
-                 toolchain is broken or the ELF was tampered with.",
-                elf_path.display(),
-                hex,
-            );
-        }
-        anyhow::bail!(
-            "{} has no populated .debug_info and carries neither a \
-             .gnu_debuglink section nor an NT_GNU_BUILD_ID note — there \
-             is no pointer to external debuginfo. Rebuild the target \
-             with `-g`, ship a paired `.debug` file, or install the \
-             distro's -dbg / -debuginfo package.",
-            elf_path.display(),
-        );
-    }
-
-    let mut tried: Vec<String> = Vec::new();
-    for candidate in &candidates {
-        let debug_data = match fs::read(candidate) {
-            Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tried.push(format!("{} (not found)", candidate.display()));
-                continue;
-            }
-            Err(e) => {
-                tried.push(format!("{}: {e}", candidate.display()));
-                continue;
-            }
-        };
-        if let Some((_, expected_crc)) = debuglink.as_ref() {
-            let actual = crc32fast::hash(&debug_data);
-            if actual != *expected_crc {
-                tried.push(format!(
-                    "{} (CRC mismatch: expected {:#010x}, got {:#010x})",
-                    candidate.display(),
-                    expected_crc,
-                    actual,
-                ));
-                continue;
-            }
-        }
-        return resolve_field_offsets_from_bytes(&debug_data, candidate);
-    }
-    anyhow::bail!(
-        "{} is stripped; searched for external debuginfo via \
-         debuglink={debuglink_name:?} build_id={build_id_hex:?} but \
-         no candidate was readable or CRC-matched. Tried: {}",
-        elf_path.display(),
-        tried.join("; "),
-    );
 }
 
 fn resolve_field_offsets_from_bytes(data: &[u8], source_path: &Path) -> Result<CounterOffsets> {

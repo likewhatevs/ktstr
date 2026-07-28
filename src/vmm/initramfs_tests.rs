@@ -5,6 +5,26 @@
 
 use super::*;
 
+/// Build a base archive through the production preparation path, mirroring
+/// what `PreparedBaseInputs::build` does for a real run. Tests assert on
+/// archive shape, so they must not bypass preparation and repeat a large
+/// binary transform in every nextest process.
+fn base_archive(
+    payload: &Path,
+    extras: &[(&str, &Path)],
+    includes: &[(&str, &Path)],
+    busybox: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let owned: Vec<(String, PathBuf)> = includes
+        .iter()
+        .map(|(name, path)| ((*name).to_owned(), (*path).to_path_buf()))
+        .collect();
+    let inputs =
+        crate::vmm::initramfs_cache::prepare_base_inputs(payload, extras, &owned, busybox)?;
+    crate::vmm::initramfs_cache::get_or_prepare_base(inputs, InitrdCompression::Uncompressed)?
+        .read_uncompressed_for_test()
+}
+
 /// Thin test wrapper over [`build_suffix`] that takes only the
 /// args tests commonly vary. The remaining [`SuffixParams`] fields
 /// default to empty, so assertions stay focused on the args- and
@@ -21,7 +41,7 @@ fn build_suffix_args(base_len: usize, args: &[String], sched_args: &[String]) ->
 }
 
 /// Thin test wrapper that produces a complete cpio newc archive by
-/// concatenating [`build_initramfs_base`] and [`build_suffix`] output.
+/// concatenating the prepared base archive and [`build_suffix`] output.
 /// Passes `payload` to the suffix so the assembled archive carries
 /// `/init` (the base no longer does). Production callers build base and
 /// suffix separately so they can stream the parts into guest memory
@@ -32,7 +52,7 @@ fn build_initramfs(
     extra_binaries: &[(&str, &Path)],
     args: &[String],
 ) -> Result<Vec<u8>> {
-    let base = build_initramfs_base(payload, extra_binaries, &[], None)?;
+    let base = base_archive(payload, extra_binaries, &[], None)?;
     let suffix = build_suffix(
         base.len(),
         &SuffixParams {
@@ -125,7 +145,7 @@ fn build_initramfs_has_init() {
 #[test]
 fn build_initramfs_base_is_valid_cpio() {
     let exe = crate::resolve_current_exe().unwrap();
-    let initrd = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let initrd = base_archive(&exe, &[], &[], None).unwrap();
     assert_eq!(&initrd[..6], b"070701");
     // Base is NOT 512-aligned on its own; only base+suffix is.
     let full = build_initramfs(&exe, &[], &[]).unwrap();
@@ -173,7 +193,7 @@ fn initramfs_empty_args() {
 #[test]
 fn suffix_adds_args_and_trailer() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let args = vec!["run".into(), "--json".into()];
     let suffix = build_suffix_args(base.len(), &args, &[]).unwrap();
     let s = String::from_utf8_lossy(&suffix);
@@ -191,7 +211,7 @@ fn split_matches_monolithic() {
     let exe = crate::resolve_current_exe().unwrap();
     let args = vec!["run".into(), "--json".into(), "scenario".into()];
     let monolithic = build_initramfs(&exe, &[], &args).unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let suffix = build_suffix(
         base.len(),
         &SuffixParams {
@@ -213,7 +233,7 @@ fn split_matches_monolithic() {
 #[test]
 fn suffix_different_args_differ() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let a = build_suffix_args(base.len(), &["a".into()], &[]).unwrap();
     let b = build_suffix_args(base.len(), &["b".into()], &[]).unwrap();
     assert_ne!(a, b, "different args should produce different suffixes");
@@ -222,7 +242,7 @@ fn suffix_different_args_differ() {
 #[test]
 fn suffix_empty_args() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let suffix = build_suffix_args(base.len(), &[], &[]).unwrap();
     assert_eq!((base.len() + suffix.len()) % 512, 0);
     let s = String::from_utf8_lossy(&suffix);
@@ -232,7 +252,7 @@ fn suffix_empty_args() {
 #[test]
 fn suffix_with_sched_enable() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let sched_enable = vec!["echo 1 > /sys/kernel/sched_ext/enable".to_string()];
     let suffix = build_suffix(
         base.len(),
@@ -262,7 +282,7 @@ fn suffix_with_sched_enable() {
 #[test]
 fn suffix_with_sched_disable() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let sched_disable = vec!["echo 0 > /sys/kernel/sched_ext/enable".to_string()];
     let suffix = build_suffix(
         base.len(),
@@ -287,7 +307,7 @@ fn suffix_with_sched_disable() {
 #[test]
 fn suffix_with_exec_cmd() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let cmd = "/usr/bin/stress-ng --cpu 1 --timeout 5s";
     let suffix = build_suffix(
         base.len(),
@@ -316,7 +336,7 @@ fn suffix_omits_empty_optional_entries() {
     // empty sched_enable, empty sched_disable, and None exec_cmd must
     // not leave zero-length cpio entries in the archive.
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let suffix = build_suffix(base.len(), &SuffixParams::default()).unwrap();
     let mut archive = Vec::with_capacity(base.len() + suffix.len());
     archive.extend_from_slice(&base);
@@ -340,7 +360,7 @@ fn suffix_omits_empty_optional_entries() {
 #[test]
 fn suffix_emits_per_staged_scheduler_args_entries() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let staged = vec![
         (
             "mitosis_args_a".to_string(),
@@ -391,7 +411,7 @@ fn suffix_emits_per_staged_scheduler_args_entries() {
 #[test]
 fn suffix_skips_staged_entries_with_empty_args() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let staged = vec![
         ("populated".to_string(), vec!["--flag".to_string()]),
         ("empty".to_string(), vec![]),
@@ -429,7 +449,7 @@ fn suffix_skips_staged_entries_with_empty_args() {
 #[test]
 fn suffix_omits_module_entries_when_empty() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
 
     let with_empty = build_suffix(
         base.len(),
@@ -465,7 +485,7 @@ fn suffix_omits_module_entries_when_empty() {
 #[test]
 fn suffix_emits_kernel_modules_in_order() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
 
     let dir = tempfile::Builder::new()
         .prefix("ktstr-kmod-suffix-test-")
@@ -545,15 +565,11 @@ fn suffix_emits_kernel_modules_in_order() {
 }
 
 #[test]
-fn try_cow_overlay_rejects_cross_region_span() {
-    // The bounds check in try_cow_overlay relies on
-    // GuestMemoryMmap::get_slice failing when a range would cross
-    // a region boundary. This test locks that semantic in: two
-    // non-contiguous regions; a range that starts in region A but
-    // extends past its end must be rejected. If this ever passes
-    // (e.g. vm-memory swaps in multi-region get_slices semantics
-    // here), try_cow_overlay's MAP_FIXED would silently clobber
-    // whatever host mapping sits between the regions.
+fn guest_memory_get_slice_rejects_cross_region_span() {
+    // Keep the vm-memory single-region slice contract explicit: the prepared
+    // loader intentionally uses get_slices to split a validated range across
+    // NUMA regions, while any caller needing one contiguous HVA must use
+    // get_slice and receive an error at the boundary.
     use vm_memory::{GuestAddress, GuestMemory};
     let region_a_size: usize = 64 * 1024;
     let region_b_size: usize = 64 * 1024;
@@ -573,8 +589,7 @@ fn try_cow_overlay_rejects_cross_region_span() {
     );
 
     // Range starting mid-region-A and extending past region A's
-    // end: must fail. This is the exact shape of the hazardous
-    // cow_overlay case.
+    // end: must fail.
     let overrun_start = region_a_start + (region_a_size as u64 / 2);
     let overrun_len = region_a_size; // well past the region's end
     assert!(
@@ -591,16 +606,6 @@ fn try_cow_overlay_rejects_cross_region_span() {
         "gap-start slice must fail"
     );
 }
-
-// NOTE: the former `try_cow_overlay_preserves_adjacent_region_bytes`
-// test lived here but never invoked the production `try_cow_overlay`
-// (it re-implemented the bounds check inline and asserted that NOT
-// writing leaves memory unchanged — a tautology). It is replaced by
-// `try_cow_overlay_maps_segment_and_preserves_adjacent_region` and
-// `try_cow_overlay_rejects_oversized_request_and_preserves_region`
-// in `src/vmm/setup/tests.rs`, which drive the real function against
-// a live LZ4 SHM segment. The `try_cow_overlay_rejects_cross_region_span`
-// test below remains as the vm_memory `get_slice` dependency-contract pin.
 
 /// Each non-LZ4 format must round-trip through the matching vendored
 /// decoder — the same codec family the kernel's RD_* unpacker uses —
@@ -693,7 +698,7 @@ fn resolve_shared_libs_dynamic_binary() {
 
 #[test]
 fn resolve_interpreter_deps_walks_nonstandard_interp_deps() {
-    // The cache key (BaseKey::hash_shared_libs) and the base packer
+    // The cache key (prepared_base_semantic_key) and the base packer
     // (build_initramfs_base) both fold a non-standard interpreter's OWN
     // shared-lib deps in via resolve_interpreter_deps. A standard ld.so is
     // statically linked (no deps) and must resolve to an EMPTY set so the
@@ -857,7 +862,7 @@ fn resolve_soname_rpath_only_wins_when_runpath_empty() {
 #[test]
 fn suffix_with_sched_args() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let sched_args = vec!["--enable-borrow".into(), "--llc".into()];
     let suffix = build_suffix_args(base.len(), &[], &sched_args).unwrap();
     let s = String::from_utf8_lossy(&suffix);
@@ -872,20 +877,13 @@ fn suffix_with_sched_args() {
 #[test]
 fn suffix_without_sched_args_omits_entry() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let suffix = build_suffix_args(base.len(), &[], &[]).unwrap();
     let s = String::from_utf8_lossy(&suffix);
     assert!(
         !s.contains("sched_args"),
         "empty sched_args should not produce entry"
     );
-}
-
-#[test]
-fn shm_segment_name_format() {
-    let name = shm_segment_name(0xDEADBEEF);
-    assert!(name.starts_with("/ktstr-base-"));
-    assert!(name.contains("deadbeef"));
 }
 
 #[test]
@@ -898,190 +896,6 @@ fn is_deleted_self_returns_false_for_current() {
     let exe = crate::resolve_current_exe().unwrap();
     // Current binary is not deleted.
     assert!(!is_deleted_self(&exe));
-}
-
-#[test]
-fn shm_store_load_unlink_roundtrip() {
-    let hash = unique_test_shm_hash(0);
-    let data = vec![0x42u8; 1024];
-    shm_store_base(hash, &data).unwrap();
-    let loaded = shm_load_base(hash);
-    assert!(loaded.is_some());
-    assert_eq!(loaded.unwrap().as_ref(), &data[..]);
-    shm_unlink_base(hash);
-    // After unlink, load should return None.
-    assert!(shm_load_base(hash).is_none());
-}
-
-#[test]
-fn shm_load_nonexistent_returns_none() {
-    let hash = unique_test_shm_hash(1);
-    shm_unlink_base(hash); // ensure clean
-    assert!(shm_load_base(hash).is_none());
-}
-
-#[test]
-fn shm_store_last_writer_wins_even_with_size_change() {
-    // Documents actual semantics: shm_store reuses the segment name,
-    // so a second write with different size overwrites the first.
-    // Idempotent writes (same content_hash → same contents) rely on
-    // callers to derive the hash from the actual content — this test
-    // deliberately uses differently-sized payloads to prove the
-    // writer does NOT assume the old name's size is still valid.
-    let hash = unique_test_shm_hash(2);
-    let d1 = vec![0x11u8; 64];
-    let d2 = vec![0x22u8; 128];
-    shm_store_base(hash, &d1).unwrap();
-    shm_store_base(hash, &d2).unwrap();
-    let loaded = shm_load_base(hash);
-    assert!(loaded.is_some());
-    assert_eq!(loaded.unwrap().as_ref(), &d2[..]);
-    shm_unlink_base(hash);
-}
-
-#[test]
-fn shm_segment_name_unique_per_hash() {
-    let n1 = shm_segment_name(0);
-    let n2 = shm_segment_name(1);
-    assert_ne!(n1, n2);
-    assert!(n1.starts_with("/ktstr-base-"));
-    assert!(n2.starts_with("/ktstr-base-"));
-}
-
-#[test]
-fn shm_unlink_nonexistent_is_noop() {
-    // Should not panic.
-    shm_unlink_base(unique_test_shm_hash(3));
-}
-
-#[test]
-fn mapped_shm_send_sync() {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<MappedShm>();
-}
-
-#[test]
-fn shm_load_base_holds_lock_until_drop() {
-    // Invariant: as long as a MappedShm is live, the SHM
-    // segment's flock is held in LOCK_SH. A concurrent writer
-    // calling LOCK_EX | LOCK_NB must fail with EWOULDBLOCK. Once
-    // the MappedShm is dropped, the lock releases and a subsequent
-    // LOCK_EX | LOCK_NB must succeed.
-    //
-    // This is the core invariant — if it regresses, shm_store's
-    // ftruncate can race with a live reader and cause SIGBUS on
-    // the mapped pages.
-    let hash = unique_test_shm_hash(4);
-    shm_unlink_base(hash); // clean any stale segment
-    shm_store_base(hash, &vec![0x55u8; 256]).unwrap();
-    let loaded = shm_load_base(hash).expect("load must succeed");
-
-    // Open a second fd and attempt LOCK_EX|LOCK_NB. Should fail
-    // with EWOULDBLOCK because the MappedShm holds LOCK_SH.
-    let name = shm_segment_name(hash);
-    let fd2 = rustix::shm::open(
-        name.as_str(),
-        rustix::shm::OFlags::RDONLY,
-        rustix::fs::Mode::empty(),
-    )
-    .expect("second shm_open must succeed");
-    let err = rustix::fs::flock(&fd2, rustix::fs::FlockOperation::NonBlockingLockExclusive);
-    assert!(
-        matches!(err, Err(e) if e == rustix::io::Errno::WOULDBLOCK),
-        "LOCK_EX|LOCK_NB must be blocked by the live reader's LOCK_SH (got {err:?})",
-    );
-    drop(fd2);
-
-    // Drop the mapping; lock releases.
-    drop(loaded);
-
-    // Now LOCK_EX|LOCK_NB must succeed on a fresh fd.
-    let fd3 = rustix::shm::open(
-        name.as_str(),
-        rustix::shm::OFlags::RDONLY,
-        rustix::fs::Mode::empty(),
-    )
-    .expect("third shm_open must succeed");
-    rustix::fs::flock(&fd3, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .expect("LOCK_EX|LOCK_NB must succeed after the MappedShm is dropped");
-    rustix::fs::flock(&fd3, rustix::fs::FlockOperation::Unlock).ok();
-    drop(fd3);
-    shm_unlink_base(hash);
-}
-
-#[test]
-fn shm_store_skips_write_when_reader_holds_lock_sh() {
-    // Regression (x86 CI wedge): shm_store takes a NON-BLOCKING
-    // LOCK_EX and SKIPS the write when a reader holds LOCK_SH (a live
-    // MappedShm / COW overlay). A blocking LOCK_EX starved indefinitely
-    // under sustained host concurrency: Linux flock grants no writer
-    // preference, so VM-lifetime LOCK_SH readers perpetually jumped the
-    // queue and wedged the suite. The skip also preserves the SIGBUS
-    // invariant: it never ftruncates a segment a reader is mapping.
-    //
-    // Same-process flock conflict: the reader's fd holds LOCK_SH and
-    // shm_store opens a second fd for LOCK_EX; flock(2) treats the two
-    // fds independently, so the writer genuinely contends.
-    let hash = unique_test_shm_hash(5);
-    shm_unlink_base(hash); // clean any stale segment
-
-    let original = [0x55u8; 256];
-    shm_store_base(hash, &original).unwrap();
-    let reader = shm_load_base(hash).expect("load must succeed");
-
-    // Writer with DIFFERENT content while the reader holds LOCK_SH:
-    // must return Ok WITHOUT blocking (a blocking LOCK_EX would
-    // self-deadlock this thread and hang) and WITHOUT rewriting the
-    // live segment.
-    shm_store_base(hash, &[0xAAu8; 512]).expect("shm_store must skip (Ok), not block");
-
-    // The reader's mapped view is untouched: the write was skipped.
-    assert!(
-        reader.as_ref().iter().all(|&b| b == 0x55),
-        "reader bytes must be unchanged: shm_store skipped, did not rewrite/truncate",
-    );
-    drop(reader);
-
-    // Once the reader releases LOCK_SH, the cache is not wedged: a
-    // writer acquires LOCK_EX and the write takes effect.
-    shm_store_base(hash, &[0xCCu8; 128]).expect("shm_store must write after reader drops");
-    let reloaded = shm_load_base(hash).expect("reload after write");
-    assert!(
-        reloaded.as_ref().len() == 128 && reloaded.as_ref().iter().all(|&b| b == 0xCC),
-        "post-drop write must take effect",
-    );
-    drop(reloaded);
-    shm_unlink_base(hash);
-}
-
-#[test]
-fn shm_load_lz4_roundtrips_and_rejects_non_lz4() {
-    // shm_load_lz4 (the #2 shared loader): round-trips an LZ4-magic
-    // segment, and rejects a segment whose first bytes are not the LZ4
-    // legacy magic (a stale zstd/gzip segment or a truncated write).
-    let hash = unique_test_shm_hash(6);
-    let lz4_name = shm_lz4_segment_name(hash);
-    let _ = rustix::shm::unlink(lz4_name.as_str()); // clean any stale segment
-
-    // LZ4-magic-prefixed bytes round-trip store -> load.
-    let mut data = LZ4_LEGACY_MAGIC.to_vec();
-    data.extend_from_slice(&[0x11u8; 64]);
-    shm_store_lz4(hash, &data).unwrap();
-    assert_eq!(
-        shm_load_lz4(hash).as_deref(),
-        Some(data.as_slice()),
-        "LZ4-magic segment must round-trip",
-    );
-
-    // A segment lacking the LZ4 legacy magic is rejected as stale.
-    let _ = rustix::shm::unlink(lz4_name.as_str());
-    shm_store_lz4(hash, &[0xDEu8; 64]).unwrap();
-    assert!(
-        shm_load_lz4(hash).is_none(),
-        "segment lacking the LZ4 legacy magic must be rejected",
-    );
-
-    let _ = rustix::shm::unlink(lz4_name.as_str());
 }
 
 #[test]
@@ -1102,7 +916,7 @@ fn strip_debug_nonexistent_fails() {
 #[test]
 fn init_lives_in_suffix_not_base() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
 
     // The base must NOT carry /init or the sentinel — keeping the
     // payload's bytes out of the base is what makes it cacheable across
@@ -1154,27 +968,61 @@ fn init_lives_in_suffix_not_base() {
 #[test]
 fn build_initramfs_base_includes_extra_shared_libs() {
     let exe = crate::resolve_current_exe().unwrap();
-    let sched = crate::test_support::require_binary("scx-ktstr");
-    let extras: Vec<(&str, &Path)> = vec![("scheduler", sched.as_path())];
-    let base = build_initramfs_base(&exe, &extras, &[], None).unwrap();
-    let s = String::from_utf8_lossy(&base);
-
-    // Every shared lib the extra resolves to must be packed into the base.
-    // Assert the resolved SET rather than a hardcoded soname: whether the
-    // scheduler static- or dynamic-links libbpf/libelf is a property of
-    // the scx-ktstr build, not of build_initramfs_base's lib-packing
-    // (which is what this test guards).
-    let resolved = resolve_shared_libs(sched.as_path()).unwrap();
+    // This test covers generic extra-ELF dependency packing. Building the
+    // large workspace scheduler from inside each libtest process made the
+    // assertion take minutes under nextest storms while adding no scheduler
+    // behavior coverage. GNU coreutils `/bin/ls` is a small, ubiquitous ELF
+    // on the glibc Linux hosts ktstr supports, and its libselinux/libpcre2
+    // closure gives us dependencies the Rust test payload does not carry.
+    let extra = Path::new("/bin/ls");
     assert!(
-        !resolved.found.is_empty(),
-        "scx-ktstr should resolve at least its C-runtime libs"
+        extra.is_file() && is_elf(extra),
+        "test host must provide an ELF /bin/ls"
     );
-    for (guest_path, _host) in &resolved.found {
+
+    let payload_libs = resolve_shared_libs(&exe).unwrap();
+    let payload_guest_paths: std::collections::HashSet<&str> = payload_libs
+        .found
+        .iter()
+        .map(|(guest_path, _)| guest_path.as_str())
+        .collect();
+    let extra_libs = resolve_shared_libs(extra).unwrap();
+    let delta: Vec<_> = extra_libs
+        .found
+        .iter()
+        .filter(|(guest_path, _)| !payload_guest_paths.contains(guest_path.as_str()))
+        .collect();
+    assert!(
+        !delta.is_empty(),
+        "/bin/ls must add at least one shared library beyond the payload; \
+         payload closure: {:?}; /bin/ls closure: {:?}",
+        payload_libs.found,
+        extra_libs.found
+    );
+
+    let extras: Vec<(&str, &Path)> = vec![("extra", extra)];
+    let inputs =
+        crate::vmm::initramfs_cache::prepare_base_inputs(&exe, &extras, &[], None).unwrap();
+    let prepared =
+        crate::vmm::initramfs_cache::get_or_prepare_base(inputs, InitrdCompression::Uncompressed)
+            .unwrap();
+    let base = prepared.read_uncompressed_for_test().unwrap();
+    let base_entries: std::collections::HashMap<_, _> = cpio_entries(&base)
+        .into_iter()
+        .map(|(name, size, _, _)| (name, size))
+        .collect();
+
+    // Check only the closure delta: finding one of the payload's existing
+    // libc-family entries would not prove that processing the extra ELF added
+    // anything to the archive.
+    for (guest_path, host_path) in delta {
+        let size = base_entries.get(guest_path.as_str());
         assert!(
-            s.contains(guest_path.as_str()),
-            "base must contain extra's resolved lib {guest_path}; \
-             resolved set: {:?}",
-            resolved.found
+            size.is_some_and(|size| *size > 0),
+            "base must contain non-empty extra-only dependency {guest_path} \
+             resolved from {}; extra closure: {:?}",
+            host_path.display(),
+            extra_libs.found
         );
     }
 }
@@ -1207,7 +1055,7 @@ fn busybox_with_include_files() {
     let tmp = tmp_dir.path().join("included");
     std::fs::write(&tmp, b"hello").unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/test.txt", tmp.as_path())];
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &includes,
@@ -1228,7 +1076,7 @@ fn busybox_with_include_files() {
 #[test]
 fn include_files_no_busybox_when_empty() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let names = cpio_entry_names(&base);
     assert!(
         !names.iter().any(|n| n == "bin/busybox"),
@@ -1247,7 +1095,7 @@ fn include_files_preserves_mode() {
 
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/run.sh", tmp.as_path())];
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &includes,
@@ -1286,7 +1134,7 @@ fn include_files_elf_gets_shared_libs() {
     }
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &includes,
@@ -1316,7 +1164,7 @@ fn include_files_non_elf_no_shared_libs() {
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/hello.sh", tmp.as_path())];
     // Should not fail (ELF parsing skipped for non-ELF).
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &includes,
@@ -1338,7 +1186,7 @@ fn include_files_adds_directory_entries() {
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> =
         vec![("include-files/subdir/nested/file.txt", tmp.as_path())];
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &includes,
@@ -1395,7 +1243,7 @@ fn include_files_rejects_path_traversal() {
     std::fs::write(&tmp, b"data").unwrap();
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/../etc/passwd", tmp.as_path())];
-    let result = build_initramfs_base(
+    let result = base_archive(
         &exe,
         &[],
         &includes,
@@ -1427,7 +1275,7 @@ fn include_files_rejects_fifo() {
     );
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/pipe", fifo_path.as_path())];
-    let result = build_initramfs_base(
+    let result = base_archive(
         &exe,
         &[],
         &includes,
@@ -1437,7 +1285,10 @@ fn include_files_rejects_fifo() {
         ),
     );
     assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    // The regular-file gate now fires inside `pin_input`'s
+    // `StableFileIdentity::from_file`, so the reason sits below the
+    // preparation context: match the whole chain.
+    let err = format!("{:#}", result.unwrap_err());
     assert!(
         err.contains("not a regular file"),
         "error should reject FIFO: {err}"
@@ -1451,7 +1302,7 @@ fn include_files_rejects_directory() {
     std::fs::create_dir(&dir_path).unwrap();
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/mydir", dir_path.as_path())];
-    let result = build_initramfs_base(
+    let result = base_archive(
         &exe,
         &[],
         &includes,
@@ -1461,7 +1312,10 @@ fn include_files_rejects_directory() {
         ),
     );
     assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    // The regular-file gate now fires inside `pin_input`'s
+    // `StableFileIdentity::from_file`, so the reason sits below the
+    // preparation context: match the whole chain.
+    let err = format!("{:#}", result.unwrap_err());
     assert!(
         err.contains("not a regular file"),
         "error should reject directory: {err}"
@@ -1472,7 +1326,7 @@ fn include_files_rejects_directory() {
 fn busybox_independent_of_include_files() {
     let exe = crate::resolve_current_exe().unwrap();
     // busybox=true but no include_files.
-    let base = build_initramfs_base(
+    let base = base_archive(
         &exe,
         &[],
         &[],
@@ -1550,7 +1404,7 @@ fn ld_so_cache_consistent_with_resolve_soname() {
 #[test]
 fn no_duplicate_cpio_entries() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let entries = cpio_entries(&base);
     let mut seen = std::collections::HashSet::new();
     let mut duplicates = Vec::new();
@@ -1587,7 +1441,7 @@ fn no_duplicate_entries_with_include_files() {
         ("usr/local/custom/platform/lib/libcustom3.so", f3.as_path()),
     ];
 
-    let base = build_initramfs_base(&exe, &[], &includes, None).unwrap();
+    let base = base_archive(&exe, &[], &includes, None).unwrap();
     let entries = cpio_entries(&base);
     let entry_names: Vec<&str> = entries.iter().map(|(n, _, _, _)| n.as_str()).collect();
 
@@ -1677,7 +1531,7 @@ fn include_elf_shared_libs_all_present_in_archive() {
     }
     let exe = crate::resolve_current_exe().unwrap();
     let includes: Vec<(&str, &Path)> = vec![("include-files/sh", sh)];
-    let base = build_initramfs_base(&exe, &[], &includes, None).unwrap();
+    let base = base_archive(&exe, &[], &includes, None).unwrap();
     let entries = cpio_entries(&base);
     let entry_map: std::collections::HashMap<&str, (u32, u32, u32)> = entries
         .iter()
@@ -1715,7 +1569,7 @@ fn all_inode_zero_entries_have_nlink_one() {
     // Check that all entries use ino=0 and nlink=1, so the kernel
     // initramfs unpacker never enters the hardlink path.
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let mut remaining: &[u8] = base.as_slice();
     while let Ok(reader) = cpio::newc::Reader::new(remaining) {
         if reader.entry().is_trailer() {
@@ -2245,6 +2099,11 @@ fn parse_ld_so_cache_parses_valid_entries_and_skips_oob_and_nonabsolute() {
         Some(&PathBuf::from(lib_abs)),
         "or_insert first-wins: the second existing mapping is ignored",
     );
+    assert_eq!(
+        map.candidates.get("libfoo.so"),
+        Some(&vec![PathBuf::from(lib_abs), PathBuf::from(lib2_abs)]),
+        "resolution must retain every duplicate-soname candidate in file order",
+    );
     // C is skipped by the OOB guard — never inserted.
     assert!(
         !map.contains_key("liboob.so"),
@@ -2255,6 +2114,116 @@ fn parse_ld_so_cache_parses_valid_entries_and_skips_oob_and_nonabsolute() {
     assert!(
         !map.contains_key("librel.so"),
         "non-absolute path must be rejected by the starts_with('/') gate",
+    );
+}
+
+#[test]
+fn ld_so_cache_resolution_skips_missing_first_duplicate_and_observes_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing-first.so");
+    let usable = temp.path().join("usable-second.so");
+    std::fs::write(&usable, b"library").unwrap();
+    let soname = "libduplicate.so";
+    let cache = LdSoCache {
+        selected: HashMap::from([(soname.to_owned(), usable.clone())]),
+        candidates: HashMap::from([(soname.to_owned(), vec![missing.clone(), usable.clone()])]),
+    };
+    let mut observations = Vec::new();
+    let resolved = resolve_soname_with_loader(
+        soname,
+        &ElfSearchPaths::default(),
+        &[],
+        temp.path(),
+        &[],
+        &cache,
+        &mut observations,
+    )
+    .unwrap();
+    assert_eq!(resolved, Some(usable.clone()));
+    assert!(
+        observations
+            .iter()
+            .any(|observation| observation.path == missing && observation.identity.is_none()),
+        "a currently missing higher-priority cache candidate must remain a \
+         closure-key observation"
+    );
+    assert!(
+        observations
+            .iter()
+            .any(|observation| observation.path == usable && observation.identity.is_some())
+    );
+}
+
+#[test]
+fn dangling_loader_candidate_target_appearance_invalidates_observation() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("future-target.so");
+    let candidate = temp.path().join("libfuture.so");
+    symlink(&target, &candidate).unwrap();
+    let mut observations = Vec::new();
+    observe_search_candidate(&candidate, &mut observations).unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].identity, None);
+
+    std::fs::write(&target, b"now present").unwrap();
+    assert!(
+        observe_search_candidate(&candidate, &mut observations).is_err(),
+        "creating a dangling candidate's target must invalidate the cached closure"
+    );
+}
+
+#[test]
+fn loader_observations_ignore_sibling_churn_but_reject_selected_file_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let search_dir = temp.path().join("deps");
+    std::fs::create_dir(&search_dir).unwrap();
+    let soname = "libselected.so";
+    let selected = search_dir.join(soname);
+    std::fs::write(&selected, b"selected revision one").unwrap();
+
+    let mut observations = Vec::new();
+    let resolved = resolve_soname_with_loader(
+        soname,
+        &ElfSearchPaths {
+            rpath: Vec::new(),
+            runpath: vec![search_dir.clone()],
+        },
+        &[],
+        temp.path(),
+        &[],
+        &LdSoCache::default(),
+        &mut observations,
+    )
+    .unwrap();
+    assert_eq!(resolved, Some(selected.clone()));
+    assert_eq!(
+        observations.len(),
+        1,
+        "only the exact candidate affects this resolution decision"
+    );
+    assert_eq!(observations[0].path, selected);
+    assert!(observations[0].identity.is_some());
+
+    std::fs::write(search_dir.join("unrelated-cargo-artifact"), b"unrelated").unwrap();
+    observe_search_candidate(&selected, &mut observations)
+        .expect("unrelated search-directory churn must leave the selected candidate stable");
+
+    std::fs::write(&selected, b"selected revision two is a different size").unwrap();
+    assert!(
+        observe_search_candidate(&selected, &mut observations).is_err(),
+        "in-place selected-candidate mutation must invalidate the closure"
+    );
+
+    let mut replacement_observations = Vec::new();
+    observe_search_candidate(&selected, &mut replacement_observations).unwrap();
+    let replacement = search_dir.join("replacement");
+    std::fs::write(&replacement, b"replacement inode").unwrap();
+    std::fs::rename(&replacement, &selected).unwrap();
+    assert!(
+        observe_search_candidate(&selected, &mut replacement_observations).is_err(),
+        "selected-candidate inode replacement must invalidate the closure"
     );
 }
 
@@ -2310,7 +2279,7 @@ fn is_standard_interpreter_matches_known_and_rejects_custom() {
 #[test]
 fn suffix_emits_workload_root_cgroup_and_scheduler_cgroup_parent() {
     let exe = crate::resolve_current_exe().unwrap();
-    let base = build_initramfs_base(&exe, &[], &[], None).unwrap();
+    let base = base_archive(&exe, &[], &[], None).unwrap();
     let suffix = build_suffix(
         base.len(),
         &SuffixParams {
@@ -2346,4 +2315,27 @@ fn suffix_emits_workload_root_cgroup_and_scheduler_cgroup_parent() {
             "{name} payload must be the path written verbatim (no transform)",
         );
     }
+}
+
+/// Verifier preparation uses this exact debug-section rewrite on warmed test
+/// executables. The allocated scheduler-manifest sections and every relocation
+/// they reference must survive byte-for-byte semantically.
+#[test]
+fn debug_strip_preserves_scheduler_manifest_elf_stamp() {
+    let executable = crate::resolve_current_exe().expect("locate unit-test executable");
+    let before = crate::test_support::read_scheduler_manifest_stamp(&executable)
+        .expect("read scheduler-manifest stamp before strip")
+        .expect("ktstr unit-test binary must carry v1 stamp sentinels");
+    assert!(
+        !before.tests.is_empty(),
+        "strip fixture must exercise relocation-backed test records, not only sentinels",
+    );
+    let bytes = std::fs::read(&executable).expect("read unit-test executable");
+    let stripped = strip_debug_sections(&bytes).expect("run production debug-strip rewrite");
+    let output = tempfile::NamedTempFile::new().expect("temporary stripped executable");
+    std::fs::write(output.path(), stripped).expect("write stripped executable");
+    let after = crate::test_support::read_scheduler_manifest_stamp(output.path())
+        .expect("read scheduler-manifest stamp after strip")
+        .expect("debug strip must retain v1 stamp sentinels");
+    assert_eq!(after, before);
 }

@@ -411,8 +411,7 @@ fn scenario_snapshot_op_captures_in_vm(
     Ok(result)
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_SNAPSHOT_OP_IN_VM: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "snapshot_op_captures_in_vm",
@@ -433,7 +432,7 @@ static __KTSTR_ENTRY_SNAPSHOT_OP_IN_VM: ktstr::test_support::KtstrTestEntry =
 /// Test 2: `Op::watch_snapshot` runs inside scx-ktstr's guest VM and
 /// drives the host-installed `SnapshotBridge`'s `register_watch`
 /// callback. Test invokes scx-ktstr with `--stall-after=1` so the
-/// scheduler's `tp_btf/sched_ext_exit` handler fires
+/// ktstr probe's selected exit handler fires
 /// `SCX_EXIT_ERROR_STALL`, the freeze coordinator dumps the live
 /// scheduler `.bss` to the variant-keyed
 /// `{sidecar_dir()}/{test_name}-{variant_hash:016x}.failure-dump.json`,
@@ -571,8 +570,7 @@ fn scenario_watch_snapshot_op_captures_exit_state(
     Ok(result)
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_WATCH_SNAPSHOT_EXIT: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "watch_snapshot_op_captures_exit_state",
@@ -743,8 +741,7 @@ fn scenario_snapshotmap_iter_against_synthetic_cgroup_map(
     Ok(result)
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_SNAPSHOTMAP_ITER: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "snapshotmap_iter_against_synthetic_cgroup_map",

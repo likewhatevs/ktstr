@@ -87,28 +87,17 @@ fn synthetic_report() -> FailureDumpReport {
     };
     let bss_map = FailureDumpMap {
         name: "bpf.bss".into(),
-        map_kva: 0,
         map_type: 2,
         value_size: 32,
         max_entries: 1,
         value: Some(bss_value),
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let hash_map = FailureDumpMap {
         name: "scx_per_task".into(),
-        map_kva: 0,
         map_type: 1,
         value_size: 8,
         max_entries: 16,
-        value: None,
         entries: vec![
             FailureDumpEntry {
                 key: Some(RenderedValue::Uint {
@@ -167,24 +156,13 @@ fn synthetic_report() -> FailureDumpReport {
                 payload: None,
             },
         ],
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let percpu_map = FailureDumpMap {
         name: "scx_pcpu".into(),
-        map_kva: 0,
         map_type: 6,
         value_size: 8,
         max_entries: 1,
-        value: None,
-        entries: Vec::new(),
-        array_entries: Vec::new(),
         percpu_entries: vec![FailureDumpPercpuEntry {
             key: 0,
             per_cpu: vec![
@@ -203,12 +181,7 @@ fn synthetic_report() -> FailureDumpReport {
                 }),
             ],
         }],
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -315,20 +288,11 @@ fn snapshot_var_ambiguity_lists_every_match() {
     };
     r.maps.push(FailureDumpMap {
         name: "other.data".into(),
-        map_kva: 0,
         map_type: 2,
         value_size: 32,
         max_entries: 1,
         value: Some(dup_value),
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     });
     let snap = Snapshot::new(&r);
     let f = snap.var("nr_cpus_onln");
@@ -677,7 +641,6 @@ fn render_entry_key_percpu_hash_fallback_uses_hex_prefix() {
 fn map_find_no_match_on_single_value_array_renders_unavailable_keys() {
     let array_map = FailureDumpMap {
         name: "scx_singleton".into(),
-        map_kva: 0,
         map_type: 2,
         value_size: 8,
         max_entries: 1,
@@ -685,15 +648,7 @@ fn map_find_no_match_on_single_value_array_renders_unavailable_keys() {
             bits: 64,
             value: 42,
         }),
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let r = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -758,20 +713,11 @@ fn map_find_no_match_caps_sampled_keys_at_no_match_key_sample() {
         .collect();
     let hash_map = FailureDumpMap {
         name: "scx_big".into(),
-        map_kva: 0,
         map_type: 1,
         value_size: 4,
         max_entries: 64,
-        value: None,
         entries,
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let r = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -827,11 +773,9 @@ fn map_find_no_match_caps_sampled_keys_at_no_match_key_sample() {
 fn map_find_no_match_preserves_duplicate_keys_in_sample() {
     let hash_map = FailureDumpMap {
         name: "scx_dup".into(),
-        map_kva: 0,
         map_type: 1,
         value_size: 4,
         max_entries: 16,
-        value: None,
         entries: vec![
             FailureDumpEntry {
                 key: Some(RenderedValue::Uint {
@@ -874,14 +818,7 @@ fn map_find_no_match_preserves_duplicate_keys_in_sample() {
                 payload: None,
             },
         ],
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let r = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -1049,20 +986,11 @@ fn map_find_no_match_cap_exact_threshold() {
         .collect();
     let hash_map = FailureDumpMap {
         name: "scx_threshold".into(),
-        map_kva: 0,
         map_type: 1,
         value_size: 4,
         max_entries: 16,
-        value: None,
         entries,
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let r = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -4754,7 +4682,6 @@ fn snapshot_field_iter_members_on_empty_array_yields_nothing() {
 fn two_instance_report(values: (u64, u64)) -> FailureDumpReport {
     let mk_bss = |obj: &str, value: u64| FailureDumpMap {
         name: format!("{obj}.bss"),
-        map_kva: 0,
         map_type: 2,
         value_size: 8,
         max_entries: 1,
@@ -4765,15 +4692,7 @@ fn two_instance_report(values: (u64, u64)) -> FailureDumpReport {
                 value: RenderedValue::Uint { bits: 64, value },
             }],
         }),
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -4866,7 +4785,6 @@ fn live_var_via_no_candidates_surfaces_var_not_found() {
 fn two_instance_two_var_report() -> FailureDumpReport {
     let mk_bss = |obj: &str, same: u64, cross: u64| FailureDumpMap {
         name: format!("{obj}.bss"),
-        map_kva: 0,
         map_type: 2,
         value_size: 16,
         max_entries: 1,
@@ -4889,15 +4807,7 @@ fn two_instance_two_var_report() -> FailureDumpReport {
                 },
             ],
         }),
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -5027,7 +4937,6 @@ fn live_vars_via_partial_coverage_map_excluded() {
     let mut r = FailureDumpReport::default();
     let alpha = FailureDumpMap {
         name: "alpha.bss".into(),
-        map_kva: 0,
         map_type: 2,
         value_size: 16,
         max_entries: 1,
@@ -5047,19 +4956,10 @@ fn live_vars_via_partial_coverage_map_excluded() {
                 },
             ],
         }),
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     let beta = FailureDumpMap {
         name: "beta.bss".into(),
-        map_kva: 0,
         map_type: 2,
         value_size: 8,
         max_entries: 1,
@@ -5073,15 +4973,7 @@ fn live_vars_via_partial_coverage_map_excluded() {
                 },
             }],
         }),
-        entries: Vec::new(),
-        array_entries: Vec::new(),
-        percpu_entries: Vec::new(),
-        percpu_hash_entries: Vec::new(),
-        arena: None,
-        ringbuf: None,
-        stack_trace: None,
-        fd_array: None,
-        error: None,
+        ..Default::default()
     };
     r.maps = vec![alpha, beta];
     r.schema = SCHEMA_SINGLE.to_string();

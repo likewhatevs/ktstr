@@ -655,7 +655,7 @@ fn group_and_average_empty_input_yields_empty_output() {
 /// `passes_observed`) lands here.
 #[test]
 fn group_and_average_single_pass_passes_through_metrics() {
-    let mut row = make_row("t", "tiny-1llc", true, 0.0);
+    let mut row = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut row, 12.0, 200, 50, 1000);
     let out = group_and_average_by(std::slice::from_ref(&row), LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
@@ -691,11 +691,11 @@ fn group_and_average_single_pass_passes_through_metrics() {
 /// stuck_count alone is f64 with a 1.0 floor.
 #[test]
 fn group_and_average_stuck_count_is_exact_fractional_mean() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.stuck_count = 1.0;
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.stuck_count = 1.0;
-    let mut c = make_row("t", "tiny-1llc", true, 0.0);
+    let mut c = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     c.stuck_count = 2.0;
     let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1, "same-key contributors fold to one aggregate");
@@ -716,11 +716,11 @@ fn group_and_average_stuck_count_is_exact_fractional_mean() {
 /// modulo IEEE rounding; u64/i64 means are rounded.
 #[test]
 fn group_and_average_multi_pass_kind_aware_fold() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut a, 10.0, 100, 30, 900);
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut b, 20.0, 200, 60, 1100);
-    let mut c = make_row("t", "tiny-1llc", true, 0.0);
+    let mut c = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut c, 30.0, 300, 90, 1000);
     let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
@@ -837,7 +837,7 @@ fn group_and_average_multi_pass_kind_aware_fold() {
 #[test]
 fn group_and_average_schedstat_rates_pool_sigma_over_sigma() {
     let mk = |run_delay: f64, pcount: f64, local: f64, count: f64| {
-        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
         r.ext_metrics.insert("total_run_delay".into(), run_delay);
         r.ext_metrics.insert("total_pcount".into(), pcount);
         r.ext_metrics.insert("total_ttwu_local".into(), local);
@@ -887,7 +887,7 @@ fn group_and_average_schedstat_rates_pool_sigma_over_sigma() {
 #[test]
 fn sched_goidle_fraction_derives_and_pools_sigma_over_sigma() {
     let mk = |goidle: f64, count: f64| {
-        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
         r.ext_metrics.insert("total_sched_goidle".into(), goidle);
         r.ext_metrics.insert("total_sched_count".into(), count);
         r
@@ -925,7 +925,7 @@ fn sched_goidle_fraction_derives_and_pools_sigma_over_sigma() {
 #[test]
 fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
     let mk = |fast: f64, slow: f64, cpu: f64| {
-        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
         r.ext_metrics
             .insert("total_taobench_ops".into(), fast + slow);
         r.ext_metrics.insert("total_taobench_fast_ops".into(), fast);
@@ -1001,7 +1001,7 @@ fn taobench_whole_run_rates_derive_and_pool_sigma_over_sigma() {
 #[test]
 fn schedstat_per_vcpu_second_rates_derive_and_pool_sigma_over_sigma() {
     let mk = |pcount: f64, run_delay: f64, vcpu_sec: f64| {
-        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
         r.ext_metrics.insert("total_pcount".into(), pcount);
         r.ext_metrics.insert("total_run_delay".into(), run_delay);
         r.ext_metrics
@@ -1049,7 +1049,7 @@ fn schedstat_per_vcpu_second_rates_derive_and_pool_sigma_over_sigma() {
 #[test]
 fn schbench_class3_rates_derive_and_pool_sigma_over_sigma() {
     let mk = |msg_rd: f64, msg_pc: f64, wkr_rd: f64, wkr_pc: f64, loops: f64| {
-        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
         r.ext_metrics
             .insert("total_schbench_msg_run_delay_ns".into(), msg_rd);
         r.ext_metrics
@@ -1126,7 +1126,7 @@ fn schbench_class3_rates_derive_and_pool_sigma_over_sigma() {
 #[test]
 fn schbench_whole_percentile_is_not_cross_run_folded() {
     let mk = |p99: f64| {
-        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
         r.ext_metrics
             .insert("wakeup_p99_latency_us_whole".into(), p99);
         r
@@ -1153,7 +1153,7 @@ fn group_and_average_avg_nr_running_is_sample_weighted_mean() {
     // weighted   = (2*10 + 4*90) / (10+90) = 380/100 = 3.8
     // unweighted = (2 + 4) / 2 = 3.0  (what a typed mean-fold would give)
     let mk = |avg: f64, samples: usize| {
-        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
         r.run_sample_count = samples;
         r.ext_metrics.insert("avg_nr_running".into(), avg);
         r
@@ -1178,14 +1178,14 @@ fn group_and_average_avg_nr_running_is_sample_weighted_mean() {
 /// mean 30.0, NOT the (20+40+0)/3 = 20.0 a passes_observed divisor gives.
 #[test]
 fn group_and_average_distribution_excludes_key_omitting_run_from_mean() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.ext_metrics
         .insert("worst_p99_wake_latency_us".to_string(), 20.0);
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.ext_metrics
         .insert("worst_p99_wake_latency_us".to_string(), 40.0);
     // Third passing run omits the key entirely.
-    let c = make_row("t", "tiny-1llc", true, 0.0);
+    let c = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].passes_observed, 3);
@@ -1212,14 +1212,14 @@ fn group_and_average_distribution_excludes_key_omitting_run_from_mean() {
 #[test]
 fn group_and_average_tail_ratio_excludes_omitting_run_and_is_unweighted() {
     let key = "worst_wake_latency_tail_ratio";
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.run_sample_count = 1000;
     a.ext_metrics.insert(key.to_string(), 2.0);
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.run_sample_count = 1;
     b.ext_metrics.insert(key.to_string(), 8.0);
     // Third passing run omits the key entirely.
-    let c = make_row("t", "tiny-1llc", true, 0.0);
+    let c = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].passes_observed, 3);
@@ -1241,10 +1241,10 @@ fn group_and_average_tail_ratio_excludes_omitting_run_and_is_unweighted() {
 #[test]
 fn group_and_average_per_phase_delta_sum_is_unweighted_mean_cross_run() {
     let key = "system_time_ns";
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.run_sample_count = 1000;
     a.ext_metrics.insert(key.to_string(), 8000.0);
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.run_sample_count = 1;
     b.ext_metrics.insert(key.to_string(), 4000.0);
     let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
@@ -1264,11 +1264,11 @@ fn group_and_average_per_phase_delta_sum_is_unweighted_mean_cross_run() {
 /// semantic to the next-level cohort.
 #[test]
 fn group_and_average_run_sample_count_sums_across_contributors() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.run_sample_count = 5;
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.run_sample_count = 15;
-    let mut c = make_row("t", "tiny-1llc", true, 0.0);
+    let mut c = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     c.run_sample_count = 30;
     let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
@@ -1285,10 +1285,10 @@ fn group_and_average_run_sample_count_sums_across_contributors() {
 /// real registry entry, not a synthetic fixture.
 #[test]
 fn group_and_average_ext_metrics_gauge_avg_weighted_by_run_sample_count() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.run_sample_count = 5;
     a.ext_metrics.insert("avg_dsq_depth".to_string(), 10.0);
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.run_sample_count = 15;
     b.ext_metrics.insert("avg_dsq_depth".to_string(), 30.0);
     let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
@@ -1317,10 +1317,10 @@ fn group_and_average_ext_metrics_gauge_avg_weighted_by_run_sample_count() {
 /// Without the floor, a is dropped (weight 0) and the mean collapses to b's 30.0.
 #[test]
 fn group_and_average_gauge_avg_floors_zero_sample_count_weight() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.run_sample_count = 0;
     a.ext_metrics.insert("avg_dsq_depth".to_string(), 10.0);
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.run_sample_count = 10;
     b.ext_metrics.insert("avg_dsq_depth".to_string(), 30.0);
     let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
@@ -1355,14 +1355,14 @@ fn group_and_average_gauge_avg_floors_zero_sample_count_weight() {
 /// skip-then-derive path.
 #[test]
 fn group_and_average_repools_iteration_rate_from_components() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.ext_metrics
         .insert("total_iterations_pooled".to_string(), 1000.0);
     a.ext_metrics.insert("total_cpu_time_sec".to_string(), 1.0);
     // A stale per-run rate must be DISCARDED (a Rate is derived, never
     // folded from its own samples).
     a.ext_metrics.insert("iteration_rate".to_string(), 999.0);
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.ext_metrics
         .insert("total_iterations_pooled".to_string(), 10.0);
     b.ext_metrics.insert("total_cpu_time_sec".to_string(), 9.0);
@@ -1411,17 +1411,17 @@ fn group_and_average_repools_iteration_rate_from_components() {
 /// key-absent run as a contributor (which a mean-over-all-runs fold would).
 #[test]
 fn group_and_average_pooled_rate_unaffected_by_key_absent_run() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.ext_metrics
         .insert("total_iterations_pooled".to_string(), 1000.0);
     a.ext_metrics.insert("total_cpu_time_sec".to_string(), 1.0);
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.ext_metrics
         .insert("total_iterations_pooled".to_string(), 10.0);
     b.ext_metrics.insert("total_cpu_time_sec".to_string(), 9.0);
     // Third PASSING run with NO pooled component keys (all cgroups
     // unmeasured — populate_run_pooled inserted neither key).
-    let c = make_row("t", "tiny-1llc", true, 0.0);
+    let c = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     let out = group_and_average_by(&[a, b, c], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
     // Components SUM over the two key-bearing runs only; the key-absent
@@ -1454,11 +1454,11 @@ fn group_and_average_pooled_rate_unaffected_by_key_absent_run() {
 /// METRICS-known keys; unknown keys ignore the weights.
 #[test]
 fn group_and_average_ext_metrics_unregistered_falls_back_to_arithmetic_mean() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.run_sample_count = 5;
     a.ext_metrics
         .insert("custom.unregistered".to_string(), 10.0);
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.run_sample_count = 15;
     b.ext_metrics
         .insert("custom.unregistered".to_string(), 30.0);
@@ -1482,9 +1482,9 @@ fn group_and_average_ext_metrics_unregistered_falls_back_to_arithmetic_mean() {
 /// component would land here as a collision.
 #[test]
 fn group_and_average_distinct_groups_stay_separate() {
-    let mut a = make_row("alpha", "tiny-1llc", true, 0.0);
+    let mut a = make_row("alpha", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut a, 10.0, 100, 30, 1000);
-    let mut b = make_row("beta", "tiny-1llc", true, 0.0);
+    let mut b = make_row("beta", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut b, 50.0, 500, 100, 2000);
     let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 2);
@@ -1499,14 +1499,14 @@ fn group_and_average_distinct_groups_stay_separate() {
 /// `passes_observed` counts only the clean ones.
 #[test]
 fn group_and_average_failed_contributors_excluded_from_mean_and_flag_aggregate() {
-    let mut pass1 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut pass1 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut pass1, 10.0, 100, 30, 1000);
-    let mut fail = make_row("t", "tiny-1llc", false, 0.0);
+    let mut fail = make_row("t", "4cpu-1llc-nosmt", false, 0.0);
     // The failing row's metrics are pathologically large —
     // if they leaked into the mean, the aggregate's `spread`
     // would explode upward.
     paint_metrics(&mut fail, 10000.0, 99999, 99999, 99999);
-    let mut pass2 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut pass2 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut pass2, 30.0, 300, 90, 1000);
     let out = group_and_average_by(&[pass1, fail, pass2], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
@@ -1533,14 +1533,14 @@ fn group_and_average_failed_contributors_excluded_from_mean_and_flag_aggregate()
 /// passing-only entries still feed the mean cleanly.
 #[test]
 fn group_and_average_skipped_contributors_excluded_from_mean_and_flag_aggregate() {
-    let mut pass1 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut pass1 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut pass1, 10.0, 100, 30, 1000);
-    let mut skip = make_row("t", "tiny-1llc", true, 0.0);
+    let mut skip = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     skip.skipped = true;
     // Pathological metrics on the skipped row to prove the
     // exclusion is real.
     paint_metrics(&mut skip, 9999.0, 99999, 99999, 99999);
-    let mut pass2 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut pass2 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut pass2, 50.0, 500, 70, 2000);
     let out = group_and_average_by(&[pass1, skip, pass2], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
@@ -1575,15 +1575,15 @@ fn group_and_average_skipped_contributors_excluded_from_mean_and_flag_aggregate(
 /// one that truly passed.
 #[test]
 fn group_and_average_inconclusive_contributors_excluded_from_mean_and_flag_aggregate() {
-    let mut pass1 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut pass1 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut pass1, 10.0, 100, 30, 1000);
     // Inconclusive row: passed=false, skipped=false,
     // inconclusive=true. Pathological metrics on this row
     // must NOT leak into the mean.
-    let mut inc = make_row("t", "tiny-1llc", false, 0.0);
+    let mut inc = make_row("t", "4cpu-1llc-nosmt", false, 0.0);
     inc.inconclusive = true;
     paint_metrics(&mut inc, 7777.0, 77777, 77777, 77777);
-    let mut pass2 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut pass2 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut pass2, 30.0, 300, 90, 2000);
     let out = group_and_average_by(&[pass1, inc, pass2], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
@@ -1617,12 +1617,12 @@ fn group_and_average_inconclusive_contributors_excluded_from_mean_and_flag_aggre
 /// signal rather than the lesser Inconclusive one.
 #[test]
 fn group_and_average_fail_dominates_inconclusive_in_aggregate_verdict() {
-    let mut pass = make_row("t", "tiny-1llc", true, 0.0);
+    let mut pass = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut pass, 10.0, 100, 30, 1000);
-    let mut inc = make_row("t", "tiny-1llc", false, 0.0);
+    let mut inc = make_row("t", "4cpu-1llc-nosmt", false, 0.0);
     inc.inconclusive = true;
     paint_metrics(&mut inc, 7777.0, 77777, 77777, 77777);
-    let mut fail = make_row("t", "tiny-1llc", false, 0.0);
+    let mut fail = make_row("t", "4cpu-1llc-nosmt", false, 0.0);
     paint_metrics(&mut fail, 9999.0, 99999, 99999, 99999);
     let out = group_and_average_by(&[pass, inc, fail], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
@@ -1641,9 +1641,9 @@ fn group_and_average_fail_dominates_inconclusive_in_aggregate_verdict() {
 /// `denom` must default to 1.0 when `passes_observed = 0`.
 #[test]
 fn group_and_average_all_failed_collapses_to_default_zero_metrics_and_failed_flag() {
-    let mut fail1 = make_row("t", "tiny-1llc", false, 0.0);
+    let mut fail1 = make_row("t", "4cpu-1llc-nosmt", false, 0.0);
     paint_metrics(&mut fail1, 99.0, 999, 99, 999);
-    let mut fail2 = make_row("t", "tiny-1llc", false, 0.0);
+    let mut fail2 = make_row("t", "4cpu-1llc-nosmt", false, 0.0);
     paint_metrics(&mut fail2, 88.0, 888, 88, 888);
     let out = group_and_average_by(&[fail1, fail2], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
@@ -1666,10 +1666,10 @@ fn group_and_average_all_failed_collapses_to_default_zero_metrics_and_failed_fla
 /// present-only count.
 #[test]
 fn group_and_average_ext_metrics_average_per_key_present_count() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.ext_metrics.insert("shared".into(), 10.0);
     a.ext_metrics.insert("a_only".into(), 100.0);
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.ext_metrics.insert("shared".into(), 30.0);
     b.ext_metrics.insert("b_only".into(), 200.0);
     let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
@@ -1690,9 +1690,9 @@ fn group_and_average_ext_metrics_average_per_key_present_count() {
 /// asserting the output keeps that order.
 #[test]
 fn group_and_average_preserves_first_seen_order() {
-    let zebra = make_row("zebra", "tiny-1llc", true, 0.0);
-    let alpha = make_row("alpha", "tiny-1llc", true, 0.0);
-    let mango = make_row("mango", "tiny-1llc", true, 0.0);
+    let zebra = make_row("zebra", "4cpu-1llc-nosmt", true, 0.0);
+    let alpha = make_row("alpha", "4cpu-1llc-nosmt", true, 0.0);
+    let mango = make_row("mango", "4cpu-1llc-nosmt", true, 0.0);
     let out = group_and_average_by(&[zebra, alpha, mango], LEGACY_PAIRING_DIMS);
     let names: Vec<&str> = out.iter().map(|r| r.row.scenario.as_str()).collect();
     assert_eq!(
@@ -1710,9 +1710,9 @@ fn group_and_average_preserves_first_seen_order() {
 /// hid the WIP-vs-committed disagreement.
 #[test]
 fn group_and_average_mixed_dirty_project_commit_renders_plus_mixed() {
-    let mut dirty = make_row("t", "tiny-1llc", true, 0.0);
+    let mut dirty = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     dirty.commit = Some("abc1234-dirty".to_string());
-    let mut clean = make_row("t", "tiny-1llc", true, 0.0);
+    let mut clean = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     clean.commit = Some("abc1234".to_string());
 
     let out = group_and_average_by(&[dirty, clean], LEGACY_PAIRING_DIMS);
@@ -1730,9 +1730,9 @@ fn group_and_average_mixed_dirty_project_commit_renders_plus_mixed() {
 /// could miss one.
 #[test]
 fn group_and_average_mixed_dirty_kernel_commit_renders_plus_mixed() {
-    let mut clean = make_row("t", "tiny-1llc", true, 0.0);
+    let mut clean = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     clean.kernel_commit = Some("def5678".to_string());
-    let mut dirty = make_row("t", "tiny-1llc", true, 0.0);
+    let mut dirty = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     dirty.kernel_commit = Some("def5678-dirty".to_string());
 
     let out = group_and_average_by(&[clean, dirty], LEGACY_PAIRING_DIMS);
@@ -1751,9 +1751,9 @@ fn group_and_average_mixed_dirty_kernel_commit_renders_plus_mixed() {
 /// regardless of clean siblings.
 #[test]
 fn group_and_average_all_dirty_keeps_dirty_suffix_no_mixed() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.commit = Some("abc1234-dirty".to_string());
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.commit = Some("abc1234-dirty".to_string());
 
     let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
@@ -1769,9 +1769,9 @@ fn group_and_average_all_dirty_keeps_dirty_suffix_no_mixed() {
 /// marker.
 #[test]
 fn group_and_average_all_clean_keeps_value_no_mixed() {
-    let mut a = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     a.commit = Some("abc1234".to_string());
-    let mut b = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     b.commit = Some("abc1234".to_string());
 
     let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
@@ -1799,9 +1799,9 @@ fn group_and_average_all_clean_keeps_value_no_mixed() {
 /// independent of the other.
 #[test]
 fn group_and_average_mixed_dirty_tracking_includes_skipped() {
-    let mut clean_pass = make_row("t", "tiny-1llc", true, 0.0);
+    let mut clean_pass = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     clean_pass.commit = Some("abc1234".to_string());
-    let mut dirty_skip = make_row("t", "tiny-1llc", true, 0.0);
+    let mut dirty_skip = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     dirty_skip.skipped = true;
     dirty_skip.commit = Some("abc1234-dirty".to_string());
 
@@ -1838,9 +1838,9 @@ fn group_and_average_mixed_dirty_tracking_includes_skipped() {
 /// test pins the FAILED arm specifically.
 #[test]
 fn group_and_average_mixed_dirty_tracking_includes_failed_contributors() {
-    let mut clean_pass = make_row("t", "tiny-1llc", true, 0.0);
+    let mut clean_pass = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     clean_pass.commit = Some("abc1234".to_string());
-    let mut dirty_fail = make_row("t", "tiny-1llc", false, 0.0);
+    let mut dirty_fail = make_row("t", "4cpu-1llc-nosmt", false, 0.0);
     dirty_fail.commit = Some("abc1234-dirty".to_string());
 
     let out = group_and_average_by(&[clean_pass, dirty_fail], LEGACY_PAIRING_DIMS);
@@ -1859,9 +1859,9 @@ fn group_and_average_mixed_dirty_tracking_includes_failed_contributors() {
     // form must register as well — `any_clean` is the
     // counterpart flag, and the same code path executes for
     // both `Some(hex)` and `Some(hex-dirty)` values.
-    let mut dirty_pass = make_row("t", "tiny-1llc", true, 0.0);
+    let mut dirty_pass = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     dirty_pass.commit = Some("def5678-dirty".to_string());
-    let mut clean_fail = make_row("t", "tiny-1llc", false, 0.0);
+    let mut clean_fail = make_row("t", "4cpu-1llc-nosmt", false, 0.0);
     clean_fail.commit = Some("def5678".to_string());
 
     let out = group_and_average_by(&[dirty_pass, clean_fail], LEGACY_PAIRING_DIMS);
@@ -1891,9 +1891,9 @@ fn group_and_average_mixed_dirty_tracking_includes_failed_contributors() {
 /// a stripping bug in `render_mixed_dirty`.
 #[test]
 fn group_and_average_mixed_dirty_strips_dirty_from_first_seen() {
-    let mut dirty_first = make_row("t", "tiny-1llc", true, 0.0);
+    let mut dirty_first = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     dirty_first.commit = Some("abc1234-dirty".to_string());
-    let mut clean_second = make_row("t", "tiny-1llc", true, 0.0);
+    let mut clean_second = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     clean_second.commit = Some("abc1234".to_string());
 
     let out = group_and_average_by(&[dirty_first, clean_second], LEGACY_PAIRING_DIMS);
@@ -1910,8 +1910,8 @@ fn group_and_average_mixed_dirty_strips_dirty_from_first_seen() {
 /// contributor has a commit value.
 #[test]
 fn group_and_average_all_none_commits_keeps_none_no_mixed() {
-    let a = make_row("t", "tiny-1llc", true, 0.0);
-    let b = make_row("t", "tiny-1llc", true, 0.0);
+    let a = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
+    let b = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
 
     let out = group_and_average_by(&[a, b], LEGACY_PAIRING_DIMS);
     assert!(
@@ -1927,17 +1927,17 @@ fn group_and_average_all_none_commits_keeps_none_no_mixed() {
 /// producing a regression. Pins the full averaging pipeline.
 #[test]
 fn group_and_average_then_compare_rows_yields_regression_on_means() {
-    let mut a1 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a1 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut a1, 10.0, 100, 30, 1000);
-    let mut a2 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a2 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut a2, 12.0, 120, 35, 1000);
-    let mut a3 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut a3 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut a3, 14.0, 140, 40, 1000);
-    let mut b1 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b1 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut b1, 28.0, 280, 70, 1000);
-    let mut b2 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b2 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut b2, 30.0, 300, 75, 1000);
-    let mut b3 = make_row("t", "tiny-1llc", true, 0.0);
+    let mut b3 = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     paint_metrics(&mut b3, 32.0, 320, 80, 1000);
 
     let agg_a = group_and_average_by(&[a1, a2, a3], LEGACY_PAIRING_DIMS);

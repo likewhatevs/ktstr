@@ -274,7 +274,7 @@ fn load_btf_from_bytes_inner(
 
     if sidecar_allowed {
         if sidecar_fresh(&sidecar, &canon_path) {
-            match std::fs::read(&sidecar) {
+            match map_sidecar(&sidecar) {
                 Ok(cached) if is_raw_btf(&cached) => {
                     match Btf::from_bytes(&cached) {
                         Ok(btf) => return Ok(btf),
@@ -301,7 +301,7 @@ fn load_btf_from_bytes_inner(
                     tracing::warn!(
                         path = %sidecar.display(),
                         err = %e,
-                        "btf sidecar read failed; falling back to ELF extraction",
+                        "btf sidecar map failed; falling back to ELF extraction",
                     );
                 }
             }
@@ -376,6 +376,26 @@ fn btf_sidecar_path(path: &Path) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
+/// Map a published sidecar read-only instead of copying it into an owned
+/// `Vec`.
+///
+/// Both sidecars are multi-MB and every nextest cell rehydrates them in a
+/// fresh process, so `std::fs::read` charged each cell a private copy of the
+/// whole file on top of the page cache that already held it. The decoders
+/// above copy out whatever they retain, so a mapping serves them identically
+/// while the pages stay shared between concurrent cells.
+///
+/// Errors (including the empty file `mmap` rejects) are reported like the
+/// read failures they replace; every caller treats one as a sidecar miss.
+pub(crate) fn map_sidecar(path: &Path) -> std::io::Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: sidecars are published by atomic rename and never rewritten in
+    // place, so the inode behind an open mapping is immutable for the
+    // mapping's lifetime — a sibling process replacing the pathname leaves
+    // this mapping on the bytes it was created from.
+    unsafe { memmap2::Mmap::map(&file) }
+}
+
 /// True iff `data` begins with the little-endian raw-BTF magic
 /// (bytes 0x9F then 0xEB in file order, i.e. the u16 0xEB9F read LE).
 ///
@@ -447,19 +467,54 @@ fn write_btf_sidecar(sidecar: &Path, bytes: &[u8]) -> Result<()> {
 /// `.artifacts` sidecar's BTF-derived products are only trustworthy
 /// paired with a matching `.btf` sidecar.
 pub(crate) fn load_btf_from_sidecar(path: &Path) -> Option<Btf> {
+    let sidecar = trusted_btf_sidecar(path)?;
+    let cached = map_sidecar(&sidecar).ok()?;
+    if !is_raw_btf(&cached) {
+        return None;
+    }
+    Btf::from_bytes(&cached).ok()
+}
+
+/// The `.btf` sidecar path for `path`, or `None` when it fails the
+/// membership + freshness gate the sidecar loaders share.
+fn trusted_btf_sidecar(path: &Path) -> Option<std::path::PathBuf> {
     let canon = std::fs::canonicalize(path).ok()?;
     if !crate::cache::path_inside_cache_root(&canon) {
         return None;
     }
     let sidecar = btf_sidecar_path(&canon);
-    if !sidecar_fresh(&sidecar, &canon) {
+    sidecar_fresh(&sidecar, &canon).then_some(sidecar)
+}
+
+/// [`load_btf_from_sidecar`] with btf-rs's `Backend::Mmap`: the sidecar
+/// stays mapped and each type is decoded from those bytes on demand
+/// instead of being parsed up front into an owned type graph.
+///
+/// Measured against the cached 7.1.5 sidecar (5.7 MiB of raw BTF):
+/// 1.3 ms and 4.5 MB resident to construct, against 61 ms and 41 MB for
+/// [`load_btf_from_sidecar`]. `resolve_type_by_id` is no slower
+/// (0.07 us against 0.09 us — both decode a type and allocate it). The
+/// whole cost moves to `resolve_ids_by_name`, which becomes a linear
+/// walk of the type section: ~0.7 ms against ~0.5 us. The two forms
+/// break even at roughly 85 name resolutions per handle.
+///
+/// So this is deliberately not the default. Dump rendering resolves a
+/// name once per `Fwd` terminal it peels
+/// ([`crate::monitor::btf_render::peel_modifiers_resolving_fwd`]) — an
+/// unbounded count over a report — while the run-path consumers resolve
+/// a handful. `vmm::vmlinux`'s `BtfProducts` owns that split.
+///
+/// btf-rs offers `Backend::Mmap` only for a base BTF read from a file,
+/// so there is no byte-slice form and no ELF fallback here; callers fall
+/// back to [`load_btf_from_sidecar`]'s owned parse.
+pub(crate) fn load_btf_from_sidecar_mapped(path: &Path) -> Option<Btf> {
+    let sidecar = trusted_btf_sidecar(path)?;
+    // btf-rs would accept a big-endian blob through its own header
+    // parse; keep the little-endian-only gate `is_raw_btf` documents.
+    if !is_raw_btf(&map_sidecar(&sidecar).ok()?) {
         return None;
     }
-    let cached = std::fs::read(&sidecar).ok()?;
-    if !is_raw_btf(&cached) {
-        return None;
-    }
-    Btf::from_bytes(&cached).ok()
+    Btf::from_file_with_backend(&sidecar, btf_rs::Backend::Mmap).ok()
 }
 
 /// True iff the `.btf` sidecar for `path` exists and is fresh relative
@@ -1122,8 +1177,13 @@ fn int_byte_width(btf: &Btf, ty: btf_rs::Type) -> Option<usize> {
 /// Resolve a dot-path within `root` to `(byte_offset_from_root,
 /// leaf_int_width)`. Mirrors [`nested_member_byte_offset`]'s descent but also
 /// returns the leaf integer's BTF-declared byte size (so reads never hardcode
-/// a width). `None` on any resolve failure or a non-integer leaf.
-fn nested_member_offset_and_width(
+/// a width). Shared by BPF-map field reads and kernel-structure validation:
+/// both must follow kernel layout changes that alter a scalar's width without
+/// moving its containing structure.
+///
+/// Returns `None` on any resolve failure, a non-integer leaf, or a bitfield
+/// leaf whose neighbouring bits cannot safely be read as part of the value.
+pub(crate) fn nested_member_offset_and_width(
     btf: &Btf,
     root: &btf_rs::Struct,
     path: &str,
@@ -1139,13 +1199,16 @@ fn nested_member_offset_and_width(
         let (off, member) = member_byte_offset_with_member(btf, &current, part).ok()?;
         total = total.checked_add(off)?;
         if is_last {
-            // A bitfield leaf (sub-byte width, kind_flag==1) cannot be read as
-            // a whole little-endian integer without capturing neighbouring
-            // bits, so reject it rather than return a wrong value.
+            // A positive-width bitfield leaf cannot be read as a whole
+            // little-endian integer without capturing neighbouring bits, so
+            // reject it rather than return a wrong value. `kind_flag` belongs
+            // to the containing struct, not to each member: btf-rs therefore
+            // returns `Some(0)` for ordinary members of a struct that contains
+            // any bitfield. Zero means this member is not itself a bitfield.
             // (`member_byte_offset_with_member` already rejects a non-byte-
             // aligned offset; this additionally rejects a byte-aligned offset
             // with a sub-byte size.)
-            if member.bitfield_size().is_some() {
+            if matches!(member.bitfield_size(), Some(width) if width > 0) {
                 return None;
             }
             let leaf_ty = btf.resolve_chained_type(&member).ok()?;
@@ -1320,7 +1383,7 @@ impl IdrOffsets {
 
 /// Byte offsets within kernel BPF structures needed for host-side
 /// BPF map discovery and value access.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct BpfMapOffsets {
     /// Offset of `name` (char\[BPF_OBJ_NAME_LEN\]) within `struct bpf_map`.
@@ -1675,7 +1738,7 @@ impl BpfProgOffsets {
 /// Captures the two fields the host-side scx walker dereferences off a
 /// `struct rq` pointer: `scx` (the embedded `struct scx_rq`) and
 /// `curr` (the currently-running `struct task_struct *`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)] // wired via ScxWalkerOffsets; stays alive once the
 // freeze coordinator populates ScxWalkerCapture.
 pub struct RqStructOffsets {
@@ -1719,7 +1782,7 @@ impl RqStructOffsets {
 ///   debug dump omits it. `clock` is similar — read by
 ///   in-kernel scheduling paths but not by `scx_dump_state`;
 ///   ktstr surfaces it for cross-CPU clock-skew analysis.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxRqOffsets {
     /// Offset of `local_dsq` (struct scx_dispatch_q). Read by
@@ -1827,7 +1890,7 @@ impl ScxRqOffsets {
 ///
 /// Walkers that need additional task_struct fields (priority, signal,
 /// stack...) compose [`TaskStructEnrichmentOffsets`] alongside this.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct TaskStructCoreOffsets {
     /// Offset of `comm` (`char[16]`).
@@ -1919,7 +1982,7 @@ impl TaskStructEnrichmentOffsets {
 /// Offsets here are relative to the `sched_ext_entity` base; the full
 /// offset within `task_struct` is
 /// `TaskStructCoreOffsets::scx + <field>`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct SchedExtEntityOffsets {
     pub runnable_node: usize,
@@ -1963,7 +2026,7 @@ impl SchedExtEntityOffsets {
 }
 
 /// Field offsets within `struct scx_dsq_list_node`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxDsqListNodeOffsets {
     /// Offset of `node` (struct list_head). Fixed at 0 in current
@@ -1985,7 +2048,7 @@ impl ScxDsqListNodeOffsets {
 }
 
 /// Field offsets within `struct scx_dispatch_q`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxDispatchQOffsets {
     /// Offset of `list` (struct list_head). Head of the FIFO task list.
@@ -2024,7 +2087,7 @@ impl ScxDispatchQOffsets {
 /// `Option<ScxSchedOffsets>` (`ScxWalkerOffsets::sched`) before
 /// constructing this; once the struct exists, several internal fields
 /// are also kernel-version-gated, so each is `Option<usize>`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxSchedOffsets {
     /// Offset of `dsq_hash` (struct rhashtable). User-allocated DSQs.
@@ -2076,7 +2139,7 @@ impl ScxSchedOffsets {
 /// is development-only (no released tag in our supported range), so
 /// the parent `ScxWalkerOffsets::sched_pnode` is `Option<…>`. Within
 /// the struct, the single `global_dsq` field is also dev-only.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxSchedPnodeOffsets {
     /// Offset of `global_dsq` (struct scx_dispatch_q). Per-NUMA-node
@@ -2102,7 +2165,7 @@ impl ScxSchedPnodeOffsets {
 /// `ScxWalkerOffsets::sched_pcpu` is `Option<…>` so kernels < v6.18
 /// don't fail BTF resolution. Inside the struct, the single
 /// `bypass_dsq` field is dev-only.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct ScxSchedPcpuOffsets {
     /// Offset of `bypass_dsq` (struct scx_dispatch_q). Per-CPU
@@ -2125,7 +2188,7 @@ impl ScxSchedPcpuOffsets {
 /// Field offsets within `struct rhashtable`, `struct bucket_table`,
 /// and `struct rhash_head`. Bundled together since the user DSQ walk
 /// needs all three to traverse a single rhashtable.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct RhashtableOffsets {
     /// `rhashtable.tbl` — `struct bucket_table __rcu *`.
@@ -2275,7 +2338,7 @@ impl UpidStructOffsets {
 /// the BTF's anonymous-struct-walking `member_byte_offset`, so the
 /// path works even if the kernel later wraps the field in an
 /// anonymous union.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct RunnableScanOffsets {
     /// Offset of `scx` (struct sched_ext_entity) within
     /// `struct task_struct`. Used by the container_of step to
@@ -2373,7 +2436,7 @@ impl RunnableScanOffsets {
 /// `TASK_COMM_LEN` is fixed at 16 by the kernel uapi
 /// (`include/linux/sched.h::TASK_COMM_LEN`); the walker reads a
 /// fixed-size 16-byte buffer at `task_struct_comm`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct TaskEnrichmentOffsets {
     // -- struct task_struct fields --
@@ -2604,7 +2667,7 @@ pub mod pid_type {
 /// - `struct scx_dsq_list_node`: include/linux/sched/ext.h
 /// - `struct sched_ext_entity`: include/linux/sched/ext.h
 /// - `struct rhashtable` / `struct bucket_table`: include/linux/rhashtable.h
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)] // wired into ScxWalkerCapture; freeze coordinator
 // populates the capture once the producer-side
 // wiring lands.
@@ -2741,6 +2804,63 @@ pub const SCX_DSQ_LNODE_ITER_CURSOR: u32 = 1;
 /// own bit-stripping helper.
 #[allow(dead_code)]
 pub const RHT_PTR_LOCK_BIT: u64 = 1;
+
+/// Every BTF-derived offset group the freeze coordinator resolves once
+/// at coordinator start, bundled so they travel together through the
+/// `<vmlinux>.artifacts` sidecar.
+///
+/// Each field is `Option` for the same reason its resolver returns
+/// `Result`: a kernel built without the relevant config (no
+/// `CONFIG_NUMA`, no arena support, a stripped vmlinux) legitimately
+/// has no offsets for that group, and every consumer already skips its
+/// pass on `None`. `None` is therefore a RESOLVED answer, not a
+/// "missing, retry" marker — the sidecar stores it as such.
+///
+/// Bundling exists to keep BTF off the run path. Before these were
+/// serialized, resolving the groups was the only reason the coordinator
+/// needed the full `Btf` on an ordinary (non-dump) run, so every cell
+/// paid a `Btf::from_bytes` over the whole vmlinux BTF. With the groups
+/// precomputed in the sidecar, BTF rehydration happens only where the
+/// full type graph is genuinely required: failure-dump rendering and the
+/// probe's split-BTF Datasec walk.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DumpOffsets {
+    /// `struct bpf_map` / `struct btf` offsets for guest map discovery.
+    pub bpf_map: Option<BpfMapOffsets>,
+    /// `struct bpf_arena` / `struct vm_struct` offsets for arena rendering.
+    pub arena: Option<crate::monitor::arena::BpfArenaOffsets>,
+    /// Per-CPU CPU-time / softirq / IRQ / iowait offsets.
+    pub cpu_time: Option<CpuTimeOffsets>,
+    /// Cgroup-hierarchy offsets for the per-cgroup PSI walk.
+    pub cgroup: Option<CgroupWalkOffsets>,
+    /// SCX walker sub-groups (each independently optional inside).
+    pub scx_walker: Option<ScxWalkerOffsets>,
+    /// Per-task enrichment offsets (all-or-nothing).
+    pub task_enrichment: Option<TaskEnrichmentOffsets>,
+    /// Per-node `vm_numa_event[]` offsets.
+    pub numa: Option<NumaStatsOffsets>,
+    /// Hoisted `RunnableScanCtx` prerequisites.
+    pub runnable_scan: Option<RunnableScanOffsets>,
+}
+
+impl DumpOffsets {
+    /// Resolve every group from a pre-loaded BTF object. Per-group
+    /// failures land as `None` — this returns no `Result` because there
+    /// is no whole-bundle failure mode: a vmlinux whose BTF parsed at
+    /// all yields a usable (possibly empty) bundle.
+    pub fn from_btf(btf: &Btf) -> Self {
+        Self {
+            bpf_map: BpfMapOffsets::from_btf(btf).ok(),
+            arena: crate::monitor::arena::BpfArenaOffsets::from_btf(btf).ok(),
+            cpu_time: CpuTimeOffsets::from_btf(btf).ok(),
+            cgroup: CgroupWalkOffsets::from_btf(btf).ok(),
+            scx_walker: ScxWalkerOffsets::from_btf(btf).ok(),
+            task_enrichment: TaskEnrichmentOffsets::from_btf(btf).ok(),
+            numa: NumaStatsOffsets::from_btf(btf).ok(),
+            runnable_scan: RunnableScanOffsets::from_btf(btf).ok(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

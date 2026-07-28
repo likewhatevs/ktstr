@@ -10,7 +10,7 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{Cap, DeviceFd, Kvm, VcpuFd, VmFd};
 use std::mem::ManuallyDrop;
-use vm_memory::{GuestAddress, GuestMemoryMmap};
+use vm_memory::GuestMemoryMmap;
 use vmm_sys_util::ioctl_iow_nr;
 
 // `kvm_ioctls::VmFd::enable_cap` is cfg-gated to x86_64/s390x/powerpc even
@@ -20,7 +20,7 @@ use vmm_sys_util::ioctl_iow_nr;
 // directly — same raw-ioctl pattern as `kvm_stats::KVM_GET_STATS_FD`.
 ioctl_iow_nr!(KVM_ENABLE_CAP_VM, kvm_bindings::KVMIO, 0xa3, kvm_enable_cap);
 
-use crate::vmm::numa_mem::{NumaMemoryLayout, ReservationGuard};
+use crate::vmm::numa_mem::{MemoryBacking, NumaMemoryLayout, ReservationGuard};
 use crate::vmm::topology::Topology;
 
 // ---------------------------------------------------------------------------
@@ -138,8 +138,13 @@ pub struct KtstrKvm {
     pub guest_mem: ManuallyDrop<GuestMemoryMmap>,
     pub topology: Topology,
     /// Per-node GPA layout used by FDT memory nodes and NUMA distance map.
-    /// `None` in deferred mode before `allocate_and_register_memory()`.
+    /// Always `Some` — guest memory is allocated in [`Self::new`].
     pub(crate) numa_layout: Option<NumaMemoryLayout>,
+    /// Actual backing selected by the allocator.
+    pub(crate) memory_backing: Option<MemoryBacking>,
+    /// True only after the final guest-memory VMA layout has been published
+    /// to KVM.
+    memory_registered: bool,
     pub has_immediate_exit: bool,
     /// True when the host KVM advertises Cap::ArmPmuV3. Threaded into
     /// FDT generation so the arm,armv8-pmuv3 node is only emitted when
@@ -148,23 +153,12 @@ pub struct KtstrKvm {
     pub has_pmu: bool,
     /// GICv3 device fd — held to keep the device alive.
     gic_fd: ManuallyDrop<DeviceFd>,
-    /// Whether hugepages were requested at construction time.
-    /// Stored so deferred memory allocation uses the same backing.
-    use_hugepages: bool,
-    /// Performance mode flag. Stored so deferred memory allocation
-    /// can check hugepage availability fresh when memory_mib was
-    /// unknown at construction time.
-    performance_mode: bool,
     /// Owns the VA reservation for per-node MAP_FIXED mmaps.
     /// Drop munmaps the entire reservation.
     _reservation: Option<ReservationGuard>,
-    /// RAII guards for COW-overlayed initramfs segments. Each guard
-    /// holds the lz4 SHM fd with `LOCK_SH`; dropping it releases the
-    /// flock and closes the fd. Must drop AFTER `_reservation` so the
-    /// COW VMAs are torn down (via the reservation's munmap) before
-    /// the flock is released — otherwise a concurrent writer could
-    /// take `LOCK_EX` and truncate the segment while the guest still
-    /// holds pages that fault through the backing file.
+    /// RAII guards for direct-COW initramfs mappings. Each guard holds its
+    /// immutable CAS object fd with `LOCK_SH`. Must drop AFTER `_reservation`
+    /// so GC cannot unlink the backing before the COW VMAs are torn down.
     pub(crate) cow_overlay_guards: Vec<crate::vmm::initramfs::CowOverlayGuard>,
 }
 
@@ -194,99 +188,12 @@ impl Drop for KtstrKvm {
 }
 
 impl KtstrKvm {
-    /// Create a new KVM VM with the given topology and memory size.
-    pub fn new(topo: Topology, memory_mib: u32, performance_mode: bool) -> Result<Self> {
-        Self::new_inner(topo, Some(memory_mib), false, performance_mode)
-    }
-
-    /// Create a new KVM VM with hugepage-backed guest memory.
-    pub fn new_with_hugepages(
-        topo: Topology,
-        memory_mib: u32,
-        performance_mode: bool,
-    ) -> Result<Self> {
-        Self::new_inner(topo, Some(memory_mib), true, performance_mode)
-    }
-
-    /// Create a KVM VM without allocating guest memory.
+    /// Create a VM with allocated but deliberately unregistered guest RAM.
     ///
-    /// Sets up /dev/kvm, VM fd, vCPUs, GICv3, and PMUv3 (when host
-    /// supports) — none of which depend on guest memory size. Memory is
-    /// allocated later via [`Self::allocate_and_register_memory`].
-    pub fn new_deferred(
-        topo: Topology,
-        use_hugepages: bool,
-        performance_mode: bool,
-    ) -> Result<Self> {
-        Self::new_inner(topo, None, use_hugepages, performance_mode)
-    }
-
-    /// Allocate guest memory and register it with KVM.
-    ///
-    /// Should be called exactly once on a VM created with
-    /// `new_deferred`; calling twice unconditionally replaces the
-    /// backing memory. Replaces the placeholder guest memory with a
-    /// real allocation of `memory_mib` mebibytes at DRAM_START and
-    /// sets `numa_layout` to the computed per-node GPA layout.
-    /// Re-checks hugepage availability when performance_mode is set,
-    /// since memory_mib was unknown at construction time and
-    /// `use_hugepages` may have been false.
-    pub fn allocate_and_register_memory(&mut self, memory_mib: u32) -> Result<()> {
-        let layout = NumaMemoryLayout::compute(&self.topology, memory_mib, DRAM_START, None)?;
-        let alloc =
-            layout.allocate_and_register(&self.vm_fd, self.use_hugepages, self.performance_mode)?;
-        // SAFETY: guest_mem is ManuallyDrop — explicit drop before
-        // replacement prevents leaking the placeholder mapping.
-        unsafe { ManuallyDrop::drop(&mut self.guest_mem) };
-        self.guest_mem = ManuallyDrop::new(alloc.guest_mem);
-        self._reservation = Some(alloc.reservation);
-        self.numa_layout = Some(layout);
-        Ok(())
-    }
-
-    /// Set the per-VM halt-poll interval via `KVM_CAP_HALT_POLL`.
-    ///
-    /// Called from `KtstrVm::run` after `acquire_run_locks` resolves the
-    /// mode/outcome the policy keys on (see `KtstrVm::halt_poll_policy`).
-    /// `KVM_CAP_HALT_POLL` is a VM-target capability, "Architectures: all",
-    /// settable at any time per the KVM API (Documentation/virt/kvm/api.rst,
-    /// 7.20), so setting it post-vCPU-create is valid on arm64 as on x86. A
-    /// `halt_poll_ns` of 0 disables host halt polling for this VM.
-    ///
-    /// Best-effort: a host without the cap warns once and continues on the
-    /// module default rather than failing the run.
-    pub(crate) fn set_halt_poll(&self, halt_poll_ns: u64) {
-        let mut cap = kvm_enable_cap {
-            cap: KVM_CAP_HALT_POLL,
-            ..Default::default()
-        };
-        cap.args[0] = halt_poll_ns;
-        // Raw ioctl: `VmFd::enable_cap` is not exposed on aarch64 by
-        // kvm-ioctls (cfg-gated to x86_64/s390x/powerpc) though the VM-fd
-        // ioctl itself is architecture-generic — see the
-        // `KVM_ENABLE_CAP_VM` definition at the top of this file.
-        // SAFETY: `vm_fd` is a live KVM VM fd for the whole `&self` borrow;
-        // `cap` is a properly initialized `kvm_enable_cap` matching the
-        // ioctl's write-only argument struct.
-        let ret =
-            unsafe { vmm_sys_util::ioctl::ioctl_with_ref(&*self.vm_fd, KVM_ENABLE_CAP_VM(), &cap) };
-        if ret < 0 {
-            let e = std::io::Error::last_os_error();
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                eprintln!(
-                    "kvm: WARNING: KVM_CAP_HALT_POLL not supported ({e}), using kernel default"
-                );
-            });
-        }
-    }
-
-    fn new_inner(
-        topo: Topology,
-        memory_mib: Option<u32>,
-        use_hugepages: bool,
-        performance_mode: bool,
-    ) -> Result<Self> {
+    /// The kernel and the complete disjoint COW initrd layout are installed
+    /// before [`Self::register_memory`] exposes a single immutable HVA
+    /// layout to KVM.
+    pub(crate) fn new(topo: Topology, memory_mib: u32, performance_mode: bool) -> Result<Self> {
         // Bound the vCPU count to MAX_VCPUS before touching any host
         // resource. The GICv3 redistributor region grows from
         // GIC_REDIST_BASE at GIC_REDIST_SIZE_PER_CPU per vCPU; the device
@@ -336,20 +243,11 @@ impl KtstrKvm {
 
         let vm_fd = crate::vmm::create_vm_with_retry(&kvm)?;
 
-        let (guest_mem, numa_layout, reservation) = match memory_mib {
-            Some(mb) => {
-                let layout = NumaMemoryLayout::compute(&topo, mb, DRAM_START, None)?;
-                let alloc =
-                    layout.allocate_and_register(&vm_fd, use_hugepages, performance_mode)?;
-                (alloc.guest_mem, Some(layout), Some(alloc.reservation))
-            }
-            None => {
-                let placeholder =
-                    GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(DRAM_START), 4096)])
-                        .context("allocate placeholder guest memory")?;
-                (placeholder, None, None)
-            }
-        };
+        let numa_layout = NumaMemoryLayout::compute(&topo, memory_mib, DRAM_START, None)?;
+        // Hugepages are never requested up front: the allocator selects them
+        // itself under `performance_mode`, serializing its free-count check
+        // with MAP_HUGETLB so a process storm cannot overcommit the pool.
+        let alloc = numa_layout.allocate(false, performance_mode)?;
 
         // Create vCPUs. On aarch64, vCPUs must exist before GIC init.
         let total = topo.total_cpus();
@@ -454,17 +352,69 @@ impl KtstrKvm {
             kvm: ManuallyDrop::new(kvm),
             vm_fd: ManuallyDrop::new(vm_fd),
             vcpus,
-            guest_mem: ManuallyDrop::new(guest_mem),
+            guest_mem: ManuallyDrop::new(alloc.guest_mem),
             topology: topo,
-            numa_layout,
+            numa_layout: Some(numa_layout),
+            memory_backing: Some(alloc.backing),
+            memory_registered: false,
             has_immediate_exit,
             has_pmu: pmu_supported,
             gic_fd: ManuallyDrop::new(gic_fd),
-            use_hugepages,
-            performance_mode,
-            _reservation: reservation,
+            _reservation: Some(alloc.reservation),
             cow_overlay_guards: Vec::new(),
         })
+    }
+
+    /// Publish the final guest-memory VMA layout to KVM exactly once.
+    pub(crate) fn register_memory(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.memory_registered,
+            "guest memory is already registered"
+        );
+        let layout = self
+            .numa_layout
+            .as_ref()
+            .context("cannot register guest memory before allocation")?;
+        layout.register(&self.vm_fd, &self.guest_mem)?;
+        self.memory_registered = true;
+        Ok(())
+    }
+
+    /// Set the per-VM halt-poll interval via `KVM_CAP_HALT_POLL`.
+    ///
+    /// Called from `KtstrVm::run` after `acquire_run_locks` resolves the
+    /// mode/outcome the policy keys on (see `KtstrVm::halt_poll_policy`).
+    /// `KVM_CAP_HALT_POLL` is a VM-target capability, "Architectures: all",
+    /// settable at any time per the KVM API (Documentation/virt/kvm/api.rst,
+    /// 7.20), so setting it post-vCPU-create is valid on arm64 as on x86. A
+    /// `halt_poll_ns` of 0 disables host halt polling for this VM.
+    ///
+    /// Best-effort: a host without the cap warns once and continues on the
+    /// module default rather than failing the run.
+    pub(crate) fn set_halt_poll(&self, halt_poll_ns: u64) {
+        let mut cap = kvm_enable_cap {
+            cap: KVM_CAP_HALT_POLL,
+            ..Default::default()
+        };
+        cap.args[0] = halt_poll_ns;
+        // Raw ioctl: `VmFd::enable_cap` is not exposed on aarch64 by
+        // kvm-ioctls (cfg-gated to x86_64/s390x/powerpc) though the VM-fd
+        // ioctl itself is architecture-generic — see the
+        // `KVM_ENABLE_CAP_VM` definition at the top of this file.
+        // SAFETY: `vm_fd` is a live KVM VM fd for the whole `&self` borrow;
+        // `cap` is a properly initialized `kvm_enable_cap` matching the
+        // ioctl's write-only argument struct.
+        let ret =
+            unsafe { vmm_sys_util::ioctl::ioctl_with_ref(&*self.vm_fd, KVM_ENABLE_CAP_VM(), &cap) };
+        if ret < 0 {
+            let e = std::io::Error::last_os_error();
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "kvm: WARNING: KVM_CAP_HALT_POLL not supported ({e}), using kernel default"
+                );
+            });
+        }
     }
 
     /// Create and initialize a GICv3 interrupt controller.
@@ -750,7 +700,7 @@ mod tests {
 
     #[test]
     fn memory_starts_at_dram() {
-        use vm_memory::GuestMemoryRegion;
+        use vm_memory::{GuestAddress, GuestMemoryRegion};
         let topo = Topology {
             llcs: 1,
             cores_per_llc: 1,
@@ -803,7 +753,7 @@ mod tests {
     /// The device MMIO window must fit EXACTLY MAX_VCPUS redistributors and
     /// no more: MAX_VCPUS redistributors end at or below SERIAL_MMIO_BASE,
     /// but MAX_VCPUS + 1 would overrun it. Pins the upper bound the runtime
-    /// guard in `new_inner` enforces — a future change that widened the
+    /// guard in [`KtstrKvm::new`] enforces — a future change that widened the
     /// device window or shrank the redistributor stride without updating
     /// MAX_VCPUS is caught at compile time.
     #[test]
@@ -825,11 +775,12 @@ mod tests {
 
     /// A topology whose total vCPU count exceeds MAX_VCPUS must be rejected
     /// with a clear error BEFORE any KVM resource is touched. The guard in
-    /// `new_inner` runs ahead of `Kvm::new()`, so the rejection is a pure
-    /// function of the topology and this test is host-independent (no
-    /// /dev/kvm). Without the guard, construction would create MAX_VCPUS + 1
-    /// vCPUs and a redistributor region overrunning the device MMIO window,
-    /// silently shadowing serial/virtio.
+    /// [`KtstrKvm::new`] runs ahead of `Kvm::new()`, so the rejection is a
+    /// pure function of the topology and this test is host-independent (no
+    /// /dev/kvm — the `memory_mib` argument is never reached). Without the
+    /// guard, construction would create MAX_VCPUS + 1 vCPUs and a
+    /// redistributor region overrunning the device MMIO window, silently
+    /// shadowing serial/virtio.
     #[test]
     fn over_max_vcpus_topology_is_rejected() {
         // total_cpus = llcs * cores_per_llc * threads_per_core. Choose a
@@ -846,7 +797,7 @@ mod tests {
         assert_eq!(topo.total_cpus(), MAX_VCPUS + 1);
         // `let Err` rather than `expect_err` (which needs the Ok type
         // `KtstrKvm` to be `Debug`).
-        let Err(err) = KtstrKvm::new_deferred(topo, false, false) else {
+        let Err(err) = KtstrKvm::new(topo, 256, false) else {
             panic!("topology over MAX_VCPUS must be rejected");
         };
         let msg = format!("{err:#}");

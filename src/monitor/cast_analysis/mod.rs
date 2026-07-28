@@ -348,6 +348,24 @@ pub(crate) struct SubprogReturn {
     /// `scx_static_alloc_internal` calls. `None` for any other
     /// allocator.
     pub alloc_size: Option<u64>,
+    /// Pre-resolved BTF struct id of the allocator's payload, filled
+    /// by the host-side loader ONLY when the allocation size maps to
+    /// exactly one candidate payload struct (via the same
+    /// [`super::sdt_alloc::discover_payload_btf_id`] size+name match
+    /// the renderer uses at chase time, so analyzer and renderer
+    /// agree on the id). `Some(sid)` populates the seeded R0's
+    /// [`RegState::ArenaU64FromAlloc::struct_type_id`], making it a
+    /// TYPED arena pointer: a later STX THROUGH the returned pointer
+    /// keys the finding against `sid` as the parent — the path that
+    /// recovers `(payload_struct, field_off)` casts for allocators
+    /// like `scx_task_alloc` whose `void __arena *` return the
+    /// analyzer cannot otherwise type. It stays `ArenaU64FromAlloc`
+    /// (not a plain `Pointer{sid}`) so the same value stored as a
+    /// VALUE records an ARENA finding rather than a spurious kptr.
+    /// `None` (the common case: ambiguous or unresolved size) leaves
+    /// the existing `ArenaU64FromAlloc` behavior untouched — false
+    /// negative over false positive.
+    pub return_struct_id: Option<u32>,
 }
 
 /// Caller-supplied annotation that ties a `BPF_LD_IMM64` instruction
@@ -616,6 +634,21 @@ enum RegState {
     ArenaU64FromAlloc {
         source: Option<(u32, u32)>,
         alloc_size: Option<u64>,
+        /// Resolved payload struct id when the host-side loader
+        /// uniquely mapped the allocation size to one candidate
+        /// (see [`SubprogReturn::return_struct_id`]); `None` for every
+        /// other allocator return. When `Some(P)`, this state doubles
+        /// as a TYPED arena pointer: used as an STX/LDX BASE it keys
+        /// findings against parent `P` (the path that recovers
+        /// `(payload, off)` casts written THROUGH an allocator's
+        /// `void __arena *` return). It stays `ArenaU64FromAlloc`
+        /// rather than becoming a plain `Pointer{P}` on purpose — an
+        /// arena pointer stored as a VALUE into a `u64` slot must
+        /// record an ARENA finding (via the [`StxValueKind::Arena`]
+        /// arm), NOT a kernel-kptr finding; a plain `Pointer{P}` value
+        /// would mis-record a kptr and conflict with the slot's arena
+        /// evidence at finalize (dropping BOTH).
+        struct_type_id: Option<u32>,
     },
     /// Register holds a frame-pointer-relative address: `r10 + offset`.
     /// Produced by `MOV rX, r10` (offset = 0) and propagated through
@@ -1412,14 +1445,18 @@ impl<'a> Analyzer<'a> {
         // captured `alloc_size`. Duplicates collapse (calling the
         // same allocator at the same PC twice would be physically
         // impossible — one PC is one instruction). The map's value is
-        // the [`SubprogReturn::alloc_size`] payload — `Some(n)` for
-        // `scx_static_alloc_internal` calls whose `size` argument the
-        // host-side loader recovered, `None` for other allocators or
-        // when the lookback failed.
-        let mut subprog_returns_by_pc: std::collections::HashMap<usize, Option<u64>> =
-            std::collections::HashMap::with_capacity(subprog_returns.len());
+        // the `(alloc_size, return_struct_id)` pair — `alloc_size` is
+        // `Some(n)` for `scx_static_alloc_internal` calls whose `size`
+        // argument the host-side loader recovered (`None` otherwise);
+        // `return_struct_id` is `Some(sid)` only when the loader
+        // uniquely resolved the payload struct (see
+        // [`SubprogReturn::return_struct_id`]).
+        let mut subprog_returns_by_pc: std::collections::HashMap<
+            usize,
+            (Option<u64>, Option<u32>),
+        > = std::collections::HashMap::with_capacity(subprog_returns.len());
         for sr in subprog_returns {
-            subprog_returns_by_pc.insert(sr.insn_offset, sr.alloc_size);
+            subprog_returns_by_pc.insert(sr.insn_offset, (sr.alloc_size, sr.return_struct_id));
         }
 
         for (pc, insn) in insns.iter().enumerate() {
@@ -1498,17 +1535,18 @@ impl<'a> Analyzer<'a> {
 
             // Allocator-return seed: the `BPF_OP_CALL` arm consults
             // this lookup and, AFTER the standard R0..=R5 clobber, sets
-            // R0 to [`RegState::ArenaU64FromAlloc`] when the PC
-            // matches a [`SubprogReturn::insn_offset`]. The subsequent
-            // STX of R0 (or any propagated copy) into a typed `u64`
-            // field of a `Pointer{P}` parent records `(P, off)` as an
-            // Arena cast finding. The optional `alloc_size` rides along
-            // for `scx_static_alloc_internal` so the renderer can
-            // size-match the payload BTF type at chase time.
-            // `Some(None)` means a seed applies but no `alloc_size` was
-            // captured (any allocator other than
-            // `scx_static_alloc_internal`, or a recovery failure);
-            // `Some(Some(n))` means seed AND captured size.
+            // R0 when the PC matches a [`SubprogReturn::insn_offset`].
+            // With `return_struct_id: Some(sid)` R0 becomes a typed
+            // `Pointer{sid}` (the STX THROUGH it keys `sid` as the
+            // parent); otherwise R0 becomes [`RegState::ArenaU64FromAlloc`]
+            // and the subsequent STX of R0 (or any propagated copy)
+            // into a typed `u64` field of a `Pointer{P}` parent records
+            // `(P, off)` as an Arena cast finding. The optional
+            // `alloc_size` rides along for `scx_static_alloc_internal`
+            // so the renderer can size-match the payload BTF type at
+            // chase time. The outer `Option` is `Some` when a seed
+            // applies at this PC; the inner pair is
+            // `(alloc_size, return_struct_id)`.
             let alloc_seed = subprog_returns_by_pc.get(&pc).copied();
 
             if insn.code == (BPF_CLASS_JMP | BPF_OP_CALL) && insn.src_reg() == BPF_PSEUDO_CALL {
@@ -1600,7 +1638,7 @@ impl<'a> Analyzer<'a> {
         insn: BpfInsn,
         skip_next: &mut bool,
         datasec_hit: Option<(u32, u32)>,
-        alloc_seed: Option<Option<u64>>,
+        alloc_seed: Option<(Option<u64>, Option<u32>)>,
     ) {
         let class = insn.code & 0x07;
         let dst = insn.dst_reg() as usize;
@@ -1948,24 +1986,43 @@ impl<'a> Analyzer<'a> {
                     // resolve to the same call site — kfunc returns
                     // are stronger evidence than the allocator
                     // allowlist.
-                    if let Some(captured_alloc_size) = alloc_seed
+                    if let Some((captured_alloc_size, return_struct_id)) = alloc_seed
                         && matches!(self.regs[0], RegState::Unknown)
                     {
-                        // Allocator-return seed has no source slot:
-                        // the value was synthesized by the allocator,
-                        // not loaded from a slot. The downstream STX
-                        // of R0 records `(parent, off)` against the
-                        // STORE site's slot via `handle_stx`, not
-                        // through this register's source field.
-                        // `captured_alloc_size` rides on the register
-                        // state: `Some(n)` for `scx_static_alloc_internal`
-                        // (no per-slot header → renderer needs the size
-                        // for BTF matching), `None` for allocators with
-                        // a per-slot header that the bridge resolves.
+                        // Allocator-return seed has no source slot: the
+                        // value was synthesized by the allocator, not
+                        // loaded from a slot. The downstream STX of R0
+                        // records `(parent, off)` against the STORE
+                        // site's slot via `handle_stx`, not through this
+                        // register's source field. `captured_alloc_size`
+                        // rides on the register state: `Some(n)` for
+                        // `scx_static_alloc_internal` (no per-slot header
+                        // → renderer needs the size for BTF matching),
+                        // `None` for allocators with a per-slot header
+                        // that the bridge resolves.
+                        //
+                        // `return_struct_id` upgrades the state to a
+                        // TYPED arena pointer when the loader uniquely
+                        // resolved the payload struct (the `len == 1`
+                        // [`super::sdt_alloc::discover_payload_btf_id`]
+                        // match — the correctness boundary). It stays an
+                        // `ArenaU64FromAlloc`, NOT a plain `Pointer{sid}`:
+                        // as an STX/LDX BASE the `struct_type_id` keys the
+                        // parent (recovering casts written THROUGH the
+                        // allocator's `void __arena *` return, which the
+                        // analyzer cannot type from the callee FuncProto);
+                        // as a stored VALUE it records an ARENA finding
+                        // (a plain `Pointer` value would mis-record a
+                        // kernel kptr and conflict with the slot's arena
+                        // evidence at finalize).
                         self.regs[0] = RegState::ArenaU64FromAlloc {
                             source: None,
                             alloc_size: captured_alloc_size,
+                            struct_type_id: return_struct_id,
                         };
+                        if let Some(sid) = return_struct_id {
+                            self.note_type_id(sid);
+                        }
                         // non-inlined-allocator telemetry: bump the seed-applied
                         // counter so [`Self::finalize`] can
                         // distinguish "we saw allocator call
@@ -2053,6 +2110,13 @@ impl<'a> Analyzer<'a> {
                 datasec_type_id,
                 base_offset,
             } => Some((datasec_type_id, base_offset)),
+            // A typed arena-allocator return (`struct_type_id` resolved)
+            // reads like a `Pointer{P}` base: an LDX through it resolves
+            // members of the payload struct `P`.
+            RegState::ArenaU64FromAlloc {
+                struct_type_id: Some(pid),
+                ..
+            } => Some((pid, 0)),
             _ => None,
         };
         if let Some((parent_btf_id, base_offset)) = typed_base {
@@ -2190,6 +2254,12 @@ impl<'a> Analyzer<'a> {
                                 RegState::ArenaU64FromAlloc {
                                     source: Some((canonical_parent, canonical_field_off)),
                                     alloc_size: inherited_size,
+                                    // A value loaded out of an arena slot
+                                    // is an arena VA, but the slot's
+                                    // finding carries no resolved payload
+                                    // struct id — leave it untyped so it
+                                    // never acts as a typed BASE.
+                                    struct_type_id: None,
                                 }
                             } else {
                                 RegState::LoadedU64Field {
@@ -2372,6 +2442,16 @@ impl<'a> Analyzer<'a> {
                 datasec_type_id,
                 base_offset,
             } => (datasec_type_id, base_offset),
+            // A typed arena-allocator return (`struct_type_id` resolved)
+            // is a `Pointer{P}`-shaped BASE: an STX THROUGH it keys the
+            // finding against payload struct `P` (offset 0 — the return
+            // points at the payload start). This is the path that
+            // recovers `(payload, off)` casts written into a slot
+            // reached via an allocator's `void __arena *` return.
+            RegState::ArenaU64FromAlloc {
+                struct_type_id: Some(pid),
+                ..
+            } => (pid, 0u32),
             _ => return,
         };
         // Two value-side variants reach the cast-finding paths:
@@ -2809,6 +2889,10 @@ impl<'a> Analyzer<'a> {
             self.regs[0] = RegState::ArenaU64FromAlloc {
                 source: None,
                 alloc_size: None,
+                // Kfunc arena allocators (e.g. bpf_arena_alloc_pages)
+                // carry a per-slot header the bridge resolves — no
+                // size-based payload struct resolution here.
+                struct_type_id: None,
             };
             // non-inlined-allocator telemetry parity with the SubprogReturn arm:
             // count this as an applied allocator seed so the
@@ -2885,6 +2969,7 @@ impl<'a> Analyzer<'a> {
                 None if ever_arena => RegState::ArenaU64FromAlloc {
                     source: None,
                     alloc_size: None,
+                    struct_type_id: None,
                 },
                 None => continue,
             };

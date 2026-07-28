@@ -1,4 +1,6 @@
-//! Terminal-output utilities: color detection, table builders,
+//! Terminal-output utilities: color detection, table builders, the
+//! cargo-style status-line layout ([`status_line`] and the
+//! [`crate::ktstr_status`] macro every CLI status print goes through),
 //! status / success / warn helpers, and the `Spinner` progress bar.
 //!
 //! Holds the cross-binary helpers that the rest of the CLI surface
@@ -21,7 +23,8 @@ pub fn stderr_color() -> bool {
 /// pipes stdout to a file while leaving stderr on the TTY — gating
 /// stdout tables on the stderr TTY state would leave ANSI escapes
 /// in the file. Table-rendering code paths gate on this reading;
-/// diagnostic/status prints use [`stderr_color`].
+/// diagnostic/status prints use [`stderr_status_color`], which folds
+/// [`stderr_color`] together with the force/`NO_COLOR` knobs.
 pub fn stdout_color() -> bool {
     use std::io::IsTerminal;
     static COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -88,8 +91,9 @@ pub fn new_wrapped_table() -> comfy_table::Table {
 /// viewer renders ANSI color but its pipes are not TTYs, so plain
 /// TTY detection would strip the styling CI logs can actually show;
 /// the latter two are the conventional user-facing force-color knobs.
-/// Consulted only by [`new_bordered_table`]'s color policy — and only
-/// when `NO_COLOR` is unset, which always wins.
+/// Consulted by [`new_bordered_table`]'s cell policy and by
+/// [`stderr_status_color`] — in both cases only when `NO_COLOR` is
+/// unset, which always wins.
 fn env_forces_color() -> bool {
     static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FORCE.get_or_init(|| {
@@ -101,7 +105,8 @@ fn env_forces_color() -> bool {
 
 /// Whether `NO_COLOR` is set (cached per process). Per the no-color
 /// convention, presence — any value — disables color; it outranks
-/// every force-color knob in [`new_bordered_table`]'s color policy.
+/// every force-color knob in [`new_bordered_table`]'s cell policy and
+/// in [`stderr_status_color`].
 fn env_no_color() -> bool {
     static NO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *NO.get_or_init(|| std::env::var_os("NO_COLOR").is_some())
@@ -223,31 +228,163 @@ pub fn restore_sigpipe_default() {
     }
 }
 
+/// Width of cargo's status column: `Compiling` / `Finished` and
+/// nextest's `Starting` / `PASS` are right-aligned in 12 columns, with
+/// the message starting at column 14. ktstr's own status lines share
+/// that geometry (see [`status_line`]) so an interleaved build → run
+/// transcript keeps one message column.
+pub const STATUS_LABEL_WIDTH: usize = 12;
+
+/// Longest `<label>:` head [`status_line`] will treat as a ktstr status
+/// prefix. Bounds the colon search so a long message whose first colon
+/// belongs to the payload (a path, a nested error) is left alone.
+const STATUS_LABEL_MAX: usize = 48;
+
+/// SGR prefix for the status label: bold + magenta, ktstr's counterpart
+/// to cargo's bold-green status verbs — a distinct hue so a ktstr line
+/// is not mistaken for one of cargo's or nextest's own.
+const STATUS_LABEL_SGR: &str = "\x1b[1;35m";
+
+/// Whether ktstr's own stderr status lines should carry ANSI color.
+/// A TTY colors; so does a non-TTY under `GITHUB_ACTIONS` /
+/// `CLICOLOR_FORCE` / `FORCE_COLOR` (Actions renders ANSI through a
+/// pipe, which is why cargo and nextest colorize there too); `NO_COLOR`
+/// outranks both. Same precedence as `new_bordered_table`'s cell
+/// policy, applied to stderr instead of stdout.
+pub fn stderr_status_color() -> bool {
+    !env_no_color() && (stderr_color() || env_forces_color())
+}
+
+/// Split a ktstr status line into its family root, its optional scope,
+/// and the message. `None` for any line outside the family, which the
+/// callers pass through untouched.
+///
+/// The family is every line the two CLIs emit as `<label>: <message>`
+/// where `<label>` is `ktstr` / `cargo ktstr` plus an optional scope
+/// (`verifier`, `nextest artifact cache`, `fatal`, …).
+fn split_status_label(head: &str) -> Option<(&'static str, &str, &str)> {
+    let root = ["cargo ktstr", "ktstr"].into_iter().find(|root| {
+        match head.as_bytes().get(root.len()) {
+            Some(b':' | b' ') => head.starts_with(root),
+            _ => false,
+        }
+    })?;
+    let colon = head.find(':').filter(|at| *at < STATUS_LABEL_MAX)?;
+    let scope = head[root.len()..colon].trim();
+    if !scope
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b' ' || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some((root, scope, head[colon + 1..].trim_start_matches(' ')))
+}
+
+/// Render one ktstr status line in cargo's status-column layout: the
+/// family root right-aligned in [`STATUS_LABEL_WIDTH`] columns, the
+/// message at column 14, and any scope demoted into the message so a
+/// long scope cannot push the message column right.
+///
+/// ```text
+///    Compiling ktstr v0.42.0 (/home/you/ktstr)
+/// cargo ktstr: resolved kernel "6.14"
+/// cargo ktstr: nextest artifact cache: artifact-tree hit; role=direct-hit
+///     Starting 1523 tests across 12 binaries
+///         PASS [   0.021s] ktstr admission::grants
+/// ```
+///
+/// `color` wraps the root in [`STATUS_LABEL_SGR`]; the padding stays
+/// outside the escape so the visible column is identical either way.
+/// Only the first line is re-laid-out — a multi-line message keeps its
+/// continuation lines verbatim.
+fn render_status_parts(line: &str, color: bool) -> Option<(String, String)> {
+    let (head, tail) = match line.find('\n') {
+        Some(at) => (&line[..at], &line[at..]),
+        None => (line, ""),
+    };
+    let (root, scope, message) = split_status_label(head)?;
+    let label = format!("{root}:");
+    let pad = " ".repeat(STATUS_LABEL_WIDTH.saturating_sub(label.len()));
+    let label = if color {
+        format!("{pad}{STATUS_LABEL_SGR}{label}\x1b[0m")
+    } else {
+        format!("{pad}{label}")
+    };
+    let message = match (scope.is_empty(), message.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!(" {message}"),
+        (false, true) => format!(" {scope}:"),
+        (false, false) => format!(" {scope}: {message}"),
+    };
+    Some((label, format!("{message}{tail}")))
+}
+
+/// [`render_status_parts`] rejoined into one line.
+fn render_status_line(line: &str, color: bool) -> Option<String> {
+    render_status_parts(line, color).map(|(label, message)| format!("{label}{message}"))
+}
+
+/// Lay one line out in cargo's status column (see
+/// [`STATUS_LABEL_WIDTH`]) against the live stderr color policy, with
+/// non-family lines passed through unchanged. Use this at the point a
+/// line reaches the terminal, not where it is built: test captures and
+/// diagnostics sinks then keep the plain, escape-free text.
+pub fn status_line(line: &str) -> String {
+    render_status_line(line, stderr_status_color()).unwrap_or_else(|| line.to_owned())
+}
+
+/// Print a status line to stderr in cargo's status-column layout.
+/// Prefer the [`ktstr_status!`](crate::ktstr_status) macro at call
+/// sites that format their line.
+pub fn print_status_line(line: &str) {
+    eprintln!("{}", status_line(line));
+}
+
+/// `eprintln!` for ktstr's own status lines: formats, then lays the
+/// line out through [`print_status_line`] (label right-aligned in
+/// cargo's status column, message at column 14, label colored when the
+/// terminal takes color). Format arguments are `eprintln!`'s.
+///
+/// ```
+/// # use ktstr::ktstr_status;
+/// let version = "6.14";
+/// ktstr_status!("cargo ktstr: resolved kernel {version:?}");
+/// ```
+#[macro_export]
+macro_rules! ktstr_status {
+    ($($arg:tt)*) => {
+        $crate::cli::print_status_line(&format!($($arg)*))
+    };
+}
+
+/// Print one status line whose MESSAGE carries `sgr` (the role color)
+/// while its label keeps [`status_line`]'s layout and label color, so a
+/// success line reads as one purple label plus one green message rather
+/// than a green run interrupted by the label's reset. Non-family lines
+/// take `sgr` whole, preserving the pre-layout behaviour.
+fn print_role_line(msg: &str, sgr: &str) {
+    let color = stderr_status_color();
+    match (render_status_parts(msg, color), color) {
+        (Some((label, message)), true) => eprintln!("{label}{sgr}{message}\x1b[0m"),
+        (Some((label, message)), false) => eprintln!("{label}{message}"),
+        (None, true) => eprintln!("{sgr}{msg}\x1b[0m"),
+        (None, false) => eprintln!("{msg}"),
+    }
+}
+
 /// Print a styled status message to stderr.
 pub(crate) fn status(msg: &str) {
-    if stderr_color() {
-        eprintln!("\x1b[1m{msg}\x1b[0m");
-    } else {
-        eprintln!("{msg}");
-    }
+    print_role_line(msg, "\x1b[1m");
 }
 
 /// Print a green success message to stderr.
 pub(crate) fn success(msg: &str) {
-    if stderr_color() {
-        eprintln!("\x1b[32m{msg}\x1b[0m");
-    } else {
-        eprintln!("{msg}");
-    }
+    print_role_line(msg, "\x1b[32m");
 }
 
 /// Print a blue warning to stderr.
 pub(crate) fn warn(msg: &str) {
-    if stderr_color() {
-        eprintln!("\x1b[34m{msg}\x1b[0m");
-    } else {
-        eprintln!("{msg}");
-    }
+    print_role_line(msg, "\x1b[34m");
 }
 
 /// Stash of the pre-spinner termios for the panic hook's restore
@@ -563,6 +700,106 @@ impl Drop for Spinner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status column every ktstr line shares with cargo and
+    /// nextest: label right-aligned in [`STATUS_LABEL_WIDTH`], message
+    /// at column 14. `cargo ktstr:` fills the field exactly (so those
+    /// lines keep their historical bytes); the shorter `ktstr:` label
+    /// the `ktstr` binary and the library resolvers emit is indented
+    /// into it instead of hugging the left margin.
+    #[test]
+    fn status_layout_puts_every_label_in_cargos_status_column() {
+        let cargo = render_status_line("cargo ktstr: resolved kernel \"6.14\"", false)
+            .expect("cargo ktstr line is in the family");
+        assert_eq!(cargo, "cargo ktstr: resolved kernel \"6.14\"");
+        let plain = render_status_line("ktstr: kernel cached at /tmp/k", false)
+            .expect("ktstr line is in the family");
+        assert_eq!(plain, "      ktstr: kernel cached at /tmp/k");
+        for line in [&cargo, &plain] {
+            assert_eq!(
+                line.find(':').expect("label colon") + 1,
+                STATUS_LABEL_WIDTH,
+                "label must end on the status column: {line:?}",
+            );
+        }
+    }
+
+    /// A scope (`verifier`, `nextest artifact cache`, `fatal`, …) is
+    /// demoted into the message so an arbitrarily long sub-label cannot
+    /// push the message column right. Every word survives, and the
+    /// `cargo ktstr: ` prefix scripts and docs grep for now heads those
+    /// lines too.
+    #[test]
+    fn status_layout_demotes_the_scope_into_the_message() {
+        assert_eq!(
+            render_status_line(
+                "cargo ktstr nextest artifact cache: artifact-tree hit; role=direct-hit",
+                false,
+            )
+            .expect("scoped line is in the family"),
+            "cargo ktstr: nextest artifact cache: artifact-tree hit; role=direct-hit",
+        );
+        assert_eq!(
+            render_status_line(
+                "cargo ktstr verifier: acquiring reserved build capacity",
+                false
+            )
+            .expect("scoped line is in the family"),
+            "cargo ktstr: verifier: acquiring reserved build capacity",
+        );
+    }
+
+    /// Color wraps the label only, with the padding OUTSIDE the escape
+    /// so the visible column is identical to the uncolored rendering,
+    /// and the message stays unstyled (cargo colors its verb, not the
+    /// text after it).
+    #[test]
+    fn status_layout_colors_only_the_label() {
+        let colored = render_status_line("ktstr: fetching latest kernel version", true)
+            .expect("family line renders");
+        assert_eq!(
+            colored,
+            "      \x1b[1;35mktstr:\x1b[0m fetching latest kernel version",
+        );
+        let stripped = colored.replace(STATUS_LABEL_SGR, "").replace("\x1b[0m", "");
+        assert_eq!(
+            stripped,
+            render_status_line("ktstr: fetching latest kernel version", false).expect("family"),
+            "escapes must not move the visible column",
+        );
+    }
+
+    /// Lines outside the family are returned untouched by
+    /// [`status_line`] — a `Compiling`/`error:`/bare-text line keeps
+    /// its own layout, and a payload colon (a path, a nested error)
+    /// never gets mistaken for a label.
+    #[test]
+    fn status_layout_passes_non_family_lines_through() {
+        for line in [
+            "   Compiling ktstr v0.42.0",
+            "error: no such kernel",
+            "/tmp/x: permission denied",
+            "ktstrfoo: not the family root",
+            "cargo ktstr /tmp/a: colon after a path segment",
+        ] {
+            assert!(
+                render_status_line(line, true).is_none(),
+                "must not be treated as a status label: {line:?}",
+            );
+            assert_eq!(status_line(line), line);
+        }
+    }
+
+    /// Only the FIRST line is re-laid-out: a multi-line status message
+    /// keeps its continuation text verbatim, and a trailing newline
+    /// (the heartbeat writers emit their own) survives the rendering.
+    #[test]
+    fn status_layout_preserves_continuation_lines() {
+        assert_eq!(
+            render_status_line("ktstr: first\n  second: still raw\n", false).expect("family"),
+            "      ktstr: first\n  second: still raw\n",
+        );
+    }
 
     #[test]
     fn spinner_drop_without_finish_does_not_panic_in_non_tty() {

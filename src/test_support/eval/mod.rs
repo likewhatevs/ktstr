@@ -35,8 +35,9 @@ use super::{KtstrTestEntry, SchedulerSpec, Topology};
 mod kernel;
 mod post_vm;
 pub(crate) use post_vm::{
-    ExpectAutoReproSatisfied, HostSkipRequest, PostVmAssertionFailure, SchedulerBuildRefused,
-    ScxBpfErrorMatcherMismatch, SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
+    ExpectAutoReproSatisfied, FrameworkInfrastructureFailure, HostSkipRequest,
+    PostVmAssertionFailure, SchedulerBuildRefused, ScxBpfErrorMatcherMismatch,
+    SurvivesStormViolated, record_skip_sidecar, run_post_vm_callbacks,
 };
 pub use post_vm::{
     capture_starvation_witness, periodic_starvation_gate, post_vm_skip, stall_ejection_skip,
@@ -144,8 +145,8 @@ pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 /// No pre-build path constructs any of these errors today. Every
 /// `ResourceContention` / `TopologyInsufficient` / `PerfModeUnavailable`
 /// construction site in the crate (`vmm::host_topology`, `vmm::mod`, and
-/// the `validate_performance_mode` / `acquire_slot_with_locks` pre-checks in
-/// `vmm::builder`) fires from inside `builder.build()` or `vm.run()` — all
+/// the `validate_performance_mode` / `plan_performance_slot` capacity checks
+/// in `vmm::builder`) fires from inside `builder.build()` or `vm.run()` — all
 /// already record their own sidecar at the bail point via the per-site
 /// `record_skip_sidecar` calls in the match arms below. The
 /// pre-build helpers (`ensure_kvm`, `resolve_test_kernel`,
@@ -176,6 +177,10 @@ pub(crate) fn run_ktstr_test_inner(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
 ) -> Result<AssertResult> {
+    // Anchor the process/admission-start clock BEFORE the impl runs its
+    // admission wait, so the watchdog wall net's absolute ceiling tracks the
+    // queue-inclusive nextest rail rather than the post-admission VM clock.
+    crate::vmm::record_process_start();
     let result = run_ktstr_test_inner_impl(entry, topo);
     if let Err(ref e) = result
         && let Some(host_skip_class) = super::host_skip_class(e)
@@ -295,6 +300,24 @@ pub(crate) fn run_ktstr_test_inner(
         }
         None => {}
     }
+    // Bounded periodic-snapshot retention (best-effort; never gates the
+    // verdict). A pass/skip run needs no periodic forensics, so the whole
+    // pile is dropped — the dominant reclaim, since most e2e tests pass and
+    // each was leaving dozens of multi-MB snapshots that nothing on disk
+    // reads. A failing run keeps only the most-recent
+    // `RETAINED_PERIODIC_SNAPSHOTS` per base (bracketing the failure); the
+    // failure DUMP — the primary evidence — is retained untouched. Prior
+    // attempts' piles were already reaped at prepare; a SIGKILL'd non-final
+    // attempt is reaped by the next attempt's prepare.
+    if passed || skipped {
+        crate::test_support::sidecar::cleanup_snapshots(entry.name, variant_hash);
+    } else {
+        crate::test_support::sidecar::bound_periodic_snapshots(
+            entry.name,
+            variant_hash,
+            crate::test_support::sidecar::RETAINED_PERIODIC_SNAPSHOTS,
+        );
+    }
     // Run-footer advisory: an `expect_err` inversion that PASSED only
     // because the scheduler failed to LOAD/attach (never ran the runtime
     // path the test intends). `take_primary_load_failure` drains the flag
@@ -320,6 +343,81 @@ fn primary_failure_dump_path(entry_name: &str, variant_hash: u64) -> std::path::
     crate::test_support::sidecar::sidecar_dir().join(format!(
         "{entry_name}-{variant_hash:016x}.failure-dump.json"
     ))
+}
+
+/// The 1-indexed nextest attempt number for this test process.
+///
+/// Nextest gives every retry its own process and exports
+/// `NEXTEST_ATTEMPT`. A direct invocation (or an older runner) has no
+/// variable and retains the historical single-attempt behavior.
+fn nextest_attempt() -> Option<u32> {
+    let raw = std::env::var_os("NEXTEST_ATTEMPT")?;
+    match raw.to_str().and_then(|s| s.parse::<u32>().ok()) {
+        Some(attempt) if attempt > 0 => Some(attempt),
+        _ => {
+            tracing::warn!(
+                value = %raw.to_string_lossy(),
+                "eval: ignoring invalid NEXTEST_ATTEMPT"
+            );
+            None
+        }
+    }
+}
+
+/// Insert `.attempt-{attempt}` immediately before
+/// `.failure-dump.json`.
+///
+/// This preserves the final suffix consumed by the CI artifact glob
+/// while handling both primary and repro shapes uniformly:
+///
+/// - `t-H.failure-dump.json` -> `t-H.attempt-1.failure-dump.json`
+/// - `t-H.repro.failure-dump.json` ->
+///   `t-H.repro.attempt-1.failure-dump.json`
+fn archived_failure_dump_path(path: &std::path::Path, attempt: u32) -> std::path::PathBuf {
+    const SUFFIX: &str = ".failure-dump.json";
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.with_extension(format!("attempt-{attempt}.failure-dump.json"));
+    };
+    let stem = name.strip_suffix(SUFFIX).unwrap_or(name);
+    path.with_file_name(format!("{stem}.attempt-{attempt}{SUFFIX}"))
+}
+
+/// Make the canonical failure-dump path available for `attempt`
+/// without destroying evidence from the preceding nextest attempt.
+///
+/// Within one attempt the path remains stable because guest code,
+/// post-VM callbacks, and the freeze coordinator all resolve the
+/// canonical filename. At retry startup the preceding process is
+/// already gone, so a same-directory rename is an atomic, zero-copy
+/// handoff to the attempt-qualified archive.
+fn prepare_failure_dump_path(path: &std::path::Path, attempt: Option<u32>) {
+    let Some(previous_attempt) = attempt
+        .filter(|attempt| *attempt > 1)
+        .map(|attempt| attempt - 1)
+    else {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "eval: failed to pre-clear stale failure-dump file"
+            ),
+        }
+        return;
+    };
+
+    let archive = archived_failure_dump_path(path, previous_attempt);
+    match std::fs::rename(path, &archive) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            path = %path.display(),
+            archive = %archive.display(),
+            error = %e,
+            "eval: failed to preserve preceding attempt's failure-dump"
+        ),
+    }
 }
 
 /// Read the primary VM's `scx_sched_state.exit_kind` from its
@@ -372,9 +470,6 @@ fn read_primary_exit_kind(entry_name: &str, variant_hash: u64) -> Option<u64> {
 /// normal stderr path; the stub is a best-effort augment, so the
 /// helper does not propagate any io::Error.
 fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vmm::VmResult) {
-    if path.exists() {
-        return;
-    }
     let stage_label =
         crate::test_support::output::classify_init_stage(result.guest_messages.as_ref());
     // Fold BUG SUMMARY into the on-disk reason so the disk artifact
@@ -388,7 +483,7 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
     };
     let raw_dump = extract_sched_ext_dump(&result.stderr).unwrap_or_default();
     let bug_summary = crate::test_support::output::extract_bug_summary(sched_log_input, &raw_dump);
-    let reason = match bug_summary {
+    let mut reason = match bug_summary {
         Some(s) => format!(
             "test failed at stage `{stage_label}`; no BPF state captured \
              (probe did not attach before failure). BUG SUMMARY: {s}"
@@ -398,6 +493,77 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
              (probe did not attach before failure)"
         ),
     };
+    if let Some(diagnostic) = failure_dump_runtime_diagnostic(result)
+        && !reason.contains(&diagnostic)
+    {
+        reason.push_str(". RUNTIME DIAGNOSTIC: ");
+        reason.push_str(&diagnostic);
+    }
+    write_placeholder_failure_dump_reason_if_missing(path, reason);
+}
+
+const MAX_FAILURE_DUMP_DIAGNOSTIC_BYTES: usize = 4096;
+
+fn bounded_failure_dump_diagnostic(value: &str) -> String {
+    if value.len() <= MAX_FAILURE_DUMP_DIAGNOSTIC_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_FAILURE_DUMP_DIAGNOSTIC_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated]", &value[..end])
+}
+
+/// Preserve crash/error evidence that otherwise exists only in
+/// nextest's stdout/stderr stream. Prefer the structured panic/crash
+/// field, then retain diagnostic lines for fatal signals and host/guest
+/// protocol failures.
+fn failure_dump_runtime_diagnostic(result: &vmm::VmResult) -> Option<String> {
+    if let Some(crash) = result
+        .crash_message
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(bounded_failure_dump_diagnostic(crash.trim()));
+    }
+
+    const MARKERS: [&str; 7] = [
+        "sigsegv",
+        "fatal signal",
+        "segmentation fault",
+        "queue designated",
+        "ktstr fatal",
+        "panic:",
+        "protocol",
+    ];
+    for stream in [&result.stderr, &result.output] {
+        let selected = stream
+            .lines()
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                MARKERS.iter().any(|marker| lower.contains(marker))
+            })
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !selected.is_empty() {
+            return Some(bounded_failure_dump_diagnostic(&selected));
+        }
+    }
+    None
+}
+
+/// Atomically write a placeholder carrying an already-classified
+/// reason. This lower-level form is also used when `build()` or `run()`
+/// returns an error before a [`vmm::VmResult`] exists.
+fn write_placeholder_failure_dump_reason_if_missing(
+    path: &std::path::Path,
+    reason: impl Into<String>,
+) {
+    if path.exists() {
+        return;
+    }
     let stub = crate::monitor::dump::FailureDumpReport::placeholder(reason);
     let json = match serde_json::to_string_pretty(&stub) {
         Ok(j) => j,
@@ -512,21 +678,16 @@ fn overcommit_skip(
 /// Classify a no-guest-result run for the contention-`NotAttached` SKIP.
 ///
 /// Returns `Some(reason)` when the run should SKIP (a clean host-resource
-/// condition): the guest reported `SchedulerNotAttached` with the enable
-/// STILL IN FLIGHT (reason carries `state=enabling`) AND the host was
-/// oversubscribed (overcommit ratio > 1.0) — the scheduler was still
-/// enabling when the startup budget expired under host time-slicing, not
-/// a load/verify reject. Returns `None` (the run FAILs) for a REJECTED
-/// enable (`state=disabling`/`disabled`), a missing sched_ext sysfs, a
-/// `SchedulerDied`, a stall on a FITTING host (ratio == 1.0), or any run
-/// with no `SchedulerNotAttached` frame.
+/// condition): the guest reported `SchedulerNotAttached` because the host's
+/// max-vCPU service budget fired while state was still `enabling`, and the
+/// host was oversubscribed. A cross-vCPU attach rendezvous can keep burning
+/// service on one runnable vCPU while another guest vCPU waits for host time;
+/// the same terminal state on a fitting host remains a real failure.
 ///
-/// The `state=enabling` token is produced by the guest's
-/// `poll_scx_attached` (`src/vmm/rust_init/scheduler.rs`): the sched_ext
-/// enable path leaves `Enabling` for `Disabling`/`Disabled` ONLY on
-/// failure, so `Enabling` at the deadline means a still-progressing (not
-/// rejected) enable. `SchedulerDied` and the non-`enabling` reasons are
-/// checked FIRST so a genuine defect can never be classified as a skip.
+/// The structured `cause=host-vcpu-service-budget state=enabling` tokens are
+/// produced by the host-authoritative attach watchdog and the guest's unified
+/// pidfd+sysfs attach wait. `SchedulerDied`, other causes, observer failures,
+/// and non-enabling states are rejected before host overcommit is considered.
 /// Pure over its inputs so the skip boundary is unit-testable without a
 /// live scheduler.
 fn contention_not_attached_skip_reason(
@@ -542,10 +703,19 @@ fn contention_not_attached_skip_reason(
         // never a contention skip.
         return None;
     };
-    // Only a still-in-flight enable is skippable; a rejected enable
-    // (disabling/disabled), sysfs-absent, or unknown state is a real
-    // defect that must FAIL.
-    if !reason.contains("state=enabling") {
+    // Accept only the exact typed host cancellation plus an in-flight enable.
+    // Substring matching would let a stale or future similarly named cause
+    // silently cross this fail-to-skip boundary.
+    let expected_cause = format!(
+        "cause={}",
+        crate::vmm::wire::AttachCancelCause::ServiceBudget.label()
+    );
+    let mut tokens = reason.split_ascii_whitespace();
+    if !tokens.any(|token| token == expected_cause)
+        || !reason
+            .split_ascii_whitespace()
+            .any(|token| token == "state=enabling")
+    {
         return None;
     }
     // On a fitting host a startup-budget stall is a real defect, not
@@ -612,60 +782,11 @@ fn run_ktstr_test_inner_impl(
     if let Some(t) = topo {
         t.validate().context("TopoOverride validation")?;
     }
-    // Pin rayon's global thread pool to the test's allowed CPUs.
-    // The pool is created lazily on first rayon use (initramfs
-    // build) — configuring it here ensures workers inherit the
-    // test's cpuset instead of spreading across all host CPUs.
-    //
-    // `build_global` succeeds only once per process. Track the
-    // first call's cpuset in a `OnceLock<Vec<usize>>`; subsequent
-    // tests with a DIFFERENT cpuset can't repin the pool, so emit
-    // a warning so the operator sees that the second test's
-    // workers may run on the first test's CPUs.
-    static FIRST_RAYON_CPUSET: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
-    let host_cpus = crate::vmm::host_topology::host_allowed_cpus();
-    if !host_cpus.is_empty() {
-        let cpus = host_cpus.clone();
-        let n = cpus.len();
-        let range = format!("{}-{}", cpus[0], cpus[n - 1]);
-        let cpus_for_handler = cpus.clone();
-        let built = rayon::ThreadPoolBuilder::new()
-            .num_threads(n.min(32))
-            .start_handler(move |_idx| {
-                let mut cpuset = nix::sched::CpuSet::new();
-                for &cpu in &cpus_for_handler {
-                    let _ = cpuset.set(cpu);
-                }
-                let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &cpuset);
-            })
-            .build_global()
-            .is_ok();
-        if built {
-            // First successful pin in this process. Record the
-            // cpuset so later tests can compare.
-            let _ = FIRST_RAYON_CPUSET.set(cpus);
-            eprintln!("no_perf_mode: rayon pool pinned to {n} CPUs ({range})");
-        } else if let Some(first) = FIRST_RAYON_CPUSET.get()
-            && first != &host_cpus
-        {
-            // build_global fails on every call after the first.
-            // When the second test's cpuset differs, warn — the
-            // pool is still pinned to `first`, not to the
-            // requested `host_cpus`, so workers run on a stale
-            // cpuset until process exit.
-            let first_n = first.len();
-            let first_range = if first_n > 0 {
-                format!("{}-{}", first[0], first[first_n - 1])
-            } else {
-                "empty".to_string()
-            };
-            eprintln!(
-                "no_perf_mode: WARNING: rayon pool already pinned to {first_n} CPUs \
-                 ({first_range}); requested {n} CPUs ({range}) won't take effect — \
-                 build_global is one-shot per process",
-            );
-        }
-    }
+    // Do not initialize Rayon globally here. A verifier storm is
+    // process-per-cell, so even a cache-hit cell would retain every global
+    // worker for its full VM lifetime. Expensive preparation paths use
+    // bounded, short-lived local work only on the elected cache builder;
+    // cache consumers therefore create no compression workers at all.
     if entry.performance_mode && super::runtime::no_perf_mode_active() {
         // One canonical reason string for both the stderr banner
         // (prefixed with the entry name for multi-test context)
@@ -696,6 +817,7 @@ fn run_ktstr_test_inner_impl(
     // the full rationale; it skips ONLY the auto-collapse case past
     // `OVERCOMMIT_SKIP_RATIO`, so an explicit `cpu_budget` and the CI
     // ~1.3x case both RUN and are validated here, never masked.
+    let host_cpus = crate::vmm::host_topology::host_allowed_cpus();
     if let Some(skip) = overcommit_skip(entry, &host_cpus, topo) {
         return Ok(skip);
     }
@@ -727,6 +849,7 @@ fn run_ktstr_test_inner_impl(
         "--ktstr-test-fn".to_string(),
         entry.name.to_string(),
     ];
+    super::probe::append_primary_probe_dump_arg(entry, &mut guest_args);
 
     let cmdline_extra = super::runtime::build_cmdline_extra(entry);
 
@@ -751,38 +874,31 @@ fn run_ktstr_test_inner_impl(
 
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
 
-    // Pre-clear stale failure-dump files before the primary VM
-    // boots. A passing rerun after a prior failed invocation must
-    // not be masked by the prior failure's leftovers — the E2E
-    // test (`tests/failure_dump_e2e.rs`) reads from the primary
-    // path and an operator inspecting the sidecar dir looks at
-    // both. Both files are variant-keyed per test
-    // (`{name}-{variant_hash}.failure-dump.json` and
-    // `{name}-{variant_hash}.repro.failure-dump.json`), so we can
-    // safely unlink both from this single primary-dispatch
-    // entry — auto-repro fires only after a primary failure
-    // emits a dump, so any repro file present here is stale by
-    // construction. NotFound is silenced; other unlink errors
-    // emit `tracing::warn!` and dispatch proceeds (the freeze
-    // coord's own write would overwrite a stale file in
-    // practice; the warn flags permission / fs anomalies for the
-    // operator).
+    // Make the canonical primary/repro paths available before boot.
+    // Direct and first-attempt runs clear stale files as before.
+    // Nextest retries atomically archive the preceding attempt first,
+    // preserving its useful dump even when this attempt fails earlier
+    // and can produce only an init-never placeholder.
     let primary_dump_path = primary_failure_dump_path(entry.name, variant_hash);
     let repro_dump_path = super::sidecar::sidecar_dir().join(format!(
         "{}-{variant_hash:016x}.repro.failure-dump.json",
         entry.name
     ));
+    let attempt = nextest_attempt();
     for stale in [&primary_dump_path, &repro_dump_path] {
-        match std::fs::remove_file(stale) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(
-                path = %stale.display(),
-                error = %e,
-                "eval: failed to pre-clear stale failure-dump file"
-            ),
-        }
+        prepare_failure_dump_path(stale, attempt);
     }
+    // Reap any prior-attempt / SIGKILL-orphaned periodic snapshots for this
+    // variant before boot so the new attempt starts from a clean snapshot
+    // slate. The freeze coordinator overwrites `{base}.snapshot.periodic_NNN`
+    // by tag, but a preceding attempt that fired MORE boundaries (or was
+    // killed by the watchdog mid-run) leaves stale higher-index snapshots the
+    // tag-keyed overwrite cannot reclaim. This is the crash-safety reap: a
+    // killed process cannot clean up after itself, so the next attempt's
+    // prepare does it — the same handoff `prepare_failure_dump_path` performs
+    // for the dump. Unlike the dump, snapshots are supplementary trajectory,
+    // not per-attempt evidence, so they are reaped rather than archived.
+    super::sidecar::cleanup_snapshots(entry.name, variant_hash);
 
     // Attach the primary failure-dump JSON sink at this dispatch
     // site, NOT inside `build_vm_builder_base` — auto-repro calls
@@ -1225,6 +1341,15 @@ fn run_ktstr_test_inner_impl(
                         &resolved_topology,
                         class,
                     );
+                } else {
+                    write_placeholder_failure_dump_reason_if_missing(
+                        &primary_dump_path,
+                        format!(
+                            "host failed before VM result at stage `build ktstr_test VM`; \
+                             RUNTIME DIAGNOSTIC: {}",
+                            bounded_failure_dump_diagnostic(&format!("{e:#}"))
+                        ),
+                    );
                 }
                 return Err(e.context("build ktstr_test VM"));
             }
@@ -1239,6 +1364,15 @@ fn run_ktstr_test_inner_impl(
                         entry,
                         &resolved_topology,
                         class,
+                    );
+                } else {
+                    write_placeholder_failure_dump_reason_if_missing(
+                        &primary_dump_path,
+                        format!(
+                            "host failed before VM result at stage `run ktstr_test VM`; \
+                             RUNTIME DIAGNOSTIC: {}",
+                            bounded_failure_dump_diagnostic(&format!("{e:#}"))
+                        ),
                     );
                 }
                 Err(e.context("run ktstr_test VM"))
@@ -1455,14 +1589,15 @@ fn run_ktstr_test_inner_impl(
                 // remaining verdict-bearing variants in this arm
                 // (TestResult, Exit, SchedExit, ScenarioStart,
                 // ScenarioPause, ScenarioResume, Stdout, SchedLog,
-                // SchedStdout, SchedStderr, Lifecycle, ExecExit, Dmesg,
-                // ProbeOutput, SnapshotReply, Crash) are consumed by
+                // SchedStdout, SchedStderr, SchedStdoutFinal,
+                // SchedStderrFinal, Lifecycle, ExecExit, Dmesg, ProbeOutput,
+                // SnapshotReply, Crash) are consumed by
                 // other walkers further down the pipeline
                 // (parse_assert_result_from_drain, bulk_exit
                 // lookup in collect_results, lifecycle classifier,
                 // sched_log concatenator, etc.). The live scheduler
-                // SchedStdout/SchedStderr streams are consumed only by
-                // the verifier cell path (`concat_sched_std*_chunks`);
+                // scheduler stream and completion-replay frames are consumed
+                // only by the verifier cell path;
                 // for a normal test VM they are diagnostic no-ops here.
                 // No per-entry side effect
                 // here. (Stderr is NOT in this arm — it has its own arm
@@ -1490,6 +1625,8 @@ fn run_ktstr_test_inner_impl(
                     | crate::vmm::wire::MsgType::SchedLog
                     | crate::vmm::wire::MsgType::SchedStdout
                     | crate::vmm::wire::MsgType::SchedStderr
+                    | crate::vmm::wire::MsgType::SchedStdoutFinal
+                    | crate::vmm::wire::MsgType::SchedStderrFinal
                     | crate::vmm::wire::MsgType::Lifecycle
                     | crate::vmm::wire::MsgType::ExecExit
                     | crate::vmm::wire::MsgType::Dmesg
@@ -1518,7 +1655,9 @@ fn run_ktstr_test_inner_impl(
                 | Some(crate::vmm::wire::MsgType::TeardownBarrierAck)
                 | Some(crate::vmm::wire::MsgType::SysRdy)
                 | Some(crate::vmm::wire::MsgType::BpfMapWriteReady)
-                | Some(crate::vmm::wire::MsgType::SchedSwapNotify) => {}
+                | Some(crate::vmm::wire::MsgType::ReadinessWait)
+                | Some(crate::vmm::wire::MsgType::SchedSwapNotify)
+                | Some(crate::vmm::wire::MsgType::AttachAttempt) => {}
                 None => {
                     tracing::warn!(
                         msg_type = bulk_entry.msg_type,
@@ -1592,6 +1731,7 @@ fn run_ktstr_test_inner_impl(
             entry,
             &kernel,
             scheduler.as_deref(),
+            &resolved_staged,
             &ktstr_bin,
             output,
             &result.stderr,
@@ -1738,6 +1878,11 @@ fn run_ktstr_test_inner_impl(
         "evaluate_vm_result (includes auto-repro): {:?}",
         post_vm_t.elapsed()
     );
+    // Post-release host-side evaluation (post_vm, sidecar finalize, auto-repro)
+    // is done; the process now unwinds to the libtest harness and exits. A large
+    // step between here and the exit-timing aggregate implicates the harness/exit
+    // path rather than admission teardown.
+    crate::vmm::exit_timing::stamp("eval_done");
     eval_result
 }
 

@@ -33,20 +33,18 @@ const RSDP_SIZE: u64 = 36;
 /// allocation (base u64, segment u16, start_bus u8, end_bus u8, reserved u32).
 const MCFG_SIZE: u64 = 36 + 8 + 16;
 
-/// Addresses and sizes of all ACPI tables after dynamic placement.
+/// Addresses of all ACPI tables after dynamic placement, plus the sizes
+/// that later writers and the placement pins need. The sizes of tables
+/// whose length nobody reads back are not carried.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct AcpiLayout {
     pub dsdt_addr: u64,
     pub dsdt_size: u64,
     pub madt_addr: u64,
-    pub madt_size: u64,
     pub fadt_addr: u64,
-    pub fadt_size: u64,
     pub srat_addr: u64,
-    pub srat_size: u64,
     pub slit_addr: u64,
-    pub slit_size: u64,
     pub hmat_addr: u64,
     pub hmat_size: u64,
     pub mcfg_addr: u64,
@@ -56,7 +54,6 @@ pub struct AcpiLayout {
     pub xsdt_addr: u64,
     pub xsdt_size: u64,
     pub rsdp_addr: u64,
-    pub rsdp_size: u64,
 }
 
 // FADT flags
@@ -452,13 +449,9 @@ pub fn setup_acpi(
         dsdt_addr,
         dsdt_size,
         madt_addr,
-        madt_size,
         fadt_addr,
-        fadt_size,
         srat_addr,
-        srat_size,
         slit_addr,
-        slit_size,
         hmat_addr,
         hmat_size,
         mcfg_addr,
@@ -468,7 +461,6 @@ pub fn setup_acpi(
         xsdt_addr,
         xsdt_size,
         rsdp_addr: RSDP_ADDR,
-        rsdp_size: RSDP_SIZE,
     };
 
     write_dsdt(mem, dsdt_addr, &dsdt_body)?;

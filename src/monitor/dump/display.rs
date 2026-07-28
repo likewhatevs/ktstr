@@ -520,8 +520,14 @@ impl std::fmt::Display for FailureDumpReport {
         {
             return f.write_str("(empty failure dump)");
         }
-        use rayon::prelude::*;
-        let rendered_maps: Vec<String> = self.maps.par_iter().map(|m| format!("{m}")).collect();
+        // A failure dump is rendered on the retry/error path, where
+        // pthread creation may already be the scarce resource. Using
+        // `par_iter()` here lazily initialized Rayon's process-global
+        // host-sized pool and retained every worker for the rest of the
+        // test process. Render in the same stable map order without
+        // creating any helper threads. Keeping the pre-rendered `String`
+        // vector preserves the prior byte output and write/error boundary.
+        let rendered_maps: Vec<String> = self.maps.iter().map(|m| format!("{m}")).collect();
         let mut first = true;
         for s in &rendered_maps {
             if !first {
@@ -1081,6 +1087,84 @@ impl std::fmt::Display for FailureDumpPercpuHashEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DISPLAY_THREAD_PROBE_ENV: &str = "KTSTR_FAILURE_DUMP_DISPLAY_THREAD_PROBE";
+    const DISPLAY_THREAD_PROBE_MARKER: &str = "failure-dump-display-thread-probe-ok";
+
+    /// Run the thread-count assertion in a fresh libtest process.
+    ///
+    /// Rayon's global pool is process-global and one-shot, so checking it
+    /// in the ordinary parallel unit-test process would be order-dependent:
+    /// an unrelated Rayon test may already have initialized the pool. The
+    /// exact-test child starts with a private process and makes the before /
+    /// after task count a deterministic regression signal.
+    #[test]
+    fn report_display_does_not_create_retained_workers() {
+        if std::env::var_os(DISPLAY_THREAD_PROBE_ENV).is_some() {
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(DISPLAY_THREAD_PROBE_ENV, "1")
+            .arg("--exact")
+            .arg(
+                "monitor::dump::display::tests::\
+                 report_display_does_not_create_retained_workers_child",
+            )
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .output()
+            .expect("spawn isolated failure-dump display probe");
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "isolated failure-dump display probe failed:\n{transcript}"
+        );
+        assert!(
+            transcript.contains(DISPLAY_THREAD_PROBE_MARKER),
+            "isolated helper did not run (wrong libtest exact name?):\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn report_display_does_not_create_retained_workers_child() {
+        if std::env::var_os(DISPLAY_THREAD_PROBE_ENV).is_none() {
+            return;
+        }
+        let task_count = || {
+            std::fs::read_dir("/proc/self/task")
+                .expect("read /proc/self/task")
+                .count()
+        };
+        let report = FailureDumpReport {
+            maps: (0..8)
+                .map(|idx| FailureDumpMap {
+                    name: format!("probe_map_{idx}"),
+                    map_type: 2,
+                    value_size: 8,
+                    max_entries: 1,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let before = task_count();
+        let rendered = format!("{report}");
+        let after = task_count();
+        assert_eq!(
+            rendered.matches("\n\n").count(),
+            7,
+            "all maps must retain their prior ordered separators"
+        );
+        assert_eq!(
+            after, before,
+            "failure-dump formatting retained worker threads: before={before}, after={after}"
+        );
+        eprintln!("{DISPLAY_THREAD_PROBE_MARKER}");
+    }
 
     /// Regression: when the event-counter timeline and
     /// vcpu_perf_at_freeze are the only populated sections, the

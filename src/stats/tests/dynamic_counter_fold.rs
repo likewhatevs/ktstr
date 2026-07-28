@@ -16,7 +16,7 @@ use super::*;
 #[test]
 fn group_and_average_dynamic_counter_ext_keys_sum_fold() {
     let mk = |lb: f64, bpf_ctr: f64, bpf_gauge: f64| {
-        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
         // Two Dynamic counter keys (unregistered) — tagged -> SUM-fold.
         r.ext_metrics.insert("lb_count_mc".into(), lb);
         r.ext_metrics.insert("scx_x_allocs".into(), bpf_ctr);
@@ -49,7 +49,7 @@ fn group_and_average_dynamic_counter_ext_keys_sum_fold() {
 /// skip or error) and the tag carries onto the aggregated row.
 #[test]
 fn group_and_average_dynamic_counter_single_run_emits_value() {
-    let mut r = make_row("t", "tiny-1llc", true, 0.0);
+    let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     r.ext_metrics.insert("lb_count_mc".into(), 1000.0);
     r.ext_counter_keys.insert("lb_count_mc".into());
     let out = group_and_average_by(&[r], LEGACY_PAIRING_DIMS);
@@ -66,13 +66,13 @@ fn group_and_average_dynamic_counter_single_run_emits_value() {
 #[test]
 fn group_and_average_dynamic_counter_partial_presence_sums_present_only() {
     let with = |v: f64| {
-        let mut r = make_row("t", "tiny-1llc", true, 0.0);
+        let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
         r.ext_metrics.insert("scx_x_allocs".into(), v);
         r.ext_counter_keys.insert("scx_x_allocs".into());
         r
     };
     // Two rows carry the counter (50, 70); the third omits it entirely.
-    let without = make_row("t", "tiny-1llc", true, 0.0);
+    let without = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     let out = group_and_average_by(&[with(50.0), with(70.0), without], LEGACY_PAIRING_DIMS);
     assert_eq!(out.len(), 1);
     let row = &out[0].row;
@@ -87,7 +87,7 @@ fn group_and_average_dynamic_counter_partial_presence_sums_present_only() {
 /// (those keys mean-fold), so a stale sidecar degrades, not hard-fails.
 #[test]
 fn gauntlet_row_ext_counter_keys_serde() {
-    let mut r = make_row("t", "tiny-1llc", true, 0.0);
+    let mut r = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     r.ext_counter_keys.insert("lb_count_mc".into());
     let json = serde_json::to_string(&r).unwrap();
     assert!(
@@ -97,7 +97,7 @@ fn gauntlet_row_ext_counter_keys_serde() {
     let back: GauntletRow = serde_json::from_str(&json).unwrap();
     assert!(back.ext_counter_keys.contains("lb_count_mc"));
     // Empty set: omitted on serialize, defaults to empty on deserialize.
-    let empty = make_row("t", "tiny-1llc", true, 0.0);
+    let empty = make_row("t", "4cpu-1llc-nosmt", true, 0.0);
     let json_empty = serde_json::to_string(&empty).unwrap();
     assert!(
         !json_empty.contains("ext_counter_keys"),

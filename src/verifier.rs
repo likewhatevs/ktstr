@@ -15,6 +15,197 @@
 //!   `parse_sched_output` extracts the enclosed block
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+/// Current schema version for [`VerifierCellOwnershipManifest`].
+pub const VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION: u32 = 1;
+
+/// One parent-elected verifier-cell owner per selected scheduler identity.
+///
+/// Test binaries are the unit nextest lists and executes. When two warmed
+/// binaries link the same exact `declare_scheduler!`, both would otherwise
+/// advertise the same `verifier/<scheduler>/<kernel>/<topology>` name and
+/// race to write its deterministic result record. The parent writes this
+/// manifest after discovery; children use it at both listing and exact
+/// dispatch boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierCellOwnershipManifest {
+    /// Wire schema version.
+    pub version: u32,
+    /// Full scheduler identity to canonical test-executable mapping.
+    pub entries: Vec<VerifierCellOwnershipEntry>,
+}
+
+/// One selected scheduler declaration and the sole test executable allowed to
+/// list, launch, and record its verifier cells.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierCellOwnershipEntry {
+    /// The complete declaration identity, not merely its cell-name component.
+    pub scheduler: crate::test_support::SchedulerJson,
+    /// Canonical absolute path of the elected warmed test executable.
+    pub executable: PathBuf,
+}
+
+/// Validated ownership view for the current test executable.
+///
+/// Construction validates the entire manifest before any scheduler lookup, so
+/// an ambiguous or partially corrupt manifest cannot selectively fall back to
+/// duplicate cell emission.
+pub(crate) struct VerifierCellOwnership {
+    current_executable: PathBuf,
+    entries: HashMap<String, VerifierCellOwnershipEntry>,
+}
+
+impl VerifierCellOwnership {
+    fn entry_for_scheduler(
+        &self,
+        scheduler_name: &str,
+    ) -> anyhow::Result<&VerifierCellOwnershipEntry> {
+        self.entries.get(scheduler_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "verifier cell ownership manifest has no entry for selected scheduler {:?}",
+                scheduler_name,
+            )
+        })
+    }
+
+    /// Whether this process is the sole owner of `scheduler`.
+    ///
+    /// A present manifest must contain every scheduler which reaches the
+    /// child's normal emission gates, and its full declaration must match the
+    /// parent-observed identity. Missing or stale entries are therefore hard
+    /// errors rather than implicit ownership.
+    pub(crate) fn owns_scheduler(
+        &self,
+        scheduler: &crate::test_support::SchedulerJson,
+    ) -> anyhow::Result<bool> {
+        let entry = self.entry_for_scheduler(&scheduler.name)?;
+        if !entry.scheduler.eq(scheduler) {
+            anyhow::bail!(
+                "verifier cell ownership declaration mismatch for scheduler {:?}: \
+                 parent recorded {:?}, child linked {:?}",
+                scheduler.name,
+                entry.scheduler,
+                scheduler,
+            );
+        }
+        Ok(entry.executable.eq(&self.current_executable))
+    }
+
+    /// Return the parent-selected full declaration when this process owns it.
+    ///
+    /// Exact dispatch uses this identity to select the matching local
+    /// registration, rather than looking up only the scheduler name and
+    /// accidentally executing an earlier same-name declaration which the
+    /// parent correctly filtered as non-emitting.
+    pub(crate) fn owned_scheduler(
+        &self,
+        scheduler_name: &str,
+    ) -> anyhow::Result<Option<&crate::test_support::SchedulerJson>> {
+        let entry = self.entry_for_scheduler(scheduler_name)?;
+        Ok(entry
+            .executable
+            .eq(&self.current_executable)
+            .then_some(&entry.scheduler))
+    }
+}
+
+fn cell_ownership_from_manifest_path(
+    manifest_path: Option<&OsStr>,
+    current_executable: &Path,
+) -> anyhow::Result<Option<VerifierCellOwnership>> {
+    let Some(manifest_path) = manifest_path else {
+        return Ok(None);
+    };
+    if manifest_path.is_empty() {
+        anyhow::bail!(
+            "{} is set but empty",
+            crate::KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST_ENV
+        );
+    }
+    let manifest_path = PathBuf::from(manifest_path);
+    let bytes = std::fs::read(&manifest_path).map_err(|error| {
+        anyhow::anyhow!(
+            "read verifier cell ownership manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: VerifierCellOwnershipManifest =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "parse verifier cell ownership manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    if manifest.version != VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION {
+        anyhow::bail!(
+            "unsupported verifier cell ownership manifest version {} in {} (expected {})",
+            manifest.version,
+            manifest_path.display(),
+            VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+        );
+    }
+
+    let current_executable = std::fs::canonicalize(current_executable).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize current verifier test executable {}: {error}",
+            current_executable.display()
+        )
+    })?;
+    let mut entries = HashMap::with_capacity(manifest.entries.len());
+    for entry in manifest.entries {
+        if !entry.executable.is_absolute() {
+            anyhow::bail!(
+                "verifier cell owner for scheduler {:?} is not absolute: {}",
+                entry.scheduler.name,
+                entry.executable.display(),
+            );
+        }
+        let canonical_owner = std::fs::canonicalize(&entry.executable).map_err(|error| {
+            anyhow::anyhow!(
+                "canonicalize verifier cell owner {} for scheduler {:?}: {error}",
+                entry.executable.display(),
+                entry.scheduler.name,
+            )
+        })?;
+        if canonical_owner.as_path() != entry.executable.as_path() {
+            anyhow::bail!(
+                "verifier cell owner for scheduler {:?} is not canonical: {} resolves to {}",
+                entry.scheduler.name,
+                entry.executable.display(),
+                canonical_owner.display(),
+            );
+        }
+        let name = entry.scheduler.name.clone();
+        if entries.insert(name.clone(), entry).is_some() {
+            anyhow::bail!(
+                "duplicate verifier cell ownership manifest entry for scheduler {name:?}"
+            );
+        }
+    }
+    Ok(Some(VerifierCellOwnership {
+        current_executable,
+        entries,
+    }))
+}
+
+/// Read and validate the parent-owned cell mapping for this test process.
+///
+/// `Ok(None)` means no dispatcher manifest was exported and preserves direct
+/// test-binary behavior. Any present-manifest failure is returned to the
+/// listing/dispatch boundary and must not fall back to shared ownership.
+pub(crate) fn verifier_cell_ownership_from_env() -> anyhow::Result<Option<VerifierCellOwnership>> {
+    let Some(manifest_path) = std::env::var_os(crate::KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST_ENV)
+    else {
+        return Ok(None);
+    };
+    let current_executable = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("locate current verifier test executable: {error}"))?;
+    cell_ownership_from_manifest_path(Some(manifest_path.as_os_str()), &current_executable)
+}
 
 /// A verifier topology which this guest kernel cannot boot without
 /// changing the topology being verified.
@@ -113,6 +304,78 @@ pub(crate) fn concat_sched_stderr_chunks(
     drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
 ) -> String {
     concat_chunks_of(drain, crate::vmm::wire::MSG_TYPE_SCHED_STDERR)
+}
+
+/// Reassemble every complete authoritative scheduler-stream transaction.
+///
+/// A transaction begins at offset zero and is accepted only when CRC-valid,
+/// well-formed chunks cover one contiguous `0..total_len` range. Interrupted
+/// replay is deliberately invisible to callers: they retain the best-effort
+/// live stream instead. Multiple complete transactions are concatenated in
+/// arrival order for scheduler-lifecycle runs that replace a scheduler inside
+/// one VM.
+fn concat_complete_sched_stream_replays(
+    drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
+    msg_type: u32,
+) -> Option<String> {
+    let drain = drain?;
+    let mut completed = Vec::<u8>::new();
+    let mut transaction = None::<(u64, Vec<u8>)>;
+    let mut saw_complete = false;
+
+    for entry in &drain.entries {
+        if entry.msg_type != msg_type {
+            continue;
+        }
+        if !entry.crc_ok {
+            transaction = None;
+            continue;
+        }
+        let Some((total_len, offset, bytes)) =
+            crate::vmm::wire::decode_sched_stream_final_chunk(&entry.payload)
+        else {
+            transaction = None;
+            continue;
+        };
+        if offset == 0 {
+            transaction = Some((total_len, Vec::new()));
+        }
+        let Some((expected_total, bytes_so_far)) = transaction.as_mut() else {
+            continue;
+        };
+        if *expected_total != total_len
+            || offset != bytes_so_far.len() as u64
+            || (bytes.is_empty() && offset != total_len)
+        {
+            transaction = None;
+            continue;
+        }
+        bytes_so_far.extend_from_slice(bytes);
+        if bytes_so_far.len() as u64 == total_len {
+            completed.extend_from_slice(bytes_so_far);
+            saw_complete = true;
+            transaction = None;
+        }
+    }
+
+    saw_complete.then(|| String::from_utf8_lossy(&completed).into_owned())
+}
+
+/// Select the authoritative terminal replay when one arrived completely;
+/// otherwise preserve the live-stream behavior used by old guests and timeout
+/// paths that never reach terminal publication.
+fn scheduler_stream_with_terminal_fallback(
+    drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
+    live_msg_type: u32,
+    replay_msg_type: u32,
+) -> String {
+    concat_complete_sched_stream_replays(drain, replay_msg_type).unwrap_or_else(|| {
+        match live_msg_type {
+            crate::vmm::wire::MSG_TYPE_SCHED_STDOUT => concat_sched_stdout_chunks(drain),
+            crate::vmm::wire::MSG_TYPE_SCHED_STDERR => concat_sched_stderr_chunks(drain),
+            _ => concat_chunks_of(drain, live_msg_type),
+        }
+    })
 }
 
 /// Concatenate every CRC-valid chunk of one `msg_type` in the drain,
@@ -787,19 +1050,19 @@ pub struct VerifierVmResult {
     /// empty — [`Self::scheduler_stdout`] / [`Self::scheduler_stderr`]
     /// are the live-streamed fallbacks that survive that case.
     pub scheduler_log: String,
-    /// The scheduler child's LIVE stdout, concatenated from the
-    /// `MSG_TYPE_SCHED_STDOUT` frames shipped per pipe-read as the run
-    /// progressed. Best-effort: whatever reached the host before the VM
-    /// exited or was watchdog-killed. Populated UNCONDITIONALLY (timeout
-    /// included) so a hung VM still surfaces its stdout. Raw child stream
-    /// — no `SCHED_OUTPUT_START/END` framing.
+    /// The scheduler child's stdout. Normally concatenated directly from the
+    /// live `MSG_TYPE_SCHED_STDOUT` frames shipped per pipe read. When the
+    /// guest detects that a live frame was suppressed or failed, a complete
+    /// terminal replay replaces that partial live stream only after its
+    /// offsets prove every byte arrived. Watchdog-killed and older guests keep
+    /// the best-effort live behavior. Raw child stream — no
+    /// `SCHED_OUTPUT_START/END` framing.
     pub scheduler_stdout: String,
-    /// The scheduler child's LIVE stderr, concatenated from the
-    /// `MSG_TYPE_SCHED_STDERR` frames. Same best-effort / unconditional
-    /// semantics as [`Self::scheduler_stdout`]. With the split streams,
-    /// libbpf / log-crate output (including the BPF verifier log region
-    /// between the `-- BEGIN/END PROG LOAD LOG --` markers) typically
-    /// lands here.
+    /// The scheduler child's stderr, using the same live-first,
+    /// completion-proven terminal fallback semantics as
+    /// [`Self::scheduler_stdout`]. Libbpf / log-crate output (including the
+    /// BPF verifier log region between the `-- BEGIN/END PROG LOAD LOG --`
+    /// markers) typically lands here.
     pub scheduler_stderr: String,
     /// Whether the scheduler positively confirmed attach. Derived from
     /// the guest's lifecycle frames ([`AttachOutcome`]). Attach is
@@ -944,6 +1207,55 @@ impl VerifierVmResult {
     }
 }
 
+/// Complete scheduler-owned launch environment for one verifier VM.
+///
+/// Generated cells build this from the linked [`crate::test_support::Scheduler`]
+/// declaration so verifier and ordinary test boots agree on every
+/// scheduler-wide input which can affect startup or BPF verification. Direct
+/// API callers retain their historical explicit-CLI-only behavior through
+/// [`Self::direct`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifierSchedulerLaunchPlan {
+    sched_args: Vec<String>,
+    cmdline_extra: String,
+    include_files: Vec<(String, PathBuf)>,
+    scheduler_cgroup_parent: Option<String>,
+}
+
+impl VerifierSchedulerLaunchPlan {
+    fn direct(extra_sched_args: &[String]) -> Self {
+        Self {
+            sched_args: extra_sched_args.to_vec(),
+            cmdline_extra: String::new(),
+            include_files: Vec::new(),
+            scheduler_cgroup_parent: None,
+        }
+    }
+
+    pub(crate) fn from_scheduler(scheduler: &crate::test_support::Scheduler) -> Self {
+        let mut sched_args = Vec::new();
+        let mut include_files = Vec::new();
+        if let Some((archive_path, host_path, guest_path)) =
+            crate::test_support::runtime::scheduler_config_file_parts(scheduler)
+        {
+            include_files.push((archive_path, host_path));
+            sched_args.push("--config".to_string());
+            sched_args.push(guest_path);
+        }
+        sched_args.extend(scheduler.sched_args.iter().map(|arg| arg.to_string()));
+
+        Self {
+            sched_args,
+            cmdline_extra: crate::test_support::runtime::scheduler_cmdline_tokens(scheduler)
+                .join(" "),
+            include_files,
+            scheduler_cgroup_parent: scheduler
+                .cgroup_parent
+                .map(|parent| parent.as_str().to_string()),
+        }
+    }
+}
+
 /// Boot a VM and collect verifier statistics via host-side memory
 /// introspection. Per-program `verified_insns` comes from
 /// `bpf_prog_aux->verified_insns` read through the guest's physical
@@ -968,11 +1280,39 @@ pub fn collect_verifier_output(
     topology: crate::vmm::topology::Topology,
     forced_cpu_budget: Option<u32>,
 ) -> anyhow::Result<VerifierVmResult> {
+    let memory_min_mib = crate::test_support::runtime::cpu_scaled_memory_mib(topology.total_cpus());
+    let launch = VerifierSchedulerLaunchPlan::direct(extra_sched_args);
+    collect_verifier_output_with_memory_min(
+        sched_bin,
+        ktstr_bin,
+        kernel,
+        &launch,
+        topology,
+        memory_min_mib,
+        forced_cpu_budget,
+    )
+}
+
+/// Preset-sweep implementation with an explicit deferred-memory floor.
+///
+/// The public direct API above retains its historical CPU-scaled behavior.
+/// The preset dispatcher passes the topology preset's capped floor so large
+/// synthetic topologies do not inflate guest RAM independently of the
+/// preset's declared budget.
+pub(crate) fn collect_verifier_output_with_memory_min(
+    sched_bin: &std::path::Path,
+    ktstr_bin: &std::path::Path,
+    kernel: &std::path::Path,
+    launch: &VerifierSchedulerLaunchPlan,
+    topology: crate::vmm::topology::Topology,
+    memory_min_mib: u32,
+    forced_cpu_budget: Option<u32>,
+) -> anyhow::Result<VerifierVmResult> {
     use anyhow::Context;
 
     // Take the Topology directly (not the lossy TopologyJson wire shape,
     // which drops `nodes` / `distances` / `llc_cores`): a preset like
-    // uneven-11llc carries per-LLC core counts that MUST reach the guest
+    // 192cpu-11llc-smt carries per-LLC core counts that MUST reach the guest
     // CPUID synthesis, so round-tripping through TopologyJson here would
     // silently boot a uniform shape instead. Validate directly so a bad
     // topology surfaces a clean error instead of the builder's panic.
@@ -981,20 +1321,15 @@ pub fn collect_verifier_output(
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid topology {validated:?}: {e}"))?;
 
-    let sched_args: Vec<String> = extra_sched_args.to_vec();
-
     // The verifier only loads the scheduler's BPF and reads the kernel
     // verifier's load-time `verified_insns` counts via host-side
     // introspection — a value fixed at BPF load, wholly INDEPENDENT of
     // perf-mode tuning (CPU pinning, RT priority, hugepages, NUMA mbind,
     // KVM exit suppression). So the verifier VM ALWAYS runs with
     // performance mode disabled: it needs none of that tuning. Disabling
-    // perf mode also moves the run OFF the default run-lock path — whose
-    // per-offset `LOCK_SH` search hard-fails "all N LLC slots busy
-    // (LOCK_SH)" (`acquire_default_run_locks`, src/vmm/mod.rs) when no
-    // candidate offset is free, the failure the verifier was hitting —
-    // ONTO the no-perf-mode plan, which reserves a shared (`LOCK_SH`)
-    // SUBSET of LLCs via `acquire_llc_plan`. `LOCK_SH` holders are
+    // perf mode also routes the run through the no-perf plan, which reserves
+    // a shared (`LOCK_SH`) subset of LLCs and admission permits atomically.
+    // `LOCK_SH` holders are
     // mutually compatible, so parallel verifier / no-perf cells no longer
     // starve each other on the LLC lock; a `performance_mode` peer holding
     // `LOCK_EX` on those LLCs can still defer a cell (nextest retries it),
@@ -1006,16 +1341,15 @@ pub fn collect_verifier_output(
     // at the builder boundary (the TryFrom above already enforces the
     // type-level invariants).
     //
-    // Size memory exactly like a normal `#[ktstr_test]` cell: the
-    // shared cpu-scaling floor for this topology, fed through the
-    // deferred path. The verifier /init is a large instrumented test
-    // binary, so the deferred budget model raises the actual
+    // Feed the caller-selected memory floor through the budget model.
+    // Direct API callers retain the historical vCPU-scaled floor, while
+    // canned verifier cells cap it at the preset's declared budget. The
+    // verifier /init is a large instrumented test
+    // binary, so the budget model raises the actual
     // allocation to fit the real initramfs (floor enforced at
     // `initramfs_min_memory_mib(&budget).max(self.memory_min_mib)` in
-    // `vmm::setup::join_compute_memory_and_load`). Verifier cells have
+    // `vmm::setup::KtstrVm::prepared_memory_mib`). Verifier cells have
     // no wprof, so no wprof floor applies here.
-    let memory_min_mib =
-        crate::test_support::runtime::cpu_scaled_memory_mib(validated.total_cpus());
     // Bounded whole-boot retry on the guest AP-bring-up-gap infra fault
     // (an AP that missed its INIT-SIPI window → the guest PID-1 panics
     // pre-test). Rebuild the VM each attempt: `build` consumes the
@@ -1031,7 +1365,8 @@ pub fn collect_verifier_output(
             .initrd_compression(crate::cache::initrd_compression_for_image(kernel))
             .init_binary(ktstr_bin)
             .scheduler_binary(sched_bin)
-            .sched_args(&sched_args)
+            .sched_args(&launch.sched_args)
+            .cmdline(&launch.cmdline_extra)
             // Boot the guest into the verifier dispatch probe: the sweep VM
             // has no `#[ktstr_test]` body, so Phase 5 spawns a SpinWait
             // workload and emits `WorkloadDispatched` on confirmed progress.
@@ -1053,7 +1388,13 @@ pub fn collect_verifier_output(
             ))
             .workload_duration(crate::test_support::runtime::VERIFIER_WORKLOAD_BUDGET)
             .no_perf_mode(true);
-        // A preset with a forced CPU budget (uneven-11llc) pins the
+        if !launch.include_files.is_empty() {
+            builder = builder.include_files(launch.include_files.clone());
+        }
+        if let Some(parent) = launch.scheduler_cgroup_parent.as_ref() {
+            builder = builder.scheduler_cgroup_parent(parent.clone());
+        }
+        // A preset with a forced CPU budget (192cpu-11llc-smt) pins the
         // no-perf mask to that many host CPUs so its vCPUs ALWAYS
         // overcommit — the deliberate, continuous time-slicing path.
         // Absent (every stock preset) leaves budget on the unchanged
@@ -1112,14 +1453,20 @@ pub fn collect_verifier_output(
         parse_sched_output(&result.output).unwrap_or("").to_string()
     };
 
-    // Concatenate the LIVE scheduler stdout / stderr streams. These are
-    // populated UNCONDITIONALLY — including on `result.timed_out`, the
-    // core case the merged-file dump misses: a watchdog kill never
-    // reaches `dump_sched_output`, but any live chunk that arrived
-    // before the kill survives in `guest_messages`. Raw child streams
-    // (no `SCHED_OUTPUT_START/END` framing), so no `parse_sched_output`.
-    let scheduler_stdout = concat_sched_stdout_chunks(result.guest_messages.as_ref());
-    let scheduler_stderr = concat_sched_stderr_chunks(result.guest_messages.as_ref());
+    // Prefer a completion-proven terminal replay only when the guest observed
+    // a dropped live chunk for that stream. Otherwise retain the zero-replay
+    // live path. Watchdog kills and old guests never emit final frames, so
+    // their existing best-effort live semantics remain unchanged.
+    let scheduler_stdout = scheduler_stream_with_terminal_fallback(
+        result.guest_messages.as_ref(),
+        crate::vmm::wire::MSG_TYPE_SCHED_STDOUT,
+        crate::vmm::wire::MSG_TYPE_SCHED_STDOUT_FINAL,
+    );
+    let scheduler_stderr = scheduler_stream_with_terminal_fallback(
+        result.guest_messages.as_ref(),
+        crate::vmm::wire::MSG_TYPE_SCHED_STDERR,
+        crate::vmm::wire::MSG_TYPE_SCHED_STDERR_FINAL,
+    );
 
     // Build ProgStats from host-side ProgVerifierStats. Each program
     // that loaded successfully is visible in prog_idr with its
@@ -1439,27 +1786,34 @@ pub struct VerifierCellRecord {
     pub stats: Vec<ProgStats>,
 }
 
-/// Map a cell's full name to a filesystem-safe record filename: every
-/// non-alphanumeric byte becomes `_`. The input is the cell's full name
-/// (`verifier/<sched>/<kernel>/<preset>`, unique per cell), so the
-/// mapping is unique per cell — a nextest RETRY of the same cell overwrites its
-/// own prior record, so the FINAL attempt's outcome wins (a cell that
-/// failed then passed on retry records PASS).
+/// Map a cell's full name to a compact content-addressed record filename.
+///
+/// The fixed-seed ahash matches ktstr's other fast content-addressed
+/// identities. Hashing the raw, length-delimited name avoids aliases introduced
+/// by filesystem sanitization (`foo-bar` versus `foo_bar`) and keeps the
+/// filename below `NAME_MAX` even when a valid scheduler name is long. A
+/// nextest RETRY of the same cell resolves to the same path and overwrites its
+/// prior record, so the FINAL attempt's outcome wins.
 fn cell_record_filename(full_name: &str) -> String {
-    let mut s: String = full_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    s.push_str(".json");
-    s
+    use std::hash::{BuildHasher, Hasher};
+
+    let bytes = full_name.as_bytes();
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+    hasher.write(&(bytes.len() as u64).to_le_bytes());
+    hasher.write(bytes);
+    format!("cell-{:016x}.json", hasher.finish())
 }
 
 /// Write a cell's PASS/FAIL/SKIP record into `dir`. Parses `full_name`
 /// (`verifier/<sched>/<kernel>/<preset>`); a name that does not fit that
 /// shape is skipped (the cell already errored on the malformed name).
-/// Best-effort: a write failure is logged and swallowed — the summary
-/// table is a convenience over the per-cell nextest output, so a lost
-/// record must never turn an otherwise-passing cell into a failure.
+/// The record is serialized to a same-directory temporary and atomically
+/// renamed over the deterministic final path. Readers therefore see either
+/// the preceding retry's complete record or the current retry's complete
+/// record, never a truncated JSON prefix. Best-effort: a write failure is
+/// logged and swallowed — the summary table is a convenience over the
+/// per-cell nextest output, so a lost record must never turn an
+/// otherwise-passing cell into a failure.
 ///
 /// `pub(crate)`: the only writer is the cell handler in
 /// `test_support::dispatch` (same crate); the reader side
@@ -1492,16 +1846,18 @@ pub(crate) fn write_cell_record(
         stats: stats.to_vec(),
     };
     let path = dir.join(cell_record_filename(full_name));
-    match serde_json::to_vec(&record) {
-        Ok(bytes) => {
-            if let Err(e) = std::fs::write(&path, bytes) {
-                eprintln!(
-                    "ktstr verifier: warning: could not write result record {}: {e}",
-                    path.display(),
-                );
-            }
-        }
-        Err(e) => eprintln!("ktstr verifier: warning: serialize result record: {e}"),
+    let result = (|| -> anyhow::Result<()> {
+        let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer(temporary.as_file_mut(), &record)?;
+        std::io::Write::flush(temporary.as_file_mut())?;
+        temporary.persist(&path).map_err(|error| error.error)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!(
+            "ktstr verifier: warning: could not atomically write result record {}: {error:#}",
+            path.display(),
+        );
     }
 }
 
@@ -1558,10 +1914,11 @@ pub enum RunOutcome {
 /// the dispatcher diagnose the empty case itself instead of surfacing a
 /// cryptic nextest exit:
 /// - `--scheduler <NAME>` set + no records: the name is not a declared
-///   scheduler, or no topology preset fits this host for it.
+///   scheduler, or its declared topology constraints / verifier-only
+///   exclusions reject every selected preset.
 /// - no `--scheduler` + no records: no `declare_scheduler!` is linked into
-///   a test binary the sweep sees, or every declared scheduler's
-///   constraints rejected all topology presets on this host.
+///   a test binary the sweep sees, or every declared scheduler rejects all
+///   selected presets through those declaration-level gates.
 ///
 /// A genuine build/exec failure still fails nextest (exit non-zero, which
 /// `--no-tests=pass` does not mask). When that nonzero exit is a REAL
@@ -1594,14 +1951,14 @@ pub fn classify_run_outcome(
         return RunOutcome::Failed(match scheduler {
             Some(name) => format!(
                 "--scheduler {name:?}: matched no verifier cell — no declared BPF \
-                 scheduler by that name, or no topology preset fits this host for \
-                 it. Run `cargo ktstr verifier` with no --scheduler to see the \
-                 swept set."
+                 scheduler by that name, or its declared topology constraints or \
+                 verifier-only exclusions rejected every selected preset. Run \
+                 `cargo ktstr verifier` with no --scheduler to see the swept set."
             ),
             None => "no verifier cells ran — no scheduler is declared via \
                  declare_scheduler! in a linked test binary, or every declared \
-                 scheduler's constraints rejected all topology presets on this \
-                 host."
+                 scheduler's topology constraints or verifier-only exclusions \
+                 rejected every selected preset."
                 .to_string(),
         });
     }
@@ -1874,6 +2231,345 @@ pub fn render_instruction_count_tables(records: &[VerifierCellRecord]) -> Option
 mod tests {
     use super::*;
 
+    fn ownership_scheduler(name: &str) -> crate::test_support::SchedulerJson {
+        let mut scheduler = crate::test_support::SchedulerJson::from_scheduler(
+            &crate::test_support::Scheduler::EEVDF,
+        );
+        scheduler.name = name.to_string();
+        scheduler
+    }
+
+    fn write_ownership_manifest(dir: &Path, manifest: &VerifierCellOwnershipManifest) -> PathBuf {
+        let path = dir.join("cell-ownership.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(manifest).expect("serialize ownership manifest"),
+        )
+        .expect("write ownership manifest");
+        path
+    }
+
+    #[test]
+    fn cell_ownership_allows_exactly_the_canonical_elected_executable() {
+        let dir = tempfile::tempdir().expect("ownership tempdir");
+        let owner = dir.path().join("owner");
+        let non_owner = dir.path().join("non-owner");
+        std::fs::write(&owner, b"owner").expect("write owner");
+        std::fs::write(&non_owner, b"non-owner").expect("write non-owner");
+        let owner = std::fs::canonicalize(owner).expect("canonical owner");
+        let non_owner = std::fs::canonicalize(non_owner).expect("canonical non-owner");
+        let owner_alias = dir.path().join("owner-alias");
+        std::os::unix::fs::symlink(&owner, &owner_alias).expect("symlink owner alias");
+        let scheduler = ownership_scheduler("shared");
+        let manifest_path = write_ownership_manifest(
+            dir.path(),
+            &VerifierCellOwnershipManifest {
+                version: VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+                entries: vec![VerifierCellOwnershipEntry {
+                    scheduler: scheduler.clone(),
+                    executable: owner.clone(),
+                }],
+            },
+        );
+
+        let elected = cell_ownership_from_manifest_path(Some(manifest_path.as_os_str()), &owner)
+            .expect("load owner view")
+            .expect("present manifest");
+        let rejected =
+            cell_ownership_from_manifest_path(Some(manifest_path.as_os_str()), &non_owner)
+                .expect("load non-owner view")
+                .expect("present manifest");
+        let elected_through_alias =
+            cell_ownership_from_manifest_path(Some(manifest_path.as_os_str()), &owner_alias)
+                .expect("load owner alias view")
+                .expect("present manifest");
+        assert!(elected.owns_scheduler(&scheduler).expect("owner lookup"));
+        assert!(
+            elected_through_alias
+                .owns_scheduler(&scheduler)
+                .expect("owner alias lookup"),
+            "current_exe aliases must compare by their canonical executable path",
+        );
+        assert!(
+            !rejected
+                .owns_scheduler(&scheduler)
+                .expect("non-owner lookup")
+        );
+        let mut stale_child = scheduler.clone();
+        stale_child.kargs.push("identity=stale-child".into());
+        assert!(
+            elected.owns_scheduler(&stale_child).is_err(),
+            "matching only the scheduler name cannot establish ownership",
+        );
+    }
+
+    #[test]
+    fn present_cell_ownership_manifest_fails_closed() {
+        let dir = tempfile::tempdir().expect("ownership tempdir");
+        let owner = dir.path().join("owner");
+        std::fs::write(&owner, b"owner").expect("write owner");
+        let owner = std::fs::canonicalize(owner).expect("canonical owner");
+        let scheduler = ownership_scheduler("shared");
+        assert!(
+            cell_ownership_from_manifest_path(None, &owner)
+                .expect("absent manifest")
+                .is_none(),
+            "only an absent environment value retains direct invocation",
+        );
+        assert!(
+            cell_ownership_from_manifest_path(Some(OsStr::new("")), &owner).is_err(),
+            "an explicitly empty manifest path is still present and must fail",
+        );
+
+        let wrong_version_path = write_ownership_manifest(
+            dir.path(),
+            &VerifierCellOwnershipManifest {
+                version: VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION + 1,
+                entries: Vec::new(),
+            },
+        );
+        assert!(
+            cell_ownership_from_manifest_path(Some(wrong_version_path.as_os_str()), &owner)
+                .is_err(),
+            "unknown ownership schemas cannot fall back to shared ownership",
+        );
+
+        let empty_path = write_ownership_manifest(
+            dir.path(),
+            &VerifierCellOwnershipManifest {
+                version: VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+                entries: Vec::new(),
+            },
+        );
+        let empty = cell_ownership_from_manifest_path(Some(empty_path.as_os_str()), &owner)
+            .expect("load empty manifest")
+            .expect("present manifest");
+        assert!(
+            empty.owns_scheduler(&scheduler).is_err(),
+            "a selected scheduler missing from a present manifest cannot become shared",
+        );
+
+        let duplicate_path = write_ownership_manifest(
+            dir.path(),
+            &VerifierCellOwnershipManifest {
+                version: VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+                entries: vec![
+                    VerifierCellOwnershipEntry {
+                        scheduler: scheduler.clone(),
+                        executable: owner.clone(),
+                    },
+                    VerifierCellOwnershipEntry {
+                        scheduler: scheduler.clone(),
+                        executable: owner.clone(),
+                    },
+                ],
+            },
+        );
+        assert!(
+            cell_ownership_from_manifest_path(Some(duplicate_path.as_os_str()), &owner).is_err(),
+            "ambiguous scheduler owners cannot be accepted",
+        );
+
+        let noncanonical_owner = dir.path().join("owner-symlink");
+        std::os::unix::fs::symlink(&owner, &noncanonical_owner).expect("symlink owner");
+        let noncanonical_path = write_ownership_manifest(
+            dir.path(),
+            &VerifierCellOwnershipManifest {
+                version: VERIFIER_CELL_OWNERSHIP_MANIFEST_VERSION,
+                entries: vec![VerifierCellOwnershipEntry {
+                    scheduler: scheduler.clone(),
+                    executable: noncanonical_owner,
+                }],
+            },
+        );
+        assert!(
+            cell_ownership_from_manifest_path(Some(noncanonical_path.as_os_str()), &owner).is_err(),
+            "owner paths must be canonical rather than merely equivalent",
+        );
+
+        let malformed_path = dir.path().join("malformed-ownership.json");
+        std::fs::write(&malformed_path, b"{").expect("write malformed manifest");
+        assert!(
+            cell_ownership_from_manifest_path(Some(malformed_path.as_os_str()), &owner).is_err(),
+            "malformed JSON cannot fall back to shared ownership",
+        );
+        assert!(
+            cell_ownership_from_manifest_path(
+                Some(dir.path().join("missing.json").as_os_str()),
+                &owner,
+            )
+            .is_err(),
+            "a missing present-manifest path cannot fall back to shared ownership",
+        );
+    }
+
+    #[test]
+    fn declared_scheduler_launch_plan_preserves_boot_environment_and_order() {
+        use crate::test_support::{Scheduler, Sysctl};
+
+        const SYSCTLS: &[Sysctl] = &[
+            Sysctl::new("kernel.ktstr_first", "1"),
+            Sysctl::new("kernel.ktstr_second", "2"),
+        ];
+        const KARGS: &[&str] = &["ktstr_first_karg=one", "ktstr_second_karg=two"];
+        const SCHED_ARGS: &[&str] = &["--mode", "verifier"];
+        let scheduler = Scheduler::named("launch-plan")
+            .sysctls(SYSCTLS)
+            .kargs(KARGS)
+            .cgroup_parent("/ktstr-verifier")
+            .config_file("/host/configs/verifier.toml")
+            .sched_args(SCHED_ARGS);
+
+        let plan = VerifierSchedulerLaunchPlan::from_scheduler(&scheduler);
+        assert_eq!(
+            plan.cmdline_extra,
+            "sysctl.kernel.ktstr_first=1 sysctl.kernel.ktstr_second=2 \
+             ktstr_first_karg=one ktstr_second_karg=two"
+        );
+        assert_eq!(
+            plan.include_files,
+            vec![(
+                "include-files/verifier.toml".to_string(),
+                PathBuf::from("/host/configs/verifier.toml"),
+            )]
+        );
+        assert_eq!(
+            plan.sched_args,
+            [
+                "--config",
+                "/include-files/verifier.toml",
+                "--mode",
+                "verifier"
+            ]
+        );
+        assert_eq!(
+            plan.scheduler_cgroup_parent.as_deref(),
+            Some("/ktstr-verifier")
+        );
+    }
+
+    #[test]
+    fn inline_config_definition_without_test_content_is_not_fabricated() {
+        use crate::test_support::Scheduler;
+
+        let scheduler = Scheduler::named("inline-template")
+            .config_file_def("--config={file}", "/include-files/inline.json")
+            .sched_args(&["--mode", "baseline"]);
+        let plan = VerifierSchedulerLaunchPlan::from_scheduler(&scheduler);
+        assert!(plan.include_files.is_empty());
+        assert_eq!(plan.sched_args, ["--mode", "baseline"]);
+    }
+
+    #[test]
+    fn direct_verifier_api_retains_explicit_cli_only_launch_shape() {
+        let plan = VerifierSchedulerLaunchPlan::direct(&["--direct".into(), "value".into()]);
+        assert_eq!(plan.sched_args, ["--direct", "value"]);
+        assert!(plan.cmdline_extra.is_empty());
+        assert!(plan.include_files.is_empty());
+        assert!(plan.scheduler_cgroup_parent.is_none());
+    }
+
+    #[test]
+    fn terminal_scheduler_stream_requires_completion_and_overrides_live_atomically() {
+        use crate::vmm::host_comms::BulkDrainResult;
+        use crate::vmm::wire::{
+            MSG_TYPE_SCHED_STDERR, MSG_TYPE_SCHED_STDERR_FINAL, ShmEntry,
+            encode_sched_stream_final_chunk,
+        };
+
+        let entry = |msg_type, payload: Vec<u8>| ShmEntry {
+            msg_type,
+            payload,
+            crc_ok: true,
+        };
+        let live = || {
+            entry(
+                MSG_TYPE_SCHED_STDERR,
+                b"live prefix missing one chunk\n".to_vec(),
+            )
+        };
+
+        let old_guest = BulkDrainResult {
+            entries: vec![live()],
+        };
+        assert_eq!(
+            scheduler_stream_with_terminal_fallback(
+                Some(&old_guest),
+                MSG_TYPE_SCHED_STDERR,
+                MSG_TYPE_SCHED_STDERR_FINAL,
+            ),
+            "live prefix missing one chunk\n",
+            "absence of new frames must preserve old-guest live semantics"
+        );
+
+        let complete = b"authoritative complete scheduler stderr\n";
+        let split = 14usize;
+        let recovered = BulkDrainResult {
+            entries: vec![
+                live(),
+                entry(
+                    MSG_TYPE_SCHED_STDERR_FINAL,
+                    encode_sched_stream_final_chunk(complete.len() as u64, 0, &complete[..split]),
+                ),
+                entry(
+                    MSG_TYPE_SCHED_STDERR_FINAL,
+                    encode_sched_stream_final_chunk(
+                        complete.len() as u64,
+                        split as u64,
+                        &complete[split..],
+                    ),
+                ),
+            ],
+        };
+        assert_eq!(
+            scheduler_stream_with_terminal_fallback(
+                Some(&recovered),
+                MSG_TYPE_SCHED_STDERR,
+                MSG_TYPE_SCHED_STDERR_FINAL,
+            ),
+            String::from_utf8_lossy(complete),
+            "one completion-proven replay must replace the partial live stream"
+        );
+
+        let interrupted = BulkDrainResult {
+            entries: vec![
+                live(),
+                entry(
+                    MSG_TYPE_SCHED_STDERR_FINAL,
+                    encode_sched_stream_final_chunk(complete.len() as u64, 0, &complete[..split]),
+                ),
+            ],
+        };
+        assert_eq!(
+            scheduler_stream_with_terminal_fallback(
+                Some(&interrupted),
+                MSG_TYPE_SCHED_STDERR,
+                MSG_TYPE_SCHED_STDERR_FINAL,
+            ),
+            "live prefix missing one chunk\n",
+            "an interrupted terminal transaction must never replace live output"
+        );
+
+        let explicit_empty = BulkDrainResult {
+            entries: vec![
+                live(),
+                entry(
+                    MSG_TYPE_SCHED_STDERR_FINAL,
+                    encode_sched_stream_final_chunk(0, 0, &[]),
+                ),
+            ],
+        };
+        assert_eq!(
+            scheduler_stream_with_terminal_fallback(
+                Some(&explicit_empty),
+                MSG_TYPE_SCHED_STDERR,
+                MSG_TYPE_SCHED_STDERR_FINAL,
+            ),
+            "",
+            "a complete empty transaction is distinct from no final transaction"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // per-cell result capture + summary table
     // -----------------------------------------------------------------------
@@ -1884,15 +2580,14 @@ mod tests {
     /// FINAL outcome wins (fail-then-pass -> PASS).
     #[test]
     fn cell_record_write_read_roundtrip_and_retry_overwrites() {
-        let dir = std::env::temp_dir().join(format!("ktstr-verif-rec-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mk temp dir");
+        let dir = tempfile::tempdir().expect("result tempdir");
         // Malformed: no verifier/ prefix, and a 2-segment name (no
         // <preset> after the kernel) — both skipped.
-        write_cell_record(&dir, "not_a_cell", true, false, &[]);
-        write_cell_record(&dir, "verifier/only/two", true, false, &[]);
+        write_cell_record(dir.path(), "not_a_cell", true, false, &[]);
+        write_cell_record(dir.path(), "verifier/only/two", true, false, &[]);
         // Well-formed cell: fail, then a retry passes -> overwrites.
-        let name = "verifier/scx_a/kernel_6_14/tiny-1llc";
-        write_cell_record(&dir, name, false, false, &[]);
+        let name = "verifier/scx_a/kernel_6_14/4cpu-1llc-nosmt";
+        write_cell_record(dir.path(), name, false, false, &[]);
         // The retry passes and carries per-program verified_insns, so the
         // final record has both the PASS outcome and the stats.
         let stats = [
@@ -1905,16 +2600,23 @@ mod tests {
                 verified_insns: 123,
             },
         ];
-        write_cell_record(&dir, name, true, false, &stats);
-        let recs = read_cell_records(&dir);
+        write_cell_record(dir.path(), name, true, false, &stats);
+        let recs = read_cell_records(dir.path());
         assert_eq!(
             recs.len(),
             1,
             "malformed names skipped; the retry overwrote its own record (one file): {recs:?}",
         );
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .expect("read result directory")
+                .count(),
+            1,
+            "atomic retry replacement must leave no temporary record behind",
+        );
         assert_eq!(recs[0].scheduler, "scx_a");
         assert_eq!(recs[0].kernel, "kernel_6_14");
-        assert_eq!(recs[0].topology, "tiny-1llc");
+        assert_eq!(recs[0].topology, "4cpu-1llc-nosmt");
         assert!(
             recs[0].passed,
             "final retry outcome (PASS) wins over the earlier FAIL"
@@ -1922,7 +2624,54 @@ mod tests {
         // Per-program verified_insns survive the JSON roundtrip and reflect
         // the final (retry) write, not the earlier stat-less fail.
         assert_eq!(recs[0].stats, stats, "stats roundtrip via serde");
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Distinct valid scheduler names may differ only at punctuation which a
+    /// filesystem sanitizer would collapse. Their cells can finish
+    /// concurrently, so the raw-name content address must keep both records
+    /// independent while preserving same-cell retry overwrite semantics.
+    #[test]
+    fn concurrent_cell_records_do_not_alias_sanitized_scheduler_names() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().expect("result tempdir");
+        let hyphenated = "verifier/foo-bar/kernel_6_14/4cpu-1llc-nosmt";
+        let underscored = "verifier/foo_bar/kernel_6_14/4cpu-1llc-nosmt";
+
+        assert_ne!(
+            cell_record_filename(hyphenated),
+            cell_record_filename(underscored),
+            "the raw cell identity, not a lossy sanitized spelling, keys the record",
+        );
+
+        let barrier = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            for (name, verified_insns) in [(hyphenated, 111), (underscored, 222)] {
+                let barrier = Arc::clone(&barrier);
+                let dir = dir.path();
+                scope.spawn(move || {
+                    let stats = [ProgStats {
+                        name: "ktstr_dispatch".into(),
+                        verified_insns,
+                    }];
+                    barrier.wait();
+                    write_cell_record(dir, name, true, false, &stats);
+                });
+            }
+            barrier.wait();
+        });
+
+        let mut records = read_cell_records(dir.path());
+        records.sort_by(|a, b| a.scheduler.cmp(&b.scheduler));
+        assert_eq!(
+            records.len(),
+            2,
+            "concurrent punctuation-distinct cells must retain two JSON records: {records:?}",
+        );
+        assert_eq!(records[0].scheduler, "foo-bar");
+        assert_eq!(records[0].stats[0].verified_insns, 111);
+        assert_eq!(records[1].scheduler, "foo_bar");
+        assert_eq!(records[1].stats[0].verified_insns, 222);
     }
 
     /// A verifier SKIP is distinct from both PASS and FAIL in the persisted
@@ -1933,7 +2682,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mk temp dir");
         write_cell_record(
             &dir,
-            "verifier/scx_a/kernel_steamos/uneven-11llc",
+            "verifier/scx_a/kernel_steamos/192cpu-11llc-smt",
             false,
             true,
             &[],
@@ -1964,11 +2713,11 @@ mod tests {
     fn render_result_table_per_scheduler_grids_tally_and_borders() {
         let recs = vec![
             // scx_a across two kernels and two topologies; the
-            // (large-4llc, kernel_6_15) cell has no record -> `-`.
+            // (128cpu-4llc-smt, kernel_6_15) cell has no record -> `-`.
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
-                topology: "tiny-1llc".into(),
+                topology: "4cpu-1llc-nosmt".into(),
                 passed: true,
                 skipped: false,
                 stats: vec![],
@@ -1976,7 +2725,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_15".into(),
-                topology: "tiny-1llc".into(),
+                topology: "4cpu-1llc-nosmt".into(),
                 passed: false,
                 skipped: false,
                 stats: vec![],
@@ -1984,7 +2733,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
-                topology: "large-4llc".into(),
+                topology: "128cpu-4llc-smt".into(),
                 passed: true,
                 skipped: false,
                 stats: vec![],
@@ -1995,7 +2744,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_15".into(),
-                topology: "large-4llc".into(),
+                topology: "128cpu-4llc-smt".into(),
                 passed: false,
                 skipped: true,
                 stats: vec![],
@@ -2005,7 +2754,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_b".into(),
                 kernel: "kernel_6_14".into(),
-                topology: "tiny-1llc".into(),
+                topology: "4cpu-1llc-nosmt".into(),
                 passed: true,
                 skipped: false,
                 stats: vec![],
@@ -2013,7 +2762,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_b".into(),
                 kernel: "kernel_6_14".into(),
-                topology: "tiny-1llc".into(),
+                topology: "4cpu-1llc-nosmt".into(),
                 passed: false,
                 skipped: false,
                 stats: vec![],
@@ -2050,26 +2799,26 @@ mod tests {
             a_sec.contains("kernel_6_14") && a_sec.contains("kernel_6_15"),
             "scx_a kernel columns present: {a_sec}"
         );
-        // The (large-4llc, kernel_6_15) triple explicitly SKIPped -> `-`,
-        // alongside the (large-4llc, kernel_6_14) ✓. The space-padded
+        // The (128cpu-4llc-smt, kernel_6_15) triple explicitly SKIPped -> `-`,
+        // alongside the (128cpu-4llc-smt, kernel_6_14) ✓. The space-padded
         // " - " match avoids the hyphens inside topology names.
         let a_large = a_sec
             .lines()
-            .find(|l| l.contains("large-4llc"))
-            .expect("scx_a large-4llc row");
+            .find(|l| l.contains("128cpu-4llc-smt"))
+            .expect("scx_a 128cpu-4llc-smt row");
         assert!(
             a_large.contains('✓') && a_large.contains(" - "),
             "skipped cell renders `-`: {a_large}"
         );
-        // tiny-1llc row: kernel_6_14 ✓, kernel_6_15 ✗ — the failing
+        // 4cpu-1llc-nosmt row: kernel_6_14 ✓, kernel_6_15 ✗ — the failing
         // kernel is named by its own column, no separate failing list.
         let a_tiny = a_sec
             .lines()
-            .find(|l| l.contains("tiny-1llc"))
-            .expect("scx_a tiny-1llc row");
+            .find(|l| l.contains("4cpu-1llc-nosmt"))
+            .expect("scx_a 4cpu-1llc-nosmt row");
         assert!(
             a_tiny.contains('✓') && a_tiny.contains('✗'),
-            "tiny-1llc row shows the pass and the fail per kernel: {a_tiny}"
+            "4cpu-1llc-nosmt row shows the pass and the fail per kernel: {a_tiny}"
         );
         // scx_b: the duplicate pass+fail triple is ONE cell, counted as a
         // fail — any failure means failure, no partial state.
@@ -2079,8 +2828,8 @@ mod tests {
         );
         let b_tiny = b_sec
             .lines()
-            .find(|l| l.contains("tiny-1llc"))
-            .expect("scx_b tiny-1llc row");
+            .find(|l| l.contains("4cpu-1llc-nosmt"))
+            .expect("scx_b 4cpu-1llc-nosmt row");
         assert!(
             b_tiny.contains('✗') && !b_tiny.contains('✓'),
             "a pass+fail duplicate-record cell renders ✗: {b_tiny}"
@@ -2116,7 +2865,7 @@ mod tests {
             r#"{
                 "scheduler": "scx_a",
                 "kernel": "kernel_6_14",
-                "topology": "tiny-1llc",
+                "topology": "4cpu-1llc-nosmt",
                 "passed": true,
                 "skipped": false,
                 "stats": [],
@@ -2148,7 +2897,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
-                topology: "tiny".into(),
+                topology: "4cpu-1llc-nosmt".into(),
                 passed: true,
                 skipped: false,
                 stats: vec![
@@ -2165,7 +2914,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_14".into(),
-                topology: "large".into(),
+                topology: "128cpu-4llc-smt".into(),
                 passed: true,
                 skipped: false,
                 stats: vec![
@@ -2185,7 +2934,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_15".into(),
-                topology: "tiny".into(),
+                topology: "4cpu-1llc-nosmt".into(),
                 passed: true,
                 skipped: false,
                 stats: vec![ProgStats {
@@ -2196,7 +2945,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_15".into(),
-                topology: "large".into(),
+                topology: "128cpu-4llc-smt".into(),
                 passed: true,
                 skipped: false,
                 stats: vec![ProgStats {
@@ -2208,7 +2957,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_b".into(),
                 kernel: "kernel_6_14".into(),
-                topology: "tiny".into(),
+                topology: "4cpu-1llc-nosmt".into(),
                 passed: true,
                 skipped: false,
                 stats: vec![ProgStats {
@@ -2222,7 +2971,7 @@ mod tests {
             VerifierCellRecord {
                 scheduler: "scx_a".into(),
                 kernel: "kernel_6_16".into(),
-                topology: "tiny".into(),
+                topology: "4cpu-1llc-nosmt".into(),
                 passed: false,
                 skipped: false,
                 stats: vec![],
@@ -2288,7 +3037,7 @@ mod tests {
         // Topology is NOT a table axis (folded into the range), so no
         // topology label appears in the output.
         assert!(
-            !out.contains("tiny") && !out.contains("large"),
+            !out.contains("4cpu-1llc-nosmt") && !out.contains("128cpu-4llc-smt"),
             "topology is not a table axis: {out}"
         );
 
@@ -2296,7 +3045,7 @@ mod tests {
         let bare = vec![VerifierCellRecord {
             scheduler: "scx_a".into(),
             kernel: "kernel_6_14".into(),
-            topology: "tiny".into(),
+            topology: "4cpu-1llc-nosmt".into(),
             passed: false,
             skipped: false,
             stats: vec![],
@@ -2340,6 +3089,11 @@ mod tests {
             e.contains("--scheduler \"nope\"") && e.contains("matched no verifier cell"),
             "scheduler-empty diagnostic: {e}"
         );
+        assert!(
+            e.contains("declared topology constraints or verifier-only exclusions")
+                && !e.contains("host"),
+            "scheduler-empty diagnostic must describe declaration gates, not host capacity: {e}"
+        );
 
         // Success + empty + no --scheduler -> "no cells ran" diagnosis
         // (must NOT silently succeed under --no-tests=pass).
@@ -2349,6 +3103,10 @@ mod tests {
         assert!(
             e.contains("no verifier cells ran") && e.contains("declare_scheduler!"),
             "no-cells diagnostic: {e}"
+        );
+        assert!(
+            e.contains("topology constraints or verifier-only exclusions") && !e.contains("host"),
+            "no-cells diagnostic must describe declaration gates, not host capacity: {e}"
         );
 
         // Nonzero exit WITH a failed cell + numeric code -> SilentExit: the

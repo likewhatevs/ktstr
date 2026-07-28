@@ -143,6 +143,46 @@ fn promote_staged_renames_well_formed_archive() {
 }
 
 #[test]
+fn promote_staged_never_replaces_preexisting_destination() {
+    let dest = tempfile::TempDir::new().unwrap();
+    let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+    let staged = staging.path().join("linux-6.14.2");
+    std::fs::create_dir(&staged).unwrap();
+    std::fs::write(staged.join("new"), b"new").unwrap();
+    let existing = dest.path().join("linux-6.14.2");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::write(existing.join("old"), b"old").unwrap();
+
+    let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2")
+        .expect_err("publication must use RENAME_NOREPLACE");
+    assert!(format!("{err:#}").contains("RENAME_NOREPLACE"));
+    assert_eq!(std::fs::read(existing.join("old")).unwrap(), b"old");
+    assert!(
+        staged.join("new").is_file(),
+        "failed no-replace promotion must leave staging available for rollback"
+    );
+}
+
+#[test]
+fn promoted_path_rollback_failure_is_attached_to_primary_error() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let published_dir = tmp.path().join("published");
+    std::fs::create_dir(&published_dir).unwrap();
+    let promoted = PromotedPath {
+        path: published_dir.clone(),
+        // Deliberately inject the wrong removal operation so rollback
+        // fails portably with "is a directory".
+        kind: PublishedPathKind::File,
+        committed: false,
+    };
+    let err = promoted.rollback(anyhow::anyhow!("primary acquisition failure"));
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("primary acquisition failure"));
+    assert!(rendered.contains("also failed to roll back"));
+    assert!(published_dir.is_dir());
+}
+
+#[test]
 fn promote_staged_rejects_stray_top_level_entry() {
     let dest = tempfile::TempDir::new().unwrap();
     let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
@@ -761,20 +801,18 @@ fn inspect_local_source_state_detects_mid_build_modification() {
 /// Bypass-branch routing is covered by two complementary
 /// tests: the `is_shared_client` predicate is unit-tested by
 /// [`is_shared_client_rejects_test_constructed_clients`],
-/// and the end-to-end branch through
-/// [`cached_releases_with_url`] is exercised by
+/// and the end-to-end routing core is exercised by
 /// [`cached_releases_with_non_singleton_bypasses_cache`] —
-/// which drives the bypass against a localhost mock URL via
-/// the URL-injection seam and proves the non-singleton
-/// `Client` skips [`RELEASES_CACHE`] and reaches
-/// [`fetch_releases`] with the supplied URL.
+/// which injects a deterministic fetch operation and proves the
+/// non-singleton `Client` skips [`RELEASES_CACHE`] and forwards the
+/// supplied client and URL.
 /// [`fetch_releases`]'s parse mechanics — the same
 /// [`parse_releases_body`] call the bypass branch runs on the
 /// response body, which production callers reach on cache
 /// miss (with [`RELEASES_URL`] pinned by the
 /// [`cached_releases_with`] wrapper) — are covered
 /// deterministically by
-/// [`fetch_releases_against_localhost_mock_returns_parsed`]
+/// [`parse_releases_body_returns_structured_releases`]
 /// via a direct [`parse_releases_body`] call, plus the
 /// `fetch_releases_*` family of error-path tests
 /// (HTTP 500, malformed JSON, missing array, partial rows,
@@ -1065,15 +1103,10 @@ fn series_resolution_routing_through_cache() {
     );
 }
 
-/// End-to-end bypass-branch routing through
-/// [`cached_releases_with_url`]: a non-singleton `Client`
-/// MUST skip [`RELEASES_CACHE`] and exercise
-/// [`fetch_releases`] against the supplied URL, NOT consult
-/// the cache. Routes through the URL-injection seam
-/// ([`cached_releases_with_url`]) so the bypass-branch fetch
-/// hits a localhost [`std::net::TcpListener`] mock that
-/// returns deterministic non-synthetic data — no real
-/// kernel.org round-trip, no offline-host timeout penalty.
+/// End-to-end bypass-branch routing through the same core as
+/// [`cached_releases_with_url`]: a non-singleton `Client` MUST skip
+/// [`RELEASES_CACHE`] and invoke the supplied fetch operation with the
+/// exact client and URL.
 ///
 /// Coexistence with `cached_releases_routing_singleton_path`:
 /// both tests pre-populate [`RELEASES_CACHE`] with the SAME
@@ -1086,21 +1119,11 @@ fn series_resolution_routing_through_cache() {
 /// test's `is_ok()` invariant was relaxed to the same
 /// tolerance for the same reason.
 ///
-/// Mock-served data is deliberately distinct from the
-/// synthetic cache contents — different version strings (in
-/// the 9.x range, never seen on real kernel.org) so a
-/// regression that mis-routed the non-singleton through the
-/// cache would return the synthetic verbatim and the
-/// `data != mock_payload` proof would surface as a value
-/// mismatch. The `Ok(...)` arm of the match below requires a
-/// successful round-trip to the mock; the `Err(_)` arm is
-/// retained as a defensive fallback for the (improbable)
-/// case where mock setup or the underlying TCP exchange
-/// fails on a constrained test host — bypass is still
-/// proven because the cache-hit path returns Ok
-/// unconditionally and any Err means
-/// [`cached_releases_with_url`] reached [`fetch_releases`],
-/// which is the bypass branch's only entry.
+/// Injected data is deliberately distinct from the synthetic cache contents
+/// so a regression that mis-routed the non-singleton through the cache returns
+/// a visibly different value. The injected operation removes localhost
+/// runtime scheduling from this routing test; HTTP and parsing have their own
+/// focused coverage.
 #[test]
 fn cached_releases_with_non_singleton_bypasses_cache() {
     // SAME synthetic data the singleton-path test uses —
@@ -1139,12 +1162,12 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
     // Verify byte-equal contents, not just length. A peer test
     // populating the cache with the same row count but
     // different moniker/version would defeat the bypass
-    // assertion below — the `data != mock_payload` check
+    // assertion below — the `data != fetched_payload` check
     // would still succeed but against the wrong baseline,
     // missing a peer-data corruption regression.
     assert_releases_eq(in_cache, &synthetic, "cache populate sanity");
 
-    // Mock body: 2 entries with version strings (9.x range)
+    // Fetched body: 2 entries with version strings (9.x range)
     // distinct from both the synthetic cache contents and
     // anything that has ever appeared on real kernel.org.
     // A regression that mis-routed the non-singleton through
@@ -1156,13 +1179,12 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
                 { "moniker": "longterm", "version": "9.98.50" }
             ]
         }"#;
-    let (_server, mock_url, _mock) = mock_releases(200, mock_body);
+    let mock_url = "https://fixture.invalid/releases.json";
 
-    // Build a non-singleton client via the shared 60s-timeout
-    // builder helper. The address differs from
+    // Build a non-singleton client. Its address differs from
     // `shared_client()`'s OnceLock-stored address, so
     // `is_shared_client(&non_singleton)` returns false and
-    // `cached_releases_with_url` takes the bypass branch.
+    // `cached_releases_with_fetch` takes the bypass branch.
     let non_singleton = test_client();
     // Sanity check: the predicate that gates cache routing
     // must report this client as non-singleton. Without
@@ -1174,26 +1196,37 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
         !super::is_shared_client(&non_singleton),
         "test precondition: non-singleton client MUST NOT compare \
              equal to the shared_client() singleton — the bypass-branch \
-             proof relies on `cached_releases_with_url` taking the \
+             proof relies on `cached_releases_with_fetch` taking the \
              non-singleton path",
     );
 
-    // Drive the bypass branch through the URL-injection
-    // seam. Mock returns the 2-entry deterministic payload;
+    // Drive the bypass branch through the fetch-operation seam.
+    // It returns the 2-entry deterministic payload;
     // a regression that mis-routed through the cache would
     // return the 3-entry synthetic instead. The match
-    // structure handles both the (expected) Ok path and the
-    // defensive Err fallback for a hypothetical TCP-level
-    // exchange failure.
-    let result = super::cached_releases_with_url(&non_singleton, &mock_url);
+    let fetch_calls = std::cell::Cell::new(0usize);
+    let data = super::cached_releases_with_fetch(&non_singleton, mock_url, |client, url| {
+        fetch_calls.set(fetch_calls.get() + 1);
+        assert!(
+            std::ptr::eq(client, &non_singleton),
+            "bypass must forward the caller's exact client"
+        );
+        assert_eq!(url, mock_url, "bypass must forward the exact URL");
+        super::parse_releases_body(mock_body)
+    })
+    .expect("injected bypass fetch succeeds");
+    assert_eq!(
+        fetch_calls.get(),
+        1,
+        "non-singleton bypass must invoke the fetch operation exactly once"
+    );
 
-    // Mock-payload reference for the Ok-arm assertion. Bypass
-    // routing is proven by `data == mock_payload` (positive
-    // confirmation: the mock URL was actually reached) AND
+    // Bypass routing is proven by `data == fetched_payload` (positive
+    // confirmation: the fetch operation was actually reached) AND
     // `data != synthetic` (the cache was skipped). Both
     // checks together pin BOTH directions of the bypass-vs-
     // cache routing decision.
-    let mock_payload = vec![
+    let fetched_payload = vec![
         Release {
             moniker: "stable".to_string(),
             version: "9.99.99".to_string(),
@@ -1203,55 +1236,22 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
             version: "9.98.50".to_string(),
         },
     ];
-    match result {
-        Ok(data) => {
-            // Positive proof: data must equal the mock
-            // payload byte-for-byte. The cache-hit path
-            // returns the 3-entry synthetic; the bypass
-            // branch reaches the mock and returns the
-            // 2-entry mock payload. Equality against
-            // mock_payload directly tests both the routing
-            // (cache vs bypass) AND the mock-server
-            // exchange (URL injection actually delivered).
-            assert_releases_eq(
-                &data,
-                &mock_payload,
-                "bypass branch must return the mock-served payload",
-            );
-            // Negative proof: data must NOT match the
-            // synthetic cache contents. Redundant with the
-            // positive check above (mock_payload and
-            // synthetic differ on length and values), but
-            // surfaces a clearer assertion message if a
-            // future regression somehow returned a third
-            // shape that happens to equal the synthetic.
-            let same_as_cache = data.len() == synthetic.len()
-                && data
-                    .iter()
-                    .zip(synthetic.iter())
-                    .all(|(got, want)| got.moniker == want.moniker && got.version == want.version);
-            assert!(
-                !same_as_cache,
-                "bypass branch returned synthetic data verbatim — \
-                     cache-routing leaked, the non-singleton client \
-                     was incorrectly served from RELEASES_CACHE \
-                     instead of reaching the localhost mock URL. \
-                     Synthetic was {synthetic:?}; got identical {data:?}",
-            );
-        }
-        Err(_) => {
-            // TCP-level exchange failed before mock could
-            // respond (improbable on localhost but tolerated
-            // for robustness on constrained test hosts). The
-            // mere fact that an Err surfaces — rather than
-            // Ok(synthetic) — proves the bypass branch was
-            // taken: the cache-hit path returns Ok
-            // unconditionally because RELEASES_CACHE is
-            // populated with a Vec, not a Result. Bypass is
-            // confirmed; mock-payload positive check is
-            // skipped under this branch.
-        }
-    }
+    assert_releases_eq(
+        &data,
+        &fetched_payload,
+        "bypass branch must return the injected fetched payload",
+    );
+    let same_as_cache = data.len() == synthetic.len()
+        && data
+            .iter()
+            .zip(synthetic.iter())
+            .all(|(got, want)| got.moniker == want.moniker && got.version == want.version);
+    assert!(
+        !same_as_cache,
+        "bypass branch returned synthetic data verbatim — cache routing \
+         leaked and the non-singleton client was incorrectly served from \
+         RELEASES_CACHE. Synthetic was {synthetic:?}; got identical {data:?}",
+    );
 
     // Cache-unchanged invariant: the bypass branch must NOT
     // populate RELEASES_CACHE. After the bypass call returns,
@@ -1261,7 +1261,7 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
     // RELEASES_CACHE (for instance, if a future refactor
     // moved the `RELEASES_CACHE.set` call before the
     // singleton check) would surface here as a cache that
-    // contains the mock payload (or a network-fetched
+    // contains the injected payload
     // shape) instead of the synthetic.
     let post = super::RELEASES_CACHE.get().expect(
         "RELEASES_CACHE must remain populated after the bypass call — \
@@ -1275,39 +1275,21 @@ fn cached_releases_with_non_singleton_bypasses_cache() {
     );
 }
 
-/// Create a mockito server with a canned /releases.json
-/// response. Returns (server, url, mock). The server owns the
-/// port — no port collisions under parallel nextest.
-fn mock_releases(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
-    let mut server = mockito::Server::new();
-    let mock = server
-        .mock("GET", "/releases.json")
-        .with_status(status)
-        .with_body(body)
-        .create();
-    let url = format!("{}/releases.json", server.url());
-    (server, url, mock)
-}
-
-/// [`parse_releases_body`] parses a canned `releases.json`
-/// string into a structured `Vec<Release>`. Drives the parse
-/// path directly on a literal body — no network, no
-/// [`fetch_releases`] invocation, exit shape pinned to "Ok
-/// with synthetic data".
+/// [`parse_releases_body`] parses a canned `releases.json` string into a
+/// structured `Vec<Release>`. Drives the parse path directly on a literal
+/// body — no network and no [`fetch_releases`] invocation.
 ///
 /// Covers the parse half of [`fetch_releases`]'s GET-and-parse
 /// path — the same [`parse_releases_body`] call that
 /// [`fetch_releases`] runs on the response body. The GET half,
-/// and the bypass-branch routing decision (non-singleton
-/// reaches `fetch_releases` with the supplied URL, NOT
-/// [`RELEASES_CACHE`]), are verified separately by
+/// and the bypass-branch routing decision (non-singleton invokes the supplied
+/// fetch operation, not [`RELEASES_CACHE`]), are verified separately by
 /// [`is_shared_client_rejects_test_constructed_clients`]
 /// (predicate-level) and by
 /// [`cached_releases_with_non_singleton_bypasses_cache`]
-/// (end-to-end through the cache helper, driven against a
-/// localhost mock URL via [`cached_releases_with_url`]).
+/// (end-to-end through the cache-routing core).
 #[test]
-fn fetch_releases_against_localhost_mock_returns_parsed() {
+fn parse_releases_body_returns_structured_releases() {
     let mock_body = r#"{
             "releases": [
                 { "moniker": "stable",   "version": "9.99.99" },
@@ -1675,9 +1657,20 @@ fn get_with_transient_retry_connection_refused_surfaces_url_context() {
     let addr = listener.local_addr().expect("read addr");
     drop(listener);
     let url = format!("http://{addr}/releases.json");
-    let client = test_client();
-    let err = super::get_with_transient_retry(&client, &url, None, "fetch", &NO_BACKOFF_RETRY)
-        .expect_err("connection refused must surface as Err");
+    // A different saturated process can reuse the just-released ephemeral
+    // port before this request runs. Bound each attempt tightly so rare port
+    // reuse becomes a prompt timeout rather than four 30-second waits. The
+    // production retry count and final error-context path are still exercised.
+    let timeout = std::time::Duration::from_millis(250);
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .no_proxy()
+        .build()
+        .expect("build bounded localhost client");
+    let err =
+        super::get_with_transient_retry(&client, &url, Some(timeout), "fetch", &NO_BACKOFF_RETRY)
+            .expect_err("connection refused must surface as Err");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("fetch "),
@@ -1953,6 +1946,36 @@ fn download_stream_finalizes_sha256_over_streamed_bytes() {
         got_hex, expected_hex,
         "streaming SHA-256 must match the one-shot digest over \
              the same bytes",
+    );
+}
+
+#[test]
+fn download_stream_cancellation_rejects_bytes_before_decoder_consumption() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(true);
+    let mut stream = DownloadStream::with_progress(std::io::Cursor::new(b"payload"), None);
+    let mut buf = [0u8; 16];
+    let err = stream
+        .read(&mut buf)
+        .expect_err("a cancelled source read must fail before consuming bytes");
+    set_git_operation_interrupted(false);
+    assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    assert_eq!(stream.bytes_total, 0);
+    assert_eq!(stream.inner.position(), 0);
+}
+
+#[test]
+fn source_retry_backoff_is_promptly_cancellable() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(true);
+    let started = std::time::Instant::now();
+    let err = source_operation_backoff(std::time::Duration::from_secs(30))
+        .expect_err("cancelled backoff must not sleep its full interval");
+    set_git_operation_interrupted(false);
+    assert!(format!("{err:#}").contains("retry backoff"));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "cancellation should be observed at the first 100 ms quantum"
     );
 }
 
@@ -2323,8 +2346,7 @@ fn resolve_expected_sha256_skip_returns_none_without_network() {
 
 /// Create a mockito server with a canned `sha256sums.asc`
 /// response. Returns (server, url, mock). The server owns the
-/// port — no port collisions under parallel nextest. Mirrors
-/// [`mock_releases`] for the checksum-manifest endpoint.
+/// port — no port collisions under parallel nextest.
 fn mock_sha256sums(status: usize, body: &str) -> (mockito::ServerGuard, String, mockito::Mock) {
     let mut server = mockito::Server::new();
     let mock = server
@@ -2371,20 +2393,24 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  linux-6.14.2.t
 }
 
 /// `resolve_expected_sha256` (no-skip) downgrades to `None` when
-/// the manifest is fetched but carries no entry for the requested
-/// tarball — the warn-and-continue fallback that keeps a build
-/// progressing through schema drift / a rotated entry. Drives the
-/// real fetch-then-parse path against a localhost mock so the
-/// `Ok(manifest) => None` arm of the production match is exercised
-/// (not just `parse_sha256_for_file` in isolation).
+/// the fetched manifest carries no entry for the requested tarball.
+/// An injected manifest fetch exercises the production
+/// `Ok(manifest) => None` routing without a schedulable localhost server.
 #[test]
 fn resolve_expected_sha256_no_skip_returns_none_when_entry_absent() {
     let manifest = "\
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.tar.xz
 ";
-    let (_server, url, _mock) = mock_sha256sums(200, manifest);
-    let client = test_client();
-    let got = super::resolve_expected_sha256_from_url(&client, &url, "linux-9.99.99.tar.xz", false);
+    let fetch_calls = std::cell::Cell::new(0usize);
+    let got = super::resolve_expected_sha256_with("linux-9.99.99.tar.xz", false, || {
+        fetch_calls.set(fetch_calls.get() + 1);
+        Ok(manifest.to_string())
+    });
+    assert_eq!(
+        fetch_calls.get(),
+        1,
+        "no-skip path must fetch the manifest exactly once"
+    );
     assert!(
         got.is_none(),
         "no-skip path must return None when the fetched manifest \
@@ -2393,16 +2419,21 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  linux-6.14.1.t
 }
 
 /// `resolve_expected_sha256` (no-skip) downgrades to `None` when
-/// the manifest fetch itself fails (HTTP 404). Drives the
-/// `Err(err) => None` arm of the production match through the
-/// URL-injection seam against a localhost mock returning 404 —
-/// the fetch-failure fallback that lets a transient CDN outage
-/// proceed without verification rather than wedging the build.
+/// the manifest fetch itself fails (HTTP 404). An injected error drives the
+/// production `Err(err) => None` arm; retry transport behavior is covered by
+/// the dedicated retry tests.
 #[test]
 fn resolve_expected_sha256_no_skip_returns_none_on_fetch_error() {
-    let (_server, url, _mock) = mock_sha256sums(404, "Not Found");
-    let client = test_client();
-    let got = super::resolve_expected_sha256_from_url(&client, &url, "linux-999.0.0.tar.xz", false);
+    let fetch_calls = std::cell::Cell::new(0usize);
+    let got = super::resolve_expected_sha256_with("linux-999.0.0.tar.xz", false, || {
+        fetch_calls.set(fetch_calls.get() + 1);
+        anyhow::bail!("fetch fixture: HTTP 404 Not Found")
+    });
+    assert_eq!(
+        fetch_calls.get(),
+        1,
+        "no-skip path must attempt the manifest fetch exactly once"
+    );
     assert!(
         got.is_none(),
         "no-skip path must return None when the manifest fetch \
@@ -2585,6 +2616,170 @@ fn transient_status_classification_pins_retryable_set() {
             "HTTP {code} must NOT retry — it routes to the caller's status gate",
         );
     }
+
+    assert!(
+        !super::is_dns_edge_failure_status(StatusCode::TOO_MANY_REQUESTS),
+        "HTTP 429 retries must remain on the current route rather than \
+         evading the server's rate limit through another DNS address",
+    );
+    for code in [502u16, 503, 504] {
+        assert!(
+            super::is_dns_edge_failure_status(StatusCode::from_u16(code).unwrap()),
+            "HTTP {code} identifies a failed gateway/CDN edge and should \
+             advance to another resolved address",
+        );
+    }
+}
+
+/// A transport error from a routed attempt must retain the already-advanced
+/// candidate tail for the same origin, while an error attributed to a
+/// different redirect origin must replace it with a fresh resolution.
+#[test]
+fn transport_error_routes_preserve_same_origin_tail_and_reset_redirect_origin() {
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+
+    let second: SocketAddr = "192.0.2.11:443".parse().unwrap();
+    let redirected: SocketAddr = "198.51.100.20:8443".parse().unwrap();
+    let mut routes = Some(super::HttpRetryRoutes {
+        host: "origin.invalid".to_owned(),
+        port: 443,
+        // The current primary has already been removed by
+        // next_routed_http_client; only the untried tail remains.
+        remaining: VecDeque::from([second]),
+    });
+
+    let same_origin = reqwest::Url::parse("https://origin.invalid/file").unwrap();
+    let has_tail =
+        super::prepare_routes_after_transport_error(&mut routes, &same_origin, &|_, _| {
+            panic!("same-origin transport failure must not re-resolve")
+        })
+        .unwrap();
+    assert!(has_tail);
+    assert_eq!(
+        routes
+            .as_ref()
+            .unwrap()
+            .remaining
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![second],
+        "same-origin failure must preserve only the untried tail",
+    );
+
+    let redirect_origin = reqwest::Url::parse("https://redirect.invalid:8443/file").unwrap();
+    let has_redirect_routes = super::prepare_routes_after_transport_error(
+        &mut routes,
+        &redirect_origin,
+        &|host, port| {
+            assert_eq!(host, "redirect.invalid");
+            assert_eq!(port, 8443);
+            Ok(vec![redirected, redirected])
+        },
+    )
+    .unwrap();
+    assert!(has_redirect_routes);
+    let reset = routes.as_ref().unwrap();
+    assert_eq!(reset.host, "redirect.invalid");
+    assert_eq!(reset.port, 8443);
+    assert_eq!(
+        reset.remaining.iter().copied().collect::<Vec<_>>(),
+        vec![redirected],
+        "redirect-origin reset must deduplicate its fresh resolution",
+    );
+}
+
+const RETRY_TEST_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const RETRY_TEST_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn configure_retry_test_connection(
+    stream: std::net::TcpStream,
+) -> std::io::Result<std::net::TcpStream> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
+    Ok(stream)
+}
+
+fn accept_retry_test_connection(
+    listener: &std::net::TcpListener,
+) -> std::io::Result<std::net::TcpStream> {
+    listener.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + RETRY_TEST_ACCEPT_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return configure_retry_test_connection(stream),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for retry-test HTTP connection",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn configure_retry_test_unix_connection(
+    stream: std::os::unix::net::UnixStream,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(RETRY_TEST_IO_TIMEOUT))?;
+    Ok(stream)
+}
+
+fn accept_retry_test_unix_connection_while_running<T>(
+    listener: &std::os::unix::net::UnixListener,
+    client: &std::thread::JoinHandle<T>,
+) -> std::io::Result<Option<std::os::unix::net::UnixStream>> {
+    listener.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + RETRY_TEST_ACCEPT_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return configure_retry_test_unix_connection(stream).map(Some),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if client.is_finished() {
+                    return Ok(None);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for Unix-socket HTTP test connection",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn read_retry_test_request_head(stream: &mut impl std::io::Read) -> std::io::Result<String> {
+    const MAX_REQUEST_HEAD: usize = 64 * 1024;
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client closed before completing the HTTP request head",
+            ));
+        }
+        head.extend_from_slice(&chunk[..read]);
+        if head.len() > MAX_REQUEST_HEAD {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP request head exceeded test limit",
+            ));
+        }
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
 }
 
 /// Serve one canned raw-HTTP response per accepted connection, in
@@ -2603,8 +2798,8 @@ fn serve_sequenced_responses(
     let handle = std::thread::spawn(move || {
         let mut served = 0usize;
         for response in responses {
-            let (mut sock, _) = match listener.accept() {
-                Ok(pair) => pair,
+            let mut sock = match accept_retry_test_connection(&listener) {
+                Ok(stream) => stream,
                 // Client gave up (e.g. the helper returned before
                 // consuming every canned response) — report how many
                 // were actually served.
@@ -2625,6 +2820,159 @@ fn serve_sequenced_responses(
 const RESPONSE_503: &str =
     "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 const RESPONSE_200: &str = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+
+/// A server that completes the response head and then holds the body open must
+/// be interrupted by the request-layer timeout. HTTP rides a Unix-domain
+/// socket so the test exercises reqwest's real response-body read path without
+/// depending on loopback access, DNS, routing, or ghars network policy. The
+/// server work runs on this test thread, so observing a complete request and
+/// writing the response head cannot be starved behind the client.
+#[test]
+fn metadata_request_timeout_bounds_headers_then_stalled_body() {
+    use std::io::Write;
+
+    // Generous request budget: reqwest's per-request timeout covers connect +
+    // request + body, so a saturated host can eat a small budget in the
+    // healthy phases and time the request out before the deliberate body
+    // stall is what fires. Two seconds keeps the assertion about the BODY
+    // stall while staying far below the socket fail-safe.
+    const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const SOCKET_FAILSAFE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let root = tempfile::tempdir().expect("metadata Unix-socket tempdir");
+    let socket_path = root.path().join("metadata-http.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("bind metadata Unix socket");
+    let url = "http://metadata.invalid/metadata".to_owned();
+    let client_url = url.clone();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .no_proxy()
+        .unix_socket(socket_path)
+        .build()
+        .expect("build timeout-test client");
+    let worker = std::thread::spawn(move || {
+        let one_attempt = super::HttpRetry {
+            attempts: 1,
+            backoff_unit: std::time::Duration::ZERO,
+        };
+        super::fetch_metadata_bytes_with(&client, &client_url, "fetch", &one_attempt, BODY_TIMEOUT)
+    });
+
+    let mut socket = accept_retry_test_unix_connection_while_running(&listener, &worker)
+        .expect("accept metadata request")
+        .expect("client must remain active until response headers arrive");
+    let request = read_retry_test_request_head(&mut socket).expect("read metadata request");
+    assert!(
+        request.starts_with("GET /metadata HTTP/1.1\r\n"),
+        "unexpected metadata request head: {request:?}",
+    );
+    socket
+        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\nconnection: keep-alive\r\n\r\n")
+        .expect("write response headers");
+    socket.flush().expect("flush response headers");
+    let body_stall_started = std::time::Instant::now();
+
+    // Keep the response body open and empty while the worker performs its
+    // blocking read. If the request timeout regresses, dropping the socket
+    // after the fail-safe prevents this test from wedging the whole suite.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let keeper = std::thread::spawn(move || {
+        let _ = release_rx.recv_timeout(SOCKET_FAILSAFE);
+        drop(socket);
+    });
+    let result = worker.join().expect("metadata client thread");
+    let body_stall_elapsed = body_stall_started.elapsed();
+    let _ = release_tx.send(());
+    keeper.join().expect("socket keeper thread");
+
+    let err = result.expect_err("a headers-then-stalled body must time out");
+    assert!(
+        format!("{err:#}").contains("read body of"),
+        "headers must have completed before the body timeout: {err:#}",
+    );
+    assert!(
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+                || cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)
+        }),
+        "stalled body must surface a timeout error: {err:#}",
+    );
+    assert!(
+        body_stall_elapsed < SOCKET_FAILSAFE,
+        "{BODY_TIMEOUT:?} body timeout took {body_stall_elapsed:?}; the socket fail-safe \
+         must not be what unblocked the read",
+    );
+}
+
+/// The live package-URL probe must retry a transient gateway response and
+/// preserve its one-byte `Range` header on the successful attempt. HTTP rides
+/// a Unix-domain socket so the complete production retry path remains covered
+/// without depending on loopback access under ghars.
+#[test]
+fn url_probe_retries_503_and_reapplies_range_header() {
+    use std::io::Write;
+
+    let root = tempfile::tempdir().expect("probe Unix-socket tempdir");
+    let socket_path = root.path().join("probe-http.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("bind probe Unix socket");
+    let url = "http://probe.invalid/package".to_owned();
+    let client_url = url.clone();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .no_proxy()
+        .unix_socket(socket_path)
+        .build()
+        .expect("build probe-test client");
+    let worker = std::thread::spawn(move || {
+        let two_attempts = super::HttpRetry {
+            attempts: 2,
+            backoff_unit: std::time::Duration::ZERO,
+        };
+        super::probe_url_status_with(
+            &client,
+            &client_url,
+            &two_attempts,
+            std::time::Duration::from_secs(10),
+        )
+    });
+
+    let mut requests = Vec::new();
+    for response in [
+        RESPONSE_503,
+        "HTTP/1.1 206 Partial Content\r\ncontent-length: 1\r\n\
+         content-range: bytes 0-0/1\r\nconnection: close\r\n\r\nx",
+    ] {
+        let mut socket = accept_retry_test_unix_connection_while_running(&listener, &worker)
+            .expect("accept probe request")
+            .expect("probe client stopped before issuing every expected attempt");
+        requests.push(read_retry_test_request_head(&mut socket).expect("read probe request"));
+        socket
+            .write_all(response.as_bytes())
+            .expect("write probe response");
+        socket.flush().expect("flush probe response");
+    }
+
+    let status = worker
+        .join()
+        .expect("probe client thread")
+        .expect("503-then-206 probe must succeed");
+    assert_eq!(status, reqwest::StatusCode::PARTIAL_CONTENT);
+    assert_eq!(requests.len(), 2);
+    for (attempt, request) in requests.iter().enumerate() {
+        let lowercase = request.to_ascii_lowercase();
+        assert!(
+            lowercase.contains("\r\nrange: bytes=0-0\r\n"),
+            "probe attempt {} lost the one-byte Range header: {request:?}",
+            attempt + 1,
+        );
+    }
+}
 
 /// A 503 on the first attempt followed by a 200 must succeed — the
 /// exact CI failure this helper exists for (cdn.kernel.org's Varnish
@@ -2648,6 +2996,99 @@ fn get_with_transient_retry_retries_503_then_succeeds() {
         2,
         "exactly two attempts: the 503 and the successful retry",
     );
+}
+
+/// A 503 from one address advances to another address published for the same
+/// hostname while retaining the hostname for the retry client.
+///
+/// Feed the production transition point the response URL and observed remote
+/// peer directly. This proves failed-peer removal and client-tail selection
+/// without a local server thread that can starve behind KVM-heavy CI tests.
+#[test]
+fn get_with_transient_retry_advances_past_failed_dns_edge() {
+    let bad_addr: std::net::SocketAddr = "192.0.2.10:80".parse().unwrap();
+    let good_addr: std::net::SocketAddr = "192.0.2.11:80".parse().unwrap();
+    let response_url = reqwest::Url::parse("http://balanced.invalid/file").unwrap();
+    let mut routes = None;
+
+    let has_routes = super::prepare_http_retry_route(
+        &mut routes,
+        super::HttpRetryRouteFailure::Response {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            response_url: &response_url,
+            remote_addr: Some(bad_addr),
+        },
+        &|resolved_host, port| {
+            assert_eq!(resolved_host, "balanced.invalid");
+            assert_eq!(port, 80);
+            Ok(vec![bad_addr, bad_addr, good_addr])
+        },
+    )
+    .expect("record failed gateway edge");
+    assert!(has_routes);
+
+    let (_, candidates) =
+        super::next_routed_http_client(&mut routes, &|resolved_host, candidates| {
+            assert_eq!(resolved_host, "balanced.invalid");
+            assert_eq!(
+                candidates,
+                &[good_addr],
+                "the 503 response peer must be removed before building the retry client",
+            );
+            reqwest::blocking::Client::builder()
+                .no_proxy()
+                .resolve_to_addrs(resolved_host, candidates)
+                .build()
+        })
+        .expect("healthy route must produce a retry client");
+    assert_eq!(candidates, [good_addr]);
+}
+
+/// An initial transport failure on the shared-client-shaped path initializes
+/// fresh route state and preserves reqwest's multi-address fallback inside the
+/// very next attempt.
+///
+/// Feed the production transition point an initial transport-error URL. The
+/// injected resolver returns the failed address followed by an alternate, and
+/// the retry builder must receive that complete ordered, deduplicated tail so
+/// reqwest can perform connector-level fallback within one attempt.
+#[test]
+fn get_with_transient_retry_routes_initial_transport_error_across_candidate_tail() {
+    let failed_addr: std::net::SocketAddr = "192.0.2.20:8080".parse().unwrap();
+    let alternate_addr: std::net::SocketAddr = "192.0.2.21:8080".parse().unwrap();
+    let failed_url = reqwest::Url::parse("http://transport-balanced.invalid:8080/file").unwrap();
+    let mut routes = None;
+
+    let has_routes = super::prepare_http_retry_route(
+        &mut routes,
+        super::HttpRetryRouteFailure::Transport {
+            failed_url: &failed_url,
+        },
+        &|resolved_host, port| {
+            assert_eq!(resolved_host, "transport-balanced.invalid");
+            assert_eq!(port, 8080);
+            Ok(vec![failed_addr, failed_addr, alternate_addr])
+        },
+    )
+    .expect("initialize routes after initial transport failure");
+    assert!(has_routes);
+
+    let (_, candidates) =
+        super::next_routed_http_client(&mut routes, &|resolved_host, candidates| {
+            assert_eq!(resolved_host, "transport-balanced.invalid");
+            assert_eq!(
+                candidates,
+                &[failed_addr, alternate_addr],
+                "an initial transport error must retain the full deduplicated \
+                 candidate tail for reqwest's connector fallback",
+            );
+            reqwest::blocking::Client::builder()
+                .no_proxy()
+                .resolve_to_addrs(resolved_host, candidates)
+                .build()
+        })
+        .expect("candidate tail must produce a retry client");
+    assert_eq!(candidates, [failed_addr, alternate_addr]);
 }
 
 /// A transient status that persists through every attempt is
@@ -3125,12 +3566,18 @@ fn print_download_size_with_content_length_renders_mib() {
     let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
         print_download_size(&response, url, "ktstr", None);
     });
-    let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
+    // Strip the label's SGR wrapper: whether the line carries color
+    // depends on the test process's own stderr/`NO_COLOR`/CI
+    // environment, while the padded status column does not.
+    let captured = crate::test_support::strip_ansi_csi(
+        &String::from_utf8(bytes).expect("captured stderr must be utf-8"),
+    );
     assert_eq!(
         captured,
-        format!("ktstr: downloading {url} (1.5 MiB)\n"),
+        format!("      ktstr: downloading {url} (1.5 MiB)\n"),
         "Content-Length present must render the MiB-annotated form \
-         with the cli_label prefix and 1-decimal size",
+         with the cli_label prefix right-aligned in the status column \
+         and a 1-decimal size",
     );
 }
 
@@ -3165,7 +3612,12 @@ fn print_download_size_without_content_length_omits_mib() {
     let (_, bytes) = crate::test_support::test_helpers::capture_stderr(|| {
         print_download_size(&response, url, "cargo ktstr", None);
     });
-    let captured = String::from_utf8(bytes).expect("captured stderr must be utf-8");
+    // See the sibling test: color is environment-dependent, the
+    // status column is not. `cargo ktstr:` fills the column exactly,
+    // so this line keeps its historical bytes.
+    let captured = crate::test_support::strip_ansi_csi(
+        &String::from_utf8(bytes).expect("captured stderr must be utf-8"),
+    );
     assert_eq!(
         captured,
         format!("cargo ktstr: downloading {url}\n"),
@@ -3386,15 +3838,16 @@ fn fetch_read_makefile_version_parses_and_guards() {
     assert_eq!(super::read_makefile_version(dir.path()), None);
 }
 
-// -- git cache key + ls-remote ref pre-resolution --
+// -- git cache identity + standalone ref discovery --
 
 #[test]
 fn git_cache_key_embeds_ref_full_hash_arch_and_suffix() {
+    use crate::kernel_path::GitRefKind;
     let h = "abc1234abc1234abc1234abc1234abc1234abc12";
-    let key = git_cache_key("for-next", h);
+    let key = git_cache_key(GitRefKind::Branch, "for-next", h);
     assert!(
-        key.starts_with(&format!("for-next-git-{h}-")),
-        "key must lead with the raw ref, the -git- marker, and the full commit hash: {key}"
+        key.starts_with("git-branch-") && key.contains(h),
+        "key must carry kind, ref identity, and the full commit hash: {key}"
     );
     let (arch, _) = arch_info();
     assert!(
@@ -3410,59 +3863,53 @@ fn git_cache_key_embeds_ref_full_hash_arch_and_suffix() {
 /// class a 28-bit short prefix risked).
 #[test]
 fn git_cache_key_full_hash_distinguishes_7hex_prefix_collision() {
+    use crate::kernel_path::GitRefKind;
     let a = "abc1234000000000000000000000000000000000";
     let b = "abc1234ffffffffffffffffffffffffffffffffff";
     assert_eq!(&a[..7], &b[..7], "fixture precondition: same 7-hex prefix");
     assert_ne!(
-        git_cache_key("for-next", a),
-        git_cache_key("for-next", b),
+        git_cache_key(GitRefKind::Branch, "for-next", a),
+        git_cache_key(GitRefKind::Branch, "for-next", b),
         "full-hash key must distinguish two commits sharing a 7-hex prefix",
     );
 }
 
-/// A slashed branch ref (e.g. `for-next/core`) must be sanitized so
-/// the cache key contains no `/` or `..` — validate_cache_key
-/// (housekeeping) hard-rejects those, which would make a slashed ref
-/// uncacheable verbatim (breaking both the pre-clone probe and the
-/// store). The full commit hash keeps the key unique, so mapping
-/// `/` -> `_` cannot serve a wrong build.
+/// Raw ref bytes are content-addressed rather than sanitized. This
+/// keeps filesystem-hostile names cacheable without making `a/b`
+/// collide with the distinct ref `a_b`.
 #[test]
-fn git_cache_key_sanitizes_slashed_ref() {
+fn git_cache_key_hashes_raw_ref_without_sanitized_aliases() {
+    use crate::kernel_path::GitRefKind;
     let h = "abc1234abc1234abc1234abc1234abc1234abc12";
-    let key = git_cache_key("for-next/core", h);
+    let key = git_cache_key(GitRefKind::Branch, "for-next/core", h);
     assert!(!key.contains('/'), "cache key must not contain `/`: {key}");
     assert!(
         !key.contains(".."),
         "cache key must not contain `..`: {key}"
     );
-    assert!(
-        key.starts_with(&format!("for-next_core-git-{h}-")),
-        "slashed ref must sanitize `/` -> `_`: {key}"
+    assert_ne!(
+        key,
+        git_cache_key(GitRefKind::Branch, "for-next_core", h),
+        "distinct raw refs must remain distinct after filesystem-safe encoding"
     );
 }
 
-/// git_cache_key must sanitize every class validate_cache_key rejects,
-/// not just `/` — a leading `.` (hidden entry) and a NUL byte would
-/// otherwise force a cache miss (and a store hard-fail). The full
-/// commit hash keeps the key unique across the collapse.
 #[test]
-fn git_cache_key_sanitizes_dot_prefixed_and_nul_refs() {
+fn git_cache_key_distinguishes_kind_and_normalizes_sha_case() {
+    use crate::kernel_path::GitRefKind;
     let h = "abc1234abc1234abc1234abc1234abc1234abc12";
-    let dot = git_cache_key(".hidden", h);
-    assert!(
-        !dot.starts_with('.'),
-        "leading `.` must be sanitized: {dot}"
+    let branch = git_cache_key(GitRefKind::Branch, "same", h);
+    let tag = git_cache_key(GitRefKind::Tag, "same", h);
+    let sha = git_cache_key(GitRefKind::Sha, &h.to_ascii_uppercase(), h);
+    assert_ne!(branch, tag, "branch and tag identities must never alias");
+    assert_ne!(branch, sha, "archive SHA and git branch identities differ");
+    assert_eq!(
+        sha,
+        git_cache_key(GitRefKind::Sha, h, &h.to_ascii_uppercase()),
+        "SHA ref and commit renderings are canonical lowercase"
     );
-    assert!(
-        dot.starts_with(&format!("_.hidden-git-{h}-")),
-        "leading `.` is prefixed with `_`: {dot}"
-    );
-    let nul = git_cache_key("a\0b", h);
+    let nul = git_cache_key(GitRefKind::Branch, "a\0b", h);
     assert!(!nul.contains('\0'), "NUL must be sanitized: {nul:?}");
-    assert!(
-        nul.starts_with(&format!("a_b-git-{h}-")),
-        "NUL maps to `_`: {nul}"
-    );
 }
 
 /// [`github_archive_url`] builds the codeload archive URL for the
@@ -3547,24 +3994,32 @@ fn resolve_ref_commit_sha_resolves_offline_lowercased() {
     use crate::kernel_path::GitRefKind;
     let sha = "ABC1234abc1234abc1234abc1234abc1234ABC12";
     assert_eq!(
-        resolve_ref_commit("https://github.com/x/y", sha, GitRefKind::Sha).as_deref(),
+        resolve_ref_commit("https://github.com/x/y", sha, GitRefKind::Sha, "test", None,)
+            .unwrap()
+            .map(|id| id.to_string())
+            .as_deref(),
         Some("abc1234abc1234abc1234abc1234abc1234abc12"),
     );
-    assert!(resolve_ref_commit("https://github.com/x/y", "foo", GitRefKind::Unknown).is_none());
+    assert!(
+        resolve_ref_commit(
+            "https://github.com/x/y",
+            "foo",
+            GitRefKind::Unknown,
+            "test",
+            None,
+        )
+        .unwrap()
+        .is_none()
+    );
 }
 
-/// Regression: a BRANCH ref must resolve over protocol-v2 ls-refs. The
-/// bug was gix's default `Options` (`prefix_from_spec_as_filter_on_remote
-/// = true`): over a protocol-v2 `ls-refs` it derives ref-prefix filters
-/// from the anonymous remote's refspecs, and with empty fetch specs +
-/// `fetch_tags = Included` that ls-refs prefix is `refs/tags` ONLY — so
-/// `refs/heads/*` never reach `remote_refs` and a branch ref resolves to
-/// `None`, defeating `resolve_git_kernel`'s clone-skip (every run
-/// re-cloned). The fix sets the flag `false`. A `Some(_)` here is only
-/// reachable once `refs/heads/for-next` reaches `remote_refs`, so
-/// reverting the flag turns this red — the `pick_ref_object_*` unit tests
-/// feed synthetic ref vectors and never exercise the `ref_map` Options
-/// path.
+/// Regression: a BRANCH ref must resolve over protocol-v2 ls-refs.
+/// Normal resolution now installs one exact branch refspec, so gix
+/// derives `refs/heads/for-next` as the server-side ref-prefix instead
+/// of the old anonymous remote's tags-only prefix. A `Some(_)` here is
+/// only reachable once that fully-qualified branch reaches
+/// `remote_refs`; the local exact-discovery tests below additionally pin
+/// the branch/tag namespace and filtering without a live network.
 ///
 /// `#[ignore]`: hits the live sched_ext remote over the network (project
 /// convention for network-fetch tests). The filtering is protocol-v2
@@ -3576,8 +4031,10 @@ fn resolve_ref_commit_sha_resolves_offline_lowercased() {
 fn resolve_ref_commit_resolves_branch_over_v2() {
     use crate::kernel_path::GitRefKind;
     let url = "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git";
-    let hash = resolve_ref_commit(url, "for-next", GitRefKind::Branch)
-        .expect("for-next branch must resolve over v2 ls-refs — the prefix filter must be off");
+    let hash = resolve_ref_commit(url, "for-next", GitRefKind::Branch, "test", None)
+        .expect("ref discovery transport must succeed")
+        .expect("for-next branch must resolve over v2 ls-refs through its exact ref-prefix");
+    let hash = hash.to_string();
     assert_eq!(hash.len(), 40, "a full commit hash is 40 hex chars: {hash}");
     assert!(
         hash.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -3653,45 +4110,6 @@ fn pick_ref_object_skips_unborn() {
     assert!(pick_ref_object(&refs, "refs/heads/new").is_none());
 }
 
-#[test]
-fn is_full_sha_gate_recognizes_only_40_char_hex() {
-    // Exactly 40 hex chars (either case) is a sha -> fast path.
-    assert!(is_full_sha(&"a".repeat(40)), "40 lowercase hex is a sha");
-    assert!(is_full_sha(&"A".repeat(40)), "40 uppercase hex is a sha");
-    // Off-by-one lengths are names, not shas -> fall through to ls-remote.
-    assert!(!is_full_sha(&"a".repeat(39)), "39 chars is not a sha");
-    assert!(!is_full_sha(&"a".repeat(41)), "41 chars is not a sha");
-    // 40 chars but a non-hex byte is a ref name, not a sha.
-    assert!(
-        !is_full_sha(&format!("{}g", "a".repeat(39))),
-        "40-char non-hex is not a sha"
-    );
-}
-
-#[test]
-fn git_clone_rejects_raw_sha_git_ref_without_panic() {
-    // A raw 40-hex commit SHA must be rejected with an actionable error
-    // rather than the gix `with_ref_name(<object-id>)` panic. The check
-    // is at git_clone's entry, BEFORE any network, so the bogus URL is
-    // never contacted (the test is deterministic + offline).
-    let tmp = tempfile::TempDir::new().unwrap();
-    let sha = "1234567890abcdef1234567890abcdef12345678";
-    let err = git_clone(
-        "https://invalid.invalid/nope.git",
-        sha,
-        tmp.path(),
-        "test",
-        None,
-    )
-    .err()
-    .expect("a raw SHA git_ref must be rejected, not cloned");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("raw commit SHA") && msg.contains("branch or tag"),
-        "the error must be actionable (use a branch or tag): {msg}"
-    );
-}
-
 /// `git_clone_tag` shallow-clones an annotated TAG — the `#tag=`
 /// git-source clone path (via `git_clone_kinded`) for a non-GitHub
 /// remote. A plain `with_ref_name` shallow clone
@@ -3741,6 +4159,853 @@ fn git_clone_tag_shallow_clones_stable_tag() {
     );
 }
 
+struct ExactCloneFixture {
+    remote: tempfile::TempDir,
+    ancestor_commit: gix::ObjectId,
+    gitlink_commit: gix::ObjectId,
+    branch_commit: gix::ObjectId,
+    tag_commit: gix::ObjectId,
+    annotated_tag_object: gix::ObjectId,
+    light_commit: gix::ObjectId,
+    unrelated_commit: gix::ObjectId,
+    slash_branch: String,
+    hex_branch: String,
+}
+
+impl ExactCloneFixture {
+    fn url(&self) -> String {
+        format!("file://{}", self.remote.path().display())
+    }
+}
+
+fn write_fixture_commit(
+    repo: &gix::Repository,
+    reference: &str,
+    marker: &str,
+    signature: gix::actor::SignatureRef<'_>,
+    parent: Option<gix::ObjectId>,
+    gitlink: Option<gix::ObjectId>,
+) -> (gix::ObjectId, gix::ObjectId) {
+    let blob = repo
+        .write_blob(marker.as_bytes())
+        .expect("fixture blob")
+        .detach();
+    let nested_blob = repo
+        .write_blob(format!("nested:{marker}").as_bytes())
+        .expect("nested fixture blob")
+        .detach();
+    let nested_tree = repo
+        .write_object(&gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: "nested.txt".into(),
+                oid: nested_blob,
+            }],
+        })
+        .expect("nested fixture tree")
+        .detach();
+    let mut entries = vec![
+        gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Blob.into(),
+            filename: "marker.txt".into(),
+            oid: blob,
+        },
+        gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Tree.into(),
+            filename: "directory".into(),
+            oid: nested_tree,
+        },
+    ];
+    if let Some(gitlink) = gitlink {
+        entries.push(gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Commit.into(),
+            filename: "submodule".into(),
+            oid: gitlink,
+        });
+    }
+    entries.sort_by(|a, b| a.filename.cmp(&b.filename));
+    let tree = gix::objs::Tree { entries };
+    let tree = repo.write_object(&tree).expect("fixture tree").detach();
+    let commit = repo
+        .commit_as(signature, signature, reference, marker, tree, parent)
+        .expect("fixture commit")
+        .detach();
+    (commit, tree)
+}
+
+fn exact_clone_fixture() -> ExactCloneFixture {
+    let remote = tempfile::TempDir::new().expect("remote tempdir");
+    let mut repo = gix::ThreadSafeRepository::init_opts(
+        remote.path(),
+        gix::create::Kind::Bare,
+        gix::create::Options::default(),
+        anon_open_opts(),
+    )
+    .expect("init bare fixture")
+    .to_thread_local();
+    let _ = repo
+        .committer_or_set_generic_fallback()
+        .expect("fixture fallback identity");
+    let signature = gix::actor::SignatureRef::from_bytes(
+        b"ktstr test <ktstr@example.invalid> 1700000000 +0000",
+    )
+    .expect("fixture signature");
+
+    let (ancestor_commit, _) =
+        write_fixture_commit(&repo, "refs/heads/base", "base", signature, None, None);
+    let (gitlink_commit, _) = write_fixture_commit(
+        &repo,
+        "refs/heads/submodule-target",
+        "submodule",
+        signature,
+        None,
+        None,
+    );
+    let (branch_commit, _) = write_fixture_commit(
+        &repo,
+        "refs/heads/same",
+        "branch",
+        signature,
+        Some(ancestor_commit),
+        Some(gitlink_commit),
+    );
+    let (tag_commit, _) = write_fixture_commit(
+        &repo,
+        "refs/heads/tag-target",
+        "annotated-tag",
+        signature,
+        Some(ancestor_commit),
+        None,
+    );
+    let annotated_tag_object = repo
+        .tag(
+            "same",
+            tag_commit,
+            gix::objs::Kind::Commit,
+            Some(signature),
+            "annotated fixture tag",
+            gix::refs::transaction::PreviousValue::Any,
+        )
+        .expect("annotated tag")
+        .id()
+        .detach();
+
+    let (light_commit, light_tree) = write_fixture_commit(
+        &repo,
+        "refs/heads/light-target",
+        "light-tag",
+        signature,
+        Some(ancestor_commit),
+        None,
+    );
+    repo.tag_reference(
+        "light",
+        light_commit,
+        gix::refs::transaction::PreviousValue::Any,
+    )
+    .expect("lightweight tag");
+    repo.tag_reference(
+        "tree-target",
+        light_tree,
+        gix::refs::transaction::PreviousValue::Any,
+    )
+    .expect("tree tag");
+
+    let slash_branch = "topic/with/slash".to_string();
+    repo.reference(
+        format!("refs/heads/{slash_branch}"),
+        branch_commit,
+        gix::refs::transaction::PreviousValue::Any,
+        "fixture slash branch",
+    )
+    .expect("slash branch");
+    let hex_branch = "a".repeat(40);
+    repo.reference(
+        format!("refs/heads/{hex_branch}"),
+        branch_commit,
+        gix::refs::transaction::PreviousValue::Any,
+        "fixture 40-hex branch",
+    )
+    .expect("hex branch");
+
+    let (unrelated_commit, _) = write_fixture_commit(
+        &repo,
+        "refs/heads/unrelated",
+        "unrelated",
+        signature,
+        None,
+        None,
+    );
+    repo.tag_reference(
+        "unrelated",
+        unrelated_commit,
+        gix::refs::transaction::PreviousValue::Any,
+    )
+    .expect("unrelated tag");
+    repo.edit_reference(gix::refs::transaction::RefEdit {
+        change: gix::refs::transaction::Change::Update {
+            log: Default::default(),
+            expected: gix::refs::transaction::PreviousValue::Any,
+            new: gix::refs::Target::Symbolic(
+                "refs/heads/unrelated"
+                    .try_into()
+                    .expect("valid fixture HEAD target"),
+            ),
+        },
+        name: "HEAD".try_into().expect("valid HEAD"),
+        deref: false,
+    })
+    .expect("point fixture HEAD at the unrelated branch");
+
+    ExactCloneFixture {
+        remote,
+        ancestor_commit,
+        gitlink_commit,
+        branch_commit,
+        tag_commit,
+        annotated_tag_object,
+        light_commit,
+        unrelated_commit,
+        slash_branch,
+        hex_branch,
+    }
+}
+
+fn exact_clone_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn assert_exact_clone(
+    fixture: &ExactCloneFixture,
+    name: &str,
+    kind: crate::kernel_path::GitRefKind,
+    expected: gix::ObjectId,
+    expected_marker: &str,
+) {
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    let acquired = git_clone_kinded(&fixture.url(), name, kind, dest.path(), "test", None)
+        .expect("exact clone");
+    let repo = gix::open(&acquired.source_dir).expect("open exact clone");
+    assert_eq!(repo.head_id().expect("clone HEAD").detach(), expected);
+    assert!(repo.head().expect("clone head state").is_detached());
+    assert!(
+        acquired.cache_key.contains(&expected.to_string()),
+        "cache identity must use the peeled commit",
+    );
+    let selected_ref = match kind {
+        crate::kernel_path::GitRefKind::Branch => format!("refs/heads/{name}"),
+        crate::kernel_path::GitRefKind::Tag => format!("refs/tags/{name}"),
+        _ => unreachable!("fixture clones only branches and tags"),
+    };
+    assert!(
+        repo.find_reference(&selected_ref).is_ok(),
+        "the one selected ref must be preserved locally",
+    );
+    if kind == crate::kernel_path::GitRefKind::Tag && name == "same" {
+        assert_eq!(
+            repo.find_reference(&selected_ref)
+                .expect("selected annotated tag")
+                .id()
+                .detach(),
+            fixture.annotated_tag_object,
+            "the selected annotated tag must retain its tag object, not be rewritten to its commit",
+        );
+    }
+    if name == "same" {
+        let unselected = match kind {
+            crate::kernel_path::GitRefKind::Branch => "refs/tags/same",
+            crate::kernel_path::GitRefKind::Tag => "refs/heads/same",
+            _ => unreachable!(),
+        };
+        assert!(
+            repo.try_find_reference(unselected)
+                .expect("look up unselected same-name ref")
+                .is_none(),
+            "the same-named ref in the other namespace must stay absent",
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(acquired.source_dir.join("marker.txt")).expect("read marker"),
+        expected_marker,
+    );
+    assert_eq!(
+        std::fs::read_to_string(acquired.source_dir.join("directory/nested.txt"))
+            .expect("read recursively copied marker"),
+        format!("nested:{expected_marker}"),
+    );
+    assert!(
+        repo.find_object(fixture.unrelated_commit).is_err(),
+        "the unrelated remote HEAD branch/tag object must not be fetched",
+    );
+    assert!(
+        repo.find_object(fixture.ancestor_commit).is_err(),
+        "depth one must leave the selected tip's parent unfetched",
+    );
+    assert!(
+        repo.find_object(fixture.gitlink_commit).is_err(),
+        "an exact clone must not recursively fetch a gitlink target",
+    );
+    assert!(
+        repo.try_find_remote("origin").is_none(),
+        "the exact snapshot intentionally has no broad origin remote",
+    );
+    for unrelated_ref in [
+        "refs/heads/unrelated",
+        "refs/tags/unrelated",
+        "refs/heads/base",
+        "refs/heads/submodule-target",
+        "refs/heads/tag-target",
+        "refs/heads/light-target",
+    ] {
+        assert!(
+            repo.try_find_reference(unrelated_ref)
+                .expect("look up unrelated local ref")
+                .is_none(),
+            "unrequested remote ref {unrelated_ref} must stay absent",
+        );
+    }
+    let shallow = std::fs::read_to_string(repo.git_dir().join("shallow")).expect("shallow file");
+    assert_eq!(
+        shallow.lines().collect::<Vec<_>>(),
+        vec![expected.to_string()]
+    );
+    let inspected = local_source(&acquired.source_dir).expect("inspect exact clone");
+    assert!(
+        !inspected.is_dirty,
+        "checkout and persisted index must match"
+    );
+}
+
+#[test]
+fn exact_clone_disambiguates_namespaces_and_preserves_only_selected_ref() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+
+    assert_exact_clone(
+        &fixture,
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        fixture.branch_commit,
+        "branch",
+    );
+    assert_exact_clone(
+        &fixture,
+        "same",
+        crate::kernel_path::GitRefKind::Tag,
+        fixture.tag_commit,
+        "annotated-tag",
+    );
+    assert_exact_clone(
+        &fixture,
+        "light",
+        crate::kernel_path::GitRefKind::Tag,
+        fixture.light_commit,
+        "light-tag",
+    );
+    assert_exact_clone(
+        &fixture,
+        &fixture.slash_branch,
+        crate::kernel_path::GitRefKind::Branch,
+        fixture.branch_commit,
+        "branch",
+    );
+    assert_exact_clone(
+        &fixture,
+        &fixture.hex_branch,
+        crate::kernel_path::GitRefKind::Branch,
+        fixture.branch_commit,
+        "branch",
+    );
+}
+
+#[test]
+fn local_exact_fetch_never_constructs_a_remote_prepare() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    TEST_EXACT_PREPARE_COUNT.store(0, Ordering::Release);
+    let outcome = git_clone_kinded_gated(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+        |_| Ok(ExactRefGate::Fetch(())),
+    )
+    .expect("force-shaped exact fetch");
+    assert!(matches!(outcome, GitCloneOutcome::Fetched { .. }));
+    assert_eq!(
+        TEST_EXACT_PREPARE_COUNT.load(Ordering::Acquire),
+        0,
+        "a directly opened local repository must never enter gix's transport path"
+    );
+}
+
+#[test]
+fn local_exact_gate_can_skip_before_materializing_a_repository() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    let outcome = git_clone_kinded_gated(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Tag,
+        dest.path(),
+        "test",
+        None,
+        |commit_id| {
+            assert_eq!(commit_id, fixture.tag_commit);
+            Ok(ExactRefGate::Skip("cached"))
+        },
+    )
+    .expect("skip local exact materialization");
+    match outcome {
+        GitCloneOutcome::Skipped { commit_hash, token } => {
+            assert_eq!(commit_hash, fixture.tag_commit.to_string());
+            assert_eq!(token, "cached");
+        }
+        GitCloneOutcome::Fetched { .. } => panic!("the cache gate requested a skip"),
+    }
+    assert!(
+        !dest.path().join("linux").exists(),
+        "a skipped local exact ref must not initialize a destination repository"
+    );
+}
+
+#[test]
+fn exact_clone_rejects_non_commit_tag_and_rolls_back() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    let err = match git_clone_kinded(
+        &fixture.url(),
+        "tree-target",
+        crate::kernel_path::GitRefKind::Tag,
+        dest.path(),
+        "test",
+        None,
+    ) {
+        Ok(_) => panic!("a tag targeting a tree is not a kernel commit"),
+        Err(err) => err,
+    };
+    assert!(format!("{err:#}").contains("to a commit"));
+    assert!(
+        !dest.path().join("linux").exists(),
+        "failed exact clone must roll its destination back",
+    );
+}
+
+#[test]
+fn exact_clone_never_replaces_preexisting_destination() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    let existing = dest.path().join("linux");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::write(existing.join("owned-by-caller"), b"keep").unwrap();
+    let err = match git_clone_kinded(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+    ) {
+        Ok(_) => panic!("RENAME_NOREPLACE must reject an existing destination"),
+        Err(err) => err,
+    };
+    assert!(format!("{err:#}").contains("RENAME_NOREPLACE"));
+    assert_eq!(
+        std::fs::read(existing.join("owned-by-caller")).unwrap(),
+        b"keep",
+        "failed publication must not alter the preexisting tree"
+    );
+}
+
+#[test]
+fn exact_clone_rolls_back_transaction_owned_post_promote_cancellation() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    TEST_INTERRUPT_AFTER_CLONE_PROMOTE.store(true, Ordering::Release);
+    let result = git_clone_kinded(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+    );
+    TEST_INTERRUPT_AFTER_CLONE_PROMOTE.store(false, Ordering::Release);
+    set_git_operation_interrupted(false);
+    let err = match result {
+        Ok(_) => panic!("post-promote cancellation must reject publication"),
+        Err(err) => err,
+    };
+    assert!(format!("{err:#}").contains("after promoting exact clone"));
+    assert!(
+        !dest.path().join("linux").exists(),
+        "the transaction-owned destination must be rolled back"
+    );
+}
+
+#[test]
+fn exact_clone_observes_process_cancellation_and_rolls_back() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    set_git_operation_interrupted(true);
+    let result = git_clone_kinded(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+    );
+    set_git_operation_interrupted(false);
+    assert!(result.is_err(), "a pre-set process cancellation aborts gix");
+    assert!(
+        !dest.path().join("linux").exists(),
+        "cancelled exact clone must roll its destination back",
+    );
+}
+
+#[test]
+fn exact_local_clone_cancels_during_object_materialization() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    set_git_operation_interrupted(false);
+    TEST_INTERRUPT_DURING_LOCAL_COPY.store(true, Ordering::Release);
+    let result = git_clone_kinded(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+    );
+    TEST_INTERRUPT_DURING_LOCAL_COPY.store(false, Ordering::Release);
+    set_git_operation_interrupted(false);
+    let err = match result {
+        Ok(_) => panic!("local object materialization must observe cancellation"),
+        Err(err) => err,
+    };
+    assert!(
+        format!("{err:#}").contains("while copying local checkout tree"),
+        "unexpected cancellation boundary: {err:#}"
+    );
+    assert!(
+        !dest.path().join("linux").exists(),
+        "cancelled local materialization must roll its destination back",
+    );
+}
+
+#[test]
+fn exact_ref_discovery_preserves_branch_tag_namespaces() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    for (kind, expected) in [
+        (
+            crate::kernel_path::GitRefKind::Branch,
+            fixture.branch_commit,
+        ),
+        (crate::kernel_path::GitRefKind::Tag, fixture.tag_commit),
+    ] {
+        assert_eq!(
+            resolve_ref_commit(&fixture.url(), "same", kind, "test", None)
+                .expect("discover exact fixture ref"),
+            Some(expected),
+            "exact discovery must preserve the requested ref namespace and peel tags to commits",
+        );
+    }
+}
+
+#[test]
+fn exact_ref_discovery_observes_shared_process_cancellation() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    set_git_operation_interrupted(true);
+    let result = resolve_ref_commit(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        "test",
+        None,
+    );
+    set_git_operation_interrupted(false);
+    assert!(
+        result.is_err(),
+        "the cache-probe ref discovery must observe the same process interrupt as pack receive",
+    );
+}
+
+#[test]
+fn exact_local_ref_discovery_rechecks_interrupt_after_lookup() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    set_git_operation_interrupted(false);
+    TEST_INTERRUPT_AFTER_REF_DISCOVERY.store(true, Ordering::Release);
+    let err = resolve_ref_commit(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        "test",
+        None,
+    )
+    .expect_err("an interrupt landing after local ref lookup must reject discovery");
+    TEST_INTERRUPT_AFTER_REF_DISCOVERY.store(false, Ordering::Release);
+    set_git_operation_interrupted(false);
+    assert!(
+        format!("{err:#}").contains("after reading local ref"),
+        "the post-lookup check must identify its publication boundary: {err:#}",
+    );
+}
+
+#[test]
+fn helper_capable_runtime_transports_are_rejected_before_connect() {
+    let _guard = exact_clone_test_guard();
+    set_git_operation_interrupted(false);
+    for (index, url) in [
+        "ssh://example.invalid/repository.git",
+        "git://example.invalid/repository.git",
+        "hg://example.invalid/repository",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dest = tempfile::TempDir::new().expect("clone dest");
+        let err = match git_clone_kinded(
+            url,
+            "main",
+            crate::kernel_path::GitRefKind::Branch,
+            dest.path(),
+            "test",
+            None,
+        ) {
+            Ok(_) => panic!("helper-capable transport must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:#}").contains("can start an external helper"),
+            "unexpected rejection for {url}: {err:#}"
+        );
+        assert!(
+            !dest.path().join("linux").exists(),
+            "rejected transport {index} must not publish a clone"
+        );
+    }
+}
+
+#[test]
+fn production_gix_acquisition_has_no_process_launcher() {
+    for (name, source) in [
+        ("runtime fetch", include_str!("fetch.rs")),
+        (
+            "build acquisition",
+            include_str!("../build_support/gix_acquire.rs"),
+        ),
+        (
+            "shared gix policy",
+            include_str!("../build_support/gix_policy.rs"),
+        ),
+    ] {
+        for forbidden in ["std::process::Command", "process::Command", "Command::new("] {
+            assert!(
+                !source.contains(forbidden),
+                "{name} contains executable-launching production code: {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn exact_clone_rejects_post_checkout_cancellation_before_writing_index() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    let clone_dir = dest.path().join("linux");
+    let interrupt = std::sync::atomic::AtomicBool::new(false);
+    TEST_INTERRUPT_AFTER_CHECKOUT.store(true, Ordering::Release);
+    let result = fetch_exact_ref_and_checkout(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        &clone_dir,
+        None,
+        &interrupt,
+    );
+    TEST_INTERRUPT_AFTER_CHECKOUT.store(false, Ordering::Release);
+
+    let err = result.expect_err("post-checkout cancellation must reject the clone");
+    assert!(format!("{err:#}").contains("during checkout"));
+    assert!(
+        interrupt.load(Ordering::Acquire),
+        "the deterministic checkout seam must flip the local interrupt",
+    );
+    assert!(
+        clone_dir.join("marker.txt").is_file(),
+        "the seam fires only after checkout has materialized the tree",
+    );
+    assert!(
+        !clone_dir.join(".git/index").exists(),
+        "an interrupted checkout must never persist its partial index",
+    );
+}
+
+#[test]
+fn exact_clone_rejects_cancellation_during_final_index_write_and_rolls_back() {
+    let _guard = exact_clone_test_guard();
+    let fixture = exact_clone_fixture();
+    let dest = tempfile::TempDir::new().expect("clone dest");
+    set_git_operation_interrupted(false);
+    TEST_INTERRUPT_AFTER_INDEX_WRITE.store(true, Ordering::Release);
+    let result = git_clone_kinded(
+        &fixture.url(),
+        "same",
+        crate::kernel_path::GitRefKind::Branch,
+        dest.path(),
+        "test",
+        None,
+    );
+    TEST_INTERRUPT_AFTER_INDEX_WRITE.store(false, Ordering::Release);
+    set_git_operation_interrupted(false);
+
+    let err = match result {
+        Ok(_) => panic!("a signal landing in final index write must reject the clone"),
+        Err(err) => err,
+    };
+    assert!(
+        format!("{err:#}").contains("after writing exact clone index"),
+        "the final post-publication check must surface in the diagnostic: {err:#}",
+    );
+    assert!(
+        !dest.path().join("linux").exists(),
+        "the outer exact-clone transaction must remove a fully materialized but interrupted tree",
+    );
+}
+
+#[test]
+fn gix_checkout_worker_tokens_are_machine_shared_and_nonblocking() {
+    let tmp = tempfile::TempDir::new().expect("worker token dir");
+    let first = GixCheckoutWorkerLease::acquire_in(tmp.path(), 7);
+    let second = GixCheckoutWorkerLease::acquire_in(tmp.path(), 7);
+    assert_eq!(first.workers(), 8);
+    assert_eq!(second.workers(), 1, "peers always proceed on their caller");
+    drop(first);
+    let third = GixCheckoutWorkerLease::acquire_in(tmp.path(), 7);
+    assert_eq!(third.workers(), 8, "dropping a lease returns all extras");
+}
+
+#[test]
+#[ignore]
+fn gix_checkout_low_budget_process_helper() {
+    let lock_dir = std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_GIX_TOKEN_DIR").unwrap());
+    let locked = std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_GIX_TOKEN_LOCKED").unwrap());
+    let release =
+        std::path::PathBuf::from(std::env::var_os("KTSTR_TEST_GIX_TOKEN_RELEASE").unwrap());
+    let lease = GixCheckoutWorkerLease::acquire_in(&lock_dir, 1);
+    assert_eq!(lease.workers(), 2, "helper must own the sole extra token");
+    std::fs::write(&locked, b"locked").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !release.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for checkout-token release barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn gix_checkout_low_host_budget_is_cross_process_global() {
+    let tmp = tempfile::TempDir::new().expect("worker token dir");
+    let locked = tmp.path().join("locked");
+    let release = tmp.path().join("release");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("--color=never")
+        .arg("fetch::tests::gix_checkout_low_budget_process_helper")
+        .env("KTSTR_TEST_GIX_TOKEN_DIR", tmp.path())
+        .env("KTSTR_TEST_GIX_TOKEN_LOCKED", &locked)
+        .env("KTSTR_TEST_GIX_TOKEN_RELEASE", &release)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn checkout-token helper");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !locked.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for checkout-token helper"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let contended = GixCheckoutWorkerLease::acquire_in(tmp.path(), 1);
+    assert_eq!(
+        contended.workers(),
+        1,
+        "the sole two-CPU extra token must be shared across processes"
+    );
+    assert!(
+        !tmp.path().join("ktstr-gix-checkout-worker-1.lock").exists(),
+        "a one-extra host must not expose any higher token slot"
+    );
+    std::fs::write(&release, b"release").unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn gix_checkout_worker_tokens_bound_concurrent_extras() {
+    let tmp = tempfile::TempDir::new().expect("worker token dir");
+    let entered = std::sync::Barrier::new(9);
+    let release = std::sync::Barrier::new(9);
+    let leased_extras = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                let lease = GixCheckoutWorkerLease::acquire_in(tmp.path(), 7);
+                leased_extras
+                    .lock()
+                    .expect("record leased extras")
+                    .push(lease.workers() - 1);
+                entered.wait();
+                release.wait();
+                drop(lease);
+            });
+        }
+        entered.wait();
+        let total: usize = leased_extras
+            .lock()
+            .expect("sum leased extras")
+            .iter()
+            .sum();
+        assert!(
+            total <= 7,
+            "simultaneous operations may share at most seven extra workers, got {total}",
+        );
+        release.wait();
+    });
+    let final_lease = GixCheckoutWorkerLease::acquire_in(tmp.path(), 7);
+    assert_eq!(
+        final_lease.workers(),
+        8,
+        "every RAII lease returns its tokens"
+    );
+}
+
 /// `latest_patch_from_git_tags` resolves an EOL series to its highest
 /// patch via a real ls-remote of the gregkh GitHub mirror — the
 /// cdn-independent resolution the CI runners need (cdn serves
@@ -3764,22 +5029,71 @@ fn latest_patch_from_git_tags_resolves_eol_series() {
     );
 }
 
-/// `anon_open_opts` must load ONLY repo-local git config. This is the
-/// fix that stops a user's `url.<base>.insteadOf` rewrite (e.g.
-/// `https://github.com/` -> `git@github.com:`) from rerouting anonymous
-/// public-mirror fetches through SSH — which prompted for the key
-/// passphrase once per operation, several at once under the concurrent
-/// intra-range kernel resolution. Pins every ambient config source OFF
-/// so a future edit that re-enables one (re-introducing the rewrite)
-/// fails here. Environment permissions are intentionally NOT asserted
-/// off: they stay at the Full-trust default so an `http(s)_proxy` env
-/// var still applies to real downloads.
+/// Runtime and build-script gix users include the same policy module. Pin the
+/// runtime side here as well so config loading, prompting, and curl liveness
+/// limits cannot drift.
 #[test]
 fn anon_open_opts_disables_ambient_config_sources() {
-    let cfg = super::anon_open_opts().permissions.config;
+    let temp = tempfile::tempdir().expect("policy test repository");
+    gix::init(temp.path()).expect("initialize policy test repository");
+    let repo =
+        gix::open_opts(temp.path(), super::anon_open_opts()).expect("open with runtime policy");
+    let cfg = repo.open_options().permissions.config;
     assert!(!cfg.user, "user (~/.gitconfig) config must not load");
     assert!(!cfg.system, "system (/etc/gitconfig) config must not load");
     assert!(!cfg.git, "XDG git config must not load");
     assert!(!cfg.env, "GIT_CONFIG_* env config must not load");
     assert!(!cfg.git_binary, "git-binary config must not load");
+    assert!(!cfg.includes, "config include files must not load");
+    let environment = repo.open_options().permissions.env;
+    assert_eq!(
+        environment.git_prefix,
+        gix::sec::Permission::Deny,
+        "GIT_* credential and askpass environment must not load"
+    );
+    assert_eq!(
+        environment.ssh_prefix,
+        gix::sec::Permission::Deny,
+        "SSH_ASKPASS must not load"
+    );
+    let attributes = repo.open_options().permissions.attributes;
+    assert!(!attributes.system, "system attributes must not load");
+    assert!(!attributes.git, "user attributes must not load");
+    assert!(
+        !attributes.git_binary,
+        "git-binary attributes must not load"
+    );
+    assert_eq!(
+        repo.config_snapshot()
+            .boolean("gitoxide.credentials.terminalPrompt"),
+        Some(false)
+    );
+    let credential_url =
+        gix::Url::from_bytes(b"https://fixture.invalid/repository.git".as_slice().into())
+            .expect("credential fixture URL");
+    let (cascade, _, prompt) = repo
+        .config_snapshot()
+        .credential_helpers(credential_url)
+        .expect("resolve runtime credential policy");
+    assert!(cascade.programs.is_empty());
+    assert_eq!(prompt.mode, gix::prompt::Mode::Disable);
+    assert!(prompt.askpass.is_none());
+    assert_eq!(
+        repo.refs.write_reflog,
+        gix::refs::store::WriteReflog::Disable,
+        "runtime exact acquisition must not require reflog identity"
+    );
+    let transport = repo
+        .transport_options("https://fixture.invalid/repository.git".as_bytes(), None)
+        .expect("resolve runtime HTTP transport policy")
+        .expect("HTTPS transport options");
+    let transport = transport
+        .downcast_ref::<gix::protocol::transport::client::blocking_io::http::Options>()
+        .expect("gix HTTP options");
+    assert_eq!(
+        transport.connect_timeout,
+        Some(std::time::Duration::from_secs(20))
+    );
+    assert_eq!(transport.low_speed_limit_bytes_per_second, 1024);
+    assert_eq!(transport.low_speed_time_seconds, 30);
 }

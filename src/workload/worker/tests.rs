@@ -15,6 +15,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+#[test]
+fn generic_phase_finalization_excludes_engine_owned_slices() {
+    assert!(!is_measured_phase_epoch(0));
+    assert!(!is_measured_phase_epoch(u32::MAX));
+    assert!(is_measured_phase_epoch(1));
+    assert!(is_measured_phase_epoch(u16::MAX.into()));
+
+    assert!(uses_generic_phase_slices(&WorkType::TimerLatency {
+        interval_us: 1_000,
+    }));
+    assert!(!uses_generic_phase_slices(&WorkType::Schbench {
+        config: crate::workload::schbench::SchbenchConfig::default(),
+    }));
+    assert!(!uses_generic_phase_slices(&WorkType::Taobench {
+        config: crate::workload::taobench::TaobenchConfig::default(),
+    }));
+}
+
 /// [`MAX_WAKE_SAMPLES`] MUST be 100_000 — the value
 /// `doc/guide/src/architecture/workers.md` cites verbatim ("clamped
 /// to at most 100_000 entries (`MAX_WAKE_SAMPLES`)"). The doc cite

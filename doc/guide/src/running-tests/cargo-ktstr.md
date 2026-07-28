@@ -133,6 +133,18 @@ that simply could not start.
 - `--nextest-profile NAME` — the nextest test profile from
   `.config/nextest.toml` (retries, timeouts, output settings).
 
+For every nextest-backed route (`test`, `coverage`, `verifier`, replay
+`--exec`, and raw `llvm-cov nextest`), cargo-ktstr supplies a
+low-priority nextest tool config. It admits VM-resource waiters immediately
+so ktstr's cross-process topology queue—not a second CPU-sized nextest
+queue—decides which fitting VM starts next, while ordinary host tests remain
+bounded to the host CPU count. For orchestrated nextest runs, cargo-ktstr
+normalizes every valid `-j` / `--test-threads` spelling to its effectively
+unbounded admission budget; otherwise a caller-supplied CPU-sized value would
+reintroduce a second scheduler ahead of ktstr. Repository policy unrelated to
+the run-slot budget still applies. Raw `llvm-cov` modes such as `report`,
+`clean`, and `show-env` are unchanged.
+
 **`--relevant` / `--base` / `--base-ref` / `--default-branch`** —
 narrow the run to only the tests whose scheduler your working-tree
 change touches, against a baseline commit (merge-base with `main` by
@@ -154,6 +166,28 @@ cargo ktstr test --kernel 7.0 -- --retries 2               # nextest retries
 cargo ktstr test --kernel 7.0 -- --features integration    # cargo features
 cargo ktstr test --relevant                                # only tests my edits affect
 ```
+
+Before a supported command runs nextest or builds/probes downstream ktstr
+test registries, cargo-ktstr uses a Cargo metadata preflight to find direct
+optional ktstr dependencies and their ktstr-only feature chains. It
+automatically adds package-qualified selectors such as
+`--features scx_lavd/ktstr-tests`. Ordinary commands restrict those
+selectors to Cargo's selected/default workspace members. Existing
+`--features` are preserved; an explicit Cargo-side `--all-features`
+remains authoritative.
+
+This applies to `test`/`nextest`, `coverage`, `llvm-cov nextest`,
+`replay --exec`, `verifier`, and the shared test-binary build used by
+`export`, `shell --test`, and `cargo ktstr affected`. Commands that
+neither run nextest nor build/probe workspace test binaries do no feature
+inference.
+
+Cargo metadata cannot identify arbitrary source-level `cfg` expressions.
+Only ktstr-specific feature chains are inferred; composite gates and
+transitive optional-helper arrangements remain explicit. Target-specific
+optional ktstr dependencies are inferred only when they match the effective
+Cargo target: cargo-ktstr asks rustc for that target's complete cfg set and
+evaluates the manifest platform expression before enabling the gate.
 
 A real single-test run against a local kernel tree looks like this.
 The source tree was already built, so ktstr resolved it to a cache key
@@ -221,6 +255,9 @@ cargo ktstr replay --dir PATH   # source sidecars from an archived tree
 
 Dry-run is the default: the filter prints to stdout so you can
 inspect it (or paste it into CI) before committing to the re-run.
+Because sidecars record the registered bare test name, replay selects
+every currently listed ordinary, `host/`, `ktstr/`, and `gauntlet/` variant
+of that name; absent variants simply match nothing.
 `--profile` / `--nextest-profile` apply with `--exec`. Distinct from
 [auto-repro](auto-repro.md), which fires inside the failing test
 process; `replay` is post-hoc, across a whole session.
@@ -243,11 +280,19 @@ merge every variant's profraw into a single report.
 
 <a id="profraw-layout"></a>
 
-Profraw files accumulate across runs — including host-side files
-that plain `cargo ktstr test` writes next to the cargo-ktstr binary
-(an `LLVM_PROFILE_FILE` injection that keeps `default.profraw` out
-of your kernel source tree; export `LLVM_PROFILE_FILE` yourself to
-opt out). To clean up:
+Managed `cargo ktstr coverage` runs merge producer/build-script shards into
+one cached `*.profdata`; raw producer shards never enter the stable artifact
+tree or content cache. After the tests, ktstr merges that seed with the live
+runtime shards and removes the private raws only after `cargo llvm-cov report`
+succeeds. A failed merge/report or an interrupted report retains the available
+raws and merged profile below the ktstr cache's
+`coverage-profraw-recovery-v1/` directory and prints the exact recovery path.
+`--no-report` keeps cargo-llvm-cov's ordinary user-owned artifact lifecycle.
+Host-side files from plain
+`cargo ktstr test` also remain next to the cargo-ktstr binary (an
+`LLVM_PROFILE_FILE` injection keeps `default.profraw` out of your kernel
+source tree; export `LLVM_PROFILE_FILE` yourself to opt out). To remove
+retained shards manually:
 
 ```sh
 cargo ktstr llvm-cov clean --profraw-only          # only *.profraw under target/llvm-cov-target/
@@ -266,11 +311,15 @@ kernel-resolution plumbing:
 
 ```sh
 cargo ktstr llvm-cov report --lcov --output-path lcov.info
+cargo ktstr llvm-cov nextest --workspace
 ```
 
 Always pass a subcommand: a bare `cargo ktstr llvm-cov` falls
 through to `cargo test`, which skips gauntlet variants and verifier
-cells entirely (they exist only under the nextest harness).
+cells entirely (they exist only under the nextest harness). The explicit
+`nextest` form gets targeted optional-ktstr feature inference; every
+other raw form (`test`, `run`, `report`, `clean`, `show-env`, or bare)
+preserves the supplied feature selection.
 
 ## kernel
 
@@ -397,6 +446,13 @@ cargo ktstr verifier --scheduler scx-ktstr     # one scheduler
 cargo ktstr verifier --raw                     # no cycle collapse
 ```
 
+Unlike ordinary test commands, a bare/unscoped verifier recursively
+widens its Cargo package selection to every compatible workspace package.
+Explicit package selectors remain scoped to the requested packages. The
+verifier reuses the targeted feature inference described under
+[`test`](#test), while excluding packages linked to an older ktstr that
+this verifier dispatcher cannot enumerate.
+
 See [BPF Verifier Sweep](verifier.md) for the cell model, real
 output, and the kernels-filter contract.
 
@@ -416,7 +472,7 @@ cargo ktstr shell --kernel ./arch/x86/boot/bzImage
 `--test NAME` derives topology, memory, and include files from a
 registered `#[ktstr_test]` (mutually exclusive with `--topology` /
 `--memory-mib`; `-i` is additive) — so "why does this only fail on
-odd-3llc" becomes an interactive session in that exact machine.
+9cpu-3llc-nosmt" becomes an interactive session in that exact machine.
 
 For scripted checks, `--exec` runs a command and exits with its
 status:

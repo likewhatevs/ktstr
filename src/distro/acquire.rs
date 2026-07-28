@@ -444,6 +444,62 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Try every equivalent official origin for one package while keeping one
+/// repository-declared digest as the authority for all of them.
+///
+/// An origin gets the complete shared transport retry policy before advancing
+/// to the next one. Interruption never looks like origin failure: it aborts the
+/// sequence immediately instead of beginning another potentially large
+/// download after Ctrl-C/SIGTERM.
+fn try_package_urls<T, F>(package: &PackageRef, attempt: F) -> Result<T>
+where
+    F: FnMut(&str) -> Result<T>,
+{
+    try_package_urls_with(package, crate::fetch::git_operation_interrupted, attempt)
+}
+
+fn try_package_urls_with<T, I, F>(
+    package: &PackageRef,
+    mut interrupted: I,
+    mut attempt: F,
+) -> Result<T>
+where
+    I: FnMut() -> bool,
+    F: FnMut(&str) -> Result<T>,
+{
+    let urls: Vec<&str> = std::iter::once(package.url.as_str())
+        .chain(package.alternate_urls.iter().map(String::as_str))
+        .collect();
+    let mut failures = Vec::with_capacity(urls.len());
+
+    for (index, url) in urls.iter().copied().enumerate() {
+        match attempt(url) {
+            Ok(value) => return Ok(value),
+            Err(error) if interrupted() => {
+                return Err(error).with_context(|| format!("download {} from {url}", package.name));
+            }
+            Err(error) => {
+                failures.push(format!("{url}: {error:#}"));
+                if index + 1 < urls.len() {
+                    tracing::warn!(
+                        package = %package.name,
+                        failed_url = url,
+                        next_url = urls[index + 1],
+                        error = %format!("{error:#}"),
+                        "official package origin failed; trying independent origin",
+                    );
+                }
+            }
+        }
+    }
+
+    bail!(
+        "all official download origins failed for {}: {}",
+        package.name,
+        failures.join("; ")
+    )
+}
+
 /// Acquire a prebuilt distro kernel (`--kernel fedora` / `ubuntu` /
 /// `amazonlinux`, with optional pinned release) into the cache and
 /// return its cache-entry directory.
@@ -523,15 +579,21 @@ pub fn acquire_distro_kernel(
             .filter(|s| !s.is_empty())
             .unwrap_or(&pkg.name);
         let dest = download_dir.join(file_name);
-        crate::fetch::download_verified_file(
-            &pkg.url,
-            &dest,
-            &pkg.sha256,
-            &pkg.name,
-            cli_label,
-            mp,
-        )
+        try_package_urls(pkg, |url| {
+            crate::fetch::download_verified_file(url, &dest, &pkg.sha256, &pkg.name, cli_label, mp)
+        })
         .with_context(|| format!("download {}", pkg.name))?;
+        if let Some(expected) = pkg.size {
+            let actual = fs::metadata(&dest)
+                .with_context(|| format!("stat downloaded package {}", dest.display()))?
+                .len();
+            if actual != expected {
+                bail!(
+                    "downloaded package {} has size {actual}, expected {expected}",
+                    pkg.name
+                );
+            }
+        }
         ensure_arch_matches_host(&package_arch(&dest)?, &dest)?;
         Ok(dest)
     };

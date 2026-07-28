@@ -10,20 +10,26 @@
 //! struct definition lives in [`super`].
 
 use anyhow::{Context, Result};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Instant;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::KtstrVm;
-use super::initramfs_cache::{BaseKey, BaseRef, get_or_build_base, get_or_compress_base_shm};
+#[cfg(any(target_arch = "aarch64", test))]
+use super::initramfs_cache::PREPARED_MAPPING_GRANULE;
+use super::initramfs_cache::{
+    PreparedInitrd, PreparedMapping, PreparedOverlay, complete_prepared_initrd,
+    get_or_prepare_base, prepare_base_inputs,
+};
 use super::memory_budget::{
     MemoryBudget, TmpfsFraction, initramfs_min_memory_mib, read_kernel_init_size,
-    read_kernel_version, read_kernel_version_from_metadata_sidecar,
+    read_kernel_version, read_kernel_version_from_metadata_sidecar, touch_ceiling_mib,
 };
+use super::numa_mem::MemoryBacking;
 use super::pi_mutex::PiMutex;
-use super::{disk_config, disk_template, host_topology, initramfs, virtio_blk, virtio_net};
+use super::{disk_config, disk_template, initramfs, virtio_blk, virtio_net};
 // The virtio-PCI transport, its MSI-X state, and the INTx resample eventfd are
 // x86_64-only (aarch64 is virtio-MMIO + GICv3 with no PCI); their only users are
 // the `#[cfg(target_arch = "x86_64")]` PCI setup paths below.
@@ -42,6 +48,10 @@ use super::aarch64::kvm;
 use super::virtio_console;
 #[cfg(target_arch = "x86_64")]
 use super::x86_64::{acpi, boot, kvm, mptable};
+
+fn framework_infrastructure<T>(result: Result<T>) -> Result<T> {
+    result.context(crate::test_support::FrameworkInfrastructureFailure)
+}
 
 /// Host-side handles for the x86_64 virtio-net PCI device. The device
 /// core lives inside the [`pci::PciBus`] function; these are the pieces
@@ -98,14 +108,10 @@ const INITRD_ADDR: u64 = 0x800_0000; // 128 MiB
 /// the FDT. Matches Firecracker/Cloud Hypervisor placement pattern —
 /// avoids conflicts with early kernel allocations near the kernel image.
 ///
-/// Aligned to the host page size (not a hardcoded 4 KB). On Apple
-/// Silicon hosts the kernel runs with 16 KB pages and the COW
-/// `MAP_FIXED` mmap rejects targets that aren't host-page-aligned
-/// with `EINVAL` — a 4 KB-aligned guest address that happens to fall
-/// mid-host-page would clobber unrelated mappings if the kernel
-/// accepted it, so the kernel correctly refuses. Round down here so
-/// the overlay path reaches `mmap` with a valid alignment regardless
-/// of host page size.
+/// Aligned to the prepared mapping granule (2 MiB), which satisfies both the
+/// guest-range geometry and the complete-hugetlb-unmap boundary. Destination
+/// host virtual addresses are validated separately against the runtime host
+/// page size.
 #[cfg(target_arch = "aarch64")]
 fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -> Result<u64> {
     // Ceiling is the PVTIME carve base, NOT the FDT address. setup_pvtime
@@ -121,9 +127,14 @@ fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -
     // initramfs and the guest's /init never starts. Anchor the whole initrd
     // below pvtime_base so it stays in advertised RAM, clear of the carve.
     let ceiling = aarch64::fdt::pvtime_base(memory_mib, total_cpus);
-    let page_size = host_page_size();
+    let page_size = PREPARED_MAPPING_GRANULE as u64;
     let mask = !(page_size - 1);
-    // Place initrd just below the PVTIME carve, host-page-aligned. Use
+    let mapped_size = initrd_max_size
+        .checked_add(page_size - 1)
+        .map(|size| size & mask)
+        .context("compressed initrd rounded mapping length overflows u64")?;
+    let aligned_ceiling = ceiling & mask;
+    // Place initrd just below the PVTIME carve, mapping-granule-aligned. Use
     // checked_sub: a compressed initramfs larger than the advertised RAM
     // span [DRAM_START, pvtime_base) would otherwise wrap the u64 (debug:
     // panic; release with overflow-checks off: a near-u64::MAX value that
@@ -134,16 +145,13 @@ fn aarch64_initrd_addr(memory_mib: u32, total_cpus: u32, initrd_max_size: u64) -
     // within advertised RAM: an initrd above pvtime_base is outside the
     // advertised /memory and the guest kernel never memblock-reserves it
     // (see this function's header comment).
-    let load_addr = ceiling
-        .checked_sub(initrd_max_size)
-        .map(|top| top & mask)
-        .with_context(|| {
-            format!(
-                "compressed initrd ({initrd_max_size} bytes) exceeds the \
+    let load_addr = aligned_ceiling.checked_sub(mapped_size).with_context(|| {
+        format!(
+            "compressed initrd ({initrd_max_size} bytes) exceeds the \
                  RAM span below the PVTIME carve (pvtime_base={ceiling:#x}): \
                  reduce initramfs size or increase VM memory"
-            )
-        })?;
+        )
+    })?;
     anyhow::ensure!(
         load_addr >= kvm::DRAM_START,
         "initrd load address {load_addr:#x} underflows DRAM_START {:#x} \
@@ -172,6 +180,572 @@ pub(crate) fn host_page_size() -> u64 {
         let sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if sz > 0 { sz as u64 } else { 0x1000 }
     })
+}
+
+fn validate_prepared_host_address(host_addr: *mut u8) -> Result<()> {
+    let host_page = host_page_size() as usize;
+    anyhow::ensure!(
+        (host_addr as usize).is_multiple_of(host_page),
+        "prepared initrd host address is not aligned to the \
+         {host_page}-byte host page size"
+    );
+    Ok(())
+}
+
+fn validate_prepared_split_host_address(host_addr: *mut u8, split_alignment: usize) -> Result<()> {
+    validate_prepared_host_address(host_addr)?;
+    anyhow::ensure!(
+        (host_addr as usize).is_multiple_of(split_alignment),
+        "prepared initrd host address is not aligned to the \
+         {split_alignment}-byte backing boundary"
+    );
+    Ok(())
+}
+
+/// The prepared CAS source is an ordinary file, so Linux `mmap(2)` requires
+/// its offset to be aligned to the runtime base page. Replacing a hugetlb VMA
+/// additionally constrains the destination address and length to the hugetlb
+/// boundary, but does not turn the source fd into a hugetlb file or impose a
+/// 2 MiB file-offset requirement.
+fn validate_prepared_file_offset(file_offset: u64, host_page_size: usize) -> Result<()> {
+    anyhow::ensure!(
+        file_offset.is_multiple_of(host_page_size as u64),
+        "prepared initrd file offset is not aligned to the \
+         {host_page_size}-byte host page size"
+    );
+    Ok(())
+}
+
+fn prepared_region_split_alignment(
+    backing: MemoryBacking,
+    host_page_size: usize,
+    mapping_granule: usize,
+) -> usize {
+    match backing {
+        MemoryBacking::BasePages => host_page_size,
+        MemoryBacking::HugeTlb2M => mapping_granule,
+    }
+}
+
+fn expected_initrd_magic(
+    compression: initramfs::InitrdCompression,
+) -> (&'static [u8], &'static str) {
+    match compression {
+        initramfs::InitrdCompression::Lz4 => (&initramfs::LZ4_LEGACY_MAGIC, "LZ4 legacy"),
+        initramfs::InitrdCompression::Zstd => (b"\x28\xb5\x2f\xfd", "zstd"),
+        initramfs::InitrdCompression::Gzip => (b"\x1f\x8b", "gzip"),
+        initramfs::InitrdCompression::Uncompressed => (b"070701", "newc cpio"),
+    }
+}
+
+fn validate_prepared_stream_magic(
+    compression: initramfs::InitrdCompression,
+    ranges: &[PreparedMapping],
+) -> Result<()> {
+    let first = ranges
+        .first()
+        .context("prepared initrd has no mapping ranges")?;
+    let (fd, file_offset) = first
+        .overlays
+        .iter()
+        .rev()
+        .find(|overlay| overlay.guest_offset == 0)
+        .map_or((&first.fd, first.file_offset), |overlay| {
+            (&overlay.fd, overlay.file_offset)
+        });
+    let (expected, name) = expected_initrd_magic(compression);
+    let mut actual = vec![0u8; expected.len()];
+    let mut done = 0usize;
+    while done < actual.len() {
+        let offset = file_offset
+            .checked_add(done as u64)
+            .context("prepared initrd magic file offset overflow")?;
+        let offset = libc::off_t::try_from(offset)
+            .context("prepared initrd magic file offset exceeds off_t")?;
+        let read = unsafe {
+            libc::pread(
+                fd.as_raw_fd(),
+                actual[done..].as_mut_ptr().cast(),
+                actual.len() - done,
+                offset,
+            )
+        };
+        if read < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("pread prepared initrd compression magic");
+        }
+        anyhow::ensure!(
+            read != 0,
+            "prepared initrd backing file is truncated before its compression magic"
+        );
+        done += read as usize;
+    }
+    anyhow::ensure!(
+        actual == expected,
+        "prepared initrd has invalid {name} magic: expected {expected:02x?}, got {actual:02x?}"
+    );
+    Ok(())
+}
+
+fn validate_prepared_backing_extent(
+    fd: &OwnedFd,
+    file_offset: u64,
+    map_len: usize,
+    host_page_size: usize,
+    description: &str,
+) -> Result<()> {
+    validate_prepared_file_offset(file_offset, host_page_size)?;
+    libc::off_t::try_from(file_offset)
+        .with_context(|| format!("{description} file offset exceeds off_t"))?;
+    let file_end = file_offset
+        .checked_add(u64::try_from(map_len)?)
+        .with_context(|| format!("{description} backing-file extent overflow"))?;
+    let stat = rustix::fs::fstat(fd).with_context(|| format!("stat {description} backing file"))?;
+    anyhow::ensure!(
+        stat.st_size >= 0 && file_end <= stat.st_size as u64,
+        "{description} exceeds its backing file: end={file_end:#x}, file_len={:#x}",
+        stat.st_size
+    );
+    Ok(())
+}
+
+/// Validate every property that can be checked before the first unsafe
+/// destination unmap. Keeping this pure over prepared-range metadata makes the
+/// exact production validator directly testable with malformed
+/// gap/overlap/reorder fixtures.
+fn validate_prepared_load(
+    total_compressed: usize,
+    compression: initramfs::InitrdCompression,
+    page_size: usize,
+    host_page_size: usize,
+    load_addr: u64,
+    ranges: &[PreparedMapping],
+) -> Result<u32> {
+    let boot_size =
+        u32::try_from(total_compressed).context("compressed initrd exceeds u32 boot-size field")?;
+    anyhow::ensure!(
+        page_size.is_power_of_two(),
+        "prepared initrd mapping granule is not a power of two"
+    );
+    anyhow::ensure!(
+        host_page_size.is_power_of_two() && page_size.is_multiple_of(host_page_size),
+        "prepared initrd host-page geometry is incompatible with its mapping granule"
+    );
+    anyhow::ensure!(
+        load_addr & (page_size as u64 - 1) == 0,
+        "prepared initrd load address {load_addr:#x} is not aligned to the \
+         {page_size}-byte prepared mapping granule"
+    );
+    anyhow::ensure!(!ranges.is_empty(), "prepared initrd has no mapping ranges");
+
+    let mut mapped_len = 0usize;
+    for range in ranges {
+        anyhow::ensure!(
+            range.guest_offset == mapped_len as u64,
+            "prepared initrd ranges contain a gap, overlap, or reordering"
+        );
+        anyhow::ensure!(
+            range.map_len > 0 && range.map_len % page_size == 0,
+            "prepared initrd mapping length is not aligned to the prepared granule"
+        );
+        validate_prepared_backing_extent(
+            &range.fd,
+            range.file_offset,
+            range.map_len,
+            host_page_size,
+            "prepared initrd mapping",
+        )?;
+        let range_end = range
+            .guest_offset
+            .checked_add(u64::try_from(range.map_len)?)
+            .context("prepared initrd mapping guest extent overflow")?;
+        let mut previous_overlay_end = range.guest_offset;
+        for overlay in &range.overlays {
+            anyhow::ensure!(
+                overlay.map_len > 0 && overlay.map_len % host_page_size == 0,
+                "prepared initrd overlay length is not aligned to the host page size"
+            );
+            anyhow::ensure!(
+                overlay.guest_offset.is_multiple_of(host_page_size as u64),
+                "prepared initrd overlay guest offset is not aligned to the host page size"
+            );
+            let overlay_end = overlay
+                .guest_offset
+                .checked_add(u64::try_from(overlay.map_len)?)
+                .context("prepared initrd overlay guest extent overflow")?;
+            anyhow::ensure!(
+                overlay.guest_offset >= range.guest_offset && overlay_end <= range_end,
+                "prepared initrd overlay escapes its primary mapping"
+            );
+            anyhow::ensure!(
+                overlay.guest_offset >= previous_overlay_end,
+                "prepared initrd overlays overlap or are reordered"
+            );
+            validate_prepared_backing_extent(
+                &overlay.fd,
+                overlay.file_offset,
+                overlay.map_len,
+                host_page_size,
+                "prepared initrd overlay",
+            )?;
+            previous_overlay_end = overlay_end;
+        }
+        mapped_len = mapped_len
+            .checked_add(range.map_len)
+            .context("prepared initrd mapped length overflow")?;
+    }
+    anyhow::ensure!(
+        total_compressed <= mapped_len && mapped_len.saturating_sub(total_compressed) < page_size,
+        "prepared initrd mapped padding is inconsistent with compressed length"
+    );
+    load_addr
+        .checked_add(mapped_len as u64)
+        .context("prepared initrd final guest address overflow")?;
+    validate_prepared_stream_magic(compression, ranges)?;
+    Ok(boot_size)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ValidatedPreparedSubrange {
+    guest_addr: u64,
+    host_addr: *mut u8,
+    file_offset: u64,
+    len: usize,
+}
+
+#[derive(Debug)]
+struct ValidatedPreparedRange {
+    range: PreparedMapping,
+    /// Complete original destination extents. These are unmapped before any
+    /// file VMA is installed, including when the original backing is hugetlb.
+    subranges: Vec<ValidatedPreparedSubrange>,
+    /// Primary extents with every overlay interval subtracted. Together with
+    /// `overlays`, these form one exact, disjoint cover of `subranges`.
+    primary_subranges: Vec<ValidatedPreparedSubrange>,
+    overlays: Vec<ValidatedPreparedOverlay>,
+}
+
+#[derive(Debug)]
+struct ValidatedPreparedOverlay {
+    overlay: PreparedOverlay,
+    subranges: Vec<ValidatedPreparedSubrange>,
+}
+
+fn validate_prepared_extent_subranges(
+    guest_mem: &GuestMemoryMmap,
+    guest_addr: u64,
+    map_len: usize,
+    file_offset: u64,
+    split_alignment: usize,
+    host_page_size: usize,
+) -> Result<Vec<ValidatedPreparedSubrange>> {
+    let mut consumed = 0usize;
+    let mut subranges = Vec::new();
+    for slice in guest_mem.get_slices(GuestAddress(guest_addr), map_len) {
+        let slice = slice.context("prepared initrd crosses a guest-memory hole")?;
+        let len = slice.len();
+        anyhow::ensure!(
+            len > 0 && len % split_alignment == 0,
+            "prepared initrd crosses a guest-memory region boundary that is not \
+             aligned to the {split_alignment}-byte backing boundary"
+        );
+        let sub_guest = guest_addr
+            .checked_add(consumed as u64)
+            .context("prepared initrd subrange guest address overflow")?;
+        let host_addr = guest_mem
+            .get_host_address(GuestAddress(sub_guest))
+            .context("resolve prepared initrd subrange host address")?;
+        validate_prepared_split_host_address(host_addr, split_alignment)?;
+        let sub_file_offset = file_offset
+            .checked_add(consumed as u64)
+            .context("prepared initrd subrange file offset overflow")?;
+        validate_prepared_file_offset(sub_file_offset, host_page_size)
+            .context("prepared initrd split produced a misaligned file offset")?;
+        subranges.push(ValidatedPreparedSubrange {
+            guest_addr: sub_guest,
+            host_addr,
+            file_offset: sub_file_offset,
+            len,
+        });
+        consumed = consumed
+            .checked_add(len)
+            .context("prepared initrd split length overflow")?;
+    }
+    anyhow::ensure!(
+        consumed == map_len,
+        "prepared initrd guest-memory split did not cover the complete range"
+    );
+    Ok(subranges)
+}
+
+fn prepared_subrange_slice(
+    source: ValidatedPreparedSubrange,
+    guest_start: u64,
+    guest_end: u64,
+) -> Result<ValidatedPreparedSubrange> {
+    anyhow::ensure!(
+        guest_start >= source.guest_addr
+            && guest_end > guest_start
+            && guest_end <= source.guest_addr.saturating_add(source.len as u64),
+        "prepared subrange slice escapes its source"
+    );
+    let delta = usize::try_from(guest_start - source.guest_addr)?;
+    let len = usize::try_from(guest_end - guest_start)?;
+    let host_addr = (source.host_addr as usize)
+        .checked_add(delta)
+        .context("prepared subrange slice host address overflow")? as *mut u8;
+    let file_offset = source
+        .file_offset
+        .checked_add(delta as u64)
+        .context("prepared subrange slice file offset overflow")?;
+    Ok(ValidatedPreparedSubrange {
+        guest_addr: guest_start,
+        host_addr,
+        file_offset,
+        len,
+    })
+}
+
+/// Subtract all validated overlay intervals from the primary extents.
+///
+/// The returned primary fragments plus the overlays are an exact disjoint
+/// cover of the original destination. This is computed before the first
+/// `munmap`, so every arithmetic/geometry failure remains non-destructive.
+fn disjoint_prepared_primary_subranges(
+    primary: &[ValidatedPreparedSubrange],
+    overlays: &[ValidatedPreparedOverlay],
+) -> Result<Vec<ValidatedPreparedSubrange>> {
+    let overlay_subranges: Vec<ValidatedPreparedSubrange> = overlays
+        .iter()
+        .flat_map(|overlay| overlay.subranges.iter().copied())
+        .collect();
+    anyhow::ensure!(
+        overlay_subranges.windows(2).all(|pair| {
+            pair[0].guest_addr.saturating_add(pair[0].len as u64) <= pair[1].guest_addr
+        }),
+        "prepared overlay subranges are not globally ordered and disjoint"
+    );
+
+    let mut fragments = Vec::new();
+    for source in primary.iter().copied() {
+        let source_end = source
+            .guest_addr
+            .checked_add(source.len as u64)
+            .context("prepared primary subrange end overflow")?;
+        let mut cursor = source.guest_addr;
+        for overlay in &overlay_subranges {
+            let overlay_end = overlay
+                .guest_addr
+                .checked_add(overlay.len as u64)
+                .context("prepared overlay subrange end overflow")?;
+            if overlay_end <= cursor {
+                continue;
+            }
+            if overlay.guest_addr >= source_end {
+                break;
+            }
+            anyhow::ensure!(
+                overlay.guest_addr >= cursor,
+                "prepared overlay subranges overlap while partitioning the primary"
+            );
+            if overlay.guest_addr > cursor {
+                fragments.push(prepared_subrange_slice(
+                    source,
+                    cursor,
+                    overlay.guest_addr.min(source_end),
+                )?);
+            }
+            cursor = overlay_end.min(source_end);
+            if cursor == source_end {
+                break;
+            }
+        }
+        if cursor < source_end {
+            fragments.push(prepared_subrange_slice(source, cursor, source_end)?);
+        }
+    }
+
+    let primary_len = primary.iter().try_fold(0usize, |total, subrange| {
+        total
+            .checked_add(subrange.len)
+            .context("prepared primary coverage length overflow")
+    })?;
+    let fragment_len = fragments.iter().try_fold(0usize, |total, subrange| {
+        total
+            .checked_add(subrange.len)
+            .context("prepared primary-fragment coverage length overflow")
+    })?;
+    let overlay_len = overlay_subranges
+        .iter()
+        .try_fold(0usize, |total, subrange| {
+            total
+                .checked_add(subrange.len)
+                .context("prepared overlay coverage length overflow")
+        })?;
+    anyhow::ensure!(
+        fragment_len
+            .checked_add(overlay_len)
+            .context("prepared disjoint coverage length overflow")?
+            == primary_len,
+        "prepared primary fragments and overlays do not exactly cover the destination"
+    );
+    Ok(fragments)
+}
+
+/// Resolve the complete guest-memory split before mutating any VMA. A mapping
+/// range may cross adjacent NUMA slots whose host virtual addresses are
+/// unrelated, but every resulting subrange must preserve the allocator's
+/// backing alignment and cover the source range exactly.
+fn validate_prepared_subranges(
+    guest_mem: &GuestMemoryMmap,
+    ranges: Vec<PreparedMapping>,
+    load_addr: u64,
+    split_alignment: usize,
+    host_page_size: usize,
+) -> Result<Vec<ValidatedPreparedRange>> {
+    anyhow::ensure!(
+        split_alignment.is_power_of_two()
+            && host_page_size.is_power_of_two()
+            && split_alignment.is_multiple_of(host_page_size),
+        "prepared initrd split alignment is incompatible with the host page size"
+    );
+    let mut validated = Vec::with_capacity(ranges.len());
+    for mut range in ranges {
+        let guest_addr = load_addr
+            .checked_add(range.guest_offset)
+            .context("prepared initrd guest address overflow")?;
+        let subranges = validate_prepared_extent_subranges(
+            guest_mem,
+            guest_addr,
+            range.map_len,
+            range.file_offset,
+            split_alignment,
+            host_page_size,
+        )?;
+        let mut overlays = Vec::with_capacity(range.overlays.len());
+        for overlay in std::mem::take(&mut range.overlays) {
+            let guest_addr = load_addr
+                .checked_add(overlay.guest_offset)
+                .context("prepared initrd overlay guest address overflow")?;
+            let subranges = validate_prepared_extent_subranges(
+                guest_mem,
+                guest_addr,
+                overlay.map_len,
+                overlay.file_offset,
+                host_page_size,
+                host_page_size,
+            )?;
+            overlays.push(ValidatedPreparedOverlay { overlay, subranges });
+        }
+        let primary_subranges = disjoint_prepared_primary_subranges(&subranges, &overlays)?;
+        validated.push(ValidatedPreparedRange {
+            range,
+            subranges,
+            primary_subranges,
+            overlays,
+        });
+    }
+    Ok(validated)
+}
+
+fn map_one_validated_prepared_extent<Map, RestoreNuma>(
+    guards: &mut Vec<initramfs::CowOverlayGuard>,
+    fd: OwnedFd,
+    subranges: Vec<ValidatedPreparedSubrange>,
+    description: &str,
+    map: &mut Map,
+    restore_numa: &mut RestoreNuma,
+) -> Result<()>
+where
+    Map: FnMut(&ValidatedPreparedSubrange, &OwnedFd) -> Result<()>,
+    RestoreNuma: FnMut(&ValidatedPreparedSubrange) -> Result<()>,
+{
+    for subrange in subranges {
+        if let Err(error) = map(&subrange, &fd) {
+            // An earlier subrange from this fd may already be live. Move
+            // the sole shared-lock owner before unwinding.
+            guards.push(initramfs::CowOverlayGuard::new(fd));
+            return Err(error).with_context(|| {
+                format!(
+                    "direct-map {description} subrange at guest {:#x} \
+                     (len={}, file_offset={:#x})",
+                    subrange.guest_addr, subrange.len, subrange.file_offset
+                )
+            });
+        }
+        if let Err(error) = restore_numa(&subrange) {
+            // The exact hole mapping is already live.
+            guards.push(initramfs::CowOverlayGuard::new(fd));
+            return Err(error).with_context(|| {
+                format!(
+                    "restore NUMA policy for direct-map {description} \
+                     subrange at guest {:#x} (len={})",
+                    subrange.guest_addr, subrange.len
+                )
+            });
+        }
+    }
+    guards.push(initramfs::CowOverlayGuard::new(fd));
+    Ok(())
+}
+
+/// Consume prevalidated ranges through the strict disjoint production shape.
+///
+/// Every complete destination is unmapped first. Only after all destinations
+/// are holes do we install primary fragments and overlays as non-overlapping
+/// file VMAs. The callback seams let tests prove ordering and partial-failure
+/// ownership; production uses `munmap` + `MAP_FIXED_NOREPLACE`, with no
+/// byte-copy or nested-replacement branch.
+fn map_validated_prepared_ranges<Unmap, Map, RestoreNuma>(
+    guards: &mut Vec<initramfs::CowOverlayGuard>,
+    validated: Vec<ValidatedPreparedRange>,
+    mut unmap: Unmap,
+    mut map: Map,
+    mut restore_numa: RestoreNuma,
+) -> Result<()>
+where
+    Unmap: FnMut(&ValidatedPreparedSubrange) -> Result<()>,
+    Map: FnMut(&ValidatedPreparedSubrange, &OwnedFd) -> Result<()>,
+    RestoreNuma: FnMut(&ValidatedPreparedSubrange) -> Result<()>,
+{
+    // Complete the destructive phase before installing any file VMA. This
+    // dissolves hugetlb mappings only at their validated 2 MiB boundaries and
+    // ensures MAP_FIXED_NOREPLACE can enforce a truly disjoint final layout.
+    for validated_range in &validated {
+        for subrange in &validated_range.subranges {
+            unmap(subrange).with_context(|| {
+                format!(
+                    "unmap prepared initrd destination at guest {:#x} (len={})",
+                    subrange.guest_addr, subrange.len
+                )
+            })?;
+        }
+    }
+
+    for validated_range in validated {
+        map_one_validated_prepared_extent(
+            guards,
+            validated_range.range.fd,
+            validated_range.primary_subranges,
+            "prepared initrd primary fragment",
+            &mut map,
+            &mut restore_numa,
+        )?;
+        for validated_overlay in validated_range.overlays {
+            map_one_validated_prepared_extent(
+                guards,
+                validated_overlay.overlay.fd,
+                validated_overlay.subranges,
+                "prepared initrd overlay",
+                &mut map,
+                &mut restore_numa,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Build the auto-mount cmdline tokens for one disk. Returns an
@@ -273,97 +847,6 @@ fn numa_balancing_cmdline_token(topology: &crate::vmm::topology::Topology) -> &'
     } else {
         " numa_balancing=disable"
     }
-}
-
-/// Pure helper: assemble the `extras` slice and the [`BaseKey`] from
-/// the resolved scheduler/probe/worker/staged-binary paths. Extracted
-/// out of [`KtstrVm::spawn_initramfs_resolve`] so the staged-extras
-/// path-format contract, the per-staged iteration order, and the
-/// shell-mode-vs-non-shell BaseKey threading can be unit-tested
-/// without spawning the resolve thread or running the full
-/// initramfs build.
-///
-/// Caller responsibilities:
-/// - Pre-compute `staged_extras_names` as
-///   `format!("{}/scheduler", staged_scheduler_archive_dir(&s.name))`
-///   for each staged scheduler (the helper indexes into this vec by
-///   position, so caller MUST keep order identical to
-///   `staged_schedulers`). Materialized externally so the borrow
-///   lifetime ties to the caller's owned Vec.
-/// - Pre-compute `merged_includes` (operator's `include_files` plus
-///   the optional alloc-worker binary).
-/// - Pre-compute `has_jemalloc_extras` = `probe.is_some() ||
-///   worker.is_some()` for shell-mode determination.
-///
-/// Returns `(extras, base_key)`. The extras vec borrows from
-/// `scheduler`, `probe`, `staged_extras_names`, and
-/// `staged_schedulers` — all `'a`-tied to the caller's lifetimes.
-/// The base_key is owned `BaseKey`.
-///
-/// `#[allow(clippy::too_many_arguments)]` — the parameter set is
-/// intrinsically flat (binaries + staging slice + flags); folding
-/// into a builder or struct here would just rename the same
-/// positional ordering. Sibling precedent: `build_vm_builder_base`
-/// in `src/test_support/runtime.rs` uses the same allow for the
-/// same reason.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn assemble_extras_and_key<'a>(
-    payload: &'a std::path::Path,
-    scheduler: Option<&'a std::path::Path>,
-    probe: Option<&'a std::path::Path>,
-    worker: Option<&'a std::path::Path>,
-    staged_schedulers: &'a [crate::vmm::builder::StagedScheduler],
-    staged_extras_names: &'a [String],
-    merged_includes: &'a [(String, PathBuf)],
-    busybox_bytes: Option<&[u8]>,
-    has_jemalloc_extras: bool,
-) -> Result<(Vec<(&'a str, &'a std::path::Path)>, BaseKey)> {
-    debug_assert_eq!(
-        staged_schedulers.len(),
-        staged_extras_names.len(),
-        "staged_schedulers and staged_extras_names must be co-indexed; \
-         caller mis-built the extras-names slice"
-    );
-
-    let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
-    if let Some(s) = scheduler {
-        extras.push(("scheduler", s));
-    }
-    if let Some(p) = probe {
-        extras.push(("bin/ktstr-jemalloc-probe", p));
-    }
-    for (idx, staged) in staged_schedulers.iter().enumerate() {
-        extras.push((staged_extras_names[idx].as_str(), staged.binary.as_path()));
-    }
-
-    // Shell-mode determination: busybox flag, non-empty includes,
-    // or any jemalloc extras (probe / worker present). Mirrors the
-    // pre-extraction logic in spawn_initramfs_resolve — kept
-    // explicit here so the helper is a closed unit under test
-    // without a hidden dependency on the caller's shell_mode
-    // computation.
-    let shell_mode = busybox_bytes.is_some() || !merged_includes.is_empty() || has_jemalloc_extras;
-
-    let staged_for_key: Vec<(&str, &std::path::Path)> = staged_schedulers
-        .iter()
-        .map(|s| (s.name.as_str(), s.binary.as_path()))
-        .collect();
-
-    let key = if shell_mode {
-        BaseKey::new_shell(
-            payload,
-            scheduler,
-            probe,
-            worker,
-            &staged_for_key,
-            merged_includes,
-            busybox_bytes,
-        )?
-    } else {
-        BaseKey::new(payload, scheduler, probe, worker, &staged_for_key)?
-    };
-
-    Ok((extras, key))
 }
 
 impl KtstrVm {
@@ -524,13 +1007,10 @@ impl KtstrVm {
     pub(super) fn init_virtio_blk(
         &self,
         vm: &kvm::KtstrKvm,
-        // No-perf worker-placement override from `run_vm`'s run-time
-        // replan. `Some` on the no-perf test path — the fresh LLC plan's
-        // CPUs, which name the LLCs the run-scoped flocks hold; the worker
-        // shares that budget. `None` on the interactive path (no replan
-        // runs) and every non-no-perf run, where the placement falls back
-        // to the build-time `self.no_perf_plan.cpus` exactly as before.
-        no_perf_cpus: Option<&[usize]>,
+        // The selected run-time placement. Performance admission can choose a
+        // different equivalent exact plan than the build-time probe, while
+        // no-perf admission can choose a fresh LLC mask.
+        effective_placement: super::EffectiveRunPlacement<'_>,
     ) -> Result<Option<Arc<PiMutex<virtio_blk::VirtioBlk>>>> {
         let Some(disk) = self.disk.as_ref() else {
             return Ok(None);
@@ -591,24 +1071,21 @@ impl KtstrVm {
         // Perf-mode produces `pinning_plan.service_cpu` (a dedicated
         // host CPU reserved away from vCPU pins) — the worker pins
         // there to keep its cache footprint out of the workload-
-        // measured cpuset. Non-perf + `--cpu-cap` produces
-        // `no_perf_plan.cpus` (the LLC mask shared with vCPUs); the
-        // worker shares the LLC but stays inside the resource budget.
-        // The two paths are orthogonal (perf-mode never has
-        // `no_perf_plan` and vice versa); both `None` means inherit
-        // the parent's affinity (degraded-sysfs / non-cap-set
+        // measured cpuset. Non-perf + `--cpu-cap` supplies the CPUs
+        // from the run-time plan acquired immediately before VM setup;
+        // the worker shares the LLC but stays inside the exact resource
+        // budget this invocation owns.
+        // The two effective placement modes are orthogonal; both `None`
+        // means inherit the parent's affinity (degraded-sysfs / non-cap-set
         // fallback). The setter only takes effect on the next worker
         // spawn — `with_options` deferred initial spawn to DRIVER_OK
         // (matching the respawn path), so this call lands inside the
         // window and the first worker observes the placement. The
-        // run-time-replan `no_perf_cpus` override wins over the
-        // build-time `no_perf_plan.cpus` so the worker binds to the same
-        // LLCs the run-scoped flocks hold.
+        // Build-time shape plans are never consulted here, so the worker
+        // can only bind to the same LLCs the run-scoped flocks hold.
         let placement = virtio_blk::WorkerPlacement {
-            service_cpu: self.pinning_plan.as_ref().and_then(|p| p.service_cpu),
-            no_perf_cpus: no_perf_cpus
-                .map(<[usize]>::to_vec)
-                .or_else(|| self.no_perf_plan.as_ref().map(|p| p.cpus.clone())),
+            service_cpu: effective_placement.service_cpu,
+            shared_cpus: effective_placement.shared_cpus.map(<[usize]>::to_vec),
         };
         blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());
@@ -870,10 +1347,8 @@ impl KtstrVm {
         vm: &kvm::KtstrKvm,
         pci_bus: &Arc<PiMutex<pci::PciBus>>,
         msix_sink: Option<Arc<dyn virtio_msix::MsixRouteSink>>,
-        // No-perf worker-placement override — same semantics as the MMIO
-        // twin `init_virtio_blk`: the run-time-replan CPUs when `Some`,
-        // else the build-time `self.no_perf_plan.cpus` fallback.
-        no_perf_cpus: Option<&[usize]>,
+        // Same selected run-time placement as the MMIO twin.
+        effective_placement: super::EffectiveRunPlacement<'_>,
     ) -> Result<Option<BlkDeviceHandles>> {
         let Some(disk) = self.disk.as_ref() else {
             return Ok(None);
@@ -893,12 +1368,10 @@ impl KtstrVm {
         // Worker placement + guest memory — same as `init_virtio_blk`. Both land
         // before the deferred initial worker spawn (DRIVER_OK), so the first
         // worker observes the placement and guest memory. The run-time-replan
-        // `no_perf_cpus` override wins over the build-time `no_perf_plan.cpus`.
+        // selected run-time placement wins over every build-time probe.
         let placement = virtio_blk::WorkerPlacement {
-            service_cpu: self.pinning_plan.as_ref().and_then(|p| p.service_cpu),
-            no_perf_cpus: no_perf_cpus
-                .map(<[usize]>::to_vec)
-                .or_else(|| self.no_perf_plan.as_ref().map(|p| p.cpus.clone())),
+            service_cpu: effective_placement.service_cpu,
+            shared_cpus: effective_placement.shared_cpus.map(<[usize]>::to_vec),
         };
         blk.set_worker_placement(placement);
         blk.set_mem((*vm.guest_mem).clone());
@@ -994,39 +1467,26 @@ impl KtstrVm {
         }))
     }
 
-    /// Create the KVM VM and optionally load the kernel.
-    ///
-    /// When `memory_mib` is `Some`, allocates guest memory and loads the
-    /// kernel immediately (existing path). When `None` (deferred), creates
-    /// the VM without memory — allocation and kernel loading happen later
-    /// in `setup_memory` after the actual initramfs size is known.
+    /// Create the KVM VM, allocate `memory_mib` of guest RAM, and load the
+    /// kernel into it. The size is resolved from the immutable prepared
+    /// inputs before admission ([`Self::prepared_memory_mib`]), so no
+    /// estimation is left to unwind here.
     pub(super) fn create_vm_and_load_kernel(
         &self,
-    ) -> Result<(kvm::KtstrKvm, Option<boot::KernelLoadResult>)> {
+        mbind_node_map: &[Vec<usize>],
+        memory_mib: u32,
+    ) -> Result<(kvm::KtstrKvm, boot::KernelLoadResult)> {
         let t0 = Instant::now();
-        let use_hugepages = self.performance_mode
-            && self.memory_mib.is_some_and(|mib| {
-                host_topology::hugepages_free() >= host_topology::hugepages_needed(mib)
-            });
 
         // `mut` is used only on x86_64, where `vm.pci_enabled` is assigned below;
         // on aarch64 (no PCI field) `vm` is never mutated after construction.
         #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
-        let mut vm = match self.memory_mib {
-            Some(mib) => {
-                if use_hugepages {
-                    kvm::KtstrKvm::new_with_hugepages(self.topology, mib, self.performance_mode)
-                        .context("create VM with hugepages")?
-                } else {
-                    kvm::KtstrKvm::new(self.topology, mib, self.performance_mode)
-                        .context("create VM")?
-                }
-            }
-            None => {
-                kvm::KtstrKvm::new_deferred(self.topology, use_hugepages, self.performance_mode)
-                    .context("create VM (deferred memory)")?
-            }
-        };
+        // Performance-mode hugepages are opportunistic. The allocator
+        // serializes its free-count check with MAP_HUGETLB so a process storm
+        // cannot all spend the same observed pool. Immutable preparation has
+        // already supplied the exact memory requirement before admission.
+        let mut vm = kvm::KtstrKvm::new(self.topology, memory_mib, self.performance_mode)
+            .context("create VM with unregistered memory")?;
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "kvm_create");
 
         // Propagate the builder's PCI-enable flag to the VM so the run loops
@@ -1038,226 +1498,236 @@ impl KtstrVm {
             vm.pci_enabled = self.pci_enabled;
         }
 
-        // When memory is already allocated (non-deferred path), do mbind
-        // and load kernel now. Deferred path does this in setup_memory.
-        let kernel_result = if self.memory_mib.is_some() {
-            if self.performance_mode && !self.mbind_node_map.is_empty() {
-                let layout = vm.numa_layout.as_ref().expect(
-                    "numa_layout is Some on the non-deferred allocation path: \
-                     allocate_and_register_memory ran during `vm_new` because \
-                     memory_mib was provided up front, and that call sets \
-                     numa_layout to Some(...) in src/vmm/{x86_64,aarch64}/kvm.rs",
-                );
-                layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
-            }
+        if self.performance_mode && !mbind_node_map.is_empty() {
+            let layout = vm
+                .numa_layout
+                .as_ref()
+                .expect("numa_layout is present after exact memory allocation");
+            layout.mbind_regions(&vm.guest_mem, mbind_node_map);
+        }
 
-            let t0 = Instant::now();
-            let kr = boot::load_kernel(&vm.guest_mem, &self.kernel).context("load kernel")?;
-            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_kernel");
-            Some(kr)
-        } else {
-            None
-        };
+        let t0 = Instant::now();
+        let kr = boot::load_kernel(&vm.guest_mem, &self.kernel).context("load kernel")?;
+        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_kernel");
 
-        Ok((vm, kernel_result))
+        Ok((vm, kr))
     }
 
-    /// Spawn initramfs resolution on a background thread.
-    /// Returns the handle to join later (after KVM creation completes).
-    pub(super) fn spawn_initramfs_resolve(&self) -> Option<JoinHandle<Result<(BaseRef, BaseKey)>>> {
-        let bin = self.init_binary.as_ref()?;
+    /// Resolve the complete immutable initrd before entering exact topology
+    /// admission. Cold cells may contend on a shared CAS builder here, but
+    /// none of them can sequester CPUs or LLCs while waiting for it.
+    pub(super) fn prepare_initramfs(&self) -> Result<Option<PreparedInitrd>> {
+        let Some(bin) = self.init_binary.as_ref() else {
+            return Ok(None);
+        };
         let payload = bin.clone();
         let scheduler = self.scheduler_binary.clone();
         let probe = self.jemalloc_probe_binary.clone();
         let worker = self.jemalloc_alloc_worker_binary.clone();
         let include_files = self.include_files.clone();
+        let kernel_config = crate::cache::kernel_config_include_for_image(&self.kernel);
         let staged_schedulers = self.staged_schedulers.clone();
         let busybox_bytes = self.busybox_bytes.clone();
+        let compression = self.initrd_compression;
         #[cfg(feature = "wprof")]
         let wprof_host_path: Option<PathBuf> = self.wprof.as_ref().map(|w| w.host_path.clone());
-        std::thread::Builder::new()
-            .name("initramfs-resolve".into())
-            .spawn(move || -> Result<(BaseRef, BaseKey)> {
-                // Extras are stripped by `build_initramfs_base`
-                // before write. The scheduler and probe can lose
-                // their DWARF without functional impact — the probe
-                // resolves `tsd_s.thread_allocated` offsets against
-                // the TARGET process's `/proc/<pid>/exe`, not against
-                // its own binary, so its own DWARF is dead weight.
-                // The worker (the probe's target) MUST retain DWARF:
-                // a stripped worker has no DWARF for the probe to
-                // walk. Route scheduler + probe through `extras`
-                // (stripped), worker through `include_files`
-                // (verbatim). Packing the probe unstripped inflated
-                // the initramfs by ~900MB per run in debug builds,
-                // which was enough to time out VM init before the
-                // test binary loaded.
-                //
-                // Staged schedulers ride the same `extras` path,
-                // packed under `staging/schedulers/<name>/scheduler`
-                // so the cpio extractor's silent parent-dir
-                // requirement gets satisfied via the auto-registered
-                // ancestor entries (see `build_initramfs_base`'s
-                // `register_parent_dirs` loop). Each staged binary
-                // contributes its own DT_NEEDED set to the shared-lib
-                // resolution chain — schedulers built against
-                // different libbpf revisions are correctly handled
-                // without operator intervention.
-                let staged_extras_names: Vec<String> = staged_schedulers
-                    .iter()
-                    .map(|s| {
-                        format!(
-                            "{}/scheduler",
-                            crate::test_support::staged::staged_scheduler_archive_dir(&s.name),
-                        )
-                    })
-                    .collect();
-                let has_jemalloc_extras = probe.as_deref().is_some() || worker.as_deref().is_some();
-
-                // Merge include_files with worker so both the cache
-                // key and the actual archive build see the same
-                // worker entry; the probe is added to extras inside
-                // `assemble_extras_and_key`. wprof (when set) also
-                // rides include_files so DT_NEEDED resolution pulls
-                // its dynamic dependencies (libelf, libz, blazesym
-                // C ABI) into the archive alongside the binary;
-                // without that, wprof fails to load inside the
-                // guest.
-                let mut merged_includes: Vec<(String, PathBuf)> = include_files.clone();
-                if let Some(w) = worker.as_deref() {
-                    merged_includes.push((
-                        "bin/ktstr-jemalloc-alloc-worker".to_string(),
-                        w.to_path_buf(),
-                    ));
-                }
-                #[cfg(feature = "wprof")]
-                if let Some(wprof_path) = wprof_host_path.as_deref() {
-                    merged_includes.push(("bin/wprof".to_string(), wprof_path.to_path_buf()));
-                }
-
-                let (extras, key) = assemble_extras_and_key(
-                    &payload,
-                    scheduler.as_deref(),
-                    probe.as_deref(),
-                    worker.as_deref(),
-                    &staged_schedulers,
-                    &staged_extras_names,
-                    &merged_includes,
-                    busybox_bytes.as_deref(),
-                    has_jemalloc_extras,
-                )?;
-
-                let include_refs: Vec<(&str, &std::path::Path)> = merged_includes
-                    .iter()
-                    .map(|(a, p)| (a.as_str(), p.as_path()))
-                    .collect();
-                let base =
-                    get_or_build_base(&payload, &extras, &include_refs, busybox_bytes, &key)?;
-                Ok((base, key))
+        // Extras are stripped by the base builder before write. The
+        // scheduler and probe can lose their DWARF without functional impact
+        // — the probe resolves `tsd_s.thread_allocated` offsets against the
+        // TARGET process's `/proc/<pid>/exe`, not against its own binary, so
+        // its own DWARF is dead weight. The worker (the probe's target) MUST
+        // retain DWARF: a stripped worker has no DWARF for the probe to walk.
+        // Route scheduler + probe through `extras` (stripped), worker through
+        // `include_files` (verbatim). Packing the probe unstripped inflated
+        // the initramfs by ~900MB per run in debug builds, which was enough to
+        // time out VM init before the test binary loaded.
+        //
+        // Staged schedulers ride the same `extras` path, packed under
+        // `staging/schedulers/<name>/scheduler` so the cpio extractor's silent
+        // parent-dir requirement gets satisfied via the auto-registered
+        // ancestor entries (see `build_initramfs_base_from_resolved`'s
+        // `register_parent_dirs` loop). Each staged binary contributes its own
+        // DT_NEEDED set to the shared-lib resolution chain.
+        let staged_extras_names: Vec<String> = staged_schedulers
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}/scheduler",
+                    crate::test_support::staged::staged_scheduler_archive_dir(&s.name),
+                )
             })
-            .ok()
-    }
+            .collect();
 
-    /// Compress base+suffix as separate LZ4 legacy streams, load into
-    /// guest memory via COW overlay (falling back to write_slice), and
-    /// verify the write. Returns `total_compressed_size`.
-    ///
-    /// On a successful COW overlay, the returned `CowOverlayGuard` is
-    /// pushed onto `vm.cow_overlay_guards` IMMEDIATELY — before any
-    /// subsequent fallible operation (suffix write, read-back verify)
-    /// runs. This is deliberate: if a later `?` unwinds this function
-    /// after the MAP_FIXED overlay is in place, a locally-held guard
-    /// would drop first, releasing `LOCK_SH` while the COW VMAs are
-    /// still live. A concurrent writer could then take `LOCK_EX` and
-    /// truncate the segment → SIGBUS on the mapped pages. Pushing the
-    /// guard onto `vm` transfers ownership to the VM, where Drop
-    /// order is structurally enforced (guard drops AFTER
-    /// `_reservation` munmaps the COW VMAs).
-    fn compress_and_load_initrd(
-        &self,
-        vm: &mut kvm::KtstrKvm,
-        base_bytes: &[u8],
-        suffix: &[u8],
-        key: &BaseKey,
-        load_addr: u64,
-    ) -> Result<u32> {
-        let uncompressed_size = base_bytes.len() + suffix.len();
+        // Merge include_files with worker so both the cache key and the actual
+        // archive build see the same worker entry; the probe rides `extras`
+        // built just below. wprof (when set) also rides include_files so
+        // DT_NEEDED resolution pulls its dynamic dependencies into the
+        // archive alongside the binary.
+        let mut merged_includes: Vec<(String, PathBuf)> = include_files;
+        if let Some((archive_path, host_path)) = kernel_config {
+            merged_includes.push((archive_path, host_path));
+        }
+        if let Some(w) = worker.as_deref() {
+            merged_includes.push((
+                "bin/ktstr-jemalloc-alloc-worker".to_string(),
+                w.to_path_buf(),
+            ));
+        }
+        #[cfg(feature = "wprof")]
+        if let Some(wprof_path) = wprof_host_path.as_deref() {
+            merged_includes.push(("bin/wprof".to_string(), wprof_path.to_path_buf()));
+        }
 
-        // Compress base and suffix as separate streams of the guest
-        // kernel's format (LZ4 legacy unless the kernel lacks RD_LZ4).
-        // The kernel's unpack_to_rootfs loop decodes one concatenated
-        // archive per iteration whatever the format (and the LZ4
-        // decoder additionally resets on re-encountering the magic
-        // mid-stream). Keeping base and suffix separate lets us
-        // COW-map the LZ4 base from SHM.
+        let mut extras: Vec<(&str, &std::path::Path)> = Vec::new();
+        if let Some(scheduler) = scheduler.as_deref() {
+            extras.push(("scheduler", scheduler));
+        }
+        if let Some(probe) = probe.as_deref() {
+            extras.push(("bin/ktstr-jemalloc-probe", probe));
+        }
+        for (index, staged) in staged_schedulers.iter().enumerate() {
+            extras.push((staged_extras_names[index].as_str(), staged.binary.as_path()));
+        }
+
         let t0 = Instant::now();
-        let lz4_base = self.get_or_compress_base(base_bytes, key)?;
-        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, suffix)?;
-        let total_compressed = lz4_base.len() + lz4_suffix.len();
+        let prepared_base = framework_infrastructure(
+            prepare_base_inputs(
+                &payload,
+                &extras,
+                &merged_includes,
+                busybox_bytes.as_deref(),
+            )
+            .and_then(|inputs| get_or_prepare_base(inputs, compression)),
+        )?;
+        let prepared = framework_infrastructure(complete_prepared_initrd(
+            prepared_base,
+            &self.suffix_params(),
+        ))?;
         tracing::debug!(
             elapsed_us = t0.elapsed().as_micros(),
-            uncompressed = uncompressed_size,
-            lz4_base = lz4_base.len(),
-            lz4_suffix = lz4_suffix.len(),
-            ratio = format!("{:.1}x", uncompressed_size as f64 / total_compressed as f64),
-            "lz4_initramfs",
+            uncompressed_bytes = prepared.uncompressed_len(),
+            compressed_bytes = prepared.compressed_len(),
+            cache_hits = prepared.cache_hits(),
+            "prepare_initrd",
         );
+        Ok(Some(prepared))
+    }
 
-        tracing::debug!(
-            base_magic = format!(
-                "{:02x}{:02x}{:02x}{:02x}",
-                lz4_base[0], lz4_base[1], lz4_base[2], lz4_base[3]
-            ),
-            suffix_magic = format!(
-                "{:02x}{:02x}{:02x}{:02x}",
-                lz4_suffix[0], lz4_suffix[1], lz4_suffix[2], lz4_suffix[3]
-            ),
-            base_len = lz4_base.len(),
-            suffix_len = lz4_suffix.len(),
-            total = total_compressed,
-            load_addr = format!("{:#x}", load_addr),
-            suffix_addr = format!("{:#x}", load_addr + lz4_base.len() as u64),
-            "initrd_load_debug",
-        );
+    /// Map a prepared initrd's immutable CAS ranges directly into guest RAM.
+    /// Returns `total_compressed_size`.
+    ///
+    /// Every path after a successful exact hole mapping transfers the backing
+    /// fd to `vm.cow_overlay_guards`, including later mmap/NUMA-policy errors.
+    /// This preserves the CAS object's shared lock for the complete lifetime
+    /// of any partial mapping. VM drop order is structural: `_reservation`
+    /// unmaps the COW VMAs before the guards release their locks.
+    fn load_prepared_initrd(
+        &self,
+        vm: &mut kvm::KtstrKvm,
+        prepared: PreparedInitrd,
+        load_addr: u64,
+        mbind_node_map: &[Vec<usize>],
+    ) -> Result<u32> {
+        framework_infrastructure(self.load_prepared_initrd_inner(
+            vm,
+            prepared,
+            load_addr,
+            mbind_node_map,
+        ))
+    }
 
-        // Try COW overlay: mmap compressed base from SHM fd directly
-        // into guest memory, sharing physical pages across VMs. LZ4
-        // only — the SHM segment always holds the LZ4 encoding of the
-        // base, which is not what a non-LZ4 boot wrote into lz4_base.
+    fn load_prepared_initrd_inner(
+        &self,
+        vm: &mut kvm::KtstrKvm,
+        prepared: PreparedInitrd,
+        load_addr: u64,
+        mbind_node_map: &[Vec<usize>],
+    ) -> Result<u32> {
+        let total_compressed = prepared.compressed_len();
+        let page_size = prepared.mapping_granule();
+        let compression = prepared.compression();
+        let host_page_size = host_page_size() as usize;
+        let backing = vm
+            .memory_backing
+            .context("prepared initrd load requires allocated guest-memory backing")?;
+        let split_alignment = prepared_region_split_alignment(backing, host_page_size, page_size);
+        let plan = prepared.plan();
+        let cache_hits = prepared.cache_hits();
+        let ranges = prepared.into_ranges();
+        let boot_size = validate_prepared_load(
+            total_compressed,
+            compression,
+            page_size,
+            host_page_size,
+            load_addr,
+            &ranges,
+        )?;
+
+        // GuestMemoryMmap is one region per NUMA memory slot; adjacent guest
+        // addresses may therefore have unrelated host VAs. Explicit hugetlb
+        // VMAs require 2 MiB replacement boundaries. Base-page/THP regions
+        // may split on the runtime host page, including caller-declared
+        // odd-MiB NUMA boundaries.
+        let validated = validate_prepared_subranges(
+            &vm.guest_mem,
+            ranges,
+            load_addr,
+            split_alignment,
+            host_page_size,
+        )?;
         let t0 = Instant::now();
-        let cow_guard = (self.initrd_compression == initramfs::InitrdCompression::Lz4)
-            .then(|| Self::try_cow_overlay(&vm.guest_mem, key, lz4_base.len(), load_addr))
-            .flatten();
-        // IMPORTANT: stash the guard on the VM IMMEDIATELY — before
-        // any fallible operation below. If a `?` unwinds this function
-        // with a locally-held guard still on the stack, the guard
-        // drops first, releasing LOCK_SH while the COW VMAs are still
-        // live. Owned by `vm`, the guard drops with the VM's
-        // declared-order Drop, which is strictly after
-        // `_reservation` (and thus the COW VMAs). See
-        // `try_cow_overlay_rejects_cross_region_span` and the C4
-        // comment on `cow_overlay_guards` in kvm.rs.
-        let cow_active = cow_guard.is_some();
-        if let Some(guard) = cow_guard {
-            vm.cow_overlay_guards.push(guard);
-        }
-        if cow_active {
-            vm.guest_mem
-                .write_slice(&lz4_suffix, GuestAddress(load_addr + lz4_base.len() as u64))
-                .context("write lz4 suffix after COW base")?;
-            tracing::debug!(
-                elapsed_us = t0.elapsed().as_micros(),
-                cow = true,
-                "initrd_write"
-            );
+        let restore_numa = self.performance_mode && !mbind_node_map.is_empty();
+        let numa_layout = if restore_numa {
+            Some(vm.numa_layout.as_ref().context(
+                "performance-mode direct-map initrd has NUMA bindings \
+                 but no NUMA memory layout",
+            )?)
         } else {
-            initramfs::load_initramfs_parts(&vm.guest_mem, &[&lz4_base, &lz4_suffix], load_addr)?;
-            tracing::debug!(
-                elapsed_us = t0.elapsed().as_micros(),
-                cow = false,
-                "initrd_write"
-            );
-        }
+            None
+        };
+        map_validated_prepared_ranges(
+            &mut vm.cow_overlay_guards,
+            validated,
+            |subrange| {
+                // SAFETY: validation proved this is the complete destination
+                // subrange inside the VM-owned reservation. No KVM memslot is
+                // registered yet on the production builder path.
+                let result = unsafe { libc::munmap(subrange.host_addr.cast(), subrange.len) };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("munmap prepared initrd destination");
+                }
+                Ok(())
+            },
+            |subrange, fd| unsafe {
+                initramfs::cow_map_file_into_hole_borrowed(
+                    subrange.host_addr,
+                    subrange.len,
+                    fd,
+                    subrange.file_offset,
+                )
+            },
+            |subrange| {
+                if let Some(layout) = numa_layout {
+                    layout.mbind_replaced_range(
+                        subrange.guest_addr,
+                        subrange.host_addr,
+                        subrange.len,
+                        mbind_node_map,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        tracing::debug!(
+            elapsed_us = t0.elapsed().as_micros(),
+            range_count = vm.cow_overlay_guards.len(),
+            cache_hits,
+            part_count = plan.part_count,
+            direct_ranges = plan.direct_ranges,
+            stitch_pages = plan.stitch_pages,
+            "initrd_direct_map"
+        );
 
         // Read back first 8 bytes from guest memory to check write.
         let mut check_buf = [0u8; 8];
@@ -1276,11 +1746,11 @@ impl KtstrVm {
                 check_buf[6],
                 check_buf[7]
             ),
-            expected_magic = "02214c18",
+            ?compression,
             "initrd_verify",
         );
 
-        Ok(total_compressed as u32)
+        Ok(boot_size)
     }
 
     /// Select the guest rootfs tmpfs fraction for the budget formula by
@@ -1288,9 +1758,8 @@ impl KtstrVm {
     /// (mainline 6.18+ or a stable series at/above its backport floor)
     /// via [`TmpfsFraction::for_kernel_version`].
     ///
-    /// Mirrors [`Self::init_payload_coverage_reserve`]: a `&self` accessor
-    /// that derives a conservatively-defaulting value threaded into
-    /// [`MemoryBudget`] at every budget call site. The version is read
+    /// This conservatively-derived value is threaded into [`MemoryBudget`]
+    /// at every budget call site. The version is read
     /// from the image's own setup_header where it is embedded
     /// ([`read_kernel_version`], the x86_64 bzImage), falling
     /// back to the cache `metadata.json` sidecar
@@ -1306,135 +1775,30 @@ impl KtstrVm {
         TmpfsFraction::for_kernel_version(version)
     }
 
-    /// Probe the `/init` payload for LLVM coverage instrumentation and,
-    /// when instrumented, compute the extra resident memory the
-    /// instrumented runtime needs.
-    ///
-    /// Returns `(instrumented, reserve_bytes)`:
-    /// - `instrumented` is `true` when the payload's `.symtab` carries
-    ///   `__llvm_profile_write_buffer` / `__llvm_profile_get_size_for_buffer`
-    ///   (the same function-shaped symbols
-    ///   [`crate::test_support::try_flush_profraw`] resolves; chosen over
-    ///   the bare `__llvm_profile_runtime` marker because the marker can
-    ///   be dead-stripped entirely under `--gc-sections` while these
-    ///   function symbols are kept alive by that flush call's link
-    ///   reference). This probes the
-    ///   PAYLOAD bytes (`self.init_binary`), NOT the host process — the
-    ///   guest `/init` may be instrumented even when the host VMM binary
-    ///   is not (and vice versa), so
-    ///   `current_binary_is_coverage_instrumented` (which probes
-    ///   `/proc/self/exe`) is the wrong signal here.
-    /// - `reserve_bytes` is the summed `sh_size` of the payload's
-    ///   `__llvm_prf_cnts` + `__llvm_prf_data` sections — the live
-    ///   coverage-counter and profile-metadata arrays. This is the floor
-    ///   on the heap buffer `__llvm_profile_write_buffer` serializes into
-    ///   at flush time. `0` (and `instrumented = false`) on any failure
-    ///   path (no payload, unreadable file, ELF parse error, symbols
-    ///   absent) — the conservative outcome, leaving the budget at its
-    ///   non-instrumented size.
-    ///
-    /// Reads the payload via `memmap2::Mmap` (matching the
-    /// `try_flush_profraw` idiom) so a ~1 GiB coverage binary is not
-    /// copied into the heap just to read its section table.
-    fn init_payload_coverage_reserve(&self) -> (bool, u64) {
-        let Some(path) = self.init_binary.as_ref() else {
-            return (false, 0);
-        };
-        let Ok(file) = std::fs::File::open(path) else {
-            return (false, 0);
-        };
-        // SAFETY: `path` is the test-author-supplied `/init` payload;
-        // ktstr never writes to it during a VM build, satisfying
-        // memmap2's no-concurrent-modification invariant. The fd pins
-        // the inode for the mapping's lifetime.
-        let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
-            return (false, 0);
-        };
-        let Ok(elf) = goblin::elf::Elf::parse(&mmap) else {
-            return (false, 0);
-        };
-
-        let vaddrs = crate::test_support::find_symbol_vaddrs(
-            &elf,
-            &[
-                "__llvm_profile_write_buffer",
-                "__llvm_profile_get_size_for_buffer",
-            ],
-        );
-        let instrumented = vaddrs.iter().any(|v| matches!(v, Some(va) if *va != 0));
-        if !instrumented {
-            return (false, 0);
-        }
-
-        // Sum the live profile sections' resident sizes. `sh_size` is
-        // the in-memory size (the counter/metadata arrays the runtime
-        // keeps resident and serializes at flush time).
-        let mut reserve_bytes: u64 = 0;
-        for sh in &elf.section_headers {
-            if let Some(name) = elf.shdr_strtab.get_at(sh.sh_name)
-                && (name == "__llvm_prf_cnts" || name == "__llvm_prf_data")
-            {
-                reserve_bytes = reserve_bytes.saturating_add(sh.sh_size);
-            }
-        }
-        (true, reserve_bytes)
-    }
-
-    /// Join the initramfs thread and load the result into guest memory.
-    /// Memory must already be allocated (non-deferred path). Validates
-    /// that allocated memory is sufficient for the initramfs.
-    ///
-    /// x86_64-only: aarch64 uses
-    /// `Self::join_and_load_initramfs_aarch64`, which computes the
-    /// FDT-relative load address from the compressed size after the
-    /// suffix is built (the address depends on `memory_mib` AND the
-    /// total compressed size, neither of which is known until after
-    /// the suffix and compression run).
-    #[cfg(target_arch = "x86_64")]
-    fn join_and_load_initramfs(
-        &self,
-        vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
-        load_addr: u64,
-    ) -> Result<(Option<u64>, Option<u32>)> {
-        let t0 = Instant::now();
-        let (base, key) = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-        let base_bytes: &[u8] = base.as_ref();
-
-        let t0 = Instant::now();
-        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
-        let uncompressed_size = base_bytes.len() + suffix.len();
-        tracing::debug!(
-            elapsed_us = t0.elapsed().as_micros(),
-            base_bytes = base_bytes.len(),
-            suffix_bytes = suffix.len(),
-            "build_suffix",
-        );
-
-        // Enforce minimum memory for initramfs extraction.
-        // This path is only reached when memory_mib was set explicitly.
-        let memory_mib = self.memory_mib.expect(
-            "join_and_load_initramfs called in deferred mode; \
-             use join_compute_memory_and_load instead",
-        );
-        // Compress first to get actual compressed size for validation.
-        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
-        let compressed_size = lz4_base.len() + lz4_suffix.len();
-        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-        let (init_coverage_instrumented, instrumented_reserve_bytes) =
-            self.init_payload_coverage_reserve();
-        let budget = MemoryBudget {
-            uncompressed_initramfs_bytes: uncompressed_size as u64,
-            compressed_initrd_bytes: compressed_size as u64,
-            kernel_init_size,
+    /// Assemble the [`MemoryBudget`] for `prepared`. Every budget consumer —
+    /// the pre-admission sizing, the permit ceiling, and the load-time
+    /// re-validation — goes through here so all three see identical inputs;
+    /// a divergence would let a cell be admitted against one figure and
+    /// rejected against another.
+    fn memory_budget(&self, prepared: &PreparedInitrd) -> Result<MemoryBudget> {
+        let (init_coverage_instrumented, instrumented_reserve_bytes) = prepared.coverage();
+        Ok(MemoryBudget {
+            uncompressed_initramfs_bytes: prepared.uncompressed_len() as u64,
+            compressed_initrd_bytes: prepared.compressed_len() as u64,
+            kernel_init_size: read_kernel_init_size(&self.kernel)?,
             init_coverage_instrumented,
             instrumented_reserve_bytes,
             tmpfs_fraction: self.tmpfs_fraction(),
-        };
+        })
+    }
+
+    /// Enforce the initramfs memory floor already applied at admission.
+    ///
+    /// Defense in depth: a builder with too-small `memory_mib` fails fast
+    /// here instead of OOMing during boot. Arch-neutral — both the x86_64
+    /// and aarch64 loaders gate on this before mapping the stream.
+    fn ensure_initramfs_memory(&self, prepared: &PreparedInitrd, memory_mib: u32) -> Result<()> {
+        let budget = self.memory_budget(prepared)?;
         let min_mib = initramfs_min_memory_mib(&budget);
         if memory_mib < min_mib {
             anyhow::bail!(
@@ -1442,97 +1806,99 @@ impl KtstrVm {
                  (uncompressed={}MiB, compressed={}MiB, \
                  init_size={}MiB): need {}MiB",
                 memory_mib,
-                uncompressed_size >> 20,
-                compressed_size >> 20,
-                kernel_init_size >> 20,
+                prepared.uncompressed_len() >> 20,
+                prepared.compressed_len() >> 20,
+                budget.kernel_init_size >> 20,
                 min_mib,
             );
         }
-
-        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
-        Ok((Some(load_addr), Some(size)))
+        Ok(())
     }
 
-    /// Deferred memory path: join initramfs, compute memory from actual
-    /// size, allocate guest memory, then load initramfs.
+    /// Resolve the exact guest-memory allocation from immutable prepared
+    /// inputs. This runs before host admission so the queue claim and the KVM
+    /// allocation use the same value.
+    pub(super) fn prepared_memory_mib(&self, prepared: Option<&PreparedInitrd>) -> Result<u32> {
+        let computed_min = if let Some(prepared) = prepared {
+            let budget = self.memory_budget(prepared)?;
+            initramfs_min_memory_mib(&budget).max(self.memory_min_mib)
+        } else {
+            256u32.max(self.memory_min_mib)
+        };
+        if let Some(configured) = self.memory_mib {
+            anyhow::ensure!(
+                configured >= computed_min,
+                "VM memory {configured}MiB is below the prepared image minimum of {computed_min}MiB"
+            );
+            Ok(configured)
+        } else {
+            Ok(computed_min)
+        }
+    }
+
+    /// Host-memory PERMIT sizing for this cell, distinct from the guest RAM
+    /// SIZE ([`Self::prepared_memory_mib`], which the KVM allocation still
+    /// uses unchanged).
     ///
-    /// Returns `(initrd_addr, initrd_size, memory_mib)`.
+    /// The admission permit reserves what a *trusted deferred* workload
+    /// makes resident, not the guest's advertised RAM. For the default /
+    /// no-perf path the backing is `MAP_NORESERVE` demand-paged (see
+    /// [`super::numa_mem`]'s `anonymous_node_map_flags` and its
+    /// oversubscription note), so the permit charges the touch ceiling
+    /// ([`touch_ceiling_mib`]) — the untouched tail between the resident set
+    /// and the sized RAM is free. A memory-hungry test keeps its escape
+    /// hatch: the ceiling is raised to any explicitly declared
+    /// `.memory_mib(...)`. The result never exceeds `sized_mib` (the guest
+    /// cannot touch more RAM than it is given). The only OOM exposure is a
+    /// test that touches more than the ceiling *without* declaring it.
+    ///
+    /// Performance mode is the exception. Its regions are prefaulted whole
+    /// by `NumaMemoryLayout::mbind_regions` (`MADV_POPULATE_WRITE`), and its
+    /// opportunistic hugetlb backing draws from a physically reserved,
+    /// non-`MAP_NORESERVE` pool (`anonymous_node_map_flags`) — either way
+    /// host residency equals the sized RAM, so the permit charges the full
+    /// size. This is the "hugetlb / prefaulted pool is physically reserved"
+    /// guard: `performance_mode` is the only path that reaches either the
+    /// `MAP_HUGETLB` mapping or the whole-region prefault.
+    pub(super) fn permit_memory_mib(
+        &self,
+        prepared: Option<&PreparedInitrd>,
+        sized_mib: u32,
+    ) -> Result<u32> {
+        let ceiling = if let Some(prepared) = prepared {
+            let budget = self.memory_budget(prepared)?;
+            touch_ceiling_mib(&budget, self.topology.total_cpus())
+        } else {
+            // No prepared image (a static-memory VM): nothing better bounds
+            // residency than the sized value itself.
+            sized_mib
+        };
+        Ok(resolve_permit_memory_mib(
+            self.performance_mode,
+            ceiling,
+            self.memory_mib.unwrap_or(0),
+            sized_mib,
+        ))
+    }
+
+    /// Validate and load a prepared initramfs into already allocated guest
+    /// memory.
     ///
     /// x86_64-only: aarch64 uses
-    /// `Self::join_compute_memory_and_load_aarch64`, which orders
-    /// the load_addr computation after `allocate_and_register_memory`
-    /// (the FDT-relative initrd address depends on `memory_mib`,
-    /// which is itself computed from the post-compress total size).
+    /// `Self::validate_and_load_initramfs_aarch64`, which computes the
+    /// FDT-relative load address from the prepared stream's compressed size.
     #[cfg(target_arch = "x86_64")]
-    fn join_compute_memory_and_load(
+    fn validate_and_load_initramfs(
         &self,
         vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
+        prepared: PreparedInitrd,
         load_addr: u64,
-    ) -> Result<(Option<u64>, Option<u32>, u32)> {
-        let t0 = Instant::now();
-        let (base, key) = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-        let base_bytes: &[u8] = base.as_ref();
-
-        let t0 = Instant::now();
-        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
-        let uncompressed_size = base_bytes.len() + suffix.len();
-        tracing::debug!(
-            elapsed_us = t0.elapsed().as_micros(),
-            base_bytes = base_bytes.len(),
-            suffix_bytes = suffix.len(),
-            "build_suffix",
-        );
-
-        let t0_compress = Instant::now();
-        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
-        let compressed_size = lz4_base.len() + lz4_suffix.len();
-        tracing::debug!(
-            elapsed_us = t0_compress.elapsed().as_micros(),
-            uncompressed = uncompressed_size,
-            compressed = compressed_size,
-            ratio = format!("{:.1}x", uncompressed_size as f64 / compressed_size as f64),
-            "deferred_lz4_compress",
-        );
-
-        // Compute memory from actual sizes, honoring the
-        // topology-requested minimum when non-zero.
-        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-        let (init_coverage_instrumented, instrumented_reserve_bytes) =
-            self.init_payload_coverage_reserve();
-        let budget = MemoryBudget {
-            uncompressed_initramfs_bytes: uncompressed_size as u64,
-            compressed_initrd_bytes: compressed_size as u64,
-            kernel_init_size,
-            init_coverage_instrumented,
-            instrumented_reserve_bytes,
-            tmpfs_fraction: self.tmpfs_fraction(),
-        };
-        let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mib);
-        tracing::debug!(
-            uncompressed_mib = uncompressed_size >> 20,
-            compressed_mib = compressed_size >> 20,
-            init_size_mib = kernel_init_size >> 20,
-            coverage_instrumented = init_coverage_instrumented,
-            coverage_reserve_mib = instrumented_reserve_bytes >> 20,
-            memory_min_mib = self.memory_min_mib,
-            memory_mib,
-            "deferred_memory_computed",
-        );
-
-        // Allocate and register guest memory.
-        vm.allocate_and_register_memory(memory_mib)
-            .with_context(|| format!("allocate deferred memory ({memory_mib}MiB)"))?;
-
-        // Load pre-compressed data into guest memory. The base is already
-        // in the LZ4 SHM cache from get_or_compress_base above, so
-        // compress_and_load_initrd will hit the cache.
-        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
-        Ok((Some(load_addr), Some(size), memory_mib))
+        mbind_node_map: &[Vec<usize>],
+        memory_mib: u32,
+    ) -> Result<(Option<u64>, Option<u32>)> {
+        self.ensure_initramfs_memory(&prepared, memory_mib)?;
+        let size = self.load_prepared_initrd(vm, prepared, load_addr, mbind_node_map)?;
+        Ok((Some(load_addr), Some(size)))
     }
 
     pub(super) fn effective_memory_mib(&self, guest_mem: &GuestMemoryMmap) -> u32 {
@@ -1546,227 +1912,41 @@ impl KtstrVm {
         }
     }
 
-    /// Get or build the compressed base. LZ4 delegates to the SHM
-    /// one-compressor election in `initramfs_cache` (which uses no
-    /// builder state, only the content hash); any other format —
-    /// the prebuilt-distro fallback for kernels without RD_LZ4 —
-    /// compresses locally, outside the LZ4-shaped SHM/COW machinery.
-    fn get_or_compress_base(&self, base_bytes: &[u8], key: &BaseKey) -> Result<Vec<u8>> {
-        match self.initrd_compression {
-            initramfs::InitrdCompression::Lz4 => Ok(get_or_compress_base_shm(key.0, base_bytes)),
-            other => initramfs::compress_initrd_part(other, base_bytes),
-        }
-    }
-
-    /// Try to COW-overlay the compressed base from LZ4 SHM into guest
-    /// memory. Returns `Some(CowOverlayGuard)` on success — the guard
-    /// owns the SHM fd and holds `LOCK_SH` for the mapping's lifetime,
-    /// and MUST be kept alive as long as the COW overlay is in use
-    /// (typically the VM lifetime). Validates the segment starts with
-    /// LZ4 legacy magic to reject stale data from a previous
-    /// compression format.
-    ///
-    /// Associated function (no `&self`): the COW path is a pure
-    /// transform of `(guest_mem, key, expected_len, load_addr)` —
-    /// it reads the SHM segment keyed by `key.0` and maps it into
-    /// `guest_mem`, touching no VM instance state. Keeping it
-    /// `self`-free lets the unit test drive the real overlay logic
-    /// without constructing a full `KtstrVm`.
-    fn try_cow_overlay(
-        guest_mem: &GuestMemoryMmap,
-        key: &BaseKey,
-        expected_len: usize,
-        load_addr: u64,
-    ) -> Option<initramfs::CowOverlayGuard> {
-        let (fd, len) = initramfs::shm_open_lz4(key.0)?;
-        if len != expected_len {
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        // Validate LZ4 legacy magic before COW-mapping. pread the
-        // first 4 bytes directly — no need to mmap the entire segment
-        // just to peek at the header.
-        use std::os::fd::AsRawFd;
-        let mut magic = [0u8; 4];
-        // SAFETY: `fd` is owned by `shm_open_lz4` and remains valid
-        // until `shm_close_fd` below; `magic` is a 4-byte stack buffer
-        // and the read length is exactly 4. The fd refers to a SHM
-        // segment with `len >= expected_len` bytes (verified above and
-        // by `shm_open_lz4`'s fstat check).
-        let n = unsafe {
-            libc::pread(
-                fd.as_raw_fd(),
-                magic.as_mut_ptr() as *mut libc::c_void,
-                4,
-                0,
-            )
-        };
-        if n != 4 {
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        if magic != initramfs::LZ4_LEGACY_MAGIC {
-            tracing::warn!(
-                magic = format!(
-                    "{:02x}{:02x}{:02x}{:02x}",
-                    magic[0], magic[1], magic[2], magic[3]
-                ),
-                "stale compressed shm segment in COW path, skipping"
-            );
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        // Refuse zero-length: mmap(len=0) is EINVAL and serves no
-        // purpose; the suffix-write fallback handles empty bases
-        // trivially. Also refuse load_addr + len overflow before
-        // bounds-checking, since GuestAddress arithmetic wraps
-        // silently on u64 overflow.
-        if len == 0 || load_addr.checked_add(len as u64).is_none() {
-            tracing::debug!(
-                load_addr = format!("{:#x}", load_addr),
-                len,
-                "cow_overlay: invalid range (zero-length or overflow), falling back"
-            );
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        // The MAP_FIXED mmap rounds `len` up to the next host page
-        // boundary internally — Apple Silicon kernels run with 16 KB
-        // pages, so a 5000-byte segment mapped against a 16 KB-page
-        // host actually clobbers 16384 bytes of host VA. Bounds-check
-        // against the rounded-up length so we don't accept a mapping
-        // that overruns the guest region, and reject load_addr that
-        // isn't host-page-aligned (mmap returns EINVAL otherwise).
-        #[cfg(target_arch = "aarch64")]
-        let host_page = host_page_size();
-        // x86_64 hosts always run with 4 KB pages, and the call sites
-        // page-align load_addr to 4 KB; the rounded-up length matches
-        // `len` exactly. Use the constant instead of paying for a
-        // sysconf(2) on every overlay attempt.
-        #[cfg(target_arch = "x86_64")]
-        let host_page: u64 = 0x1000;
-        if load_addr & (host_page - 1) != 0 {
-            tracing::debug!(
-                load_addr = format!("{:#x}", load_addr),
-                host_page,
-                "cow_overlay: load_addr not host-page-aligned, falling back"
-            );
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        let rounded_len = (len as u64)
-            .checked_add(host_page - 1)
-            .map(|v| v & !(host_page - 1));
-        let Some(rounded_len) = rounded_len else {
-            tracing::debug!(
-                load_addr = format!("{:#x}", load_addr),
-                len,
-                "cow_overlay: rounded length overflows u64, falling back"
-            );
-            initramfs::shm_close_fd(fd);
-            return None;
-        };
-        // Bounds-check [load_addr, load_addr + rounded_len) against
-        // guest memory BEFORE the MAP_FIXED mmap. `get_host_address`
-        // only validates the start address — without a length check,
-        // MAP_FIXED would silently overwrite whatever host VA happens
-        // to follow the region (other guest regions, reserved VA, or
-        // unrelated mappings). `get_slice` fails if the range extends
-        // past the region's end or spans a region boundary, which is
-        // exactly the guarantee MAP_FIXED needs.
-        let rounded_usize = match usize::try_from(rounded_len) {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::debug!(
-                    load_addr = format!("{:#x}", load_addr),
-                    rounded_len,
-                    "cow_overlay: rounded length exceeds usize, falling back"
-                );
-                initramfs::shm_close_fd(fd);
-                return None;
-            }
-        };
-        if guest_mem
-            .get_slice(GuestAddress(load_addr), rounded_usize)
-            .is_err()
-        {
-            tracing::debug!(
-                load_addr = format!("{:#x}", load_addr),
-                len,
-                rounded_len,
-                "cow_overlay: range exceeds guest memory region, falling back"
-            );
-            initramfs::shm_close_fd(fd);
-            return None;
-        }
-        let Ok(host_addr) = guest_mem.get_host_address(GuestAddress(load_addr)) else {
-            initramfs::shm_close_fd(fd);
-            return None;
-        };
-        // cow_overlay takes ownership of `fd` on both Some and None
-        // paths: on success the guard carries it; on failure
-        // cow_overlay itself closes it. Do NOT call shm_close_fd here.
-        unsafe { initramfs::cow_overlay(host_addr, len, fd) }
-    }
-
     /// Write cmdline, boot params, and topology tables to guest memory.
     ///
-    /// When `kernel_result` is `None` (deferred memory mode), this method
-    /// first joins the initramfs thread to learn the actual size, allocates
-    /// guest memory from that size, does mbind, and loads the kernel — all
-    /// before proceeding with the normal initramfs load and boot param setup.
+    /// Memory is already allocated and the kernel already loaded by
+    /// [`Self::create_vm_and_load_kernel`]; this maps the prepared initramfs
+    /// on top, freezes the HVA layout, and emits boot params / MP / ACPI.
     #[cfg(target_arch = "x86_64")]
     pub(super) fn setup_memory(
         &self,
         vm: &mut kvm::KtstrKvm,
-        kernel_result: Option<boot::KernelLoadResult>,
-        initramfs_handle: Option<JoinHandle<Result<(BaseRef, BaseKey)>>>,
+        kernel_result: boot::KernelLoadResult,
+        prepared_initrd: Option<PreparedInitrd>,
+        mbind_node_map: &[Vec<usize>],
+        admitted_memory_mib: u32,
     ) -> Result<boot::KernelLoadResult> {
-        // Deferred memory path: join initramfs first to learn its size,
-        // then allocate memory, load kernel, and load initramfs — all in
-        // one shot with no estimation.
-        let (kernel_result, initrd_addr, initrd_size) = if let Some(kr) = kernel_result {
-            // Non-deferred: memory already allocated, kernel already loaded.
-            // compress_and_load_initrd transfers the CowOverlayGuard
-            // directly onto vm.cow_overlay_guards before any fallible
-            // operation, so a mid-function `?` cannot drop the guard
-            // before the COW VMAs are torn down.
-            let (initrd_addr, initrd_size) = match initramfs_handle {
-                Some(handle) => self.join_and_load_initramfs(vm, handle, INITRD_ADDR)?,
-                None => (None, None),
-            };
-            (kr, initrd_addr, initrd_size)
-        } else {
-            // Deferred memory path: join initramfs first to learn its size,
-            // then allocate memory, load kernel, and load initramfs — all in
-            // one shot with no estimation.
-            let (initrd_addr, initrd_size, _memory_mib) = match initramfs_handle {
-                Some(handle) => self.join_compute_memory_and_load(vm, handle, INITRD_ADDR)?,
-                None => {
-                    // No initramfs — allocate minimum memory.
-                    let memory_mib = 256u32;
-                    vm.allocate_and_register_memory(memory_mib)
-                        .context("allocate deferred memory (no initramfs)")?;
-                    (None, None, memory_mib)
-                }
-            };
-
-            if self.performance_mode && !self.mbind_node_map.is_empty() {
-                let layout = vm.numa_layout.as_ref().expect(
-                    "numa_layout is Some after the deferred allocate_and_register_memory \
-                     call above: that call sets numa_layout to Some(...) in \
-                     src/vmm/{x86_64,aarch64}/kvm.rs before this branch can reach here",
-                );
-                layout.mbind_regions(&vm.guest_mem, &self.mbind_node_map);
-            }
-
-            // Load kernel into the freshly allocated memory.
-            let t0 = Instant::now();
-            let kr = boot::load_kernel(&vm.guest_mem, &self.kernel).context("load kernel")?;
-            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_kernel");
-
-            (kr, initrd_addr, initrd_size)
+        // load_prepared_initrd transfers the CowOverlayGuard directly onto
+        // vm.cow_overlay_guards before any fallible operation, so a
+        // mid-function `?` cannot drop the guard before the COW VMAs are
+        // torn down.
+        let (initrd_addr, initrd_size) = match prepared_initrd {
+            Some(prepared) => self.validate_and_load_initramfs(
+                vm,
+                prepared,
+                INITRD_ADDR,
+                mbind_node_map,
+                admitted_memory_mib,
+            )?,
+            None => (None, None),
         };
+
+        // The guest-memory HVA becomes immutable at this boundary. Kernel and
+        // NUMA setup may have populated anonymous RAM, and the complete
+        // prepared initrd is now a disjoint COW VMA layout; no MAP_FIXED is
+        // permitted after KVM learns the address range.
+        vm.register_memory()
+            .context("register final guest-memory layout with KVM")?;
 
         // Resolve effective memory_mib for boot params / ACPI / SHM.
         let memory_mib = self.effective_memory_mib(&vm.guest_mem);
@@ -1791,10 +1971,8 @@ impl KtstrVm {
             &vm.guest_mem,
             &self.topology,
             vm.numa_layout.as_ref().expect(
-                "numa_layout is Some by the time setup_acpi runs: \
-                 memory allocation (whether deferred or not) ran earlier \
-                 in this function and set numa_layout via \
-                 allocate_and_register_memory in src/vmm/x86_64/kvm.rs",
+                "numa_layout is Some for every VM: KtstrKvm::new allocates \
+                 guest memory and sets it (src/vmm/x86_64/kvm.rs)",
             ),
             vm.pci_enabled,
             self.networks.len(),
@@ -1803,6 +1981,75 @@ impl KtstrVm {
         tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "mptable_acpi");
 
         Ok(kernel_result)
+    }
+
+    /// Dynamic cmdline tail shared by both arches. Companion to
+    /// [`base_guest_cmdline`]: that pins the static common flags, this pins
+    /// the config-derived ones (verbose/loglevel, rdinit, disk auto-mount,
+    /// numa balancing, wprof, bpf-map-write gate, cmdline_extra). Centralized
+    /// for the same reason — a per-arch drift here previously left
+    /// `sysctl.vm.overcommit_memory=1` on x86 only, OOM-ing the aarch64 guest
+    /// /init.
+    ///
+    /// `verbose_extra` is the per-arch verbose-only prefix (x86_64:
+    /// `" earlyprintk=serial"`; aarch64: `""` — it already has earlycon
+    /// unconditionally). `cmdline_extra` stays LAST so an operator
+    /// `.cmdline("loglevel=7")` still wins the kernel's last-duplicate-wins
+    /// parse.
+    fn append_dynamic_cmdline_tail(&self, cmdline: &mut String, verbose_extra: &str) {
+        let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
+        if verbose {
+            cmdline.push_str(verbose_extra);
+            cmdline.push_str(" loglevel=7");
+        } else {
+            cmdline.push_str(" loglevel=0");
+        }
+        if self.init_binary.is_some() {
+            cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
+        }
+        // Auto-mount handshake. Emit a `KTSTR_DISK0_FS=<tag>` token whenever
+        // the first disk has been pre-formatted so the guest init at
+        // [`crate::vmm::rust_init::auto_mount_data_disks`] can mount
+        // `/dev/vda` at `/mnt/disk0` before the test dispatch runs.
+        // `Filesystem::Raw` skips the emission because there is no on-disk fs
+        // to mount; the guest sees only the absent token and short-circuits
+        // the mount path.
+        //
+        // `KTSTR_DISK0_RO=1` is emitted when the disk is configured
+        // `read_only`. The virtio_blk device advertises `VIRTIO_BLK_F_RO` for
+        // that case so the guest's gendisk is RO; mounting RW would fail with
+        // `-EROFS` (kernel `do_mount` path: `__btrfs_open_devices` probes the
+        // bdev's `bdev_read_only` and returns EROFS when the RW mount tries to
+        // write). The token lets the guest set `MS_RDONLY` proactively,
+        // surfacing the intent in the cmdline and avoiding the kernel-side
+        // EROFS path.
+        //
+        // The cache_tag() value is reused as the fstype string because it is
+        // already kebab-free, <=8 chars, and matches the on-disk-format
+        // identifier the host selected — using the same value for both keeps
+        // the guest mount and host cache key in lockstep, so a future
+        // `Filesystem` variant rename only has to update one place (the
+        // `cache_tag` match in disk_config.rs) and the cmdline / mount
+        // automatically follow.
+        if let Some(disk) = self.disk.as_ref() {
+            cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
+        }
+        cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
+        #[cfg(feature = "wprof")]
+        if let Some(wprof) = self.wprof.as_ref() {
+            cmdline.push_str(" KTSTR_WPROF_ARGS=");
+            cmdline.push_str(&wprof.args_cmdline());
+        }
+        if !self.bpf_map_writes.is_empty() {
+            cmdline.push_str(" KTSTR_AWAIT_BPF_MAP_WRITE_READY=1");
+        }
+        if !self.cmdline_extra.is_empty() {
+            cmdline.push(' ');
+            cmdline.push_str(&self.cmdline_extra);
+        }
     }
 
     /// Build the guest kernel cmdline (base flags + per-device `virtio_mmio.device=` tokens).
@@ -1860,18 +2107,6 @@ impl KtstrVm {
             "no_timer_check clocksource=kvm-clock i8042.noaux i8042.nomux \
              i8042.nopnp i8042.dumbkbd {pci_flag}reboot=k"
         ));
-        let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
-            .map(|v| v == "1")
-            .unwrap_or(false)
-            || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
-        if verbose {
-            cmdline.push_str(" earlyprintk=serial loglevel=7");
-        } else {
-            cmdline.push_str(" loglevel=0");
-        }
-        if self.init_binary.is_some() {
-            cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
-        }
         // Virtio-console MMIO device on the kernel cmdline. The kernel's
         // virtio_mmio_cmdline_devices driver parses this to register the
         // MMIO transport at the given base address and IRQ.
@@ -1886,58 +2121,16 @@ impl KtstrVm {
         // the virtio-pci driver — it needs NO `virtio_mmio.device=` token (the
         // same reason the NIC emits none; aarch64 keeps blk on virtio-MMIO and
         // emits the token in `finish_aarch64_setup`). The single PCI block
-        // function becomes `/dev/vda`. The auto-mount handshake tokens below are
-        // transport-independent and still emitted whenever a disk is attached.
-        if let Some(disk) = self.disk.as_ref() {
-            // Auto-mount handshake. Emit a `KTSTR_DISK0_FS=<tag>`
-            // token whenever the first disk has been pre-formatted so
-            // the guest init at
-            // [`crate::vmm::rust_init::auto_mount_data_disks`]
-            // can mount `/dev/vda` at `/mnt/disk0` before the test
-            // dispatch runs. `Filesystem::Raw` skips the emission
-            // because there is no on-disk fs to mount; the guest
-            // sees only the absent token and short-circuits the
-            // mount path.
-            //
-            // `KTSTR_DISK0_RO=1` is emitted when the disk is
-            // configured `read_only`. The virtio_blk device
-            // advertises `VIRTIO_BLK_F_RO` for that case so the
-            // guest's gendisk is RO; mounting RW would fail with
-            // `-EROFS` (kernel `do_mount` path: `__btrfs_open_devices`
-            // probes the bdev's `bdev_read_only` and returns EROFS
-            // when the RW mount tries to write). The token lets the
-            // guest set `MS_RDONLY` proactively, surfacing the
-            // intent in the cmdline and avoiding the kernel-side
-            // EROFS path.
-            //
-            // The cache_tag() value is reused as the fstype string
-            // because it is already kebab-free, ≤8 chars, and
-            // matches the on-disk-format identifier the host
-            // selected — using the same value for both keeps the
-            // guest mount and host cache key in lockstep, so a
-            // future `Filesystem` variant rename only has to update
-            // one place (the `cache_tag` match in disk_config.rs)
-            // and the cmdline / mount automatically follow.
-            cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
-        }
-        // No virtio-net cmdline token on x86_64: the NIC is a virtio-pci
-        // function (builder `.network()` sets `pci_enabled`), enumerated
-        // by the guest over ECAM and bound by the virtio-pci driver — it
-        // needs no `virtio_mmio.device=` token. (aarch64 keeps its NIC on
-        // virtio-MMIO and emits the token in `finish_aarch64_setup`.)
-        cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
-        #[cfg(feature = "wprof")]
-        if let Some(wprof) = self.wprof.as_ref() {
-            cmdline.push_str(" KTSTR_WPROF_ARGS=");
-            cmdline.push_str(&wprof.args_cmdline());
-        }
-        if !self.bpf_map_writes.is_empty() {
-            cmdline.push_str(" KTSTR_AWAIT_BPF_MAP_WRITE_READY=1");
-        }
-        if !self.cmdline_extra.is_empty() {
-            cmdline.push(' ');
-            cmdline.push_str(&self.cmdline_extra);
-        }
+        // function becomes `/dev/vda`. The auto-mount handshake tokens in the
+        // shared tail are transport-independent and still emitted whenever a
+        // disk is attached.
+        //
+        // No virtio-net cmdline token on x86_64 either: the NIC is a
+        // virtio-pci function (builder `.network()` sets `pci_enabled`),
+        // enumerated by the guest over ECAM and bound by the virtio-pci
+        // driver. (aarch64 keeps its NIC on virtio-MMIO and emits the token in
+        // `finish_aarch64_setup`.)
+        self.append_dynamic_cmdline_tail(&mut cmdline, " earlyprintk=serial");
         cmdline
     }
 
@@ -1978,13 +2171,13 @@ impl KtstrVm {
 
 #[cfg(target_arch = "aarch64")]
 impl KtstrVm {
-    /// Allocate and register guest memory regions for aarch64, including
-    /// NUMA-aware placement.
+    /// Map the prepared initramfs, register guest memory, and emit the FDT
+    /// for aarch64.
     ///
-    /// Uses the same LZ4 SHM compress cache and COW overlay path as the
-    /// x86_64 `Self::setup_memory` flow. The shared helpers
-    /// ([`Self::get_or_compress_base`], [`Self::compress_and_load_initrd`],
-    /// [`Self::try_cow_overlay`]) are arch-neutral; this function differs
+    /// Uses the same persistent prepared-initrd CAS and direct COW mapping
+    /// path as the x86_64 `Self::setup_memory` flow. The shared helpers
+    /// ([`Self::load_prepared_initrd`] and the prepared-initrd CAS range
+    /// planner) are arch-neutral; this function differs
     /// from the x86_64 driver only in (a) computing the initrd load
     /// address from the dynamic FDT placement (`aarch64_initrd_addr`)
     /// instead of the fixed `INITRD_ADDR`, and (b) handing off to
@@ -1993,211 +2186,51 @@ impl KtstrVm {
     pub(super) fn setup_memory_aarch64(
         &self,
         vm: &mut kvm::KtstrKvm,
-        kernel_result: Option<boot::KernelLoadResult>,
-        initramfs_handle: Option<JoinHandle<Result<(BaseRef, BaseKey)>>>,
+        kernel_result: boot::KernelLoadResult,
+        prepared_initrd: Option<PreparedInitrd>,
+        mbind_node_map: &[Vec<usize>],
+        admitted_memory_mib: u32,
     ) -> Result<boot::KernelLoadResult> {
-        // Deferred memory path for aarch64.
-        let (kernel_result, initrd_addr, initrd_size) = if let Some(kr) = kernel_result {
-            // Non-deferred: memory already allocated, kernel already loaded.
-            // compress_and_load_initrd transfers the CowOverlayGuard
-            // directly onto vm.cow_overlay_guards before any fallible
-            // operation, so a mid-function `?` cannot drop the guard
-            // before the COW VMAs are torn down.
-            let (initrd_addr, initrd_size) = match initramfs_handle {
-                Some(handle) => {
-                    // `self.memory_mib` is required on the non-deferred
-                    // path: deferred boots take the early-return branch
-                    // below, so we only reach this site after the builder
-                    // accepted a concrete `memory_mib`. Surface it as an
-                    // error rather than `unwrap()` so a future refactor
-                    // that drops the deferred guard fails loudly with an
-                    // actionable diagnostic instead of an opaque panic.
-                    let memory_mib = self.memory_mib.context(
-                        "internal: non-deferred aarch64 path requires memory_mib to be set",
-                    )?;
-                    self.join_and_load_initramfs_aarch64(vm, handle, memory_mib)?
-                }
-                None => (None, None),
-            };
-            (kr, initrd_addr, initrd_size)
-        } else {
-            // Deferred memory path: join initramfs first to learn its
-            // size, allocate memory, then load kernel and initramfs.
-            let (initrd_addr, initrd_size) = match initramfs_handle {
-                Some(handle) => self.join_compute_memory_and_load_aarch64(vm, handle)?,
-                None => {
-                    // No initramfs — allocate minimum memory.
-                    let memory_mib = 256u32;
-                    vm.allocate_and_register_memory(memory_mib)
-                        .context("allocate deferred memory (no initramfs, aarch64)")?;
-                    (None, None)
-                }
-            };
-
-            // Load kernel into the freshly allocated memory.
-            let t0 = Instant::now();
-            let kr =
-                boot::load_kernel(&vm.guest_mem, &self.kernel).context("load kernel (aarch64)")?;
-            tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "load_kernel");
-
-            (kr, initrd_addr, initrd_size)
+        // load_prepared_initrd transfers the CowOverlayGuard directly onto
+        // vm.cow_overlay_guards before any fallible operation, so a
+        // mid-function `?` cannot drop the guard before the COW VMAs are
+        // torn down.
+        let (initrd_addr, initrd_size) = match prepared_initrd {
+            Some(prepared) => self.validate_and_load_initramfs_aarch64(
+                vm,
+                prepared,
+                admitted_memory_mib,
+                mbind_node_map,
+            )?,
+            None => (None, None),
         };
 
+        // PVTIME setup in finish_aarch64_setup resolves its GPA through a
+        // memslot, so register immediately after the final COW mapping and
+        // before that ioctl. No later operation replaces a VMA.
+        vm.register_memory()
+            .context("register final aarch64 guest-memory layout with KVM")?;
         self.finish_aarch64_setup(vm, kernel_result, initrd_addr, initrd_size)
     }
 
-    /// Non-deferred aarch64 initramfs load: join handle, build suffix,
-    /// compress base+suffix via the LZ4 SHM cache to learn the
-    /// compressed size, validate that `memory_mib` is sufficient, compute
-    /// the FDT-relative load address, then COW-or-copy the compressed
-    /// stream into guest memory via the shared
-    /// [`Self::compress_and_load_initrd`] path.
-    fn join_and_load_initramfs_aarch64(
+    /// aarch64 initramfs load: validate that `memory_mib` is sufficient,
+    /// compute the FDT-relative load address, then direct-map the prepared
+    /// compressed stream into guest memory.
+    fn validate_and_load_initramfs_aarch64(
         &self,
         vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
+        prepared: PreparedInitrd,
         memory_mib: u32,
+        mbind_node_map: &[Vec<usize>],
     ) -> Result<(Option<u64>, Option<u32>)> {
-        let t0 = Instant::now();
-        let (base, key) = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-        let base_bytes: &[u8] = base.as_ref();
-
-        let t0 = Instant::now();
-        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
-        let uncompressed_size = base_bytes.len() + suffix.len();
-        tracing::debug!(
-            elapsed_us = t0.elapsed().as_micros(),
-            base_bytes = base_bytes.len(),
-            suffix_bytes = suffix.len(),
-            "build_suffix",
-        );
-
-        // Compress to learn the compressed size for the load_addr
-        // calculation. Primes the LZ4 SHM cache so the subsequent
-        // compress_and_load_initrd call hits the cache instead of
-        // recompressing.
-        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
-        let compressed_size = lz4_base.len() + lz4_suffix.len();
-
-        // Validate the operator-supplied memory_mib against the
-        // initramfs budget. Mirrors the x86_64 join_and_load_initramfs
-        // contract: a builder with too-small memory_mib fails fast here
-        // instead of OOMing during boot.
-        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-        let (init_coverage_instrumented, instrumented_reserve_bytes) =
-            self.init_payload_coverage_reserve();
-        let budget = MemoryBudget {
-            uncompressed_initramfs_bytes: uncompressed_size as u64,
-            compressed_initrd_bytes: compressed_size as u64,
-            kernel_init_size,
-            init_coverage_instrumented,
-            instrumented_reserve_bytes,
-            tmpfs_fraction: self.tmpfs_fraction(),
-        };
-        let min_mib = initramfs_min_memory_mib(&budget);
-        if memory_mib < min_mib {
-            anyhow::bail!(
-                "VM memory {}MiB insufficient for initramfs \
-                 (uncompressed={}MiB, compressed={}MiB, \
-                 init_size={}MiB): need {}MiB",
-                memory_mib,
-                uncompressed_size >> 20,
-                compressed_size >> 20,
-                kernel_init_size >> 20,
-                min_mib,
-            );
-        }
-
+        self.ensure_initramfs_memory(&prepared, memory_mib)?;
+        let compressed_size = prepared.compressed_len();
         let load_addr = aarch64_initrd_addr(
             memory_mib,
             self.topology.total_cpus(),
             compressed_size as u64,
         )?;
-        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
-        Ok((Some(load_addr), Some(size)))
-    }
-
-    /// Deferred aarch64 initramfs load: join handle, build suffix,
-    /// compress (priming the LZ4 SHM cache), compute memory budget,
-    /// allocate guest memory, then load initramfs via the shared
-    /// COW-overlay path. Returns `(Some(load_addr), Some(size))`.
-    fn join_compute_memory_and_load_aarch64(
-        &self,
-        vm: &mut kvm::KtstrKvm,
-        handle: JoinHandle<Result<(BaseRef, BaseKey)>>,
-    ) -> Result<(Option<u64>, Option<u32>)> {
-        let t0 = Instant::now();
-        let (base, key) = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("initramfs-resolve thread panicked"))??;
-        tracing::debug!(elapsed_us = t0.elapsed().as_micros(), "initramfs_join");
-        let base_bytes: &[u8] = base.as_ref();
-
-        let t0 = Instant::now();
-        let suffix = initramfs::build_suffix(base_bytes.len(), &self.suffix_params())?;
-        let uncompressed_size = base_bytes.len() + suffix.len();
-        tracing::debug!(
-            elapsed_us = t0.elapsed().as_micros(),
-            base_bytes = base_bytes.len(),
-            suffix_bytes = suffix.len(),
-            "build_suffix",
-        );
-
-        // Compress before computing memory so the budget formula uses
-        // actual compressed size. Primes the LZ4 SHM cache so the
-        // subsequent compress_and_load_initrd call hits it.
-        let t0_compress = Instant::now();
-        let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
-        let lz4_suffix = initramfs::compress_initrd_part(self.initrd_compression, &suffix)?;
-        let compressed_size = lz4_base.len() + lz4_suffix.len();
-        tracing::debug!(
-            elapsed_us = t0_compress.elapsed().as_micros(),
-            uncompressed = uncompressed_size,
-            compressed = compressed_size,
-            ratio = format!("{:.1}x", uncompressed_size as f64 / compressed_size as f64),
-            "deferred_lz4_compress",
-        );
-
-        let kernel_init_size = read_kernel_init_size(&self.kernel)?;
-        let (init_coverage_instrumented, instrumented_reserve_bytes) =
-            self.init_payload_coverage_reserve();
-        let budget = MemoryBudget {
-            uncompressed_initramfs_bytes: uncompressed_size as u64,
-            compressed_initrd_bytes: compressed_size as u64,
-            kernel_init_size,
-            init_coverage_instrumented,
-            instrumented_reserve_bytes,
-            tmpfs_fraction: self.tmpfs_fraction(),
-        };
-        let memory_mib = initramfs_min_memory_mib(&budget).max(self.memory_min_mib);
-        tracing::debug!(
-            uncompressed_mib = uncompressed_size >> 20,
-            compressed_mib = compressed_size >> 20,
-            init_size_mib = kernel_init_size >> 20,
-            coverage_instrumented = init_coverage_instrumented,
-            coverage_reserve_mib = instrumented_reserve_bytes >> 20,
-            memory_min_mib = self.memory_min_mib,
-            memory_mib,
-            "deferred_memory_computed",
-        );
-
-        vm.allocate_and_register_memory(memory_mib)
-            .with_context(|| format!("allocate deferred memory ({memory_mib}MiB, aarch64)"))?;
-
-        // Compute load_addr only AFTER memory_mib is known: it determines
-        // the FDT position and thus pvtime_base, and the initrd now sits
-        // just below pvtime_base (the PVTIME carve), not the FDT.
-        let load_addr = aarch64_initrd_addr(
-            memory_mib,
-            self.topology.total_cpus(),
-            compressed_size as u64,
-        )?;
-
-        let size = self.compress_and_load_initrd(vm, base_bytes, &suffix, &key, load_addr)?;
+        let size = self.load_prepared_initrd(vm, prepared, load_addr, mbind_node_map)?;
         Ok((Some(load_addr), Some(size)))
     }
 
@@ -2230,43 +2263,15 @@ impl KtstrVm {
             " earlycon=uart,mmio,{:#x}",
             aarch64::kvm::SERIAL_MMIO_BASE
         ));
-        let verbose = std::env::var(crate::KTSTR_VERBOSE_ENV)
-            .map(|v| v == "1")
-            .unwrap_or(false)
-            || std::env::var("RUST_BACKTRACE").is_ok_and(|v| v == "1" || v == "full");
-        if verbose {
-            cmdline.push_str(" loglevel=7");
-        } else {
-            cmdline.push_str(" loglevel=0");
-        }
-        if self.init_binary.is_some() {
-            cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
-        }
-        // Auto-mount tokens for the configured disk. aarch64 advertises
-        // the virtio-blk MMIO transport via FDT (see
+        // aarch64 advertises the virtio-blk MMIO transport via FDT (see
         // `create_fdt(..., self.disk.is_some(), ...)` below), so the
-        // `virtio_mmio.device=` cmdline form used on x86_64 is omitted.
-        // The `KTSTR_DISK0_*` tokens, however, are env-style markers
-        // consumed by the guest init at
+        // `virtio_mmio.device=` cmdline form used on x86_64 is omitted. The
+        // `KTSTR_DISK0_*` tokens the shared tail emits, however, are env-style
+        // markers consumed by the guest init at
         // `crate::vmm::rust_init::auto_mount_data_disks` — they are
         // arch-neutral and required on aarch64 for the same auto-mount
         // contract as x86_64.
-        if let Some(disk) = self.disk.as_ref() {
-            cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
-        }
-        cmdline.push_str(numa_balancing_cmdline_token(&self.topology));
-        #[cfg(feature = "wprof")]
-        if let Some(wprof) = self.wprof.as_ref() {
-            cmdline.push_str(" KTSTR_WPROF_ARGS=");
-            cmdline.push_str(&wprof.args_cmdline());
-        }
-        if !self.bpf_map_writes.is_empty() {
-            cmdline.push_str(" KTSTR_AWAIT_BPF_MAP_WRITE_READY=1");
-        }
-        if !self.cmdline_extra.is_empty() {
-            cmdline.push(' ');
-            cmdline.push_str(&self.cmdline_extra);
-        }
+        self.append_dynamic_cmdline_tail(&mut cmdline, "");
 
         let t0 = Instant::now();
         boot::validate_cmdline(&cmdline)?;
@@ -2300,10 +2305,8 @@ impl KtstrVm {
             initrd_size,
             guest_l1_unified,
             vm.numa_layout.as_ref().expect(
-                "numa_layout is Some by the time FDT creation runs: \
-                 memory allocation (whether deferred or not) ran earlier \
-                 in this function and set numa_layout via \
-                 allocate_and_register_memory in src/vmm/aarch64/kvm.rs",
+                "numa_layout is Some for every VM: KtstrKvm::new allocates \
+                 guest memory and sets it (src/vmm/aarch64/kvm.rs)",
             ),
             self.disk.is_some(),
             !self.networks.is_empty(),
@@ -2340,39 +2343,61 @@ impl KtstrVm {
 ///
 /// Keyed on signals resolved by the time `KtstrVm::run` calls this — the
 /// build-time mode flags plus the run-time `acquire_run_locks` outcome
-/// (`overcommit` is true when the default path fell back to an overcommitted
-/// CPU mask rather than a 1:1 pin, i.e. `RunLocks::default_cpu_mask` is set):
+/// (`default_shared_cpu_claim` is true for default-style admission, including
+/// an exact pin whose lifetime reservation was converted to CPU-SH):
 ///
 /// * `no_perf_mode` → `Some(0)`: the guest deliberately shares host CPUs with
 ///   peers, so halt polling burns CPU that belongs to others.
-/// * `performance_mode` → `None`: perf mode disables HLT exits and enables the
+/// * `default_shared_cpu_claim` → `Some(0)`: an interactive shell configured
+///   from a performance builder still uses default-style shared admission, so
+///   the acquired claim outranks the build-time mode flag.
+/// * `performance_mode` → `None`: an actually isolated perf run disables HLT exits and enables the
 ///   guest's own haltpoll cpuidle (see `tune_kvm_caps`), which drives
 ///   `MSR_KVM_POLL_CONTROL` — host halt polling is redundant, leave the module
 ///   default.
-/// * default mode, overcommit fallback → `Some(0)`: vCPUs exceed the acquired
-///   host CPUs, so polling wastes contended CPU time.
-/// * default mode, 1:1 pin → `None`: each vCPU owns a host CPU; leave the
-///   module default (200_000 == KVM_HALT_POLL_NS_DEFAULT on stock x86), which
-///   is exactly what the prior build-time policy set explicitly.
+/// * default mode, exact pin or shared fallback → `Some(0)`: both retain
+///   CPU-SH, so compatible peers may overlap later and polling would burn
+///   their shared time.
 ///
 /// `no_perf_mode` is checked first: `build()` forces `performance_mode=false`
-/// under it, and overcommit only arises on the default path, so the arms are
-/// mutually exclusive — the order only fixes a defensive precedence.
+/// under it, and default-style shared admission is a separate mode outcome.
 pub(super) fn halt_poll_policy(
     no_perf_mode: bool,
     performance_mode: bool,
-    overcommit: bool,
+    default_shared_cpu_claim: bool,
 ) -> Option<u64> {
     if no_perf_mode {
+        return Some(0);
+    }
+    if default_shared_cpu_claim {
         return Some(0);
     }
     if performance_mode {
         return None;
     }
-    if overcommit {
-        return Some(0);
-    }
     None
+}
+
+/// Combine the touch `ceiling`, any explicitly `declared` memory, and the
+/// `sized` guest RAM into the host-memory PERMIT charge (MiB). Pure so the
+/// admission-charge policy is unit-testable without a live [`KtstrVm`]; see
+/// [`KtstrVm::permit_memory_mib`] for the derivation of `ceiling`.
+///
+/// - `performance_mode`: the region is prefaulted whole / hugetlb-reserved,
+///   so residency equals `sized` — charge the full size.
+/// - otherwise: charge the touch `ceiling`, but never below `declared`
+///   (the test's `.memory_mib(...)` escape hatch) and never above `sized`
+///   (the guest cannot fault in more RAM than it is given).
+fn resolve_permit_memory_mib(
+    performance_mode: bool,
+    ceiling: u32,
+    declared: u32,
+    sized: u32,
+) -> u32 {
+    if performance_mode {
+        return sized;
+    }
+    ceiling.max(declared).min(sized)
 }
 
 #[cfg(test)]

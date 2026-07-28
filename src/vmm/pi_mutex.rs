@@ -128,6 +128,23 @@ impl<T> PiMutex<T> {
         }
         PiMutexGuard { mutex: self }
     }
+
+    /// Try to lock the mutex without parking in the kernel.
+    ///
+    /// Returns `None` only for ordinary contention (`EBUSY`). Every other
+    /// failure remains fatal for the same reason as [`Self::lock`]: returning
+    /// a guard without exclusive ownership would violate Rust's aliasing
+    /// contract. Callers which own a cooperative cancellation edge can retry
+    /// this operation with a bounded park between attempts instead of becoming
+    /// uninterruptibly stuck in `pthread_mutex_lock`.
+    pub(crate) fn try_lock(&self) -> Option<PiMutexGuard<'_, T>> {
+        let rc = unsafe { libc::pthread_mutex_trylock(self.mutex.get()) };
+        match rc {
+            0 => Some(PiMutexGuard { mutex: self }),
+            libc::EBUSY => None,
+            _ => panic!("pthread_mutex_trylock failed: {rc}"),
+        }
+    }
 }
 
 impl<T> Drop for PiMutex<T> {
@@ -192,6 +209,25 @@ mod tests {
         });
         handle.join().unwrap();
         assert_eq!(*m.lock(), 1);
+    }
+
+    #[test]
+    fn pi_mutex_try_lock_reports_contention_without_blocking() {
+        let m = Arc::new(PiMutex::new(0u32));
+        let held = m.lock();
+        let m2 = Arc::clone(&m);
+        let handle = std::thread::spawn(move || {
+            assert!(
+                m2.try_lock().is_none(),
+                "try_lock must report a live owner as contention"
+            );
+        });
+        handle.join().unwrap();
+        drop(held);
+        assert!(
+            m.try_lock().is_some(),
+            "try_lock must acquire after the prior owner releases"
+        );
     }
 
     #[test]

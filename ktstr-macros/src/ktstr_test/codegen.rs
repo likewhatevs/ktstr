@@ -20,6 +20,18 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     let orig_name = &input.sig.ident;
     let inner_name = format_ident!("__ktstr_inner_{}", orig_name);
     let entry_name = format_ident!("__KTSTR_ENTRY_{}", orig_name.to_string().to_uppercase());
+    let manifest_entry_name = format_ident!(
+        "__KTSTR_SCHED_MANIFEST_TEST_{}",
+        orig_name.to_string().to_uppercase()
+    );
+    let admission_entry_name = format_ident!(
+        "__KTSTR_ADMISSION_TEST_{}",
+        orig_name.to_string().to_uppercase()
+    );
+    let admission_key_name = format_ident!(
+        "__KTSTR_ADMISSION_TEST_KEY_{}",
+        orig_name.to_string().to_uppercase()
+    );
     let name_str = orig_name.to_string();
 
     // Destructure attrs into per-field bare locals. The codegen
@@ -286,6 +298,14 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     } else {
         quote! {}
     };
+    let manifest_primary_scheduler = quote! {
+        ::ktstr::test_support::SchedulerManifestUseStampV1::new(#scheduler_tokens)
+    };
+    let manifest_staged_schedulers = staged_schedulers_slice.iter().map(|scheduler| {
+        quote! {
+            ::ktstr::test_support::SchedulerManifestUseStampV1::new(&#scheduler)
+        }
+    });
 
     // Conditionally-emitted KtstrTestEntry fields. Each block is
     // either an empty TokenStream (so the field is left to
@@ -577,18 +597,23 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
     // non-host failure; expect_ok panics with it), so it is interpolated.
     let host_arms = |not_host_class: proc_macro2::TokenStream| {
         quote! {
-            Err(e) => match ::ktstr::test_support::classify_host_error(
-                &e,
-                ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some(),
-            ) {
-                ::ktstr::test_support::HostClass::Skip { reason } => {
-                    eprintln!("ktstr: SKIP: {reason}");
-                    return;
+            Err(e) => {
+                if ::ktstr::test_support::is_framework_infrastructure_failure(&e) {
+                    panic!("ktstr: FAIL: {e:#}");
                 }
-                ::ktstr::test_support::HostClass::Fail { reason } => {
-                    panic!("ktstr: FAIL: {reason}");
+                match ::ktstr::test_support::classify_host_error(
+                    &e,
+                    ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some(),
+                ) {
+                    ::ktstr::test_support::HostClass::Skip { reason } => {
+                        eprintln!("ktstr: SKIP: {reason}");
+                        return;
+                    }
+                    ::ktstr::test_support::HostClass::Fail { reason } => {
+                        panic!("ktstr: FAIL: {reason}");
+                    }
+                    ::ktstr::test_support::HostClass::NotHostClass => #not_host_class,
                 }
-                ::ktstr::test_support::HostClass::NotHostClass => #not_host_class,
             },
         }
     };
@@ -740,6 +765,39 @@ pub(super) fn emit_entry_static(input: ItemFn, attrs: AttrValues) -> proc_macro2
             #workload_root_cgroup_field
             ..::ktstr::test_support::KtstrTestEntry::DEFAULT
         };
+
+        #[::ktstr::distributed_slice(
+            ::ktstr::test_support::KTSTR_SCHEDULER_MANIFEST_TESTS_V1
+        )]
+        #[linkme(crate = ::ktstr::linkme)]
+        static #manifest_entry_name:
+            ::ktstr::test_support::SchedulerManifestTestStampV1 =
+            ::ktstr::test_support::SchedulerManifestTestStampV1::new(
+                &#entry_name,
+                &[
+                    #manifest_primary_scheduler,
+                    #(#manifest_staged_schedulers),*
+                ],
+            );
+
+        #[::ktstr::distributed_slice(
+            ::ktstr::test_support::KTSTR_ADMISSION_TESTS_V3
+        )]
+        #[linkme(crate = ::ktstr::linkme)]
+        static #admission_entry_name:
+            ::ktstr::test_support::AdmissionTestStampV3 =
+            ::ktstr::test_support::AdmissionTestStampV3::new(&#entry_name);
+
+        #[::ktstr::distributed_slice(
+            ::ktstr::test_support::KTSTR_ADMISSION_TEST_KEYS_V3
+        )]
+        #[linkme(crate = ::ktstr::linkme)]
+        static #admission_key_name:
+            ::ktstr::test_support::AdmissionTestKeyV3 =
+            ::ktstr::test_support::AdmissionTestKeyV3::new(
+                &#entry_name,
+                &#admission_entry_name,
+            );
 
         #pairing_assert
 

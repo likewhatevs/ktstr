@@ -183,7 +183,7 @@ pub(crate) fn write_com2(msg: &str) {
 /// Materialise the per-test workload-cgroup root declared via
 /// `#[ktstr_test(workload_root_cgroup = "/path")]`. Reads
 /// `/workload_root_cgroup` (written by
-/// [`crate::vmm::initramfs::build_suffix`] when
+/// [`crate::vmm::initramfs::build_dynamic_tail`] when
 /// [`crate::vmm::initramfs::SuffixParams::workload_root_cgroup`] is
 /// `Some`), validates the absolute-path shape, mkdir's
 /// `/sys/fs/cgroup{path}`, and enables `+cpuset +cpu` controllers
@@ -206,7 +206,7 @@ pub(crate) fn create_workload_root_cgroup_from_file() {
 
 /// Materialise the per-scheduler cgroup the scheduler process is
 /// placed in. Reads `/scheduler_cgroup_parent` (written by
-/// [`crate::vmm::initramfs::build_suffix`] when
+/// [`crate::vmm::initramfs::build_dynamic_tail`] when
 /// [`crate::vmm::initramfs::SuffixParams::scheduler_cgroup_parent`]
 /// is `Some` — sourced from
 /// [`crate::test_support::Scheduler::cgroup_parent`]), validates

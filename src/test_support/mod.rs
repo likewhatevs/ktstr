@@ -53,7 +53,14 @@ use crate::scenario::Ctx;
 #[cfg(test)]
 use anyhow::Result;
 
+mod admission_stamp;
 mod args;
+#[doc(hidden)]
+pub use admission_stamp::{
+    AdmissionCellDescriptor, AdmissionCellKind, AdmissionMode, AdmissionTestKeyV3,
+    AdmissionTestStampV3, AdmissionTopologyDescriptor, KTSTR_ADMISSION_TEST_KEYS_V3,
+    KTSTR_ADMISSION_TESTS_V3, read_admission_cell_stamp,
+};
 // Re-exported for the workload-side CgroupChurn worker, which resolves the
 // same workload cgroup root the host-side setup uses but lives outside the
 // private `args` module's subtree.
@@ -72,6 +79,8 @@ mod eval;
 mod host_class;
 mod metrics;
 mod output;
+#[doc(hidden)]
+pub use output::strip_ansi_csi;
 // Reachable crate-wide (vmm::VmResult::guest_assert_result parses the guest
 // AssertResult from its own drained guest_messages via this helper, mirroring
 // the eval-layer use). The fn itself is pub(crate); this just lifts it out of
@@ -87,12 +96,54 @@ mod probe;
 pub(crate) use probe::PROBE_OUTPUT_END;
 mod probe_metrics;
 mod profraw;
+pub(crate) use eval::FrameworkInfrastructureFailure;
 pub use eval::{
     capture_starvation_witness, periodic_starvation_gate, post_vm_skip, stall_ejection_skip,
     starved_below_minimum_skip,
 };
 pub use profraw::current_binary_is_coverage_instrumented;
 pub mod runtime;
+mod scheduler_manifest_stamp;
+#[doc(hidden)]
+pub use scheduler_manifest_stamp::{
+    KTSTR_SCHEDULER_MANIFEST_DECLARATIONS_V1, KTSTR_SCHEDULER_MANIFEST_TESTS_V1,
+    SchedulerManifestDeclarationStampV1, SchedulerManifestStampSliceV1,
+    SchedulerManifestStampStrV1, SchedulerManifestStampSysctlV1, SchedulerManifestTestStampV1,
+    SchedulerManifestUseStampV1, read_scheduler_manifest_stamp,
+};
+
+/// Read scheduler discovery metadata and validate the admission wire-format
+/// envelope through one ELF mapping.
+///
+/// Cargo invokes this once per warmed binary. This path checks versions,
+/// section/header shape, registry counts, and compact-key integrity without
+/// decoding every topology payload. The target runner subsequently performs
+/// strict exact-name lookup and fully decodes the selected cell before it
+/// acquires resources or executes the test binary.
+#[doc(hidden)]
+pub fn read_scheduler_manifest_and_validate_admission_stamp(
+    path: &std::path::Path,
+) -> std::result::Result<Option<SchedulerManifestProbe>, String> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "open warmed test binary {} for ktstr metadata: {error}",
+            path.display(),
+        )
+    })?;
+    // SAFETY: the map is read-only, the file stays alive through construction,
+    // and the returned mapping owns its VMA.
+    let data = unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|error| {
+        format!(
+            "map warmed test binary {} for ktstr metadata: {error}",
+            path.display(),
+        )
+    })?;
+    scheduler_manifest_stamp::advise_sparse_elf(&data);
+    let reader = scheduler_manifest_stamp::ElfStampReader::new(path, &data)?;
+    let manifest = scheduler_manifest_stamp::read_scheduler_manifest_stamp_reader(&reader)?;
+    admission_stamp::validate_admission_stamp_envelope_reader(&reader)?;
+    Ok(manifest)
+}
 mod shell_descriptor;
 pub use shell_descriptor::{SchedulerKind, ShellTestDescriptor};
 #[cfg(feature = "wprof")]
@@ -129,8 +180,9 @@ pub(crate) use args::extract_export_output_arg;
 #[allow(unused_imports)]
 pub(crate) use args::{
     CellParentCgroupArg, VERIFIER_WORKLOAD_FLAG, cell_parent_path_is_valid,
-    extract_export_test_arg, extract_probe_stack_arg, extract_shell_test_arg, extract_test_fn_arg,
-    extract_topo_arg, extract_work_type_arg, is_verifier_workload, parse_cell_parent_cgroup,
+    extract_export_check_test_arg, extract_export_test_arg, extract_probe_stack_arg,
+    extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg, extract_work_type_arg,
+    is_verifier_workload, parse_cell_parent_cgroup,
 };
 #[allow(unused_imports)]
 pub(crate) use runtime::{append_base_sched_args, content_hash, scratch_dir, sys_rdy_budget_ms};
@@ -138,8 +190,9 @@ pub(crate) use runtime::{append_base_sched_args, content_hash, scratch_dir, sys_
 pub(crate) use sidecar::enriched_parse_error_message_for_test;
 pub use sidecar::{
     PerfDeltaAssertionRecord, SidecarResult, ThroughputDenomination, collect_pool,
-    detect_kernel_commit, format_run_artifact_footer, newest_run_dir, repo_is_dirty, runs_root,
-    sidecar_dir, source_dir_for,
+    detect_kernel_commit, detect_project_commit, format_run_artifact_footer,
+    kernel_commit_for_resolved, newest_run_dir, repo_is_dirty, runs_root, sidecar_dir,
+    source_dir_for,
 };
 pub(crate) use sidecar::{
     SidecarIoError, SidecarParseError, apply_archive_source_override, collect_sidecars,
@@ -155,15 +208,30 @@ pub use dispatch::{
 };
 pub use entry::{
     BinaryKindJson, BpfMapAgg, BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS,
-    KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, PerfDeltaAssertion, Scheduler,
-    SchedulerJson, SchedulerListEntry, SchedulerSpec, SchedulerTestJson, Sysctl, Topology,
-    TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
+    KtstrTestEntry, MemSideCache, NumaDistance, NumaNode, PerfDeltaAssertion,
+    SCHEDULER_MANIFEST_PROBE_ARG, Scheduler, SchedulerArtifactRequirement, SchedulerJson,
+    SchedulerListEntry, SchedulerManifestProbe, SchedulerSpec, SchedulerTestJson, Sysctl,
+    SysctlJson, Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
     default_post_vm_periodic_fired, find_scheduler, find_test,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};
 pub(crate) use host_class::host_skip_class;
 pub use host_class::{HostClass, classify_host_error};
+
+/// True when an error is a ktstr framework/CAS/COW infrastructure failure
+/// which must never be reinterpreted as host insufficiency or inverted by an
+/// `expect_err` test.
+///
+/// This hidden public predicate is consumed by proc-macro-generated libtest
+/// wrappers in downstream crates, where the private marker type itself cannot
+/// be named.
+#[doc(hidden)]
+pub fn is_framework_infrastructure_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<eval::FrameworkInfrastructureFailure>()
+        .is_some()
+}
 pub use metrics::{
     MAX_WALK_DEPTH, WALK_TRUNCATION_SENTINEL_NAME, extract_metrics, is_truncation_sentinel_name,
     walk_json_leaves,
@@ -175,8 +243,9 @@ pub use payload::{
 };
 pub(crate) use probe::maybe_dispatch_vm_test;
 pub(crate) use probe::{
-    PROBE_DRAIN_GRACE, finalize_probe_after_unwind, maybe_dispatch_vm_test_with_args,
-    maybe_dispatch_vm_test_with_phase_a, propagate_rust_env_from_cmdline, start_probe_phase_a,
+    PROBE_DRAIN_GRACE, ProbePhaseAState, finalize_probe_after_unwind,
+    maybe_dispatch_vm_test_with_args, maybe_dispatch_vm_test_with_phase_a,
+    propagate_rust_env_from_cmdline, start_probe_phase_a,
 };
 pub use probe_metrics::{
     MAX_SCAN_INDEX, ThreadLookup, count_indexed_metrics, find_metric, find_metric_u64,
@@ -438,14 +507,13 @@ pub(crate) fn require_bpf_prog_offsets(
 mod tests {
     use super::*;
     use crate::ktstr_test;
-    use linkme::distributed_slice;
 
     // Register a test entry in the distributed slice for unit testing find_test.
     fn __ktstr_inner_unit_test_dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
     }
 
-    #[distributed_slice(KTSTR_TESTS)]
+    #[crate::ktstr_test_entry]
     static __KTSTR_ENTRY_UNIT_TEST_DUMMY: KtstrTestEntry = KtstrTestEntry {
         name: "__unit_test_dummy__",
         func: __ktstr_inner_unit_test_dummy,

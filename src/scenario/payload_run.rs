@@ -2319,6 +2319,135 @@ mod tests {
         f(&ctx)
     }
 
+    #[cfg(unix)]
+    fn parse_proc_stat_state_and_pgrp(
+        stat: &[u8],
+        pid: libc::pid_t,
+    ) -> std::io::Result<(u8, libc::pid_t)> {
+        let delimiter = stat
+            .windows(2)
+            .rposition(|window| window == b") ")
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("/proc/{pid}/stat has no command terminator"),
+                )
+            })?;
+        let suffix = std::str::from_utf8(&stat[delimiter + 2..]).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("/proc/{pid}/stat is not UTF-8 after its command: {error}"),
+            )
+        })?;
+        let mut fields = suffix.split_ascii_whitespace();
+        let state = fields
+            .next()
+            .and_then(|field| field.as_bytes().first().copied())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("/proc/{pid}/stat has no process state"),
+                )
+            })?;
+        let _ppid = fields.next().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("/proc/{pid}/stat has no parent pid"),
+            )
+        })?;
+        let pgrp = fields
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("/proc/{pid}/stat has no process group"),
+                )
+            })?
+            .parse()
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("/proc/{pid}/stat has an invalid process group: {error}"),
+                )
+            })?;
+        Ok((state, pgrp))
+    }
+
+    #[cfg(unix)]
+    fn live_process_group_members(pgid: libc::pid_t) -> std::io::Result<Vec<(libc::pid_t, u8)>> {
+        let mut live = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<libc::pid_t>().ok())
+            else {
+                continue;
+            };
+            let stat = match std::fs::read(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let (state, member_pgid) = parse_proc_stat_state_and_pgrp(&stat, pid)?;
+            if member_pgid == pgid && !matches!(state, b'Z' | b'X' | b'x') {
+                live.push((pid, state));
+            }
+        }
+        Ok(live)
+    }
+
+    /// Wait until a process group has no live members.
+    ///
+    /// `killpg(pgid, 0)` continues succeeding while a killed descendant is a
+    /// zombie owned by an outer CI subreaper. Such a process is conclusively
+    /// dead, but this test process cannot call `wait(2)` on it. Inspecting the
+    /// process state keeps the teardown assertion strict about live members
+    /// without confusing supervisor-owned zombies for surviving workloads.
+    #[cfg(unix)]
+    fn wait_for_process_group_termination(
+        pgid: libc::pid_t,
+        timeout: std::time::Duration,
+        context: &str,
+    ) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            // SAFETY: signal zero is an existence/permission probe and does
+            // not alter any member of the process group.
+            let probe = unsafe { libc::killpg(pgid, 0) };
+            if probe != 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::ESRCH),
+                    "unexpected errno probing process group {pgid} after {context}: {error}",
+                );
+                return;
+            }
+
+            let live = live_process_group_members(pgid)
+                .unwrap_or_else(|error| panic!("inspect process group {pgid}: {error}"));
+            if live.is_empty() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("process group {pgid} still has live members after {context}: {live:?}",);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_stat_parser_handles_spaces_and_parentheses_in_comm() {
+        let stat = b"37 (worker ) with spaces) S 11 29 29 0 -1";
+        assert_eq!(
+            parse_proc_stat_state_and_pgrp(stat, 37).expect("parse synthetic stat"),
+            (b'S', 29),
+        );
+    }
+
     const FIO_BINARY: Payload = Payload {
         name: "fio",
         kind: PayloadKind::Binary("fio"),
@@ -4216,10 +4345,9 @@ mod tests {
     /// A single-process SIGKILL would leave the background sleeper
     /// alive; `killpg` must reach it.
     ///
-    /// The existence probe reaps may lag the SIGKILL delivery — the
-    /// loop waits up to 30s, which covers slow CI runners, a
-    /// heavily-loaded host, and the `waitpid` race where the child
-    /// is dying but not yet reaped.
+    /// SIGKILL delivery may lag the caller. The bounded live-member
+    /// check accepts a dead zombie that is awaiting an outer
+    /// subreaper, but still fails if any member can execute.
     #[cfg(unix)]
     #[test]
     fn kill_reaps_fork_descendants_via_process_group() {
@@ -4243,29 +4371,12 @@ mod tests {
             // private `child` field.
             let pgid = libc::pid_t::try_from(handle.pid().expect("child still present"))
                 .expect("child pid fits in pid_t");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             let (_, _) = handle.kill().expect("kill+reap");
-            // After kill+reap the whole process group must be gone.
-            // Poll `killpg(pgid, 0)` (existence probe) until ESRCH;
-            // SIGKILL delivery + reap can lag the caller.
-            loop {
-                // SAFETY: killpg with signal 0 is a pure existence query
-                // with no side effects beyond errno.
-                let rc = unsafe { libc::killpg(pgid, 0) };
-                if rc != 0 {
-                    let err = std::io::Error::last_os_error();
-                    assert_eq!(
-                        err.raw_os_error(),
-                        Some(libc::ESRCH),
-                        "unexpected errno from killpg probe: {err}",
-                    );
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    panic!("process group {pgid} still alive after kill+reap");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
+            wait_for_process_group_termination(
+                pgid,
+                std::time::Duration::from_secs(30),
+                "explicit kill+reap",
+            );
         });
     }
 
@@ -4309,29 +4420,11 @@ mod tests {
             // src/scenario/payload_run.rs routes through
             // `kill_payload_process_group` + `child.wait()`.
             drop(handle);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                // SAFETY: killpg with signal 0 is a pure existence
-                // query with no side effects beyond errno.
-                let rc = unsafe { libc::killpg(pgid, 0) };
-                if rc != 0 {
-                    let err = std::io::Error::last_os_error();
-                    assert_eq!(
-                        err.raw_os_error(),
-                        Some(libc::ESRCH),
-                        "unexpected errno from killpg probe after drop: {err}",
-                    );
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    panic!(
-                        "process group {pgid} still alive 30 s after \
-                         PayloadHandle drop — Drop-path killpg sweep \
-                         failed to reach every member",
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
+            wait_for_process_group_termination(
+                pgid,
+                std::time::Duration::from_secs(30),
+                "PayloadHandle drop",
+            );
         });
     }
 
@@ -4393,8 +4486,7 @@ mod tests {
     /// shell, drive `wait_with_deadline` with a 500 ms budget
     /// (so the whole test fits inside the 30s-slack nextest
     /// budget without standing up a whole scenario) and probes the
-    /// pgid with `killpg(pgid, 0)` after the deadline fires —
-    /// ESRCH proves the sweep reached every member.
+    /// pgid after the deadline fires and proves no live member remains.
     #[cfg(unix)]
     #[test]
     fn wait_with_deadline_timeout_kills_process_group() {
@@ -4435,36 +4527,11 @@ mod tests {
         // a future refactor that surfaces the signal number as
         // the exit_code would regress this.
         assert_eq!(out.exit_code, -1);
-        // After timeout-driven kill+reap, the whole process group
-        // must be gone. Poll `killpg(pgid, 0)` (existence probe)
-        // until ESRCH — SIGKILL delivery + reap of the backgrounded
-        // sleeper can lag the caller, so allow up to 30 s (matches
-        // kill_reaps_fork_descendants_via_process_group's budget).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            // SAFETY: killpg with signal 0 is a pure existence
-            // query with no side effects beyond errno.
-            let rc = unsafe { libc::killpg(pgid, 0) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                assert_eq!(
-                    err.raw_os_error(),
-                    Some(libc::ESRCH),
-                    "unexpected errno from killpg probe after \
-                     timeout: {err}",
-                );
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "process group {pgid} still alive 30 s after \
-                     wait_with_deadline timeout fired — killpg sweep \
-                     in the timeout branch failed to reach every \
-                     member",
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        wait_for_process_group_termination(
+            pgid,
+            std::time::Duration::from_secs(30),
+            "wait_with_deadline timeout",
+        );
     }
 
     /// [`spawn_error_context`] is the sole place the spawn-error

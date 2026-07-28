@@ -61,8 +61,71 @@ kernel-build version="":
 # the #[ktstr_test(wprof)] tests require — when itself built with the
 # feature. E.g. `just test 6.14 wprof` → cargo-ktstr built `--features
 # wprof`; tests run `--features integration,wprof`.
+# Host-saturation sampler wrapper: the drain's CPU-bound-vs-idle question
+# can only be settled with a host-wide busy series plus permit-pool
+# occupancy, and no per-cell telemetry captures either. Diagnostic only;
+# written to the build-diagnostics dir CI uploads. Wraps both the test
+# and coverage recipes so every heavy lane produces the series.
+_with-host-sampler +cmd:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "${KTSTR_BUILD_DIAGNOSTICS_DIR:-}" ]; then
+        mkdir -p "${KTSTR_BUILD_DIAGNOSTICS_DIR}"
+        # Materialized once for the sampler loop: probing each permit file
+        # with LOCK_SH|LOCK_NB from a single interpreter per sample replaces
+        # the /proc/locks seq-file walk (which serializes on the kernel
+        # lock-table lock and poisons peer flock ops — the regression this
+        # branch removed from the planner) without forking per file.
+        probe_script="${KTSTR_BUILD_DIAGNOSTICS_DIR}/.permit-probe.py"
+        printf '%s\n' \
+            'import fcntl, glob, sys' \
+            'held = 0' \
+            'for path in glob.glob(sys.argv[1] + "/ktstr-permit-*"):' \
+            '    try:' \
+            '        handle = open(path)' \
+            '    except OSError:' \
+            '        continue' \
+            '    try:' \
+            '        fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)' \
+            '        fcntl.flock(handle, fcntl.LOCK_UN)' \
+            '    except OSError:' \
+            '        held += 1' \
+            '    finally:' \
+            '        handle.close()' \
+            'print(held)' > "$probe_script"
+        (
+            lock_dir="${KTSTR_LOCK_DIR:-}"
+            echo "host-sample-format: v2 t idle iowait cpu_total permit_locks io_sectors io_ms"
+            while true; do
+                # idle and iowait stay separate columns: folded together they
+                # cannot distinguish an idle host from one blocked on IO,
+                # which is the whole question the series exists to answer.
+                cpu=$(awk '/^cpu /{print "idle="$5, "iowait="$6, "cpu_total="$2+$3+$4+$5+$6+$7+$8+$9}' /proc/stat)
+                permits=0
+                if [ -n "$lock_dir" ] && command -v python3 >/dev/null 2>&1; then
+                    # Permit files persist after release; a permit is HELD
+                    # only while some process flocks it (always LOCK_EX). A
+                    # failed SH probe means an EX holder; a successful probe
+                    # is released immediately and can only collide with a
+                    # concurrent EX probe for a microsecond-scale window.
+                    permits=$(python3 "$probe_script" "$lock_dir" 2>/dev/null || echo 0)
+                fi
+                # Aggregate IO across real block devices (skip loop/ram):
+                # sectors read+written and ms spent in IO, cumulative like
+                # /proc/stat, so deltas give the IO rate and utilization the
+                # CPU columns cannot see.
+                io=$(awk '$3 !~ /^(loop|ram)/ {r+=$6; w+=$10; t+=$13} END {print "io_sectors="r+w, "io_ms="t}' /proc/diskstats 2>/dev/null)
+                echo "host-sample: t=$(date +%s) ${cpu} permit_locks=${permits} ${io}"
+                sleep 5
+            done > "${KTSTR_BUILD_DIAGNOSTICS_DIR}/host-saturation.log" 2>/dev/null
+        ) &
+        sampler_pid=$!
+        trap 'kill "${sampler_pid}" 2>/dev/null || true' EXIT
+    fi
+    {{cmd}}
+
 test kernel extra-features="":
-    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --no-fail-fast -j $(nproc)
+    @just _with-host-sampler cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr test --kernel {{kernel}} -- --profile ci --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --no-fail-fast
 
 # Run trybuild compile_fail fixtures.
 #
@@ -136,7 +199,8 @@ distro-boot spec pattern:
     set -euo pipefail
     cargo run --bin cargo-ktstr -- ktstr kernel build --kernel {{spec}}
     errlog=$(mktemp)
-    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel {{spec}} --exec 'uname -r' 2>"$errlog") \
+    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel {{spec}} --exec 'uname -r' \
+        2> >(tee "$errlog" >&2)) \
         || { echo "FAIL: {{spec}} boot exited nonzero; stderr:"; cat "$errlog"; rm -f "$errlog"; exit 1; }
     rm -f "$errlog"
     printf 'boot %-12s uname -r => %s\n' '{{spec}}' "$rel"
@@ -157,7 +221,7 @@ gke-boot:
     rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel gke --no-perf-mode \
         --disk 256mib \
         --exec 'test -b /dev/vda && grep -qw btrfs /proc/filesystems && uname -r' \
-        2>"$errlog") \
+        2> >(tee "$errlog" >&2)) \
         || { echo "FAIL: gke disk/Btrfs boot exited nonzero; stderr:"; cat "$errlog"; rm -f "$errlog"; exit 1; }
     rm -f "$errlog"
     printf 'boot %-12s uname -r => %s\n' 'gke' "$rel"
@@ -176,10 +240,11 @@ local-package-boot ver:
     set -euo pipefail
     rpm="$(pwd)/target/ktstr-synthetic-{{ver}}.rpm"
     KTSTR_E2E_KERNEL_VERSION='{{ver}}' KTSTR_E2E_RPM_OUT="$rpm" \
-        cargo nextest run -p ktstr --run-ignored only \
-        -E 'test(pack_built_kernel_into_synthetic_rpm)'
+        cargo run --bin cargo-ktstr -- ktstr test --kernel '{{ver}}' -- \
+        --run-ignored only -E 'test(pack_built_kernel_into_synthetic_rpm)'
     errlog=$(mktemp)
-    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel "$rpm" --exec 'uname -r' 2>"$errlog") \
+    rel=$(cargo run --bin cargo-ktstr -- ktstr shell --kernel "$rpm" --exec 'uname -r' \
+        2> >(tee "$errlog" >&2)) \
         || { echo "FAIL: synthetic-rpm boot exited nonzero; stderr:"; cat "$errlog"; rm -f "$errlog"; exit 1; }
     rm -f "$errlog"
     printf 'local-package boot uname -r => %s\n' "$rel"
@@ -204,15 +269,18 @@ devdep-isolation:
 # is passed to the cargo-ktstr build (so a blob-embedding feature like `wprof` is
 # provisioned — see `test`) AND appended to the inner coverage feature list.
 coverage kernel extra-features="":
-    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr coverage --kernel {{kernel}} -- --profile ci --lcov --output-path lcov.info --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --exclude-from-report scx-ktstr
+    @just _with-host-sampler cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr coverage --kernel {{kernel}} -- --profile ci --lcov --output-path lcov.info --features integration{{ if extra-features != "" { "," + extra-features } else { "" } }} --exclude-from-report scx-ktstr
 
 # Show sccache statistics
 sccache-stats:
     sccache --show-stats
 
-# Show the last run's gauntlet analysis (CI posts it as a post-test step)
-stats:
-    cargo run --bin cargo-ktstr -- ktstr stats last-run
+# Show the last run's gauntlet analysis (CI posts it as a post-test step).
+# Keep the cargo-ktstr feature shape identical to the preceding test build so
+# an embedded-tool feature such as `wprof` reuses that binary instead of
+# compiling a second no-feature variant solely for reporting.
+stats extra-features="":
+    cargo run --bin cargo-ktstr {{ if extra-features != "" { "--features " + extra-features } else { "" } }} -- ktstr stats last-run
 
 # Compare performance_mode metrics: HEAD vs a baseline commit (noise-adjusted; runs per side defaults to 5)
 perf-delta kernel base="" runs="5":

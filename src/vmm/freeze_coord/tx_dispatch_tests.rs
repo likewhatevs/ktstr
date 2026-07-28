@@ -112,6 +112,7 @@ impl SinkState {
             run_is_wprof: self.run_is_wprof,
             sys_rdy_evt: &mut self.sys_rdy_evt,
             bpf_map_write_ready_evt: Some(&self.bpf_map_write_ready_evt),
+            readiness_wait: None,
             snapshot_requests_pending: &mut self.snapshot_requests_pending,
             kernel_op_requests_pending: &mut self.kernel_op_requests_pending,
             kern_phys_base: &self.kern_phys_base,
@@ -134,6 +135,8 @@ impl SinkState {
             // lifecycle-stage side effects, so every advance site no-ops.
             progress_ledger: None,
             contention_recorder: None,
+            attach_attempts: None,
+            attach_control_console: None,
             expected_kernel_build_id: None,
         }
     }

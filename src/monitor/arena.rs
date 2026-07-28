@@ -157,7 +157,7 @@ const MAX_VM_RANGE_BYTES: u64 = 0x1_0000_0000;
 ///
 /// Resolved from BTF at startup so the walker doesn't hardcode kernel
 /// layout. Mirrors the [`super::btf_offsets::BpfMapOffsets`] pattern.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BpfArenaOffsets {
     /// Offset of `kern_vm` (`struct vm_struct *`) within `struct bpf_arena`.
     pub arena_kern_vm: usize,

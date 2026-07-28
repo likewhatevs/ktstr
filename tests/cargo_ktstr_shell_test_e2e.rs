@@ -91,8 +91,13 @@ fn shell_test_resolves_topology_from_named_test() {
     // (or its `includes=test:M+cli:N` suffix) surfaces here. The
     // two `--exec` args produce stdout (nproc result);
     // banner stays on stderr.
+    // The banner renders through the shared status-line layout: the
+    // `ktstr:` label is right-aligned in cargo's status column and
+    // color-wrapped when the environment takes color (CI forces it),
+    // with the `shell` scope demoted into the message.
+    let plain_stderr = ktstr::test_support::strip_ansi_csi(&stderr);
     assert!(
-        stderr.contains("ktstr shell: test=shell_test_topo_fixture"),
+        plain_stderr.contains("ktstr: shell: test=shell_test_topo_fixture"),
         "banner must name the resolved test on stderr; got:\n{stderr}",
     );
     assert!(

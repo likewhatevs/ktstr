@@ -930,9 +930,9 @@ impl TopologyConstraints {
     /// Conservative default constraints: single NUMA node, 1-12 LLCs,
     /// no SMT requirement, 1-192 CPUs. Accepts most single-node
     /// gauntlet presets ktstr ships while rejecting multi-NUMA presets
-    /// (numa2-*, numa4-*) and the scale-boundary single-node presets
-    /// that exceed the CPU/LLC caps (240cpu-15llc-{smt2,nosmt},
-    /// 252cpu-14llc-{smt2,nosmt}, and related variants). Test authors
+    /// (`2numa-*`, `4numa-*`) and the scale-boundary single-node presets
+    /// that exceed the CPU/LLC caps (`240cpu-15llc-{smt,nosmt}`,
+    /// `252cpu-14llc-{smt,nosmt}`, and related variants). Test authors
     /// that want broader coverage must
     /// raise `max_numa_nodes`, `max_llcs`, or `max_cpus` explicitly.
     ///
@@ -1713,7 +1713,9 @@ impl Scheduler {
 /// register via [`KTSTR_TESTS`].
 #[derive(Debug)]
 pub struct KtstrTestEntry {
-    /// Fully qualified test name as it appears in nextest output.
+    /// Bare registered test name. Discovery prefixes VM entries with
+    /// `ktstr/`, host-only entries with `host/`, and generated topology
+    /// variants with `gauntlet/`.
     pub name: &'static str,
     /// Entry point invoked once per replica, inside the guest VM when
     /// `host_only` is false and on the host when it is true.
@@ -1724,8 +1726,10 @@ pub struct KtstrTestEntry {
     /// Host-topology constraints (CPU and LLC bounds) that gate
     /// whether this entry is eligible on the current machine.
     pub constraints: TopologyConstraints,
-    /// Guest memory in MiB (binary mebibytes; conversion at
-    /// VM-launch is `value << 20` bytes, not `value * 1_000_000`).
+    /// Guest-memory floor in MiB. Deferred sizing can raise the final
+    /// allocation to fit the prepared initramfs. Values are binary
+    /// mebibytes; conversion at VM launch is `value << 20` bytes, not
+    /// `value * 1_000_000`.
     pub memory_mib: u32,
     /// Host-CPU budget for the no-perf vCPU mask — the number of host
     /// CPUs the VM's vCPU threads share. `None` auto-sizes from the vCPU
@@ -1999,10 +2003,10 @@ pub struct KtstrTestEntry {
     /// `#[ktstr_test(ignore)]` / `#[ktstr_test(ignore = true)]`.
     ///
     /// This lives on the registered entry in addition to the generated
-    /// libtest wrapper's `#[ignore]`: cargo-ktstr discovers `ktstr/<name>`
-    /// cases from [`KTSTR_TESTS`], so the
-    /// custom listing path must carry the same bit or it would run an ignored
-    /// VM fixture by default.
+    /// libtest wrapper's `#[ignore]`: cargo-ktstr discovers generated
+    /// `ktstr/<name>` VM cases and `host/<name>` host-only cases from
+    /// [`KTSTR_TESTS`], so the custom listing path must carry the same bit or
+    /// it would run an ignored fixture by default.
     pub ignored: bool,
     /// Extra host-side file specs beyond what the entry's
     /// [`scheduler`](Self::scheduler) / [`payload`](Self::payload) /
@@ -2167,6 +2171,30 @@ pub struct KtstrTestEntry {
     /// callback (counter increment, file open) should pick exactly
     /// one slot.
     pub post_vm_unconditional: Option<super::PostVmCallback>,
+    /// Gate boot-time scheduler launch on full probe-counter dump
+    /// readiness.
+    ///
+    /// When true, the primary runtime adds
+    /// `KTSTR_AWAIT_PROBE_DUMP_READY=1` to the guest cmdline. Guest
+    /// args also request the minimal diagnostic probe needed to
+    /// materialize the counter map. Guest init then waits before
+    /// spawning the scheduler until the host
+    /// freeze coordinator has used the real failure-dump decoder to
+    /// discover `probe_bp.bss`, parse its split BTF, resolve the
+    /// `ktstr_pcpu_counters` offset, and read the complete per-CPU
+    /// counter slab. This is stronger than
+    /// [`crate::scenario::ops::await_accessor_ready`], which only
+    /// proves accessor adoption and runs after scheduler launch.
+    ///
+    /// Auto-repro does not inherit this primary-only gate: stall
+    /// auto-repro deliberately skips probe attachment and therefore
+    /// cannot satisfy it.
+    ///
+    /// The gate is intended for diagnostic tests whose scheduler
+    /// arguments trigger a failure relative to process startup (for
+    /// example `--stall-after=1`). `false` (the default) adds no host
+    /// decode work and no guest wait.
+    pub probe_dump_ready_gate: bool,
     /// Periodic snapshot count: when non-zero, the freeze
     /// coordinator divides the 10 %–90 % slice of the capturable
     /// window into `num_snapshots + 1` equal intervals and fires a
@@ -2362,7 +2390,7 @@ impl KtstrTestEntry {
             llc_cores: None,
         },
         constraints: TopologyConstraints::DEFAULT,
-        memory_mib: 2048,
+        memory_mib: 256,
         cpu_budget: None,
         scheduler: &crate::test_support::Scheduler::EEVDF,
         staged_schedulers: &[],
@@ -2394,6 +2422,7 @@ impl KtstrTestEntry {
         networks: &[],
         post_vm: None,
         post_vm_unconditional: None,
+        probe_dump_ready_gate: false,
         num_snapshots: 0,
         workload_root_cgroup: None,
         kaslr: true,
@@ -2818,9 +2847,9 @@ pub static KTSTR_TESTS: [KtstrTestEntry];
 
 /// Distributed slice collecting all `declare_scheduler!` registrations
 /// via linkme. Each entry is a `&'static Scheduler` pointing at a
-/// const emitted by the macro. The verifier discovers schedulers by
-/// spawning the test binary with `--ktstr-list-schedulers`; a per-binary
-/// ctor walks this slice and serializes each entry to JSON.
+/// const emitted by the macro. Runtime lookup and retained private probe
+/// commands walk this slice; `cargo ktstr` discovery reads the parallel
+/// versioned ELF-stamp registry without starting the binary.
 #[distributed_slice]
 pub static KTSTR_SCHEDULERS: [&'static Scheduler];
 
@@ -2900,19 +2929,43 @@ where
     map
 }
 
+/// Ordered JSON representation of one [`Sysctl`].
+///
+/// A scheduler may declare the same key more than once and the last write
+/// wins, so [`SchedulerJson::sysctls`] uses a sequence of these records rather
+/// than a JSON object. That preserves declaration order and duplicate keys as
+/// part of the scheduler's execution identity.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SysctlJson {
+    /// Dotted sysctl key (for example, `"kernel.sched_rr_timeslice_ms"`).
+    pub key: String,
+    /// Value written to the sysctl.
+    pub value: String,
+}
+
 /// JSON shape projected from a registered [`Scheduler`]. Each entry
-/// carries scheduler name, a [`BinaryKindJson`]-tagged binary
-/// specification (Discover / Path / Eevdf / KernelBuiltin),
-/// per-scheduler default [`TopologyJson`], always-on scheduler
-/// args, declared kernel set, and gauntlet constraints. Internal
-/// fields (assertion overrides, sysctls, kargs, cgroup parent,
-/// config-file plumbing) are intentionally omitted.
+/// carries the complete execution identity needed to compare declarations:
+/// scheduler name, a [`BinaryKindJson`]-tagged binary specification
+/// (Discover / Path / Eevdf / KernelBuiltin), guest setup, static scheduler
+/// configuration, per-scheduler default [`TopologyJson`], always-on scheduler
+/// args, declared kernel set, and gauntlet constraints. Assertion overrides
+/// and inline per-test config-file content are intentionally omitted.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerJson {
     /// Scheduler name — the `name = "..."` value supplied to
     /// [`declare_scheduler!`](crate::declare_scheduler) or
     /// [`Scheduler::named`].
     pub name: String,
+    /// Manifest directory of the crate that declared this scheduler.
+    ///
+    /// `Discover` resolution is workspace-relative: cargo walks upward from
+    /// this directory to find the declaring workspace. The verifier parent
+    /// carries it through scheduler discovery so it can prebuild the exact
+    /// package once and key the immutable artifact manifest identically to
+    /// the child cell. The serde default keeps probes from older linked test
+    /// binaries readable during a rolling upgrade.
+    #[serde(default)]
+    pub manifest_dir: String,
     /// Binary specification: distinguishes Discover (build via cargo
     /// `[[bin]]` name), Path (use absolute path verbatim), Eevdf
     /// (kernel default scheduler, no binary), and KernelBuiltin
@@ -2930,6 +2983,21 @@ pub struct SchedulerJson {
     pub topology: TopologyJson,
     /// Always-on scheduler CLI args.
     pub sched_args: Vec<String>,
+    /// Guest sysctls applied before scheduler startup, in declaration order.
+    ///
+    /// This remains a sequence instead of a map because duplicate keys are
+    /// meaningful: the last declared value wins.
+    #[serde(default)]
+    pub sysctls: Vec<SysctlJson>,
+    /// Extra guest kernel command-line arguments.
+    #[serde(default)]
+    pub kargs: Vec<String>,
+    /// Optional scheduler cgroup parent path.
+    #[serde(default)]
+    pub cgroup_parent: Option<String>,
+    /// Optional host-side static scheduler config-file path.
+    #[serde(default)]
+    pub config_file: Option<String>,
     /// Kernel specs (consumed by `cargo_ktstr::kernel::resolve_kernel_set`).
     pub kernels: Vec<String>,
     /// Named topology presets excluded only from the verifier matrix.
@@ -2939,22 +3007,64 @@ pub struct SchedulerJson {
     pub constraints: TopologyConstraintsJson,
 }
 
-/// A [`SchedulerJson`] plus the number of `#[ktstr_test]`s declared against
-/// it. Emitted (as a JSON array) by the `--ktstr-list-schedulers` probe so
-/// `cargo ktstr affected` can enumerate declared schedulers AND skip those
-/// with zero tests when producing its CI matrix, in one probe.
+/// A [`SchedulerJson`] plus the number of `#[ktstr_test]`s which use it as
+/// either their primary or a staged scheduler. Emitted (as a JSON array) by
+/// the `--ktstr-list-schedulers` probe so `cargo ktstr affected` can enumerate
+/// declared schedulers AND skip those with zero test uses when producing its
+/// CI matrix, in one probe.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerListEntry {
     /// The projected scheduler.
     pub scheduler: SchedulerJson,
-    /// Count of registered [`KtstrTestEntry`]s whose scheduler is this one.
+    /// Count of registered [`KtstrTestEntry`]s whose primary or staged
+    /// scheduler is this one.
     pub test_count: usize,
 }
 
-/// A single `#[ktstr_test]` paired with its declared scheduler's name. Emitted
-/// (as a JSON array) by the `--ktstr-list-scheduler-tests` probe so `--relevant`
-/// can map each test to its scheduler and select the tests whose scheduler a
-/// diff affects.
+/// One exact scheduler executable requirement reported by a warmed test
+/// binary.
+///
+/// The artifact identity is `(binary_kind, manifest_dir)`. Repeated primary
+/// and staged uses collapse into one entry, while `use_count` records how many
+/// registry edges require it and `schedulers` retains every declared name
+/// sharing the executable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerArtifactRequirement {
+    /// `Discover(package)` or `Path(path)`. Kernel-only schedulers are omitted.
+    pub binary_kind: BinaryKindJson,
+    /// Exact declaring `CARGO_MANIFEST_DIR`.
+    pub manifest_dir: String,
+    /// Sorted, unique scheduler names using the executable.
+    pub schedulers: Vec<String>,
+    /// Number of primary plus staged references across [`KTSTR_TESTS`].
+    pub use_count: usize,
+}
+
+/// Complete scheduler metadata projected from one test binary.
+///
+/// `cargo ktstr` reconstructs this object from the binary's versioned ELF
+/// stamp without executing it. The private
+/// `--ktstr-list-scheduler-manifest` runtime projection remains available to
+/// internal callers and as an exact parity oracle.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerManifestProbe {
+    /// Every scheduler declaration linked into this test binary.
+    pub declarations: Vec<SchedulerListEntry>,
+    /// Every userspace scheduler executable referenced by its test registry.
+    pub artifact_requirements: Vec<SchedulerArtifactRequirement>,
+    /// Every registered test paired once with each primary and staged
+    /// scheduler it exercises.
+    pub tests: Vec<SchedulerTestJson>,
+}
+
+/// Private CLI discriminator for the combined scheduler-manifest probe.
+#[doc(hidden)]
+pub const SCHEDULER_MANIFEST_PROBE_ARG: &str = "--ktstr-list-scheduler-manifest";
+
+/// A single `#[ktstr_test]` paired with one scheduler it exercises. A test
+/// contributes one entry for its primary scheduler and one for every staged
+/// scheduler. Included in [`SchedulerManifestProbe::tests`] and also emitted
+/// as the legacy JSON array for `--ktstr-list-scheduler-tests`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerTestJson {
     /// The `#[ktstr_test]` function name, as registered.
@@ -2978,6 +3088,125 @@ pub enum BinaryKindJson {
     Eevdf,
     /// Built into the kernel (e.g. `scx_simple` enabled via sysfs). No userspace binary.
     KernelBuiltin,
+}
+
+fn collect_scheduler_artifact_requirements<'a>(
+    schedulers: impl IntoIterator<Item = &'a Scheduler>,
+) -> Vec<SchedulerArtifactRequirement> {
+    struct Accumulator {
+        binary_kind: BinaryKindJson,
+        manifest_dir: String,
+        schedulers: std::collections::BTreeSet<String>,
+        use_count: usize,
+    }
+
+    let mut requirements: std::collections::BTreeMap<(u8, String, String), Accumulator> =
+        std::collections::BTreeMap::new();
+    for scheduler in schedulers {
+        let (kind_order, value, binary_kind) = match scheduler.binary {
+            SchedulerSpec::Discover(package) => (
+                0,
+                package.to_string(),
+                BinaryKindJson::Discover(package.to_string()),
+            ),
+            SchedulerSpec::Path(path) => {
+                (1, path.to_string(), BinaryKindJson::Path(path.to_string()))
+            }
+            SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => continue,
+        };
+        let manifest_dir = scheduler.manifest_dir.to_string();
+        let accumulator = requirements
+            .entry((kind_order, value, manifest_dir.clone()))
+            .or_insert_with(|| Accumulator {
+                binary_kind,
+                manifest_dir,
+                schedulers: std::collections::BTreeSet::new(),
+                use_count: 0,
+            });
+        accumulator.schedulers.insert(scheduler.name.to_string());
+        accumulator.use_count += 1;
+    }
+    requirements
+        .into_values()
+        .map(|requirement| SchedulerArtifactRequirement {
+            binary_kind: requirement.binary_kind,
+            manifest_dir: requirement.manifest_dir,
+            schedulers: requirement.schedulers.into_iter().collect(),
+            use_count: requirement.use_count,
+        })
+        .collect()
+}
+
+fn test_schedulers<'a>(
+    primary: &'a Scheduler,
+    staged: &'a [&'a Scheduler],
+) -> impl Iterator<Item = &'a Scheduler> + 'a {
+    std::iter::once(primary).chain(staged.iter().copied())
+}
+
+fn collect_scheduler_list_entries_from<'a>(
+    schedulers: impl IntoIterator<Item = &'a Scheduler>,
+    tests: impl IntoIterator<Item = (&'a Scheduler, &'a [&'a Scheduler])>,
+) -> Vec<SchedulerListEntry> {
+    let mut test_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (primary, staged) in tests {
+        for scheduler in test_schedulers(primary, staged) {
+            *test_counts.entry(scheduler.name).or_insert(0) += 1;
+        }
+    }
+    schedulers
+        .into_iter()
+        .map(|scheduler| SchedulerListEntry {
+            scheduler: SchedulerJson::from_scheduler(scheduler),
+            test_count: test_counts.get(scheduler.name).copied().unwrap_or(0),
+        })
+        .collect()
+}
+
+fn collect_scheduler_list_entries() -> Vec<SchedulerListEntry> {
+    collect_scheduler_list_entries_from(
+        KTSTR_SCHEDULERS.iter().copied(),
+        KTSTR_TESTS
+            .iter()
+            .map(|test| (test.scheduler, test.staged_schedulers)),
+    )
+}
+
+fn collect_registered_scheduler_artifact_requirements() -> Vec<SchedulerArtifactRequirement> {
+    let schedulers = KTSTR_TESTS.iter().flat_map(|entry| {
+        std::iter::once(entry.scheduler).chain(entry.staged_schedulers.iter().copied())
+    });
+    collect_scheduler_artifact_requirements(schedulers)
+}
+
+fn collect_scheduler_tests_from<'a>(
+    tests: impl IntoIterator<Item = (&'a str, &'a Scheduler, &'a [&'a Scheduler])>,
+) -> Vec<SchedulerTestJson> {
+    tests
+        .into_iter()
+        .flat_map(|(test, primary, staged)| {
+            test_schedulers(primary, staged).map(move |scheduler| SchedulerTestJson {
+                test: test.to_string(),
+                scheduler: scheduler.name.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn collect_scheduler_tests() -> Vec<SchedulerTestJson> {
+    collect_scheduler_tests_from(
+        KTSTR_TESTS
+            .iter()
+            .map(|test| (test.name, test.scheduler, test.staged_schedulers)),
+    )
+}
+
+fn collect_scheduler_manifest_probe() -> SchedulerManifestProbe {
+    SchedulerManifestProbe {
+        declarations: collect_scheduler_list_entries(),
+        artifact_requirements: collect_registered_scheduler_artifact_requirements(),
+        tests: collect_scheduler_tests(),
+    }
 }
 
 /// JSON-friendly mirror of `Topology` for the verifier wire format.
@@ -3090,7 +3319,85 @@ impl From<TopologyConstraintsJson> for TopologyConstraints {
     }
 }
 
+fn verifier_kernel_entry_matches_spec(label: &str, sanitized: &str, spec: &str) -> bool {
+    use crate::kernel_path::{KernelId, decompose_version_for_compare};
+
+    match KernelId::parse(spec) {
+        KernelId::Version(spec_ver) => {
+            label == spec_ver || sanitized == super::sanitize_kernel_label(&spec_ver)
+        }
+        KernelId::Range { start, end, .. } => {
+            let Some(entry_t) = decompose_version_for_compare(label) else {
+                return false;
+            };
+            let Some(start_t) = decompose_version_for_compare(&start) else {
+                return false;
+            };
+            let Some(end_t) = decompose_version_for_compare(&end) else {
+                return false;
+            };
+            entry_t >= start_t && entry_t <= end_t
+        }
+        KernelId::CacheKey(_)
+        | KernelId::Path(_)
+        | KernelId::Git { .. }
+        | KernelId::Package { .. }
+        | KernelId::Distro { .. } => sanitized == super::sanitize_kernel_label(spec),
+    }
+}
+
+pub(super) fn verifier_kernel_specs_accept<'a>(
+    declared: impl IntoIterator<Item = &'a str>,
+    label: &str,
+    sanitized: &str,
+) -> bool {
+    let mut declared_any = false;
+    for spec in declared {
+        declared_any = true;
+        if verifier_kernel_entry_matches_spec(label, sanitized, spec) {
+            return true;
+        }
+    }
+    !declared_any
+}
+
 impl SchedulerJson {
+    /// Whether one resolved kernel entry survives this scheduler's declared
+    /// kernel filter. Shared by test-binary cell emission and the
+    /// `cargo ktstr verifier` parent prebuild planner so both sides classify
+    /// the same raw/sanitized label pair identically.
+    pub fn accepts_verifier_kernel(&self, label: &str, sanitized: &str) -> bool {
+        verifier_kernel_specs_accept(self.kernels.iter().map(String::as_str), label, sanitized)
+    }
+
+    /// Whether one canned topology preset survives this scheduler's verifier
+    /// constraints and named verifier-only exclusions.
+    pub fn accepts_verifier_preset(&self, preset: &crate::gauntlet::TopoPreset) -> bool {
+        TopologyConstraints::from(self.constraints).accepts_verifier(&preset.topology)
+            && !self
+                .verifier_exclude_topologies
+                .iter()
+                .any(|excluded| excluded == preset.name)
+    }
+
+    /// Whether the resolved kernel × canned-preset matrix contains at least
+    /// one cell this scheduler can emit. Binary-kind, path-existence,
+    /// workspace-membership, and scheduler-name checks are intentionally
+    /// handled by the callers because they require registry or filesystem
+    /// context; the matrix policy itself stays pure and shared.
+    pub fn has_accepted_verifier_cell<'a>(
+        &self,
+        kernels: impl IntoIterator<Item = (&'a str, &'a str)>,
+        presets: &[crate::gauntlet::TopoPreset],
+    ) -> bool {
+        kernels
+            .into_iter()
+            .any(|(label, sanitized)| self.accepts_verifier_kernel(label, sanitized))
+            && presets
+                .iter()
+                .any(|preset| self.accepts_verifier_preset(preset))
+    }
+
     /// Project a `Scheduler` static into its JSON shape.
     pub fn from_scheduler(s: &Scheduler) -> Self {
         let binary_kind = match s.binary {
@@ -3101,6 +3408,7 @@ impl SchedulerJson {
         };
         Self {
             name: s.name.to_string(),
+            manifest_dir: s.manifest_dir.to_string(),
             binary_kind,
             topology: TopologyJson {
                 num_numa_nodes: s.topology.num_numa_nodes(),
@@ -3109,6 +3417,17 @@ impl SchedulerJson {
                 threads_per_core: s.topology.threads_per_core,
             },
             sched_args: s.sched_args.iter().map(|a| a.to_string()).collect(),
+            sysctls: s
+                .sysctls
+                .iter()
+                .map(|sysctl| SysctlJson {
+                    key: sysctl.key().to_string(),
+                    value: sysctl.value().to_string(),
+                })
+                .collect(),
+            kargs: s.kargs.iter().map(|arg| arg.to_string()).collect(),
+            cgroup_parent: s.cgroup_parent.map(|parent| parent.as_str().to_string()),
+            config_file: s.config_file.map(str::to_string),
             kernels: s.kernels.iter().map(|k| k.to_string()).collect(),
             verifier_exclude_topologies: s
                 .verifier_exclude_topologies
@@ -3131,9 +3450,9 @@ impl SchedulerJson {
 ::ctor::declarative::ctor! {
 /// Ctor that intercepts `--ktstr-list-schedulers` before `main()` runs.
 /// Walks [`KTSTR_SCHEDULERS`], emits a [`SchedulerListEntry`] per scheduler
-/// (its [`SchedulerJson`] projection plus the count of [`KTSTR_TESTS`]
-/// declared against it) as a single JSON array on stdout, and exits with
-/// status 0.
+/// (its [`SchedulerJson`] projection plus the count of primary and staged
+/// uses across [`KTSTR_TESTS`]) as a single JSON array on stdout, and exits
+/// with status 0.
 ///
 /// One ctor per binary, regardless of how many schedulers the binary
 /// registers — walks the slices once and emits a single JSON array. The
@@ -3148,20 +3467,7 @@ fn __ktstr_list_schedulers() {
     if !std::env::args().any(|a| a == "--ktstr-list-schedulers") {
         return;
     }
-    // Count declared tests per scheduler name (a scheduler with no test still
-    // appears, with test_count 0).
-    let mut test_counts: std::collections::HashMap<&'static str, usize> =
-        std::collections::HashMap::new();
-    for t in KTSTR_TESTS.iter() {
-        *test_counts.entry(t.scheduler.name).or_insert(0) += 1;
-    }
-    let entries: Vec<SchedulerListEntry> = KTSTR_SCHEDULERS
-        .iter()
-        .map(|s| SchedulerListEntry {
-            scheduler: SchedulerJson::from_scheduler(s),
-            test_count: test_counts.get(s.name).copied().unwrap_or(0),
-        })
-        .collect();
+    let entries = collect_scheduler_list_entries();
     let json = ::serde_json::to_string(&entries).expect("serialize schedulers");
     println!("{json}");
     std::process::exit(0);
@@ -3169,23 +3475,58 @@ fn __ktstr_list_schedulers() {
 }
 
 ::ctor::declarative::ctor! {
+/// Ctor that emits declarations, artifact requirements, and per-test scheduler
+/// mappings for one test binary in a single process startup.
+#[ctor(unsafe)]
+fn __ktstr_list_scheduler_manifest() {
+    if !std::env::args().any(|argument| {
+        argument == SCHEDULER_MANIFEST_PROBE_ARG
+    }) {
+        return;
+    }
+    let manifest = collect_scheduler_manifest_probe();
+    let json = ::serde_json::to_string(&manifest).expect("serialize scheduler manifest probe");
+    println!("{json}");
+    std::process::exit(0);
+}
+}
+
+::ctor::declarative::ctor! {
+/// Ctor that reports every scheduler executable referenced by this binary's
+/// [`KTSTR_TESTS`] registry.
+///
+/// Both each test's primary scheduler and every `staged_schedulers` entry are
+/// included. `Path` and `Discover` requirements are deduplicated by exact
+/// binary specification plus declaring manifest directory; kernel-only
+/// schedulers are omitted. The `cargo ktstr` parent uses this probe to make
+/// one strict artifact manifest complete before any nextest child starts.
+#[ctor(unsafe)]
+fn __ktstr_list_scheduler_artifact_requirements() {
+    if !std::env::args().any(|argument| {
+        argument == "--ktstr-list-scheduler-artifact-requirements"
+    }) {
+        return;
+    }
+    let requirements = collect_registered_scheduler_artifact_requirements();
+    let json =
+        ::serde_json::to_string(&requirements).expect("serialize scheduler artifact requirements");
+    println!("{json}");
+    std::process::exit(0);
+}
+}
+
+::ctor::declarative::ctor! {
 /// Ctor that intercepts `--ktstr-list-scheduler-tests` before `main()` runs.
-/// Walks [`KTSTR_TESTS`], emits a [`SchedulerTestJson`] per test (its name and
-/// its declared scheduler's name) as a single JSON array on stdout, and exits
-/// 0. Distinct from `--ktstr-list-schedulers`: this is test-NAME level, spawned
-/// only for a `--relevant` run to map each test to its scheduler.
+/// Walks [`KTSTR_TESTS`], emits a [`SchedulerTestJson`] for each test's primary
+/// and staged scheduler as a single JSON array on stdout, and exits 0.
+/// Distinct from `--ktstr-list-schedulers`: this is test-NAME level, retained
+/// as the legacy mapping probe.
 #[ctor(unsafe)]
 fn __ktstr_list_scheduler_tests() {
     if !std::env::args().any(|a| a == "--ktstr-list-scheduler-tests") {
         return;
     }
-    let entries: Vec<SchedulerTestJson> = KTSTR_TESTS
-        .iter()
-        .map(|t| SchedulerTestJson {
-            test: t.name.to_string(),
-            scheduler: t.scheduler.name.to_string(),
-        })
-        .collect();
+    let entries = collect_scheduler_tests();
     let json = ::serde_json::to_string(&entries).expect("serialize scheduler tests");
     println!("{json}");
     std::process::exit(0);
@@ -3309,7 +3650,7 @@ mod tests {
         assert!(d.topology.nodes.is_none());
         assert!(d.topology.distances.is_none());
         assert_eq!(d.constraints, TopologyConstraints::DEFAULT);
-        assert_eq!(d.memory_mib, 2048);
+        assert_eq!(d.memory_mib, 256);
         // scheduler defaults to `&Scheduler::EEVDF`, whose
         // compile-time-fixed `.name = "eevdf"`. Read directly via
         // field access — no kind dispatch.
@@ -5078,7 +5419,7 @@ mod tests {
     // -- TopologyConstraints::accepts_verifier --
     //
     // The two beyond-host battery shapes added alongside this gate.
-    // WIDE_192 stands in for uneven-11llc's gating dimensions (11 LLCs,
+    // WIDE_192 stands in for 192cpu-11llc-smt's gating dimensions (11 LLCs,
     // 192 CPUs, 1 node, SMT — the gate reads only num_llcs/total_cpus/
     // numa/threads, not the per-LLC unevenness). NUMA2_2LLC: 2 nodes,
     // 2 LLCs, 32 CPUs, SMT.
@@ -5161,7 +5502,7 @@ mod tests {
         assert!(!c.accepts(&WIDE_192(), 4096, 4096, 4096)); // cap: numa? no — llcs 11<=12, cpus 198>192
         assert!(!c.accepts(&NUMA2_2LLC(), 4096, 4096, 4096)); // cap: numa 2>1
         // And the classic default-active presets still pass unchanged.
-        assert!(c.accepts_no_perf_mode(&Topology::new(1, 8, 4, 2), 4096)); // medium-8llc
+        assert!(c.accepts_no_perf_mode(&Topology::new(1, 8, 4, 2), 4096)); // 64cpu-8llc-smt
         assert!(c.accepts(&Topology::new(1, 8, 4, 2), 4096, 4096, 4096));
     }
 
@@ -6241,6 +6582,10 @@ mod tests {
         assert_eq!(from_trait.config_content, from_const.config_content);
         assert!(from_trait.disk.is_none() && from_const.disk.is_none());
         assert!(from_trait.post_vm.is_none() && from_const.post_vm.is_none());
+        assert_eq!(
+            from_trait.probe_dump_ready_gate,
+            from_const.probe_dump_ready_gate
+        );
         assert_eq!(from_trait.num_snapshots, from_const.num_snapshots);
         // `assert` field lock-step: Assert does not derive PartialEq,
         // so compare via `format_human()` (renders every
@@ -6817,8 +7162,8 @@ mod tests {
     }
 
     /// `from_scheduler` copies `name`, the four topology dimensions,
-    /// `sched_args`, `kernels`, verifier exclusions, and every constraint field into the
-    /// wire shape. `EEVDF` defaults the topology to
+    /// execution setup, `sched_args`, `kernels`, verifier exclusions, and
+    /// every constraint field into the wire shape. `EEVDF` defaults the topology to
     /// 1 numa × 1 llc × 2 cores × 1 thread (see `Scheduler::EEVDF`),
     /// and the constraints to `TopologyConstraints::DEFAULT`. Pins
     /// every projected field so a mis-mapped dimension (e.g. swapping
@@ -6827,6 +7172,7 @@ mod tests {
     fn from_scheduler_copies_name_topology_args_kernels_constraints() {
         let json = SchedulerJson::from_scheduler(&Scheduler::EEVDF);
         assert_eq!(json.name, "eevdf");
+        assert_eq!(json.manifest_dir, env!("CARGO_MANIFEST_DIR"));
         // EEVDF topology baseline.
         assert_eq!(json.topology.num_numa_nodes, 1);
         assert_eq!(json.topology.num_llcs, 1);
@@ -6834,6 +7180,10 @@ mod tests {
         assert_eq!(json.topology.threads_per_core, 1);
         // EEVDF carries no sched_args, no kernel filter.
         assert!(json.sched_args.is_empty());
+        assert!(json.sysctls.is_empty());
+        assert!(json.kargs.is_empty());
+        assert!(json.cgroup_parent.is_none());
+        assert!(json.config_file.is_none());
         assert!(json.kernels.is_empty());
         assert!(json.verifier_exclude_topologies.is_empty());
         // Constraints mirror TopologyConstraints::DEFAULT.
@@ -6847,8 +7197,9 @@ mod tests {
     }
 
     /// Non-default fields round-trip through the projection: a
-    /// scheduler with an overridden topology, explicit `sched_args`,
-    /// `kernels`, and tightened `constraints` projects each verbatim.
+    /// scheduler with an overridden topology, explicit guest setup,
+    /// `sched_args`, `kernels`, and tightened `constraints` projects each
+    /// verbatim.
     /// `Scheduler::topology(numa, llcs, cores, threads)` maps the
     /// argument order to the `Topology` fields, so this also pins
     /// that the projection reads `num_numa_nodes()`/`num_llcs()`
@@ -6856,6 +7207,12 @@ mod tests {
     #[test]
     fn from_scheduler_projects_overridden_fields_verbatim() {
         static ARGS: &[&str] = &["--slice-us", "20000"];
+        static SYSCTLS: &[Sysctl] = &[
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "10"),
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "25"),
+            Sysctl::new("kernel.numa_balancing", "0"),
+        ];
+        static KARGS: &[&str] = &["nosmt", "iomem=relaxed"];
         static KERNELS: &[&str] = &["6.14", "6.15..6.16"];
         static VERIFIER_EXCLUDES: &[&str] = &["240cpu-15llc-nosmt"];
         let s = Scheduler::named("custom")
@@ -6863,6 +7220,10 @@ mod tests {
             // 2 numa × 4 llcs × 8 cores × 2 threads
             .topology(2, 4, 8, 2)
             .sched_args(ARGS)
+            .sysctls(SYSCTLS)
+            .kargs(KARGS)
+            .cgroup_parent("/custom")
+            .config_file("scheduler.toml")
             .kernels(KERNELS)
             .verifier_exclude_topologies(VERIFIER_EXCLUDES)
             .constraints(
@@ -6882,6 +7243,27 @@ mod tests {
         assert_eq!(json.topology.cores_per_llc, 8);
         assert_eq!(json.topology.threads_per_core, 2);
         assert_eq!(json.sched_args, vec!["--slice-us", "20000"]);
+        assert_eq!(
+            json.sysctls,
+            vec![
+                SysctlJson {
+                    key: "kernel.sched_rr_timeslice_ms".into(),
+                    value: "10".into(),
+                },
+                SysctlJson {
+                    key: "kernel.sched_rr_timeslice_ms".into(),
+                    value: "25".into(),
+                },
+                SysctlJson {
+                    key: "kernel.numa_balancing".into(),
+                    value: "0".into(),
+                },
+            ],
+            "sysctl projection must preserve order and duplicate keys",
+        );
+        assert_eq!(json.kargs, vec!["nosmt", "iomem=relaxed"]);
+        assert_eq!(json.cgroup_parent.as_deref(), Some("/custom"));
+        assert_eq!(json.config_file.as_deref(), Some("scheduler.toml"));
         assert_eq!(json.kernels, vec!["6.14", "6.15..6.16"]);
         assert_eq!(json.verifier_exclude_topologies, vec!["240cpu-15llc-nosmt"],);
         assert_eq!(json.constraints.min_numa_nodes, 2);
@@ -6917,6 +7299,88 @@ mod tests {
         );
     }
 
+    /// `manifest_dir` was added to the scheduler-list wire shape after the
+    /// original probe protocol. Older JSON remains readable so a CLI can
+    /// diagnose a mixed-version binary explicitly instead of failing at
+    /// deserialization before it can name the offending declaration.
+    #[test]
+    fn scheduler_json_missing_manifest_dir_defaults_empty() {
+        let json = SchedulerJson::from_scheduler(&Scheduler::EEVDF);
+        let mut value = serde_json::to_value(json).expect("serialize SchedulerJson");
+        value
+            .as_object_mut()
+            .expect("SchedulerJson is an object")
+            .remove("manifest_dir");
+        let back: SchedulerJson =
+            serde_json::from_value(value).expect("legacy SchedulerJson deserializes");
+        assert!(back.manifest_dir.is_empty());
+    }
+
+    /// Execution-identity fields were added after the original scheduler-list
+    /// wire protocol. A CLI must still deserialize an older linked test binary
+    /// and treat every omitted field as its no-op declaration default.
+    #[test]
+    fn scheduler_json_missing_execution_identity_fields_default_empty() {
+        static SYSCTLS: &[Sysctl] = &[Sysctl::new("kernel.numa_balancing", "0")];
+        let json = SchedulerJson::from_scheduler(
+            &Scheduler::named("legacy")
+                .sysctls(SYSCTLS)
+                .kargs(&["nosmt"])
+                .cgroup_parent("/legacy")
+                .config_file("legacy.toml"),
+        );
+        let mut value = serde_json::to_value(json).expect("serialize SchedulerJson");
+        let object = value
+            .as_object_mut()
+            .expect("SchedulerJson serializes as an object");
+        for field in ["sysctls", "kargs", "cgroup_parent", "config_file"] {
+            assert!(
+                object.remove(field).is_some(),
+                "fixture must contain {field}"
+            );
+        }
+        let back: SchedulerJson =
+            serde_json::from_value(value).expect("legacy SchedulerJson deserializes");
+        assert!(back.sysctls.is_empty());
+        assert!(back.kargs.is_empty());
+        assert!(back.cgroup_parent.is_none());
+        assert!(back.config_file.is_none());
+    }
+
+    /// `SchedulerJson` equality is the declaration identity used by recursive
+    /// verifier discovery. Every execution setup field must therefore make an
+    /// otherwise same-name declaration unequal.
+    #[test]
+    fn scheduler_json_execution_fields_participate_in_identity() {
+        static SYSCTLS: &[Sysctl] = &[Sysctl::new("kernel.numa_balancing", "0")];
+        static SYSCTLS_AB: &[Sysctl] = &[
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "10"),
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "25"),
+        ];
+        static SYSCTLS_BA: &[Sysctl] = &[
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "25"),
+            Sysctl::new("kernel.sched_rr_timeslice_ms", "10"),
+        ];
+        let baseline = SchedulerJson::from_scheduler(&Scheduler::named("same"));
+        let variants = [
+            SchedulerJson::from_scheduler(&Scheduler::named("same").sysctls(SYSCTLS)),
+            SchedulerJson::from_scheduler(&Scheduler::named("same").kargs(&["nosmt"])),
+            SchedulerJson::from_scheduler(&Scheduler::named("same").cgroup_parent("/identity")),
+            SchedulerJson::from_scheduler(&Scheduler::named("same").config_file("identity.toml")),
+        ];
+        for variant in variants {
+            assert_ne!(
+                variant, baseline,
+                "execution setup must participate in SchedulerJson identity",
+            );
+        }
+        assert_ne!(
+            SchedulerJson::from_scheduler(&Scheduler::named("same").sysctls(SYSCTLS_AB)),
+            SchedulerJson::from_scheduler(&Scheduler::named("same").sysctls(SYSCTLS_BA)),
+            "sysctl declaration order must participate in SchedulerJson identity",
+        );
+    }
+
     /// [`SchedulerListEntry`] — the `--ktstr-list-schedulers` wire element (a
     /// [`SchedulerJson`] plus `test_count`) — survives a serde round-trip
     /// field-for-field, the exact shape `cargo ktstr affected` deserializes.
@@ -6938,6 +7402,107 @@ mod tests {
         let back: SchedulerListEntry =
             serde_json::from_str(&text).expect("deserialize SchedulerListEntry");
         assert_eq!(back, entry, "SchedulerListEntry must round-trip unchanged");
+    }
+
+    #[test]
+    fn scheduler_manifest_probe_roundtrips_all_payloads_together() {
+        let scheduler = Scheduler::named("rt")
+            .binary_discover("scx_rt")
+            .manifest_dir("/workspace");
+        let manifest = SchedulerManifestProbe {
+            declarations: vec![SchedulerListEntry {
+                scheduler: SchedulerJson::from_scheduler(&scheduler),
+                test_count: 2,
+            }],
+            artifact_requirements: vec![SchedulerArtifactRequirement {
+                binary_kind: BinaryKindJson::Discover("scx_rt".into()),
+                manifest_dir: "/workspace".into(),
+                schedulers: vec!["rt".into()],
+                use_count: 2,
+            }],
+            tests: vec![SchedulerTestJson {
+                test: "boot_smoke".into(),
+                scheduler: "rt".into(),
+            }],
+        };
+        let text = serde_json::to_string(&manifest).expect("serialize SchedulerManifestProbe");
+        assert!(
+            text.contains("\"declarations\"")
+                && text.contains("\"artifact_requirements\"")
+                && text.contains("\"tests\""),
+            "the combined protocol carries every scheduler probe payload: {text}",
+        );
+        let back: SchedulerManifestProbe =
+            serde_json::from_str(&text).expect("deserialize SchedulerManifestProbe");
+        assert_eq!(back, manifest);
+    }
+
+    #[test]
+    fn scheduler_manifest_counts_and_maps_primary_and_staged_uses() {
+        let primary = Scheduler::named("primary");
+        let staged_a = Scheduler::named("staged_a");
+        let staged_b = Scheduler::named("staged_b");
+        let staged = [&staged_a, &staged_b];
+
+        let declarations = collect_scheduler_list_entries_from(
+            [&primary, &staged_a, &staged_b],
+            [(&primary, staged.as_slice())],
+        );
+        assert_eq!(
+            declarations
+                .iter()
+                .map(|entry| (entry.scheduler.name.as_str(), entry.test_count,))
+                .collect::<Vec<_>>(),
+            [("primary", 1), ("staged_a", 1), ("staged_b", 1)],
+            "a staged-only scheduler is still exercised by the test",
+        );
+
+        let tests = collect_scheduler_tests_from([("scheduler_swap", &primary, staged.as_slice())]);
+        assert_eq!(
+            tests
+                .iter()
+                .map(|entry| (entry.test.as_str(), entry.scheduler.as_str(),))
+                .collect::<Vec<_>>(),
+            [
+                ("scheduler_swap", "primary"),
+                ("scheduler_swap", "staged_a"),
+                ("scheduler_swap", "staged_b"),
+            ],
+            "change-scoped selection must retain every scheduler the test can run",
+        );
+    }
+
+    #[test]
+    fn scheduler_artifact_requirements_dedupe_primary_and_staged_uses() {
+        let first = Scheduler::named("first")
+            .binary_discover("scx_shared")
+            .manifest_dir("/workspace");
+        let alias = Scheduler::named("alias")
+            .binary_discover("scx_shared")
+            .manifest_dir("/workspace");
+        let path = Scheduler::named("path")
+            .binary(SchedulerSpec::Path("/opt/scx_path"))
+            .manifest_dir("/other");
+        let requirements = collect_scheduler_artifact_requirements([&first, &alias, &first, &path]);
+        assert_eq!(requirements.len(), 2);
+        assert_eq!(
+            requirements[0],
+            SchedulerArtifactRequirement {
+                binary_kind: BinaryKindJson::Discover("scx_shared".into()),
+                manifest_dir: "/workspace".into(),
+                schedulers: vec!["alias".into(), "first".into()],
+                use_count: 3,
+            },
+        );
+        assert_eq!(
+            requirements[1],
+            SchedulerArtifactRequirement {
+                binary_kind: BinaryKindJson::Path("/opt/scx_path".into()),
+                manifest_dir: "/other".into(),
+                schedulers: vec!["path".into()],
+                use_count: 1,
+            },
+        );
     }
 
     /// [`SchedulerTestJson`] — the `--ktstr-list-scheduler-tests` wire element

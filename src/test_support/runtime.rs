@@ -211,9 +211,13 @@ pub(crate) fn perf_only_skips_entry(entry: &KtstrTestEntry) -> bool {
 }
 
 /// Derive initramfs archive path, host path, and guest path from a
-/// scheduler's `config_file`. Returns `None` when no config file is set.
-pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {
-    let config_path = entry.scheduler.config_file?;
+/// scheduler's static `config_file`. This scheduler-only projection is shared
+/// by ordinary test VMs and generated verifier cells so both launch the same
+/// declaration instead of silently dropping the verifier's config.
+pub(crate) fn scheduler_config_file_parts(
+    scheduler: &super::entry::Scheduler,
+) -> Option<(String, PathBuf, String)> {
+    let config_path = scheduler.config_file?;
     let file_name = Path::new(config_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -221,6 +225,11 @@ pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathB
     let archive_path = format!("include-files/{file_name}");
     let guest_path = format!("/include-files/{file_name}");
     Some((archive_path, PathBuf::from(config_path), guest_path))
+}
+
+/// Entry-shaped compatibility wrapper for the ordinary test launch paths.
+pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {
+    scheduler_config_file_parts(entry.scheduler)
 }
 
 /// Stable u64 hash of arbitrary string content.
@@ -301,14 +310,36 @@ pub(crate) fn config_content_parts(
 /// `unknown-unknown` fallback. Anything the two VM-launch sites
 /// (`run_ktstr_test_inner` and `attempt_auto_repro`) previously
 /// re-implemented side-by-side lives here.
-pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for s in entry.scheduler.sysctls {
+/// Ordered guest-kernel cmdline tokens owned by a scheduler declaration.
+///
+/// Keep this projection independent of `KtstrTestEntry`: generated verifier
+/// cells have a scheduler but no test entry, and booting them without these
+/// tokens can change scheduler startup, BPF rodata, and verifier instruction
+/// counts. Sysctls precede raw kargs exactly as on the ordinary test path.
+pub(crate) fn scheduler_cmdline_tokens(scheduler: &super::entry::Scheduler) -> Vec<String> {
+    let mut parts = Vec::new();
+    for s in scheduler.sysctls {
         parts.push(format!("sysctl.{}={}", s.key(), s.value()));
     }
-    for &karg in entry.scheduler.kargs {
+    for &karg in scheduler.kargs {
         parts.push(karg.to_string());
     }
+    parts
+}
+
+fn build_cmdline_extra_with_probe_dump_gate(
+    entry: &KtstrTestEntry,
+    include_probe_dump_gate: bool,
+) -> String {
+    let mut parts = scheduler_cmdline_tokens(entry.scheduler);
+    // Framework-owned readiness authority. Scheduler kargs are otherwise
+    // passed through verbatim, but they may neither arm nor disarm this
+    // watchdog-accounting protocol: only the typed test-entry field decides
+    // whether the primary VM emits the exact `=1` token. This also prevents
+    // auto-repro from inheriting a raw scheduler-provided gate.
+    parts.retain(|part| {
+        part != "KTSTR_AWAIT_PROBE_DUMP_READY" && !part.starts_with("KTSTR_AWAIT_PROBE_DUMP_READY=")
+    });
     // Per-test KASLR opt-out (see `KtstrTestEntry.kaslr` doc). The base
     // cmdline `base_guest_cmdline` at `src/vmm/setup/mod.rs` does NOT
     // inject `nokaslr` by default — KASLR is on. A test that needs determinism sets `kaslr = false` in
@@ -330,6 +361,14 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     // periodic runs pay the wait; non-periodic runs never see the flag.
     if entry.num_snapshots > 0 {
         parts.push("KTSTR_AWAIT_PERIODIC_READY=1".to_string());
+    }
+    // Diagnostic scheduler-start gate: only explicitly opted-in tests
+    // pay the host's full probe-counter decode and guest wait. The
+    // host publishes the matching edge only after the exact dump
+    // reader succeeds, so scheduler-relative fault timers start with
+    // the diagnostic substrate already readable.
+    if include_probe_dump_gate && entry.probe_dump_ready_gate {
+        parts.push("KTSTR_AWAIT_PROBE_DUMP_READY=1".to_string());
     }
     if let Ok(bt) = std::env::var("RUST_BACKTRACE") {
         parts.push(format!("RUST_BACKTRACE={bt}"));
@@ -373,6 +412,25 @@ pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
     parts.join(" ")
 }
 
+/// Build the primary VM's cmdline additions.
+///
+/// An explicitly opted-in primary carries the probe-dump readiness gate. Its
+/// guest args also carry the matching minimal probe request; see
+/// `append_primary_probe_dump_arg`.
+pub(crate) fn build_cmdline_extra(entry: &KtstrTestEntry) -> String {
+    build_cmdline_extra_with_probe_dump_gate(entry, true)
+}
+
+/// Build an auto-repro VM's cmdline additions without primary-only launch
+/// gates.
+///
+/// Stall auto-repro intentionally skips probe attachment, so inheriting a
+/// primary cell's probe-dump gate would make guest init wait for an edge the
+/// host can never publish.
+pub(crate) fn build_auto_repro_cmdline_extra(entry: &KtstrTestEntry) -> String {
+    build_cmdline_extra_with_probe_dump_gate(entry, false)
+}
+
 #[cfg(feature = "wprof")]
 pub(crate) fn attach_wprof_if_requested(
     builder: crate::vmm::KtstrVmBuilder,
@@ -408,26 +466,136 @@ pub(crate) fn attach_wprof_if_requested(
 /// `.memory_deferred_min(mib)`, which raises the actual allocation to
 /// fit the real initramfs, so the final boot memory may exceed this.
 pub(crate) fn cpu_scaled_memory_mib(cpus: u32) -> u32 {
-    (cpus * 64).max(256)
+    checked_cpu_scaled_memory_mib(cpus)
+        .expect("validated live topology overflows the 64 MiB/vCPU memory floor")
+}
+
+/// Fallible scalar form used when decoding topology dimensions from an ELF.
+pub(crate) fn checked_cpu_scaled_memory_mib(cpus: u32) -> Option<u32> {
+    cpus.checked_mul(64).map(|scaled| scaled.max(256))
+}
+
+/// Memory floor for one verifier topology preset.
+///
+/// Verifier VMs use deferred sizing, so the actual initramfs budget may raise
+/// this floor. The preset budget caps only the topology-derived CPU scaling:
+/// a 252-vCPU synthetic topology must not advertise 16 GiB merely because it
+/// has many vCPUs when the preset explicitly budgets 4 GiB. Small presets keep
+/// the ordinary 64 MiB/vCPU floor.
+pub(crate) fn verifier_preset_memory_min_mib(cpus: u32, preset_memory_mib: usize) -> u32 {
+    checked_verifier_preset_memory_min_mib(cpus, preset_memory_mib)
+        .expect("validated live verifier topology overflows the 64 MiB/vCPU memory floor")
+}
+
+/// Fallible verifier-memory projection for topology data decoded from an ELF.
+pub(crate) fn checked_verifier_preset_memory_min_mib(
+    cpus: u32,
+    preset_memory_mib: usize,
+) -> Option<u32> {
+    let preset_cap = u32::try_from(preset_memory_mib).unwrap_or(u32::MAX);
+    checked_cpu_scaled_memory_mib(cpus).map(|scaled| scaled.min(preset_cap))
+}
+
+/// wprof BPF ringbuf sizing baked into `WprofConfig::default_args`.
+///
+/// wprof allocates `WPROF_DEFAULT_RINGBUF_CNT` BPF ring buffers, each
+/// `--ringbuf-size` KiB rounded up to a power-of-two byte size; the
+/// tracer faults the whole arena in on capture, so guest RAM must
+/// cover it. These two constants are the single source of truth:
+/// `crate::vmm::wprof::WprofConfig::default_args` renders them into
+/// the `--ringbuf-size=`/`--ringbuf-cnt=` flags AND
+/// [`WPROF_MIN_MEMORY_MIB`] derives the guest-memory floor from them,
+/// so changing the sizing here moves the flags and the floor together.
+///
+/// The default is deliberately minimal — a single 16 MiB ring buffer,
+/// which is wprof's own per-buffer default (`DEFAULT_RINGBUF_SZ`) and
+/// comfortably holds the short sched-event captures ktstr's wprof
+/// tests run. ktstr only tests that wprof writes valid data
+/// end-to-end; oversizing merely inflates the per-cell fault-in cost.
+/// Larger captures pass their own `#[ktstr_test(wprof_args = "...")]`
+/// and, if the resulting arena exceeds the guest's normal memory,
+/// their own `memory_mib`.
+pub(crate) const WPROF_DEFAULT_RINGBUF_SIZE_KB: u32 = 16 * 1024;
+pub(crate) const WPROF_DEFAULT_RINGBUF_CNT: u32 = 1;
+
+/// Guest-memory floor (MiB) for a stamped wprof attachment, derived
+/// from the default ringbuf arena above.
+///
+/// Always compiled because the cargo-ktstr admission runner reads a
+/// stamped wprof bit from an ELF built with a different feature set
+/// than its own, so this projection cannot be `wprof`-gated. The
+/// public wprof API remains feature-gated and aliases this value.
+///
+/// At the minimal default the arena (16 MiB) sits below the universal
+/// 256 MiB memory floor from [`cpu_scaled_memory_mib`], so this floor
+/// is subsumed and never bumps a real VM; it re-engages only if the
+/// default ringbuf sizing above ever grows the arena past that floor.
+pub(crate) const WPROF_MIN_MEMORY_MIB: u32 = {
+    let per_rb_bytes = wprof_next_pow2_u64(WPROF_DEFAULT_RINGBUF_SIZE_KB as u64 * 1024);
+    let arena_bytes = per_rb_bytes * WPROF_DEFAULT_RINGBUF_CNT as u64;
+    (arena_bytes / (1024 * 1024)) as u32
+};
+
+/// Round `n` up to the next power of two, mirroring wprof's
+/// `round_pow_of_2` on the ringbuf byte size. `const fn` so the
+/// memory floor is a compile-time constant.
+const fn wprof_next_pow2_u64(n: u64) -> u64 {
+    let mut p: u64 = 1;
+    while p < n {
+        p <<= 1;
+    }
+    p
+}
+
+/// Apply the feature-independent memory floor encoded by a stamped wprof bit.
+pub(crate) fn apply_wprof_memory_floor(raw_mib: u32, wprof: bool) -> u32 {
+    if wprof && raw_mib < WPROF_MIN_MEMORY_MIB {
+        WPROF_MIN_MEMORY_MIB
+    } else {
+        raw_mib
+    }
+}
+
+/// Compute the exact deferred-memory floor from admission-stamp scalars.
+///
+/// This is the process-independent core of [`derive_test_memory_mib`].  The
+/// pre-exec target runner has only the final ELF stamp, not a live
+/// [`KtstrTestEntry`], and must publish the same lower bound before it starts
+/// the heavyweight test process. Keeping the scalar projection here prevents
+/// admission and VM construction from acquiring different memory weights.
+pub(crate) fn derive_test_memory_min_mib(cpus: u32, declared_memory_mib: u32, wprof: bool) -> u32 {
+    checked_derive_test_memory_min_mib(cpus, declared_memory_mib, wprof)
+        .expect("validated live topology overflows the 64 MiB/vCPU memory floor")
+}
+
+/// Fallible admission-memory projection for topology data decoded from an ELF.
+pub(crate) fn checked_derive_test_memory_min_mib(
+    cpus: u32,
+    declared_memory_mib: u32,
+    wprof: bool,
+) -> Option<u32> {
+    let raw = checked_cpu_scaled_memory_mib(cpus)?.max(declared_memory_mib);
+    Some(apply_wprof_memory_floor(raw, wprof))
 }
 
 /// Derive the test VM's memory floor from a CPU count + entry.
 ///
 /// Returns `max(cpu_scaled_memory_mib(cpus), entry.memory_mib)`. When
-/// the `wprof` feature is enabled and `entry.wprof` is true, bumps
-/// to `WPROF_MIN_MEMORY_MIB` if below that floor.
+/// `entry.wprof` is true, bumps to the feature-independent stamped wprof
+/// memory floor if below it. The tracer attachment itself remains gated by
+/// the `wprof` feature.
 ///
 /// The returned value is the LOWER BOUND on guest memory; the
 /// VM builder ultimately uses `.memory_deferred_min(mib)` which
 /// also accounts for the initramfs size, so the final boot memory
 /// may exceed this value.
 pub(crate) fn derive_test_memory_mib(cpus: u32, entry: &KtstrTestEntry) -> u32 {
-    let raw = cpu_scaled_memory_mib(cpus).max(entry.memory_mib);
+    let memory_min_mib = derive_test_memory_min_mib(cpus, entry.memory_mib, entry.wprof);
     #[cfg(feature = "wprof")]
     {
-        use crate::vmm::wprof::{WPROF_MIN_MEMORY_MIB, apply_wprof_memory_floor};
-        let mem = apply_wprof_memory_floor(raw, entry.wprof);
-        if mem != raw {
+        use crate::vmm::wprof::WPROF_MIN_MEMORY_MIB;
+        let raw = cpu_scaled_memory_mib(cpus).max(entry.memory_mib);
+        if memory_min_mib != raw {
             tracing::info!(
                 test = %entry.name,
                 requested_mib = raw,
@@ -436,10 +604,8 @@ pub(crate) fn derive_test_memory_mib(cpus: u32, entry: &KtstrTestEntry) -> u32 {
                  WPROF_MIN_MEMORY_MIB"
             );
         }
-        mem
     }
-    #[cfg(not(feature = "wprof"))]
-    raw
+    memory_min_mib
 }
 
 /// Resolve the VM topology and memory size from an optional
@@ -1518,6 +1684,98 @@ mod tests {
     }
 
     #[test]
+    fn build_cmdline_extra_emits_probe_dump_gate_only_when_opted_in() {
+        let _lock = lock_env();
+        let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
+        let _env_log = EnvVarGuard::remove("RUST_LOG");
+        let _env_sd = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "/tmp/ktstr-test");
+
+        let default = KtstrTestEntry {
+            name: "probe_dump_gate_default",
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert!(
+            !build_cmdline_extra(&default).contains("KTSTR_AWAIT_PROBE_DUMP_READY"),
+            "the default path must not pay the probe-dump readiness gate"
+        );
+
+        let opted_in = KtstrTestEntry {
+            name: "probe_dump_gate_enabled",
+            probe_dump_ready_gate: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(
+            build_cmdline_extra(&opted_in),
+            "KTSTR_AWAIT_PROBE_DUMP_READY=1 KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
+        );
+    }
+
+    #[test]
+    fn build_auto_repro_cmdline_extra_omits_primary_probe_dump_gate() {
+        let _lock = lock_env();
+        let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
+        let _env_log = EnvVarGuard::remove("RUST_LOG");
+        let _env_sd = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "/tmp/ktstr-test");
+
+        let opted_in = KtstrTestEntry {
+            name: "probe_dump_gate_auto_repro",
+            probe_dump_ready_gate: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(
+            build_auto_repro_cmdline_extra(&opted_in),
+            "KTSTR_SIDECAR_DIR=/tmp/ktstr-test",
+            "auto-repro must not inherit the primary-only probe-dump gate"
+        );
+    }
+
+    #[test]
+    fn scheduler_kargs_cannot_forge_or_disable_probe_dump_gate() {
+        let _lock = lock_env();
+        let _env_bt = EnvVarGuard::remove("RUST_BACKTRACE");
+        let _env_log = EnvVarGuard::remove("RUST_LOG");
+        let _env_sd = EnvVarGuard::set(crate::KTSTR_SIDECAR_DIR_ENV, "/tmp/ktstr-test");
+
+        static SCHED: Scheduler = Scheduler::named("probe-gate-kargs").kargs(&[
+            "quiet",
+            "KTSTR_AWAIT_PROBE_DUMP_READY=0",
+            "KTSTR_AWAIT_PROBE_DUMP_READY=1",
+        ]);
+        let disabled = KtstrTestEntry {
+            name: "probe_gate_kargs_disabled",
+            scheduler: &SCHED,
+            ..KtstrTestEntry::DEFAULT
+        };
+        assert_eq!(
+            build_cmdline_extra(&disabled),
+            "quiet KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
+        );
+
+        let enabled = KtstrTestEntry {
+            name: "probe_gate_kargs_enabled",
+            scheduler: &SCHED,
+            probe_dump_ready_gate: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let primary = build_cmdline_extra(&enabled);
+        assert_eq!(
+            primary,
+            "quiet KTSTR_AWAIT_PROBE_DUMP_READY=1 KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
+        );
+        assert_eq!(
+            primary
+                .split_ascii_whitespace()
+                .filter(|token| *token == "KTSTR_AWAIT_PROBE_DUMP_READY=1")
+                .count(),
+            1
+        );
+        assert_eq!(
+            build_auto_repro_cmdline_extra(&enabled),
+            "quiet KTSTR_SIDECAR_DIR=/tmp/ktstr-test"
+        );
+    }
+
+    #[test]
     fn build_cmdline_extra_propagates_rust_env() {
         let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
@@ -1586,22 +1844,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_vm_topology_none_floors_memory_at_256() {
-        // Tiny topology: 1*1*1=1 cpu -> 64 MiB raw, entry.memory_mib=0,
-        // floor = max(64, 256, 0) = 256.
-        //
-        // Override memory_mib explicitly to 0 — KtstrTestEntry::DEFAULT
-        // sets memory_mib=2048, which would bypass the floor entirely
-        // and leave this test vacuously passing regardless of the
-        // max(…, 256, …) branch. Setting memory_mib=0 makes the 256
-        // floor the exact lower bound the assertion verifies.
+    fn resolve_vm_topology_default_memory_can_stay_below_two_gib() {
+        // The default topology has two vCPUs, so cpu scaling yields
+        // 128 MiB and the framework-wide 256-MiB floor wins. This
+        // specifically guards against restoring a stale multi-GiB
+        // entry default that would defeat deferred payload sizing.
         let entry = KtstrTestEntry {
             name: "tiny",
-            memory_mib: 0,
             ..KtstrTestEntry::DEFAULT
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
         assert_eq!(mem, 256, "memory floor = 256 MiB, got {mem}");
+        assert!(mem < 2048, "default memory must not pin every VM at 2 GiB");
     }
 
     #[test]
@@ -1609,31 +1863,38 @@ mod tests {
         // Entry with explicit memory_mib above the cpu*64 and 256 floors.
         let entry = KtstrTestEntry {
             name: "mem",
-            memory_mib: 8192,
-            ..KtstrTestEntry::DEFAULT
-        };
-        let (_topo, mem) = resolve_vm_topology(&entry, None);
-        assert_eq!(mem, 8192);
-    }
-
-    #[cfg(feature = "wprof")]
-    #[test]
-    fn resolve_vm_topology_wprof_floors_memory_on_entry_path() {
-        // Entry with wprof=true and memory below the wprof floor.
-        // The entry-derived path must raise memory to WPROF_MIN_MEMORY_MIB.
-        let entry = KtstrTestEntry {
-            name: "wprof_floor",
-            memory_mib: 512,
-            wprof: true,
+            memory_mib: 1536,
             ..KtstrTestEntry::DEFAULT
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
         assert_eq!(
-            mem,
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
-            "wprof=true must bump memory to >= WPROF_MIN_MEMORY_MIB \
-             ({}), got {mem}",
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+            mem, 1536,
+            "a real explicit override must win even when it is not the old 2-GiB default"
+        );
+    }
+
+    #[cfg(feature = "wprof")]
+    #[test]
+    fn resolve_vm_topology_wprof_does_not_oversize_at_minimal_default() {
+        // wprof=true with the minimal default arena must NOT oversize:
+        // the derived wprof floor (16 MiB) is below the entry's own
+        // memory, so the entry-derived path sizes the VM exactly like
+        // the same non-wprof entry. Guards against restoring a
+        // multi-GiB wprof floor that pinned every wprof cell high.
+        let entry = KtstrTestEntry {
+            name: "wprof_minimal",
+            memory_mib: 512,
+            wprof: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        // Compile-time invariant: at the minimal default the wprof
+        // floor stays at/under the universal 256 MiB floor, so it is
+        // subsumed and cannot oversize a VM.
+        const { assert!(crate::vmm::wprof::WPROF_MIN_MEMORY_MIB <= 256) };
+        let (_topo, mem) = resolve_vm_topology(&entry, None);
+        assert_eq!(
+            mem, 512,
+            "wprof must not oversize past the entry's own 512 MiB; got {mem}"
         );
     }
 
@@ -1678,11 +1939,15 @@ mod tests {
     fn derive_test_memory_mib_baseline_without_wprof() {
         let entry = KtstrTestEntry {
             name: "baseline",
-            memory_mib: 0,
             ..KtstrTestEntry::DEFAULT
         };
         let mem = derive_test_memory_mib(2, &entry);
         assert_eq!(mem, 256, "2 cpus * 64 = 128, floor 256 wins");
+        assert_eq!(
+            derive_test_memory_min_mib(2, entry.memory_mib, entry.wprof),
+            mem,
+            "the admission-stamp scalar projection must equal entry-based VM sizing",
+        );
     }
 
     #[test]
@@ -1697,13 +1962,56 @@ mod tests {
     }
 
     #[test]
+    fn stamped_wprof_memory_floor_is_feature_independent() {
+        // The floor is applied by value, not by cfg!(feature = "wprof"):
+        // a below-floor raw is bumped, an at/above-floor raw passes
+        // through — identically whether or not the reader binary was
+        // built with wprof.
+        assert_eq!(
+            apply_wprof_memory_floor(WPROF_MIN_MEMORY_MIB - 1, true),
+            WPROF_MIN_MEMORY_MIB,
+            "a raw below the derived floor must be bumped up to it",
+        );
+        assert_eq!(
+            apply_wprof_memory_floor(WPROF_MIN_MEMORY_MIB, true),
+            WPROF_MIN_MEMORY_MIB,
+            "a raw at the floor passes through (strict-less-than)",
+        );
+        assert_eq!(apply_wprof_memory_floor(4096, true), 4096);
+        assert_eq!(apply_wprof_memory_floor(4096, false), 4096);
+        // At the minimal default arena the floor (16 MiB) is far below
+        // the universal 256 MiB floor, so admission sizing is dominated
+        // by the latter regardless of the wprof bit — the whole point
+        // of the minimal default is that wprof no longer oversizes.
+        assert_eq!(derive_test_memory_min_mib(2, 768, true), 768);
+        assert_eq!(derive_test_memory_min_mib(2, 768, false), 768);
+    }
+
+    #[test]
+    fn checked_admission_memory_scaling_rejects_overflow() {
+        assert_eq!(checked_cpu_scaled_memory_mib(u32::MAX), None);
+        assert_eq!(
+            checked_derive_test_memory_min_mib(u32::MAX, 256, false),
+            None
+        );
+        assert_eq!(checked_verifier_preset_memory_min_mib(u32::MAX, 4096), None);
+    }
+
+    #[test]
+    fn verifier_preset_memory_caps_synthetic_cpu_scaling() {
+        assert_eq!(verifier_preset_memory_min_mib(4, 2048), 256);
+        assert_eq!(verifier_preset_memory_min_mib(32, 2048), 2048);
+        assert_eq!(verifier_preset_memory_min_mib(64, 2048), 2048);
+        assert_eq!(verifier_preset_memory_min_mib(252, 4096), 4096);
+    }
+
+    #[test]
     fn cpu_scaled_memory_mib_backs_derive_test_memory_mib() {
         // The entry-aware wrapper must reduce to the shared core when no
         // per-entry override raises it — the invariant that lets the
-        // verifier cell reuse cpu_scaled_memory_mib directly.
+        // direct verifier API reuse cpu_scaled_memory_mib directly.
         let entry = KtstrTestEntry {
             name: "shared",
-            memory_mib: 0,
             ..KtstrTestEntry::DEFAULT
         };
         for cpus in [1u32, 4, 8, 32] {
@@ -1711,21 +2019,19 @@ mod tests {
                 derive_test_memory_mib(cpus, &entry),
                 cpu_scaled_memory_mib(cpus),
                 "derive_test_memory_mib must equal the shared core for \
-                 {cpus} cpus when entry.memory_mib=0"
+                 {cpus} cpus when the entry uses the framework minimum"
             );
         }
     }
 
     #[cfg(feature = "wprof")]
     #[test]
-    fn resolve_vm_topology_wprof_no_bump_at_exact_floor() {
-        // Boundary case: derived memory equals WPROF_MIN_MEMORY_MIB
-        // exactly. The handler uses strict `<` so 2048 passes through
-        // unchanged. A regression that flipped to `<=` would be a
-        // 2048→2048 no-op (still unobservable), but a regression
-        // that flipped to `>` (or `>= ... { raw } else { FLOOR }`)
-        // would catastrophically floor every test. This test pins
-        // the strict-less-than direction.
+    fn resolve_vm_topology_wprof_universal_floor_dominates_tiny_arena() {
+        // With the minimal default arena the wprof floor is far below
+        // the universal 256 MiB floor, so the latter dominates even
+        // when the entry declares exactly WPROF_MIN_MEMORY_MIB. The
+        // strict-less-than direction of the floor condition itself is
+        // pinned directly in `stamped_wprof_memory_floor_is_feature_independent`.
         let entry = KtstrTestEntry {
             name: "wprof_exact",
             memory_mib: crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
@@ -1734,21 +2040,18 @@ mod tests {
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
         assert_eq!(
-            mem,
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
-            "memory_mib equal to WPROF_MIN_MEMORY_MIB must pass \
-             through unchanged (strict-less-than floor condition); \
-             got {mem}"
+            mem, 256,
+            "universal 256 MiB floor dominates the tiny wprof arena; got {mem}"
         );
     }
 
     #[cfg(feature = "wprof")]
     #[test]
-    fn resolve_vm_topology_wprof_floors_zero_entry_memory_mib() {
+    fn resolve_vm_topology_wprof_zero_entry_memory_mib_uses_universal_floor() {
         // Edge case: entry.memory_mib=0 with wprof=true. The raw
         // derivation `max(cpus*64, 256, 0)` resolves to 256 on the
-        // default 1-CPU topology, which is well below the floor.
-        // wprof must bump to WPROF_MIN_MEMORY_MIB.
+        // default 1-CPU topology; the minimal wprof arena is below
+        // that, so the universal 256 MiB floor is what the VM gets.
         let entry = KtstrTestEntry {
             name: "wprof_zero_mib",
             memory_mib: 0,
@@ -1757,11 +2060,9 @@ mod tests {
         };
         let (_topo, mem) = resolve_vm_topology(&entry, None);
         assert_eq!(
-            mem,
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
-            "entry.memory_mib=0 with wprof=true must floor to \
-             WPROF_MIN_MEMORY_MIB ({}); got {mem}",
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
+            mem, 256,
+            "entry.memory_mib=0 with wprof=true resolves to the \
+             universal 256 MiB floor; got {mem}"
         );
     }
 
@@ -1785,9 +2086,14 @@ mod tests {
         };
         let mem = derive_test_memory_mib(2, &entry);
         assert_eq!(
+            mem, 256,
+            "helper applies the wprof floor (16 MiB) but it is subsumed \
+             by the universal 256 MiB floor for a 2-cpu VM; got {mem}"
+        );
+        assert_eq!(
+            derive_test_memory_min_mib(2, entry.memory_mib, entry.wprof),
             mem,
-            crate::vmm::wprof::WPROF_MIN_MEMORY_MIB,
-            "helper must floor wprof memory regardless of caller; got {mem}"
+            "pre-exec admission must apply the same wprof floor as VM sizing",
         );
 
         // wprof=false: derivation returns the raw formula

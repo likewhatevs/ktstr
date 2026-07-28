@@ -39,8 +39,8 @@
 
 mod common;
 
-use anyhow::Result;
-use common::failure_dump::read_failure_dump;
+use anyhow::{Context, Result};
+use common::failure_dump::{failure_dump_artifact, read_failure_dump};
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::{SCHEMA_SINGLE, VmResult};
@@ -76,6 +76,7 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
 /// marker even though `expect_err` inverts the stall itself to PASS.
 fn check_bss_dump(result: &VmResult) -> Result<()> {
     let value = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
     // The full-dump happy path expects SCHEMA_SINGLE; a `degraded`
     // schema here means the freeze coordinator's capture-vs-degraded
@@ -127,8 +128,8 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "dump has no scheduler `.bss` map (got {} maps): {value}",
-                maps.len()
+                "dump has no scheduler `.bss` map (got {} maps); {dump_artifact}",
+                maps.len(),
             )
         })?;
 
@@ -146,7 +147,7 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
     if kind != "struct" {
         anyhow::bail!(
             "expected .bss value to render as a Struct (kind=\"struct\"), got kind={kind:?}: \
-             {value_field}"
+             {dump_artifact}"
         );
     }
     let members = value_field
@@ -250,8 +251,8 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
             "dump JSON `vcpu_regs` has no entry with non-zero \
              instruction_pointer — every slot is null or has zero IP. \
              Capture-on-vCPU-thread path may be broken or rendezvous \
-             timed out before any vCPU completed handle_freeze. \
-             Full vcpu_regs: {vcpu_regs:?}"
+             timed out before any vCPU completed handle_freeze; \
+             {dump_artifact}"
         );
     }
 
@@ -361,8 +362,8 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
                  declares one via lib/arena_map.h, so either the dump \
                  path filtered it out, the map enumeration missed it, \
                  or the scheduler failed to load the arena. Got {} \
-                 maps total: {value}",
-                maps.len()
+                 maps total; {dump_artifact}",
+                maps.len(),
             )
         })?;
     // Arena map JSON shape:
@@ -379,7 +380,7 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
              BPF_MAP_TYPE_ARENA arm did not populate ArenaSnapshot \
              (likely arena_offsets was None: kernel BTF lacks \
              struct bpf_arena, or BpfArenaOffsets::from_btf failed). \
-             arena map JSON: {arena_map}"
+             {dump_artifact}"
         )
     })?;
 
@@ -391,7 +392,7 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
         Some(p) => p.as_array().map(|a| a.as_slice()).ok_or_else(|| {
             anyhow::anyhow!(
                 "arena.pages is present but not an array — \
-                 ArenaSnapshot serde shape changed. arena field: {arena_field}"
+                 ArenaSnapshot serde shape changed; {dump_artifact}"
             )
         })?,
         None => &[],
@@ -402,7 +403,7 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
              returned no pages. Either the PTE walker found no mapped \
              pgoffs (kern_vm translation failed for every page), \
              max_entries is 0, or scx_task_alloc never ran on any task \
-             (alloc_count={alloc_count_int}). arena field: {arena_field}"
+             (alloc_count={alloc_count_int}); {dump_artifact}"
         );
     }
 
@@ -420,16 +421,15 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "arena.declared_pages is 0 (or absent) — \
              ArenaWalkPlan computed a zero-page span, meaning \
-             `info.max_entries` was unreadable or zero at dump time. \
-             arena field: {arena_field}"
+             `info.max_entries` was unreadable or zero at dump time; \
+             {dump_artifact}"
         );
     }
     if (arena_pages.len() as u64) > declared_pages {
         anyhow::bail!(
             "arena.pages.len() ({}) exceeds declared_pages ({}) — \
              walker invariant violated; ArenaWalkPlan should never \
-             emit more pages than the declared capacity. arena field: \
-             {arena_field}",
+             emit more pages than the declared capacity; {dump_artifact}",
             arena_pages.len(),
             declared_pages
         );
@@ -452,14 +452,14 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
     const KTSTR_ARENA_MAGIC_LE: [u8; 8] = KTSTR_ARENA_MAGIC.to_le_bytes();
     let mut magic_hits = 0usize;
     let mut total_bytes = 0usize;
-    for page in arena_pages {
+    for (page_index, page) in arena_pages.iter().enumerate() {
         let bytes = page
             .get("bytes")
             .and_then(|b| b.as_array())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "arena page missing `bytes` array — \
-                     ArenaPage serde shape changed. page: {page}"
+                    "arena page {page_index} is missing its `bytes` array — \
+                     ArenaPage serde shape changed; {dump_artifact}"
                 )
             })?;
         // Each element must be a u8; collect into a flat Vec<u8>.
@@ -510,8 +510,7 @@ fn check_bss_dump(result: &VmResult) -> Result<()> {
     Ok(())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "failure_dump_renders_bss_fields",
@@ -605,6 +604,7 @@ fn failure_dump_renders_array_entries(ctx: &ktstr::scenario::Ctx) -> Result<Asse
 /// even though expect_err inverts the stall itself to PASS.
 fn check_array_entries_dump(result: &VmResult) -> Result<()> {
     let value = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
     let schema = value
         .get("schema")
@@ -639,8 +639,8 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
             anyhow::anyhow!(
                 "dump has no multi-entry ARRAY fixture (map_type=2, max_entries=16) — \
                  the scx-ktstr ktstr_array_fixture map is missing from the IDR walk \
-                 or was mis-typed by the renderer. maps={}: {value}",
-                maps.len()
+                 or was mis-typed by the renderer. maps={}; {dump_artifact}",
+                maps.len(),
             )
         })?;
 
@@ -656,12 +656,12 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
     anyhow::ensure!(
         array_map.get("value").is_none_or(|v| v.is_null()),
         "multi-entry ARRAY must populate `array_entries`, not the single-entry \
-         `value`: {array_map}"
+         `value`; {dump_artifact}"
     );
     // 16 < MAX_ARRAY_KEYS (4096) and every entry is mapped → no error.
     anyhow::ensure!(
         array_map.get("error").is_none_or(|e| e.is_null()),
-        "ARRAY render must be error-free for 16 mapped entries: {array_map}"
+        "ARRAY render must be error-free for 16 mapped entries; {dump_artifact}"
     );
 
     let entries = array_map
@@ -670,14 +670,15 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "ARRAY fixture has no `array_entries` — the prior 'only key 0' \
-                 behaviour would leave this empty with `value` set: {array_map}"
+                 behaviour would leave this empty with `value` set; \
+                 {dump_artifact}"
             )
         })?;
     anyhow::ensure!(
         entries.len() == KTSTR_ARRAY_ENTRIES as usize,
-        "expected {KTSTR_ARRAY_ENTRIES} array_entries (every key rendered), got {}: \
-         {array_map}",
-        entries.len()
+        "expected {KTSTR_ARRAY_ENTRIES} array_entries (every key rendered), got {}; \
+         {dump_artifact}",
+        entries.len(),
     );
 
     // Each entry i: key == i, value is a struct whose `magic` member is
@@ -685,27 +686,32 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
     // per-key stride read the correct entry (not key 0 repeated, not a
     // wrong-stride overlap).
     for (i, entry) in entries.iter().enumerate() {
-        let key = entry
-            .get("key")
-            .and_then(|k| k.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("array_entries[{i}] missing u32 `key`: {entry}"))?;
+        let key = entry.get("key").and_then(|k| k.as_u64()).ok_or_else(|| {
+            anyhow::anyhow!("array_entries[{i}] missing u32 `key`; {dump_artifact}")
+        })?;
         anyhow::ensure!(
             key == i as u64,
             "array_entries[{i}].key == {key}, expected {i} (entries must be key-ordered)"
         );
 
         let val = entry.get("value").ok_or_else(|| {
-            anyhow::anyhow!("array_entries[{i}] has no value (unreadable key?): {entry}")
+            anyhow::anyhow!(
+                "array_entries[{i}] has no value (unreadable key?); \
+                 {dump_artifact}"
+            )
         })?;
         anyhow::ensure!(
             val.get("kind").and_then(|k| k.as_str()) == Some("struct"),
-            "array_entries[{i}].value must render as a struct: {val}"
+            "array_entries[{i}].value must render as a struct; {dump_artifact}"
         );
         let members = val
             .get("members")
             .and_then(|m| m.as_array())
             .ok_or_else(|| {
-                anyhow::anyhow!("array_entries[{i}].value struct has no members: {val}")
+                anyhow::anyhow!(
+                    "array_entries[{i}].value struct has no members; \
+                     {dump_artifact}"
+                )
             })?;
         let member_u64 = |nm: &str| -> Option<u64> {
             members
@@ -720,11 +726,12 @@ fn check_array_entries_dump(result: &VmResult) -> Result<()> {
         anyhow::ensure!(
             magic == Some(KTSTR_ARRAY_MAGIC),
             "array_entries[{i}].magic must be KTSTR_ARRAY_MAGIC (0x{KTSTR_ARRAY_MAGIC:x}); \
-             got {magic:?}: {val}"
+             got {magic:?}; {dump_artifact}"
         );
         anyhow::ensure!(
             key_echo == Some(i as u64),
-            "array_entries[{i}].key_echo must echo the key {i}; got {key_echo:?}: {val}"
+            "array_entries[{i}].key_echo must echo the key {i}; got {key_echo:?}; \
+             {dump_artifact}"
         );
     }
 
@@ -777,6 +784,7 @@ fn scenario_failure_dump_renders_capture_modules(
 /// marker even though `expect_err` inverts the stall itself to PASS.
 fn check_capture_dump(result: &VmResult) -> Result<()> {
     let value = read_failure_dump(result)?;
+    let dump_artifact = failure_dump_artifact(result);
 
     // The freeze coordinator captures one `vcpu_regs` slot per booted
     // vCPU (BSP + APs), so its length is the authoritative online-CPU
@@ -791,7 +799,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "dump JSON missing `vcpu_regs` — cannot determine the expected \
-                 per-CPU count for the walker cross-check. Full JSON: {value}"
+                 per-CPU count for the walker cross-check; {dump_artifact}"
             )
         })?;
 
@@ -807,7 +815,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "scx_walker_unavailable={reason:?} — capture_scx::build returned \
              None or the walker reached no state. Captures must always \
-             produce data when scx-ktstr is loaded. Full JSON: {value}"
+             produce data when scx-ktstr is loaded; {dump_artifact}"
         );
     }
     let rq_scx_states = value
@@ -816,7 +824,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "dump JSON missing `rq_scx_states` array — capture_scx \
-                 wiring did not populate the field. Full JSON: {value}"
+                 wiring did not populate the field; {dump_artifact}"
             )
         })?;
     if rq_scx_states.len() != num_cpus {
@@ -826,7 +834,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
              collect_vcpu_regs). walk_rq_scx silently skips a CPU on \
              sub-group offset / per-CPU rq translate failure, so fewer \
              entries means a skipped CPU; more means a walker over-count. \
-             Full rq_scx_states: {rq_scx_states:?}",
+             {dump_artifact}",
             rq_scx_states.len(),
         );
     }
@@ -846,7 +854,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
              CPU's rq->scx scalar read came back zero, meaning the walker \
              ran but every per-CPU scx_rq is empty. Either no scx tasks \
              were ever runnable or the rq_pa translate produced wrong \
-             addresses. Full rq_scx_states: {rq_scx_states:?}"
+             addresses; {dump_artifact}"
         );
     }
 
@@ -856,14 +864,14 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "dump JSON missing `dsq_states` array — capture_scx \
-                 wiring did not populate the field. Full JSON: {value}"
+                 wiring did not populate the field; {dump_artifact}"
             )
         })?;
     if dsq_states.is_empty() {
         anyhow::bail!(
             "dsq_states is empty — walk_dsqs reached no DSQs. The \
              global DSQ (SCX_DSQ_GLOBAL per-node) must always be \
-             reachable when *scx_root is non-null. Full JSON: {value}"
+             reachable when *scx_root is non-null; {dump_artifact}"
         );
     }
 
@@ -873,7 +881,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "scx_sched_state is absent or null — read_scx_sched_state \
              returned None. *scx_root was unreadable or the BTF offsets \
-             didn't resolve. Full JSON: {value}"
+             didn't resolve; {dump_artifact}"
         );
     }
 
@@ -891,8 +899,8 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "task_enrichments_unavailable={reason:?} — capture_tasks::build \
              returned None or the walker yielded zero tasks. Captures \
-             must always produce data when scx tasks are runnable. Full \
-             JSON: {value}"
+             must always produce data when scx tasks are runnable; \
+             {dump_artifact}"
         );
     }
     let task_enrichments = value
@@ -902,14 +910,14 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
             anyhow::anyhow!(
                 "dump JSON missing `task_enrichments` array — \
                  capture_tasks wiring did not populate the field. \
-                 Full JSON: {value}"
+                 {dump_artifact}"
             )
         })?;
     if task_enrichments.is_empty() {
         anyhow::bail!(
             "task_enrichments is empty — runnable_list walker found no \
              tasks. With workers_per_cgroup>0 driving load, at least \
-             one task must be runnable at freeze time. Full JSON: {value}"
+             one task must be runnable at freeze time; {dump_artifact}"
         );
     }
     // At least one enrichment must carry an identity that proves the
@@ -929,7 +937,8 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
             "no task_enrichment entry has pid>0 AND non-empty comm — \
              every task_struct read produced pid<=0 or empty comm, \
              meaning the slab translate fell back to garbage memory. \
-             Full task_enrichments: {task_enrichments:?}"
+             entries={}; {dump_artifact}",
+            task_enrichments.len(),
         );
     }
 
@@ -954,7 +963,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
         anyhow::bail!(
             "per_node_numa is empty AND per_node_numa_unavailable is \
              absent — the dump pipeline broke its own contract that \
-             one of the two must be populated. Full JSON: {value}"
+             one of the two must be populated; {dump_artifact}"
         );
     }
 
@@ -973,8 +982,7 @@ fn check_capture_dump(result: &VmResult) -> Result<()> {
     Ok(())
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "failure_dump_renders_capture_modules",
@@ -1006,20 +1014,22 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
-/// Asserts that the failure dump's `probe_counters` field captures
-/// non-zero `trigger_count` after an SCX_EXIT_ERROR_STALL fires.
+/// Asserts that the failure dump's `probe_counters` field captures a
+/// structurally valid trigger counter and a live non-zero kprobe counter after
+/// an SCX_EXIT_ERROR_STALL fires.
 ///
 /// User-facing test bar (per project memory): the BPF probe's
 /// per-CPU diagnostic counters must surface in the failure dump
-/// with values that prove each tracepoint actually fired during
+/// with values that prove each probe actually fired during
 /// the run. After the per-CPU conversion landed (replacing N
 /// shared-global counters with a `[MAX_CPUS][KTSTR_PCPU_NR]`
 /// 2D array in `.bss`), this test pins:
 ///   1. `probe_counters` is present and structured (not absent /
 ///      null in the JSON);
-///   2. `probe_counters.trigger_count > 0` — the
-///      `tp_btf/sched_ext_exit` handler fired at least once during
-///      the stall, which proves the per-CPU sum reaches the host;
+///   2. `probe_counters.trigger_count` is present and numeric. Zero is a
+///      valid precise-freeze result: the hardware watchpoint linearizes on
+///      the scheduler's `exit_kind` write before the selected trigger
+///      increments this slot;
 ///   3. `probe_counters.probe_count > 0` — kprobes attached and
 ///      fired (confirms the host-side sum walks the array, since
 ///      a stub-empty array would produce 0 even on a working run).
@@ -1032,10 +1042,10 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
 fn scenario_failure_dump_renders_probe_counters(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
-    // Adopt the accessor before the --stall-after=1 freeze so the dump
-    // renders a full report (probe_counters present); the host-side
-    // `check_probe_dump` callback does the assertions.
-    await_accessor_ready();
+    // This entry's `probe_dump_ready_gate` has already held scheduler
+    // launch until the exact probe-counter dump decoder succeeded.
+    // The host-side `check_probe_dump` callback asserts that the later
+    // stall dump preserves that readiness and carries live counters.
     let steps = vec![Step {
         setup: vec![ctx.cgroup_def("cg_0")].into(),
         ops: vec![],
@@ -1045,43 +1055,103 @@ fn scenario_failure_dump_renders_probe_counters(
 }
 
 /// Host-side post_vm assertion for `failure_dump_renders_probe_counters`.
-/// Reads the dump via `read_failure_dump` and verifies the probe's
-/// per-CPU `.bss` counters surfaced (non-zero `trigger_count` and
-/// `probe_count`). Runs unconditionally; its Err is a hard FAIL via the
+/// Reads the dump directly and verifies the probe's per-CPU `.bss` counters
+/// surfaced (numeric `trigger_count` and non-zero `probe_count`). This
+/// acceptance deliberately does not use `read_failure_dump`: the readiness
+/// handshake has already proved that this exact map is decodable, so a later
+/// placeholder or mapless dump is a regression, not an inconclusive
+/// `HostSkipRequest`. Runs unconditionally; its Err is a hard FAIL via the
 /// framework's `PostVmAssertionFailure` marker even though `expect_err`
 /// inverts the stall itself to PASS.
 fn check_probe_dump(result: &VmResult) -> Result<()> {
-    let value = read_failure_dump(result)?;
+    let dump_path = result.failure_dump_path()?;
+    let json = std::fs::read_to_string(&dump_path).with_context(|| {
+        format!(
+            "probe-counter failure dump missing at {} after its readiness \
+             handshake succeeded",
+            dump_path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .map_err(|error| anyhow::anyhow!("probe-counter dump is not valid JSON: {error}"))?;
+    let dump_artifact = failure_dump_artifact(result);
+
+    validate_required_probe_dump(&value, &dump_artifact)?;
+
+    Ok(())
+}
+
+/// Validate the dump-level prerequisites promised by the probe readiness edge
+/// before checking the counter payload itself.
+///
+/// Keep this helper free of `post_vm_skip`: the dedicated acceptance cannot
+/// turn a placeholder or an empty-map dump into a passing nextest case.
+fn validate_required_probe_dump(
+    value: &serde_json::Value,
+    dump_artifact: &str,
+) -> Result<(u64, u64)> {
+    anyhow::ensure!(
+        !value
+            .get("is_placeholder")
+            .and_then(|placeholder| placeholder.as_bool())
+            .unwrap_or(false),
+        "probe-counter dump is a placeholder after its readiness handshake \
+         succeeded; {dump_artifact}"
+    );
+
+    let maps = value
+        .get("maps")
+        .and_then(|maps| maps.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "probe-counter dump is missing its top-level `maps` array; \
+                 {dump_artifact}"
+            )
+        })?;
+    anyhow::ensure!(
+        !maps.is_empty(),
+        "probe-counter dump has no rendered BPF maps after its readiness \
+         handshake succeeded; {dump_artifact}"
+    );
 
     // `probe_counters` is `skip_serializing_if = "Option::is_none"`,
     // so its absence in the JSON means the host-side decoder
-    // returned None. That's a regression — when the probe has
-    // attached and fired (which the stall scenario guarantees),
-    // the decoder must produce a populated struct.
+    // returned None. That's a regression — the pre-scheduler readiness gate
+    // has already proved the exact decoder can read this slab, so the precise
+    // stall freeze must preserve a populated struct.
     let probe_counters = value.get("probe_counters").ok_or_else(|| {
         anyhow::anyhow!(
             "dump JSON missing `probe_counters` field — \
              decode_probe_counters_snapshot returned None. \
              Probe `.bss` map absent, BTF lookup failed, or the \
-             `ktstr_pcpu_counters` array offset didn't resolve. \
-             Full JSON: {value}"
+             `ktstr_pcpu_counters` array offset didn't resolve; \
+             {dump_artifact}"
         )
     })?;
     if probe_counters.is_null() {
         anyhow::bail!(
             "`probe_counters` is null — decoder ran but produced None; \
-             same prerequisite-missing failure modes as above. \
-             Full JSON: {value}"
+             same prerequisite-missing failure modes as above; \
+             {dump_artifact}"
         );
     }
 
-    // `trigger_count` is the structural assertion — a stall
-    // scenario is guaranteed to fire `tp_btf/sched_ext_exit`
-    // (the SCX kernel emits SCX_EXIT_ERROR_STALL through the
-    // tracepoint), so a zero value here means either (a) the
-    // probe didn't attach the trigger handler, (b) the handler
-    // fired but the per-CPU slot bump didn't land, or (c) the
-    // host-side cross-CPU sum walked the wrong slot index.
+    validate_probe_counters(probe_counters, dump_artifact)
+}
+
+/// Validate the counter serde shape and the precise-freeze ordering invariant.
+///
+/// The scheduler error watchpoint traps immediately after the kernel writes
+/// `exit_kind`. That store precedes every selected trigger point, so a correct
+/// hardware-linearized dump may observe `trigger_count == 0`.
+/// Delaying capture to make it non-zero would lose the stronger invariant that
+/// the probe skeleton and its map are still alive. `probe_count > 0` is the
+/// independent live-array proof: the Phase-A `enqueue_task_scx` kprobe has
+/// already fired before the scheduler stalls.
+fn validate_probe_counters(
+    probe_counters: &serde_json::Value,
+    dump_artifact: &str,
+) -> Result<(u64, u64)> {
     let trigger_count = probe_counters
         .get("trigger_count")
         .and_then(|v| v.as_u64())
@@ -1089,23 +1159,13 @@ fn check_probe_dump(result: &VmResult) -> Result<()> {
             anyhow::anyhow!(
                 "`probe_counters.trigger_count` missing or non-numeric — \
                  ProbeBssCounters serde shape changed. \
-                 probe_counters: {probe_counters}"
+                 probe_counters: {probe_counters}; {dump_artifact}"
             )
         })?;
-    if trigger_count == 0 {
-        anyhow::bail!(
-            "`probe_counters.trigger_count == 0` — `tp_btf/sched_ext_exit` \
-             never fired (or the per-CPU slot didn't increment). The stall \
-             scenario must produce at least one tracepoint fire. \
-             probe_counters: {probe_counters}"
-        );
-    }
 
-    // `probe_count` cross-validates the array walk: the kprobe
-    // handler is attached to multiple kernel functions (sched
-    // entry / dispatch path) and fires throughout the run, so a
-    // healthy stall scenario produces hundreds-to-millions of
-    // fires. A non-zero value here proves the host-side reader
+    // `probe_count` cross-validates the array walk: the primary readiness
+    // path attaches `enqueue_task_scx`, which fires during scheduler startup
+    // and workload dispatch. A non-zero value here proves the host-side reader
     // walked the per-CPU slots (rather than reading a stub-zero
     // value from index 0 of an empty array).
     let probe_count = probe_counters
@@ -1115,7 +1175,7 @@ fn check_probe_dump(result: &VmResult) -> Result<()> {
             anyhow::anyhow!(
                 "`probe_counters.probe_count` missing or non-numeric — \
                  ProbeBssCounters serde shape changed. \
-                 probe_counters: {probe_counters}"
+                 probe_counters: {probe_counters}; {dump_artifact}"
             )
         })?;
     if probe_count == 0 {
@@ -1123,7 +1183,7 @@ fn check_probe_dump(result: &VmResult) -> Result<()> {
             "`probe_counters.probe_count == 0` — kprobe path never fired \
              across the run. Either probe attach failed, ktstr_enabled \
              never flipped to true, or the host-side sum walked the wrong \
-             slot index. probe_counters: {probe_counters}"
+             slot index. probe_counters: {probe_counters}; {dump_artifact}"
         );
     }
 
@@ -1133,21 +1193,51 @@ fn check_probe_dump(result: &VmResult) -> Result<()> {
          `.bss` `ktstr_pcpu_counters` array)"
     );
 
-    Ok(())
+    Ok((trigger_count, probe_count))
 }
 
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[test]
+fn probe_counter_validation_accepts_zero_trigger_at_watchpoint_linearization() {
+    let counters = serde_json::json!({
+        "trigger_count": 0,
+        "probe_count": 1,
+    });
+    assert_eq!(
+        validate_probe_counters(&counters, "synthetic dump").unwrap(),
+        (0, 1)
+    );
+}
+
+#[test]
+fn probe_counter_acceptance_rejects_placeholder_as_hard_failure() {
+    let placeholder = serde_json::json!({
+        "is_placeholder": true,
+        "maps": [],
+    });
+    let error = validate_required_probe_dump(&placeholder, "synthetic dump").unwrap_err();
+    assert!(
+        error.to_string().contains("is a placeholder"),
+        "placeholder must be a hard validation error, got: {error:#}"
+    );
+}
+
+#[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_FAILURE_DUMP_PROBE_COUNTERS: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "failure_dump_renders_probe_counters",
         func: scenario_failure_dump_renders_probe_counters,
         scheduler: &KTSTR_SCHED,
-        // --stall-after=1 fires SCX_EXIT_ERROR_STALL on watchdog
-        // timeout. The probe's tp_btf/sched_ext_exit handler
-        // bumps `KTSTR_PCPU_TRIGGER_COUNT` on every fire, so a
-        // single stall produces a non-zero cross-CPU sum.
+        // --stall-after=1 fires SCX_EXIT_ERROR_STALL on watchdog timeout.
+        // The hardware watchpoint may freeze before the selected trigger bumps
+        // `KTSTR_PCPU_TRIGGER_COUNT`; the separate Phase-A kprobe count
+        // is the live per-CPU-array proof.
         extra_sched_args: &["--stall-after=1"],
+        // `--stall-after` is scheduler-relative, so a scenario-body
+        // `await_accessor_ready()` is too late: the one-second timer
+        // starts before the test function runs. Hold scheduler launch
+        // until the host can decode the exact probe-counter slab used
+        // by the failure dump.
+        probe_dump_ready_gate: true,
         // watchdog_timeout sets the GUEST scx watchdog (scx_sched.
         // watchdog_timeout), so a stalled task trips SCX_EXIT_ERROR_STALL
         // ~3s after it parks. duration drives the HOST watchdog deadline
@@ -1163,8 +1253,8 @@ static __KTSTR_ENTRY_FAILURE_DUMP_PROBE_COUNTERS: ktstr::test_support::KtstrTest
         // outcome of --stall-after=1) to PASS. The real counter
         // assertions live in `check_probe_dump`, a
         // post_vm_unconditional callback whose Err is a hard FAIL via
-        // PostVmAssertionFailure — so a missing/zero counter fails the
-        // test even though the stall itself is inverted.
+        // PostVmAssertionFailure — so a missing counter or zero probe_count
+        // fails the test even though the stall itself is inverted.
         expect_err: true,
         post_vm_unconditional: Some(check_probe_dump),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT

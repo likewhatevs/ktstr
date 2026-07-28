@@ -922,6 +922,96 @@ pub(crate) fn start_kernel_map_for_tcr(tcr_el1: u64) -> Option<u64> {
     }
 }
 
+/// One-line snapshot of the aarch64 guest-kernel address-derivation
+/// inputs, for the failure-dump diagnostic that pins the arm64+7.1
+/// walk-failure root cause.
+///
+/// Background: the freeze coordinator reads guest kernel state
+/// (probe `.bss` counters, `*scx_root->exit_kind`) through the
+/// aarch64 TTBR1 page-table walk. On the arm64 + guest-kernel 7.1
+/// lanes that walk can fail and leave the capture at the `maps:[]`
+/// placeholder. Every static arm64 VA-layout formula this code
+/// derives (`KIMAGE_VADDR`, `PAGE_OFFSET`, `VA_BITS_MIN`,
+/// `MODULES_VADDR`, the direct-map inversion) is byte-identical
+/// between kernel 6.14 (which works) and 7.1, and the sole concrete
+/// arm64 layout behaviour change in that window — removal of
+/// linear-map / `memstart_addr` randomization (commit
+/// `1db780bafa4c arm64/mm: Remove randomization of the linear map`)
+/// — is absorbed by reading the runtime `memstart_addr`. So the
+/// break is NOT in a static formula.
+///
+/// The failure is also NOT uniform per kernel boot: on the run that
+/// added this diagnostic, `test-arm64` (7.1) PASSED the probe-counter
+/// read while `7.1-wprof` and `coverage-arm64` failed it. That
+/// per-lane / load-dependent split weakens the static-`TCR_EL1`
+/// hypothesis (a fixed FEAT_LPA2 / granule config would fail every 7.1
+/// lane alike) and points instead at a timing-sensitive read-path race
+/// whose window the two lanes' timeout signatures (`7.1-wprof` ~126.5s,
+/// `coverage-arm64` ~12.6s) bracket.
+///
+/// This snapshot is the right first data either way: if a failing lane
+/// ever records `walk_supported=false` (`lpa2(ds)=1`, or an unexpected
+/// granule / T1SZ the walker's `Aarch64WalkParams::from_tcr_el1` in
+/// `super::reader` rejects), a static config-rejection is confirmed; if
+/// every lane — passing and failing — records the SAME
+/// `walk_supported=true` line with identical bases, the config is
+/// exonerated and the race hypothesis stands, redirecting the next step
+/// to per-level walk-failure instrumentation. It decodes the raw
+/// `TCR_EL1` into granule, VA width, the DS bit, and whether
+/// [`start_kernel_map_for_tcr`] + `from_tcr_el1` accept the config.
+///
+/// Pure and arch-independent (raw bit math on `tcr_el1`) so it is unit
+/// testable on the x86_64 CI host; the caller writes it once per
+/// process to the build-diagnostics file.
+/// On x86_64 the sole production caller
+/// (`GuestKernel::emit_arm64_derivation_diag_once`) compiles to an
+/// empty body, so the function is reachable only from tests there —
+/// allow the resulting dead-code diagnostic off-aarch64.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn arm64_derivation_diag(
+    tcr_el1: u64,
+    cr3_pa: u64,
+    start_kernel_map: u64,
+    page_offset: u64,
+    phys_base: u64,
+) -> String {
+    let t1sz = (tcr_el1 >> 16) & 0x3F;
+    let tg1 = (tcr_el1 >> 30) & 0x3;
+    let ds = (tcr_el1 >> 59) & 1;
+    let granule = match tg1 {
+        0b01 => "16K",
+        0b10 => "4K",
+        0b11 => "64K",
+        _ => "reserved(0b00)",
+    };
+    let va_bits = 64u64.saturating_sub(t1sz);
+    // Replicate `Aarch64WalkParams::from_tcr_el1`'s accept conditions
+    // so the diagnostic reports walk-supportability on every arch
+    // (the real decoder is `#[cfg(target_arch = "aarch64")]`). A
+    // divergence here is caught by
+    // `arm64_derivation_diag_matches_from_tcr_el1` on aarch64.
+    let stride: Option<u64> = match tg1 {
+        0b11 => Some(13),
+        0b01 => Some(11),
+        0b10 => Some(9),
+        _ => None,
+    };
+    let walk_supported = ds == 0
+        && t1sz != 0
+        && stride.is_some_and(|s| {
+            va_bits >= 4 && {
+                let levels_below = (va_bits - 4) / s;
+                (1..=4).contains(&levels_below)
+            }
+        });
+    format!(
+        "arm64-derivation: tcr_el1={tcr_el1:#018x} t1sz={t1sz} va_bits={va_bits} \
+         granule={granule} lpa2(ds)={ds} walk_supported={walk_supported} \
+         kimage_vaddr(start_kernel_map)={start_kernel_map:#018x} \
+         page_offset={page_offset:#018x} phys_base={phys_base:#x} ttbr1(cr3_pa)={cr3_pa:#018x}"
+    )
+}
+
 /// Read the `__per_cpu_offset` array from guest memory.
 /// Returns per-CPU offsets for each CPU (index = CPU number).
 ///
@@ -1185,6 +1275,39 @@ pub(crate) fn compute_rq_pas(
 mod tests {
     use super::*;
 
+    /// A `KernelSymbols` with every field at its "symbol not found"
+    /// value. Tests override only the field under test via struct
+    /// update. Deliberately a helper rather than `#[derive(Default)]`
+    /// on the type: `runqueues == 0` is invalid in production (see the
+    /// construction-time check in `from_vmlinux`), so a crate-visible
+    /// `Default` would let a real code path build an unresolved table.
+    fn bare_symbols() -> KernelSymbols {
+        KernelSymbols {
+            runqueues: 0,
+            per_cpu_offset: 0,
+            page_offset_base_kva: None,
+            memstart_addr_kva: None,
+            phys_base_kva: None,
+            scx_root: None,
+            scx_tasks: None,
+            init_top_pgt: None,
+            pgtable_l5_enabled: None,
+            prog_idr: None,
+            scx_watchdog_timeout: None,
+            scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
+            jiffies_64: None,
+            psi_system: None,
+            cgrp_dfl_root: None,
+            kernel_cpustat: None,
+            kstat: None,
+            tick_cpu_sched: None,
+            node_data: None,
+            entry_syscall_64_kva: None,
+            kernel_text_kva: None,
+        }
+    }
+
     #[test]
     fn arm64_direct_map_base_rebases_randomized_memstart_to_guest_offsets() {
         let page_offset = 0xffff_0000_0000_0000u64;
@@ -1321,6 +1444,70 @@ mod tests {
         //               = 0xFFFF_8000_8000_0000.
         let tcr = (0b10u64 << 30) | (16u64 << 16);
         assert_eq!(start_kernel_map_for_tcr(tcr), Some(0xFFFF_8000_8000_0000));
+    }
+
+    /// The freeze-diagnostic snapshot for the assumed ktstr guest
+    /// config (VA_BITS=48, 4 KiB, no LPA2) must report a walk-
+    /// supportable configuration — that is the "6.14 works" baseline
+    /// the arm64+7.1 run is compared against. Pure math, so this runs
+    /// on the x86_64 CI host too.
+    #[test]
+    fn arm64_derivation_diag_reports_supported_for_va48_4k() {
+        // T1SZ=16 (VA_BITS=48), TG1=0b10 (4 KiB), DS=0.
+        let tcr = (0b10u64 << 30) | (16u64 << 16);
+        let s = arm64_derivation_diag(
+            tcr,
+            0x4123_4000,
+            0xFFFF_8000_8000_0000,
+            0xFFFF_0000_0000_0000,
+            0,
+        );
+        assert!(s.contains("granule=4K"), "{s}");
+        assert!(s.contains("va_bits=48"), "{s}");
+        assert!(s.contains("lpa2(ds)=0"), "{s}");
+        assert!(s.contains("walk_supported=true"), "{s}");
+    }
+
+    /// The smoking-gun case: a guest that boots with TCR_EL1.DS=1
+    /// (FEAT_LPA2) is rejected by `Aarch64WalkParams::from_tcr_el1`,
+    /// so every page-table walk returns None and the capture renders
+    /// the `maps:[]` placeholder. If the arm64+7.1 lane log shows
+    /// `lpa2(ds)=1 walk_supported=false`, the LPA2-rejection
+    /// hypothesis is confirmed in one run.
+    #[test]
+    fn arm64_derivation_diag_flags_lpa2_as_unsupported() {
+        // T1SZ=16, TG1=0b10 (4 KiB), DS=1 (bit 59).
+        let tcr = (1u64 << 59) | (0b10u64 << 30) | (16u64 << 16);
+        let s = arm64_derivation_diag(tcr, 0, 0xFFFF_8000_8000_0000, 0xFFFF_0000_0000_0000, 0);
+        assert!(s.contains("lpa2(ds)=1"), "{s}");
+        assert!(s.contains("walk_supported=false"), "{s}");
+    }
+
+    /// The diagnostic's replicated accept-logic must not drift from
+    /// the real walker gate. On aarch64, cross-check the reported
+    /// `walk_supported` flag against `Aarch64WalkParams::from_tcr_el1`
+    /// across the encodings the two share opinions on.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn arm64_derivation_diag_matches_from_tcr_el1() {
+        use super::super::reader::Aarch64WalkParams;
+        let cases = [
+            (0b10u64 << 30) | (16u64 << 16),                // VA48 4K, DS=0
+            (0b01u64 << 30) | (17u64 << 16),                // VA47 16K, DS=0
+            (0b11u64 << 30) | (16u64 << 16),                // VA48 64K, DS=0
+            (1u64 << 59) | (0b10u64 << 30) | (16u64 << 16), // LPA2 (DS=1)
+            (0b00u64 << 30) | (16u64 << 16),                // reserved TG1
+            0u64,                                           // TCR not ready
+        ];
+        for tcr in cases {
+            let diag_supported =
+                arm64_derivation_diag(tcr, 0, 0, 0, 0).contains("walk_supported=true");
+            let decoder_supported = Aarch64WalkParams::from_tcr_el1(tcr).is_some();
+            assert_eq!(
+                diag_supported, decoder_supported,
+                "walk-supportability drift for tcr={tcr:#x}"
+            );
+        }
     }
 
     #[test]
@@ -1778,28 +1965,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert_eq!(
@@ -1816,30 +1983,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
-            page_offset_base_kva: None,
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
-        };
+        let symbols = bare_symbols();
 
         assert_eq!(
             resolve_page_offset(&mem, &symbols, START_KERNEL_MAP),
@@ -1858,28 +2002,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert_eq!(
@@ -1902,28 +2026,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert_eq!(
@@ -1949,28 +2053,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert_eq!(
@@ -1992,28 +2076,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
-            page_offset_base_kva: None,
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert!(resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
@@ -2032,28 +2096,8 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
         let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
-            page_offset_base_kva: None,
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
             pgtable_l5_enabled: Some(l5_kva),
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
+            ..bare_symbols()
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
@@ -2067,30 +2111,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let symbols = KernelSymbols {
-            runqueues: 0,
-            per_cpu_offset: 0,
-            page_offset_base_kva: None,
-            memstart_addr_kva: None,
-            phys_base_kva: None,
-            scx_root: None,
-            scx_tasks: None,
-            init_top_pgt: None,
-            pgtable_l5_enabled: None,
-            prog_idr: None,
-            scx_watchdog_timeout: None,
-            scx_watchdog_timestamp: None,
-            scx_watchdog_interval: None,
-            jiffies_64: None,
-            psi_system: None,
-            cgrp_dfl_root: None,
-            kernel_cpustat: None,
-            kstat: None,
-            tick_cpu_sched: None,
-            node_data: None,
-            entry_syscall_64_kva: None,
-            kernel_text_kva: None,
-        };
+        let symbols = bare_symbols();
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
     }

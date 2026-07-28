@@ -1,5 +1,7 @@
+use super::super::protocol as admission_protocol;
 use super::super::*;
 use super::*;
+use crate::vmm::topology::Topology;
 
 /// `CpuCap::new(1)` succeeds — minimum legal cap.
 #[test]
@@ -182,33 +184,6 @@ fn host_llcs_by_numa_node_dual_node() {
     assert_eq!(map.get(&1), Some(&vec![1, 3]));
 }
 
-/// Asymmetric: node 0 has 3 LLCs, node 1 has 1 LLC.
-/// `numa_nodes_with_capacity(2)` returns only node 0.
-#[test]
-fn numa_nodes_with_capacity_asymmetric() {
-    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 1)]);
-    let cap2: Vec<usize> = topo
-        .numa_nodes_with_capacity(2)
-        .into_iter()
-        .map(|(node, _)| node)
-        .collect();
-    assert_eq!(cap2, vec![0], "only node 0 has ≥ 2 LLCs");
-    let cap1: Vec<usize> = topo
-        .numa_nodes_with_capacity(1)
-        .into_iter()
-        .map(|(node, _)| node)
-        .collect();
-    assert_eq!(cap1, vec![0, 1], "both nodes have ≥ 1 LLC");
-}
-
-/// `numa_nodes_with_capacity` with min_llcs > every node's
-/// count returns empty — no candidates.
-#[test]
-fn numa_nodes_with_capacity_over_max_returns_empty() {
-    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 1)]);
-    assert!(topo.numa_nodes_with_capacity(99).is_empty());
-}
-
 /// `numa_nodes_sorted_by_distance` with identity closure:
 /// anchor == node → 10, else 20. Anchor sorts first; remaining
 /// nodes preserve BTreeMap ascending order (stable sort over
@@ -277,14 +252,8 @@ fn acquire_llc_plan_rejects_cap_over_allowed_cpus() {
     let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
     let cap = CpuCap::new(3).unwrap();
-    let err = acquire_llc_plan(
-        &topo,
-        &test_topo,
-        Some(cap),
-        PlacementPolicy::Consolidate,
-        false,
-    )
-    .expect_err("cap > allowed_cpus must error");
+    let err = plan_llc_selection_only(&topo, &test_topo, Some(cap), PlacementPolicy::Consolidate)
+        .expect_err("cap > allowed_cpus must error");
     assert!(
         err.downcast_ref::<CpuBudgetUnsatisfiable>().is_some(),
         "must be CpuBudgetUnsatisfiable: {err:#}"
@@ -341,9 +310,9 @@ fn plan_from_snapshots_returns_ascending_indices() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
-            holders: Vec::new(),
             holder_count: if idx >= 2 { 5 } else { 0 },
+            exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
@@ -375,9 +344,9 @@ fn plan_from_snapshots_target_ge_all_selects_every_llc() {
     let snapshots: Vec<LlcSnapshot> = (0..3)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
-            holders: Vec::new(),
             holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..3).collect();
@@ -401,6 +370,36 @@ fn plan_from_snapshots_target_ge_all_selects_every_llc() {
     assert_eq!(selected_over, vec![0, 1, 2], "target > len clamps");
 }
 
+/// Saturation must preserve the LLC identities carried by the snapshots.
+/// Sparse snapshots arise when the caller's allowed CPU set excludes whole
+/// LLCs; treating snapshot positions as LLC indices would turn `[1, 3]` into
+/// `[0, 1]` and reserve the wrong lockfiles.
+#[test]
+fn plan_from_snapshots_sparse_saturation_preserves_llc_indices() {
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let snapshots = [1usize, 3]
+        .into_iter()
+        .map(|llc_idx| LlcSnapshot {
+            llc_idx,
+            holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
+        })
+        .collect::<Vec<_>>();
+    let allowed = (0..4).collect::<std::collections::BTreeSet<_>>();
+
+    let selected = plan_from_snapshots(
+        &snapshots,
+        2,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
+
+    assert_eq!(selected, vec![1, 3]);
+}
+
 /// `plan_from_snapshots` with `target == 0` returns empty —
 /// early return in the algorithm. Pins the degenerate case
 /// so a future "optimization" that assumes selected[0] exists
@@ -410,9 +409,9 @@ fn plan_from_snapshots_target_zero_returns_empty() {
     let topo = synth_host_topo(&[(vec![0], 0)]);
     let snapshots: Vec<LlcSnapshot> = vec![LlcSnapshot {
         llc_idx: 0,
-        lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-0.lock"),
-        holders: Vec::new(),
         holder_count: 0,
+        exclusive_held: false,
+        granted_count: 0,
     }];
     let allowed: std::collections::BTreeSet<usize> = [0].into_iter().collect();
     let selected = plan_from_snapshots(
@@ -424,6 +423,82 @@ fn plan_from_snapshots_target_zero_returns_empty() {
         PlacementPolicy::Consolidate,
     );
     assert!(selected.is_empty());
+}
+
+#[test]
+fn overlapping_llc_groups_materialize_a_distinct_cpu_budget() {
+    let topo = HostTopology::new_for_tests_unchecked(&[(vec![0, 1], 0), (vec![1, 2], 0)]);
+    let snapshots = (0..2)
+        .map(|llc_idx| LlcSnapshot {
+            llc_idx,
+            holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
+        })
+        .collect::<Vec<_>>();
+    let allowed = [0usize, 1, 2]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let selected = plan_from_snapshots(
+        &snapshots,
+        3,
+        &topo,
+        &allowed,
+        |from, to| if from == to { 10 } else { 20 },
+        PlacementPolicy::Consolidate,
+    );
+    let states = std::collections::BTreeMap::new();
+    let (cpus, _) = materialize_plan_cpus(
+        &selected,
+        &topo,
+        &allowed,
+        &states,
+        3,
+        CpuSelectionPolicy::WithinEachLlc(PlacementPolicy::Consolidate),
+    )
+    .expect("the union of overlapping LLC groups carries three CPUs");
+    assert_eq!(cpus, vec![0, 1, 2]);
+    assert_eq!(
+        cpus.iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3,
+        "the exact CPU claim must not shrink when converted to a set",
+    );
+}
+
+#[test]
+fn sparse_cpu_rotation_uses_eligible_ordinals_not_cpu_ids() {
+    let topo = synth_host_topo(&[(vec![2, 8, 32], 0)]);
+    let eligible = [2usize, 8, 32]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let (cpus, _) = materialize_plan_cpus(
+        &[0],
+        &topo,
+        &eligible,
+        &std::collections::BTreeMap::new(),
+        3,
+        CpuSelectionPolicy::WithinEachLlc(PlacementPolicy::Spread { rotation: 1 }),
+    )
+    .expect("one sparse LLC carries the full budget");
+    assert_eq!(
+        cpus,
+        vec![8, 32, 2],
+        "rotation is over sorted eligible positions, independent of sparse CPU IDs",
+    );
+}
+
+#[test]
+fn missing_cpu_observation_is_advisory_and_keeps_the_cpu_eligible() {
+    let allowed = [2usize, 8]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let eligible =
+        cpu_eligible_allowed(&allowed, &std::collections::BTreeMap::new(), |_| Ok(false))
+            .expect("unknown CPU state remains plannable");
+    assert_eq!(eligible, allowed);
 }
 
 /// `plan_from_snapshots` prefers LLCs with `holder_count > 0`
@@ -447,15 +522,15 @@ fn plan_from_snapshots_prefers_higher_holder_count() {
     let snapshots: Vec<LlcSnapshot> = vec![
         LlcSnapshot {
             llc_idx: 0,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-0.lock"),
-            holders: Vec::new(),
             holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
         },
         LlcSnapshot {
             llc_idx: 1,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-1.lock"),
-            holders: Vec::new(),
             holder_count: 5,
+            exclusive_held: false,
+            granted_count: 0,
         },
     ];
     // Same-node distance closure so placement doesn't bias by
@@ -491,27 +566,27 @@ fn plan_from_snapshots_always_ascending_across_target_range() {
     let snapshots: Vec<LlcSnapshot> = vec![
         LlcSnapshot {
             llc_idx: 0,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-0.lock"),
-            holders: Vec::new(),
             holder_count: 3,
+            exclusive_held: false,
+            granted_count: 0,
         },
         LlcSnapshot {
             llc_idx: 1,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-1.lock"),
-            holders: Vec::new(),
             holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
         },
         LlcSnapshot {
             llc_idx: 2,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-2.lock"),
-            holders: Vec::new(),
             holder_count: 7,
+            exclusive_held: false,
+            granted_count: 0,
         },
         LlcSnapshot {
             llc_idx: 3,
-            lockfile_path: std::path::PathBuf::from("/tmp/ktstr-llc-3.lock"),
-            holders: Vec::new(),
             holder_count: 1,
+            exclusive_held: false,
+            granted_count: 0,
         },
     ];
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
@@ -547,9 +622,9 @@ fn make_jobs_for_plan_matches_cpu_count() {
     let plan = LlcPlan {
         locked_llcs: vec![0, 1],
         cpus: vec![0, 1, 2, 3],
+        permits: Vec::new(),
         mems: std::collections::BTreeSet::new(),
-        snapshot: Vec::new(),
-        locks: Vec::new(),
+        locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     assert_eq!(make_jobs_for_plan(&plan), 4);
 }
@@ -563,9 +638,9 @@ fn make_jobs_for_plan_empty_cpus_floors_to_one() {
     let plan = LlcPlan {
         locked_llcs: Vec::new(),
         cpus: Vec::new(),
+        permits: Vec::new(),
         mems: std::collections::BTreeSet::new(),
-        snapshot: Vec::new(),
-        locks: Vec::new(),
+        locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     assert_eq!(
         make_jobs_for_plan(&plan),
@@ -677,9 +752,9 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
     let multi_plan = LlcPlan {
         locked_llcs: vec![0, 1],
         cpus: vec![0, 1],
+        permits: Vec::new(),
         mems: [0usize, 1].into_iter().collect(),
-        snapshot: Vec::new(),
-        locks: Vec::new(),
+        locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     let msg = cross_node_spill_warning(&multi_plan, &topo)
         .expect("multi-node plan must produce a warning");
@@ -687,8 +762,8 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
     // must thread the rendered LLC list + the node count through.
     let expected = format!(
         "ktstr: reserving LLCs {list} across {n} NUMA nodes \
-         (preferred single-node contiguous unavailable). Build \
-         will run; memory-access latency may be higher.",
+         (preferred single-node contiguous unavailable). Work \
+         will proceed; memory-access latency may be higher.",
         list = format_llc_list(&multi_plan.locked_llcs, &topo),
         n = multi_plan.mems.len(),
     );
@@ -708,9 +783,9 @@ fn warn_if_cross_node_spill_predicate_gates_stderr() {
     let single_plan = LlcPlan {
         locked_llcs: vec![0],
         cpus: vec![0],
+        permits: Vec::new(),
         mems: [0usize].into_iter().collect(),
-        snapshot: Vec::new(),
-        locks: Vec::new(),
+        locks: admission_protocol::Acquired::untracked(Vec::new()),
     };
     assert!(
         cross_node_spill_warning(&single_plan, &topo).is_none(),
@@ -736,111 +811,46 @@ fn cpu_cap_effective_count_on_zero_llc_host() {
     );
 }
 
-/// Multi-process concurrent `acquire_llc_plan`: a child process
-/// holds `LOCK_SH` on one LLC's lockfile via `flock(1)` (SHELL
-/// utility), then the parent calls `acquire_llc_plan` with a
-/// cap forcing the planner to consolidate onto an LLC that has
-/// holders. The consolidation invariant (`holder_count DESC`
-/// ordering in `plan_from_snapshots`) requires the parent's
-/// plan to include the child's LLC.
-///
-/// Uses `flock(1)` + `sleep` rather than Rust fork() so the
-/// holder is a different process (different pid, different OFD)
-/// than the test thread — proving the /proc/locks cross-process
-/// enumeration path is exercised.
-///
-/// `flock(1)` is expected on every Linux host that runs ktstr
-/// tests (it's in util-linux, part of the minimum viable CI
-/// image). If it's absent the test short-circuits rather than
-/// failing — the invariant is real but the test infrastructure
-/// depends on a userspace utility.
+/// A current-version HELD publication supplies consolidation occupancy without
+/// any procfs scan. The planner must prefer that compatible SH-held LLC over a
+/// fresh peer when the cap selects only one.
 #[test]
 fn acquire_llc_plan_consolidates_on_peer_held_llc() {
     let _llc_prefix = LlcLockPrefixGuard::new();
-    // 2 LLCs on the same node so NUMA-locality doesn't bias
-    // against consolidation.
+    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
     let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
-
-    // Child process holds SH on LLC 1's lockfile via flock(1).
-    // Keep it alive until explicitly killed so host load cannot
-    // close the observation window before the parent's acquire.
     let target_lock = llc_lock_path(1);
-    // Ensure the lockfile exists so flock(1) opens the right
-    // inode (not a fresh one that /proc/locks would attribute
-    // to the flock(1) pid on a different inode than the parent
-    // sees).
-    crate::flock::materialize(&target_lock).expect("materialize lockfile");
-
-    use std::os::unix::process::CommandExt as _;
-    let child = std::process::Command::new("flock")
-        .args(["-s", "-n", &target_lock, "sleep", "300"])
-        .process_group(0)
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // flock(1) missing — skip rather than fail.
-            eprintln!(
-                "acquire_llc_plan_consolidates_on_peer_held_llc: \
-                 flock(1) not available, skipping ({e})"
-            );
-            return;
-        }
-        Err(e) => panic!("spawn flock(1): {e}"),
-    };
-
-    // Wait for the peer's LOCK_SH to become observable. A fixed sleep
-    // races process scheduling on a saturated runner: the child can
-    // remain runnable but unscheduled past any guessed delay.
-    let allowed: std::collections::BTreeSet<usize> = [0usize, 1].into_iter().collect();
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let peer_seen = loop {
-        let snapshots =
-            discover_llc_snapshots(&topo, &allowed, &mountinfo).expect("discover must succeed");
-        if snapshots
-            .iter()
-            .find(|s| s.llc_idx == 1)
-            .is_some_and(|s| s.holder_count == 1)
-        {
-            break true;
-        }
-        if std::time::Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
+    let physical = crate::flock::try_flock(&target_lock, FlockMode::Shared)
+        .expect("open peer LLC lock")
+        .expect("acquire peer LLC SH");
+    let claim = admission_protocol::ClaimSet::with_modes(
+        [1usize],
+        std::iter::empty(),
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let peer =
+        admission_protocol::publish_acquired(&claim, physical).expect("publish peer LLC HELD");
 
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let cap = CpuCap::new(1).expect("cap=1 valid");
-    let plan = peer_seen.then(|| {
-        acquire_llc_plan(
-            &topo,
-            &test_topo,
-            Some(cap),
-            PlacementPolicy::Consolidate,
-            false,
-        )
-    });
-
-    // Sweep both flock and its sleep child before any assertion can
-    // panic, then reap flock so the test leaves no process or zombie.
-    if let Some(pgid) = libc::pid_t::try_from(child.id())
-        .ok()
-        .filter(|&p| p > 0)
-        .map(nix::unistd::Pid::from_raw)
-    {
-        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-    }
-    let _ = child.wait();
-
-    assert!(
-        peer_seen,
-        "peer LOCK_SH on LLC 1 did not become visible within 30s"
+    let proc_reads_before = crate::flock::proc_locks::proc_locks_read_count_for_tests();
+    let plan = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        Some(cap),
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect("current-version SH occupancy remains compatible");
+    assert_eq!(
+        crate::flock::proc_locks::proc_locks_read_count_for_tests(),
+        proc_reads_before,
+        "successful current-version placement must not scan /proc/locks",
     );
-    let plan = plan
-        .expect("peer was visible, so acquire was attempted")
-        .expect("SH is reentrant — parent SH must coexist with child SH");
 
     // Consolidation picked LLC 1 (the one with a holder) over
     // LLC 0 (fresh). The `holder_count DESC` ordering in
@@ -848,254 +858,93 @@ fn acquire_llc_plan_consolidates_on_peer_held_llc() {
     assert_eq!(
         plan.locked_llcs,
         vec![1],
-        "cap=1 with child holding SH on LLC 1 must pick LLC 1 \
+        "cap=1 with a published SH holder on LLC 1 must pick LLC 1 \
          (consolidation over fresh LLC 0); got {:?}",
         plan.locked_llcs,
     );
 
     drop(plan);
+    drop(peer);
 }
 
-/// `discover_llc_snapshots` EXCLUDES the calling process from the
-/// PLAN-driving `holder_count`, but keeps it in the diagnostic
-/// `holders` vec — while a PEER process's hold DOES count.
-///
-/// Rationale: no-perf `build()` now holds each planned LLC's
-/// `LOCK_SH` from build through run (the fd strip was removed), so at
-/// the run-time replan our own build-time fd is present in
-/// `/proc/locks` for the very LLCs we already reserved. If
-/// `holder_count` counted it, the Spread policy — which prefers the
-/// LEAST-held LLCs — would flee our own reservation onto a different
-/// LLC, the exact opposite of the truthful-holder-count fix. This
-/// test holds `LOCK_SH` on LLC 0 from the test PROCESS and on LLC 1
-/// from a `flock(1)` CHILD, then asserts LLC 0's `holder_count` is 0
-/// (self excluded) with self still in the `holders` vec, and LLC 1's
-/// `holder_count` is 1 (the peer counts).
-///
-/// Uses `flock(1)` for the peer so the holder is a genuinely
-/// different pid; absent util-linux the test skips rather than fails
-/// (same convention as `acquire_llc_plan_consolidates_on_peer_held_llc`).
+/// No-perf build planning must remain ownership-free, while the matching
+/// run-time acquisition must own the exact LLC and CPU resources it returns.
+/// This pins the phase boundary that keeps initrd/CAS preparation outside
+/// topology admission without weakening run-time isolation.
 #[test]
-fn discover_excludes_self_pid_from_holder_count() {
+fn plan_only_holds_nothing_and_runtime_plan_holds_exact_resources() {
     let _llc_prefix = LlcLockPrefixGuard::new();
-    // 2 LLCs on the same node; both CPUs in `allowed` so neither LLC
-    // is skipped by discover's allowed-overlap filter.
-    let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
-    let allowed: std::collections::BTreeSet<usize> = [0usize, 1].into_iter().collect();
-
-    // Self-hold SH on LLC 0 from this process/thread.
-    let self_lock_path = llc_lock_path(0);
-    crate::flock::materialize(&self_lock_path).expect("materialize self lockfile");
-    let _self_hold = try_flock(&self_lock_path, FlockMode::Shared)
-        .expect("open self lockfile")
-        .expect("self SH on a fresh LLC 0 lockfile must succeed");
-
-    // Peer child holds SH on LLC 1 via flock(1). Materialize first so
-    // the child opens the same inode the parent's discover stats.
-    let peer_lock_path = llc_lock_path(1);
-    crate::flock::materialize(&peer_lock_path).expect("materialize peer lockfile");
-    // Lead a fresh process group so the kill below reaches `flock`'s
-    // `sleep` grandchild too, not just `flock` (mirrors the make(1)
-    // spawn+killpg pattern in cli::kernel_build::make).
-    use std::os::unix::process::CommandExt as _;
-    let child = std::process::Command::new("flock")
-        .args(["-s", "-n", &peer_lock_path, "sleep", "300"])
-        .process_group(0)
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "discover_excludes_self_pid_from_holder_count: \
-                 flock(1) not available, skipping ({e})"
-            );
-            return;
-        }
-        Err(e) => panic!("spawn flock(1): {e}"),
-    };
-    // The peer child must be SCHEDULED and take its LOCK_SH before we
-    // stat /proc/locks. A fixed sleep races that acquisition on a loaded
-    // host — a freshly spawned process can sit unscheduled far longer
-    // than any guessed delay — so poll discover until the peer's hold is
-    // visible instead of assuming a fixed settle time. The child holds
-    // for the poll's whole lifetime (killed below), so the observation
-    // window can never fall outside the peer's hold.
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let snapshots = loop {
-        let snaps =
-            discover_llc_snapshots(&topo, &allowed, &mountinfo).expect("discover must succeed");
-        let peer_seen = snaps
-            .iter()
-            .find(|s| s.llc_idx == 1)
-            .is_some_and(|s| s.holder_count == 1);
-        if peer_seen || std::time::Instant::now() >= deadline {
-            break snaps;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-
-    let llc0 = snapshots
-        .iter()
-        .find(|s| s.llc_idx == 0)
-        .expect("LLC 0 snapshot present");
-    let llc1 = snapshots
-        .iter()
-        .find(|s| s.llc_idx == 1)
-        .expect("LLC 1 snapshot present");
-
-    let self_pid = std::process::id();
-    assert!(
-        llc0.holders.iter().any(|h| h.pid == self_pid),
-        "self must remain in the diagnostic holders vec for LLC 0; \
-         holders={:?}",
-        llc0.holders,
-    );
-    assert_eq!(
-        llc0.holder_count, 0,
-        "self-held SH must be EXCLUDED from LLC 0's holder_count (got \
-         {}, holders={:?})",
-        llc0.holder_count, llc0.holders,
-    );
-    assert_eq!(
-        llc1.holder_count, 1,
-        "a peer process's SH must COUNT toward LLC 1's holder_count \
-         (got {}, holders={:?})",
-        llc1.holder_count, llc1.holders,
-    );
-    assert!(
-        llc1.holders.iter().all(|h| h.pid != self_pid),
-        "self never locked LLC 1, so must not appear there; holders={:?}",
-        llc1.holders,
-    );
-
-    // The child holds until killed (sleep 300); sweep its whole process
-    // group so `flock` AND its `sleep` grandchild die, then reap `flock`
-    // so we leave neither a lingering process nor a zombie. Guard the
-    // pgid cast as make's killpg does: a non-positive pgid would broadcast
-    // to the caller's group.
-    if let Some(pgid) = libc::pid_t::try_from(child.id())
-        .ok()
-        .filter(|&p| p > 0)
-        .map(nix::unistd::Pid::from_raw)
-    {
-        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-    }
-    let _ = child.wait();
-}
-
-/// The plan `acquire_llc_plan` returns carries its `LOCK_SH` flock
-/// fds LIVE: held through the plan's lifetime, visible to a peer's
-/// `/proc/locks` read, and released on drop. This is the precondition
-/// the no-perf `build()` fix relies on — `build()` now forwards the
-/// plan's `locks` onto `KtstrVm::no_perf_plan` UNSTRIPPED (the
-/// historical `drop(std::mem::take(&mut plan.locks))` is gone), so a
-/// concurrent peer's DISCOVER observes a truthful holder count from
-/// build through run. With the fds stripped (the old behavior) the
-/// Spread policy's holder-count feedback was dead.
-///
-/// Asserts: (1) `plan.locks` is non-empty; (2) our pid is a holder of
-/// the locked LLC's lockfile while the plan lives; (3) after
-/// `drop(plan)` our pid is gone from that lockfile's holders.
-#[test]
-fn acquire_llc_plan_holds_locks_live_until_drop() {
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
-    let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
+    let _cpu_prefix = CpuLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93640, 93641]);
+    let topo = HostTopology::new_for_tests(&[(vec![93640], 0), (vec![93641], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let cap = CpuCap::new(1).expect("cap=1 valid");
+    let registry_reads_before =
+        crate::vmm::host_topology::protocol::aggregate_snapshot_read_count_for_tests();
 
-    let plan = acquire_llc_plan(
+    let build_plan = plan_llc_selection_only(
+        &topo,
+        &test_topo,
+        Some(cap),
+        PlacementPolicy::spread_for_process(),
+    )
+    .expect("build-time plan-only selection must succeed");
+    assert!(
+        build_plan.locks.is_empty(),
+        "build-time no-perf planning must retain zero real resource fds",
+    );
+    assert_eq!(
+        crate::vmm::host_topology::protocol::aggregate_snapshot_read_count_for_tests(),
+        registry_reads_before,
+        "shape-only planning must not consult the live admission registry",
+    );
+    let build_llc = build_plan.locked_llcs[0];
+    let build_cpu = build_plan.cpus[0];
+    assert!(
+        !std::path::Path::new(&llc_lock_path(build_llc)).exists(),
+        "shape-only planning must not materialize its selected LLC lockfile",
+    );
+    assert!(
+        !std::path::Path::new(&cpu_lock_path(build_cpu)).exists(),
+        "shape-only planning must not materialize its selected CPU lockfile",
+    );
+    let build_llc_probe = try_flock(llc_lock_path(build_llc), FlockMode::Exclusive)
+        .expect("probe build-time LLC")
+        .expect("build-time plan must not own its selected LLC");
+    let build_cpu_probe = try_flock(cpu_lock_path(build_cpu), FlockMode::Exclusive)
+        .expect("probe build-time CPU")
+        .expect("build-time plan must not own its selected CPU");
+    drop((build_llc_probe, build_cpu_probe, build_plan));
+
+    let runtime_plan = acquire_llc_plan_interruptible(
         &topo,
         &test_topo,
         Some(cap),
         PlacementPolicy::spread_for_process(),
         false,
+        None,
+        None,
+        None,
     )
-    .expect("acquire_llc_plan must succeed on a fresh two-LLC host");
+    .expect("run-time acquisition must succeed on a fresh two-LLC host");
     assert!(
-        !plan.locks.is_empty(),
-        "the plan must carry its live LOCK_SH fds (the build-time fd \
-         strip is gone); got empty locks",
-    );
-
-    let locked = *plan
-        .locked_llcs
-        .first()
-        .expect("a cap=1 plan locks exactly one LLC");
-    let lock_path = std::path::PathBuf::from(llc_lock_path(locked));
-    let self_pid = std::process::id();
-
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo while plan alive");
-    let held = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
-        .expect("read holders while plan alive");
-    assert!(
-        held.iter().any(|h| h.pid == self_pid),
-        "our LOCK_SH must be visible in /proc/locks while the plan \
-         lives; holders={held:?}",
-    );
-
-    drop(plan);
-
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo after drop");
-    let after = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
-        .expect("read holders after drop");
-    assert!(
-        after.iter().all(|h| h.pid != self_pid),
-        "dropping the plan must release our LOCK_SH; holders still \
-         list us: {after:?}",
-    );
-}
-
-/// The build-time no-perf fds live in a `Mutex<Vec<OwnedFd>>` on
-/// `KtstrVm` (not on the plan) so `acquire_run_locks`, which only has
-/// `&self`, can release them the moment its replan adopts fresh locks.
-/// This test exercises exactly that release path: park a held
-/// `LOCK_SH` fd in such a slot, confirm our pid is a holder, then run
-/// the `drop(std::mem::take(&mut *slot.lock().unwrap()))` release
-/// through a SHARED (`&`) borrow of the slot — the same expression the
-/// no-perf replan arm runs — and confirm our pid drops out of
-/// `/proc/locks`. Without the interior-mutable slot the fd could only
-/// release at `KtstrVm` drop, leaving a phantom hold on any LLC the
-/// replan abandoned for the whole run.
-#[test]
-fn parked_build_locks_release_through_shared_borrow() {
-    let _llc_prefix = LlcLockPrefixGuard::new();
-    let lock_path_s = llc_lock_path(0);
-    let lock_path = std::path::PathBuf::from(&lock_path_s);
-    crate::flock::materialize(&lock_path_s).expect("materialize lockfile");
-    let fd = try_flock(&lock_path_s, FlockMode::Shared)
-        .expect("open lockfile")
-        .expect("SH on a fresh lockfile must succeed");
-
-    // The slot as it lives on `KtstrVm`. Bind by shared ref to prove
-    // the release needs only `&self`, not `&mut`.
-    let slot: std::sync::Mutex<Vec<std::os::fd::OwnedFd>> = std::sync::Mutex::new(vec![fd]);
-    let slot_ref: &std::sync::Mutex<Vec<std::os::fd::OwnedFd>> = &slot;
-
-    let self_pid = std::process::id();
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo while parked");
-    let held = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
-        .expect("read holders while parked");
-    assert!(
-        held.iter().any(|h| h.pid == self_pid),
-        "the parked fd must hold LOCK_SH; holders={held:?}",
-    );
-
-    // The exact release expression from `acquire_run_locks`' no-perf arm.
-    drop(std::mem::take(&mut *slot_ref.lock().unwrap()));
-
-    let mountinfo = crate::flock::read_mountinfo().expect("read mountinfo after release");
-    let after = crate::flock::read_holders_with_mountinfo(&lock_path, &mountinfo)
-        .expect("read holders after release");
-    assert!(
-        after.iter().all(|h| h.pid != self_pid),
-        "take-and-drop through the shared borrow must release our \
-         LOCK_SH; holders still list us: {after:?}",
+        !runtime_plan.locks.is_empty(),
+        "run-time plan must carry its live resource fds",
     );
     assert!(
-        slot_ref.lock().unwrap().is_empty(),
-        "the slot must be drained after the take",
+        try_flock(
+            llc_lock_path(runtime_plan.locked_llcs[0]),
+            FlockMode::Exclusive,
+        )
+        .expect("probe run-time LLC")
+        .is_none(),
+        "run-time plan must hold its selected LLC",
+    );
+    assert!(
+        try_flock(cpu_lock_path(runtime_plan.cpus[0]), FlockMode::Exclusive)
+            .expect("probe run-time CPU")
+            .is_none(),
+        "run-time plan must hold its selected CPU",
     );
 }
 
@@ -1148,7 +997,8 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
         None,
         PlacementPolicy::Consolidate,
         false,
-        |_selected, _snapshots| {
+        None,
+        |_selected, _cpus, _snapshots| {
             let n = counter.get();
             counter.set(n + 1);
             if n == 0 {
@@ -1157,7 +1007,7 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
             } else {
                 // Attempt 1: peer released, acquire succeeds
                 // with an empty fd set (production would have
-                // actual OwnedFd values; the LlcPlan RAII
+                // actual admission owners; the LlcPlan RAII
                 // contract is exercised elsewhere).
                 Ok(Some(Vec::new()))
             }
@@ -1165,12 +1015,68 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
     )
     .expect("retry on attempt 1 must succeed");
     // Attempt 1 produced locks (empty vec is fine — the plan
-    // constructor accepts any Vec<OwnedFd>).
+    // constructor accepts an empty admission-owner vector).
     assert_eq!(counter.get(), 2, "acquire_fn called exactly twice");
     // 30% of 2 allowed CPUs = ceil(0.6) = 1 CPU → pick 1 LLC
     // (seed-node first: LLC 0). `selected` holds only LLC 0;
     // the second LLC stays unlocked.
     assert_eq!(plan.locked_llcs, vec![0]);
+}
+
+/// Once the outer LLC-plan path owns the real reservation fds, acquisition is
+/// committed. Cancellation racing immediately after the final flock succeeds
+/// must not replace that success with `Interrupted` and silently discard the
+/// reservation. The protocol-level granted/coordinator tests pin the registry
+/// commit boundary; this test pins the caller above those branches.
+#[test]
+fn acquire_llc_plan_commit_is_terminal_when_cancellation_arrives_after_lock_acquire() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93550]);
+    let topo = synth_host_topo(&[(vec![93550], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    let cancelled = AtomicBool::new(false);
+
+    let plan = acquire_llc_plan_with_acquire_fn(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Consolidate,
+        false,
+        Some(&cancelled),
+        |selected, cpus, snapshots| {
+            let acquired =
+                match try_acquire_llc_plan_locks_with_evidence(selected, cpus, snapshots)? {
+                    LlcLockAttempt::Acquired(locks) => Some(locks),
+                    LlcLockAttempt::Contended(_) | LlcLockAttempt::Unavailable => None,
+                };
+            assert!(
+                acquired.is_some(),
+                "fresh isolated lock pool must commit on its first probe",
+            );
+            cancelled.store(true, Ordering::Release);
+            Ok(acquired)
+        },
+    )
+    .expect("post-commit cancellation must not replace LLC-plan success");
+
+    assert!(
+        cancelled.load(Ordering::Acquire),
+        "seam must inject cancellation after the real flock succeeds",
+    );
+    assert_eq!(plan.locked_llcs, vec![0]);
+    assert_eq!(plan.locks.len(), 2);
+    assert!(
+        try_flock(llc_lock_path(0), FlockMode::Exclusive)
+            .expect("probe live LLC reservation")
+            .is_none(),
+        "returned plan must retain ownership despite post-commit cancellation",
+    );
+
+    drop(plan);
+    let released = try_flock(llc_lock_path(0), FlockMode::Exclusive)
+        .expect("probe dropped LLC reservation")
+        .expect("dropping the successful plan must release its reservation");
+    drop(released);
 }
 
 /// TOCTOU retry EXHAUSTED path via the acquire-fn seam: every
@@ -1198,7 +1104,8 @@ fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
         None,
         PlacementPolicy::Consolidate,
         false,
-        |_selected, _snapshots| {
+        None,
+        |_selected, _cpus, _snapshots| {
             counter.set(counter.get() + 1);
             Ok(None)
         },
@@ -1226,21 +1133,48 @@ fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
     );
 }
 
-/// Fast-phase seam contract under `wait = true`: the `acquire_fn`
-/// seam belongs to the FAST PHASE ONLY — exactly
-/// `ACQUIRE_MAX_TOCTOU_RETRIES + 1` calls — after which the wait
-/// phase acquires through the protocol head engine against REAL
-/// lockfiles, independent of the seam. The closure always bounces
-/// (simulating fast-path contention) while the real lockfile pool is
-/// free, so the head's first sweep completes immediately: the
-/// acquisition must SUCCEED even though the seam never returned
-/// locks. Before the queue design, a bouncing acquire_fn meant
-/// guaranteed failure; this pins the phase split.
+#[test]
+fn live_ex_holder_uses_fresh_holder_diagnostics_not_registered_claim_error() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93650]);
+    let topo = synth_host_topo(&[(vec![93650], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    let _held = try_flock(llc_lock_path(0), FlockMode::Exclusive)
+        .expect("open live LLC blocker")
+        .expect("take live LLC blocker");
+    let error = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        CpuCap::new(1).ok(),
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("the only LLC is held EX");
+    let message = format!("{error:#}");
+    assert!(
+        !message.contains("registered reservation claims"),
+        "a real flock holder is not a registry-claim-only fast failure: {message}",
+    );
+    assert!(
+        message.contains("contended:") && message.contains("LLC 0") && message.contains("held"),
+        "a live EX flock holder must be named by the per-needle probe bail: {message}",
+    );
+}
+
+/// A waiting caller performs one real fast attempt, then uses the registry as
+/// its retry mechanism. The seam always bounces while the real lockfile pool is
+/// free, so the elected coordinator completes immediately.
 #[test]
 fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
     let _llc_prefix = LlcLockPrefixGuard::new();
-    let _allowed = AllowedCpusGuard::new(vec![93700]);
-    let topo = synth_host_topo(&[(vec![93700], 0)]);
+    // Queue-registry CPU identities are real host CPU indices and therefore
+    // live below `/sys/devices/system/cpu/possible`. The per-test lock prefix
+    // already provides isolation, so use a valid low synthetic identity here.
+    let _allowed = AllowedCpusGuard::new(vec![0]);
+    let topo = synth_host_topo(&[(vec![0], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(1, 1);
 
     let counter = std::cell::Cell::new(0u32);
@@ -1250,7 +1184,8 @@ fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
         None,
         PlacementPolicy::Consolidate,
         true,
-        |_selected, _snapshots| {
+        None,
+        |_selected, _cpus, _snapshots| {
             counter.set(counter.get() + 1);
             // Fast phase always bounces; the wait phase must succeed
             // without this seam.
@@ -1260,16 +1195,188 @@ fn acquire_llc_plan_wait_phase_acquires_beyond_the_seam() {
     .expect("wait phase must acquire via real lockfiles after the fast phase exhausts");
     assert_eq!(
         counter.get(),
-        ACQUIRE_MAX_TOCTOU_RETRIES + 1,
-        "acquire_fn is a fast-phase seam: exactly TOCTOU+1 calls, \
-         never invoked by the head engine",
+        1,
+        "waiting acquisition must make exactly one fast attempt before registry admission",
     );
     assert_eq!(plan.locked_llcs, vec![0]);
     assert_eq!(
         plan.locks.len(),
-        1,
-        "head-acquired LOCK_SH fd rides the plan"
+        2,
+        "head-acquired LLC and CPU LOCK_SH fds ride the plan"
     );
+}
+
+#[test]
+fn plan_only_ignores_live_exclusive_holders() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93720, 93721]);
+    let topo = synth_host_topo(&[(vec![93720], 0), (vec![93721], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(2, 1);
+    let _held: Vec<_> = [0usize, 1]
+        .into_iter()
+        .map(|llc| {
+            try_flock(llc_lock_path(llc), FlockMode::Exclusive)
+                .expect("open LLC EX blocker")
+                .expect("take LLC EX blocker")
+        })
+        .collect();
+    let plan = plan_llc_selection_only(
+        &topo,
+        &test_topo,
+        CpuCap::new(2).ok(),
+        PlacementPolicy::Spread { rotation: 0 },
+    )
+    .expect("temporary EX contention must not make plan-only fail");
+    assert_eq!(plan.locked_llcs, vec![0, 1]);
+    assert_eq!(plan.cpus, vec![93720, 93721]);
+    assert!(plan.locks.is_empty(), "plan-only never owns resource fds");
+}
+
+#[test]
+fn plan_only_cargo_test_mode_matches_runtime_full_allowed_cpuset() {
+    let _env_guard = env_lock();
+    let _cargo = EnvGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![93730, 93731]);
+    let topo = synth_host_topo(&[(vec![93730], 0), (vec![93731], 1)]);
+    let test_topo = crate::topology::TestTopology::synthetic(2, 1);
+    let cap = CpuCap::new(1).expect("cap=1");
+
+    let build_plan = plan_llc_selection_only(
+        &topo,
+        &test_topo,
+        Some(cap),
+        PlacementPolicy::Spread { rotation: 0 },
+    )
+    .expect("cargo-test build plan");
+    let runtime_plan = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        Some(cap),
+        PlacementPolicy::Spread { rotation: 0 },
+        true,
+        None,
+        None,
+        None,
+    )
+    .expect("cargo-test runtime plan");
+
+    assert_eq!(build_plan.cpus, vec![93730, 93731]);
+    assert_eq!(
+        build_plan.cpus, runtime_plan.cpus,
+        "build budget and runtime mask must describe the same full allowed cpuset",
+    );
+    assert_eq!(build_plan.locked_llcs, runtime_plan.locked_llcs);
+    assert!(build_plan.locks.is_empty());
+    assert!(runtime_plan.locks.is_empty());
+    for path in [
+        llc_lock_path(0),
+        llc_lock_path(1),
+        cpu_lock_path(93730),
+        cpu_lock_path(93731),
+    ] {
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "cargo-test shape/acquire bypass must not materialize {path}",
+        );
+    }
+}
+
+#[test]
+fn registered_claim_fast_fails_without_acquire_or_diagnostic_enrichment() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0]);
+    let topo = synth_host_topo(&[(vec![0], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    let claim =
+        admission_protocol::ClaimSet::new([0usize], std::iter::empty(), FlockMode::Exclusive);
+    let watch = admission_protocol::ClaimSet::with_modes(
+        [0usize],
+        [0usize],
+        FlockMode::Exclusive,
+        FlockMode::Shared,
+    );
+    let coordinator =
+        match admission_protocol::register_ticket_or_acquire(claim, watch, None, |_| {
+            Ok::<Option<()>, anyhow::Error>(None)
+        })
+        .expect("register exclusive LLC claim")
+        {
+            admission_protocol::TicketWork::Coordinator(coordinator) => coordinator,
+            admission_protocol::TicketWork::Acquired(_) => {
+                panic!("fresh registry must elect a coordinator")
+            }
+        };
+    let attempts = std::cell::Cell::new(0usize);
+    let proc_reads_before = crate::flock::proc_locks::proc_locks_read_count_for_tests();
+    let error = acquire_llc_plan_with_acquire_fn(
+        &topo,
+        &test_topo,
+        None,
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        |_, _, _| {
+            attempts.set(attempts.get() + 1);
+            Ok(None)
+        },
+    )
+    .expect_err("a covering registered claim must fail fast");
+    assert!(error.downcast_ref::<ResourceContention>().is_some());
+    assert_eq!(
+        attempts.get(),
+        0,
+        "aggregate-proven claim contention must not touch the real acquire seam",
+    );
+    // The wait=false bail diagnostic probes contended LLC lock files with a
+    // non-blocking flock; it never walks host-global /proc/locks. (Here the
+    // fence is registry-only, so no LLC is physically held and none is named.)
+    assert_eq!(
+        crate::flock::proc_locks::proc_locks_read_count_for_tests(),
+        proc_reads_before,
+        "the contention bail must not scan /proc/locks",
+    );
+    drop(coordinator);
+}
+
+/// The wait=false contention bail names the physically-held LLC via a
+/// per-needle non-blocking flock probe, never a host-global `/proc/locks`
+/// walk.
+#[test]
+fn contention_bail_names_held_llc_without_scanning_proc_locks() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0]);
+    let topo = HostTopology::new_for_tests(&[(vec![0], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    // A peer physically holds LLC 0's lock EX but registers no claim, so the
+    // registry-based discover sees LLC 0 free and plans it; the physical
+    // acquire then fails, yielding an LLC-0 contention marker the bail names.
+    let held = crate::flock::try_flock(llc_lock_path(0), FlockMode::Exclusive)
+        .expect("open LLC 0 lock")
+        .expect("hold LLC 0 EX");
+    let proc_reads_before = crate::flock::proc_locks::proc_locks_read_count_for_tests();
+    let error = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        Some(CpuCap::new(1).expect("cap=1 valid")),
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("a physically held LLC 0 must fail the nonblocking plan");
+    let reason = error.to_string();
+    assert!(
+        reason.contains("LLC 0") && reason.contains("held"),
+        "the bail must name the physically-held LLC 0; got: {reason}",
+    );
+    assert_eq!(
+        crate::flock::proc_locks::proc_locks_read_count_for_tests(),
+        proc_reads_before,
+        "the bail must probe the LLC lock files, not scan /proc/locks",
+    );
+    drop(held);
 }
 
 /// `plan_from_snapshots` MUST-CONSOLIDATE invariant: on a
@@ -1291,9 +1398,9 @@ fn plan_from_snapshots_consolidation_overrides_fresh_ordering() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
-            holders: Vec::new(),
             holder_count: if idx == 3 { 5 } else { 0 },
+            exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
@@ -1310,6 +1417,123 @@ fn plan_from_snapshots_consolidation_overrides_fresh_ordering() {
         vec![3],
         "target=1 with peer-held LLC 3 must pick LLC 3, not the \
          lowest-index fresh LLC 0 — consolidation overrides fresh",
+    );
+}
+
+/// Elastic planners retain held-first Consolidate ordering while rotating the
+/// fresh suffix. Distinct process-stable rotations must therefore fan out both
+/// on a cold host and when a partially usable held LLC cannot cover the whole
+/// target. Returned plans remain sorted in canonical acquisition order.
+#[test]
+fn elastic_fresh_rotations_fan_out_cold_prefix_and_warm_spill_suffix() {
+    let topo = synth_host_topo(&[
+        (vec![0], 0),
+        (vec![1], 0),
+        (vec![2], 0),
+        (vec![3], 0),
+        (vec![4], 0),
+        (vec![5], 0),
+        (vec![6], 0),
+        (vec![7], 0),
+    ]);
+    let cold_snapshots: Vec<LlcSnapshot> = (0..8)
+        .map(|llc_idx| LlcSnapshot {
+            llc_idx,
+            holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
+        })
+        .collect();
+    let allowed: std::collections::BTreeSet<usize> = (0..8).collect();
+    let barrier = std::sync::Barrier::new(3);
+
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            barrier.wait();
+            plan_from_snapshots_with_fresh_rotation(
+                &cold_snapshots,
+                2,
+                &topo,
+                &allowed,
+                |_, _| 10,
+                PlacementPolicy::Consolidate,
+                Some(0),
+            )
+        });
+        let second = scope.spawn(|| {
+            barrier.wait();
+            plan_from_snapshots_with_fresh_rotation(
+                &cold_snapshots,
+                2,
+                &topo,
+                &allowed,
+                |_, _| 10,
+                PlacementPolicy::Consolidate,
+                Some(2),
+            )
+        });
+        barrier.wait();
+        (
+            first.join().expect("first cold planner"),
+            second.join().expect("second cold planner"),
+        )
+    });
+
+    assert_eq!(first, vec![0, 1]);
+    assert_eq!(second, vec![2, 3]);
+    let first: std::collections::BTreeSet<_> = first.into_iter().collect();
+    let second: std::collections::BTreeSet<_> = second.into_iter().collect();
+    assert!(
+        first.is_disjoint(&second),
+        "distinct cold rotations must choose disjoint LLC prefixes",
+    );
+
+    let warm_topo = synth_host_topo(&[
+        (vec![0, 1, 2, 3], 0),
+        (vec![4, 5, 6, 7], 0),
+        (vec![8, 9, 10, 11], 0),
+        (vec![12, 13, 14, 15], 0),
+        (vec![16, 17, 18, 19], 0),
+    ]);
+    let warm_snapshots: Vec<LlcSnapshot> = (0..5)
+        .map(|llc_idx| LlcSnapshot {
+            llc_idx,
+            holder_count: if llc_idx == 4 { 3 } else { 0 },
+            exclusive_held: false,
+            granted_count: 0,
+        })
+        .collect();
+    // The held LLC contributes only CPUs 16 and 17 inside this cpuset. A
+    // six-CPU target must consolidate there first, then take one whole fresh
+    // four-CPU LLC. Distinct rotations should choose distinct spill LLCs.
+    let warm_allowed: std::collections::BTreeSet<usize> = (0..18).collect();
+    let first = plan_from_snapshots_with_fresh_rotation(
+        &warm_snapshots,
+        6,
+        &warm_topo,
+        &warm_allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+        Some(0),
+    );
+    let second = plan_from_snapshots_with_fresh_rotation(
+        &warm_snapshots,
+        6,
+        &warm_topo,
+        &warm_allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+        Some(2),
+    );
+    assert_eq!(
+        first,
+        vec![0, 4],
+        "held LLC must score first, with the final plan sorted for acquisition",
+    );
+    assert_eq!(
+        second,
+        vec![2, 4],
+        "the held LLC stays selected while the fresh spill suffix rotates",
     );
 }
 
@@ -1333,9 +1557,9 @@ fn plan_from_snapshots_single_node_fit_no_spill() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
-            holders: Vec::new(),
             holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     // Canonical distance: same-node 10, cross-node 20.
@@ -1372,9 +1596,9 @@ fn plan_from_snapshots_equal_scores_tiebreak_ascending() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
-            holders: Vec::new(),
             holder_count: 5,
+            exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = (0..4).collect();
@@ -1409,6 +1633,1017 @@ fn default_cpu_budget_30_percent_rounded_up_min_one() {
     assert_eq!(default_cpu_budget(4), 2, "ceil(1.2) = 2");
     assert_eq!(default_cpu_budget(10), 3, "ceil(3.0) = 3");
     assert_eq!(default_cpu_budget(100), 30, "exact 30%");
+}
+
+#[test]
+fn elastic_sizing_uses_every_available_cpu_up_to_its_maximum() {
+    let sizing = LlcPlanSizing::Elastic;
+    assert_eq!(sizing.target_for_capacity(8, 0), None);
+    assert_eq!(sizing.target_for_capacity(8, 1), Some(1));
+    assert_eq!(sizing.target_for_capacity(8, 5), Some(5));
+    assert_eq!(sizing.target_for_capacity(8, 8), Some(8));
+    assert_eq!(sizing.target_for_capacity(8, 13), Some(8));
+    assert_eq!(sizing.queued_target(8), 1);
+
+    let exact = LlcPlanSizing::Exact;
+    assert_eq!(exact.target_for_capacity(8, 7), None);
+    assert_eq!(exact.target_for_capacity(8, 8), Some(8));
+    assert_eq!(exact.target_for_capacity(8, 13), Some(8));
+    assert_eq!(exact.queued_target(8), 8);
+}
+
+#[test]
+fn cooperative_permits_admit_four_host_width_claims_and_reject_a_fifth() {
+    let host_width = 8;
+    let pool = AdmissionPermitPool::for_host(host_width);
+    assert_eq!(pool.len(), host_width * COOPERATIVE_OVERSUBSCRIPTION);
+    let mut held = std::collections::BTreeSet::new();
+
+    for lane in 0..COOPERATIVE_OVERSUBSCRIPTION {
+        let selection = select_admission_permits(
+            PermitAdmission::Cooperative,
+            &pool,
+            host_width,
+            host_width,
+            lane * host_width,
+            &[],
+            |candidate| Ok(candidate.permits.is_disjoint(&held)),
+            |_| Ok(false),
+        )
+        .unwrap()
+        .expect("each of four host-width cooperative lanes must fit");
+        assert_eq!(selection.permits.len(), host_width);
+        assert!(selection.permits.iter().all(|permit| held.insert(*permit)));
+    }
+
+    assert_eq!(held.len(), pool.len());
+    assert!(
+        select_admission_permits(
+            PermitAdmission::Cooperative,
+            &pool,
+            host_width,
+            host_width,
+            0,
+            &[],
+            |candidate| Ok(candidate.permits.is_disjoint(&held)),
+            |_| Ok(false),
+        )
+        .unwrap()
+        .is_none(),
+        "a fifth host-width claim must wait until one of the four lanes releases",
+    );
+}
+
+/// A zero-width request names no permits. The selection loop only stops on
+/// `permits.len() == maximum`, so a `maximum` of 0 would otherwise run to the
+/// end of the pool and name every ready permit in it — a whole-host admission
+/// claim funding no CPUs.
+#[test]
+fn zero_width_permit_request_names_no_permits() {
+    let host_width = 8;
+    let pool = AdmissionPermitPool::for_host(host_width);
+    assert_eq!(pool.len(), host_width * COOPERATIVE_OVERSUBSCRIPTION);
+
+    let mut probes = 0usize;
+    let selection = select_admission_permits(
+        PermitAdmission::Cooperative,
+        &pool,
+        0,
+        0,
+        0,
+        &[],
+        |_| {
+            probes += 1;
+            Ok(true)
+        },
+        |_| Ok(false),
+    )
+    .expect("select a zero-width shape")
+    .expect("a zero-width request with no floor is met by an empty selection");
+    assert!(
+        selection.permits.is_empty(),
+        "zero-width selection must name no permits, got {:?}",
+        selection.permits,
+    );
+    assert_eq!(
+        selection.admission_class,
+        admission_protocol::AdmissionClass::Ordinary,
+    );
+    assert_eq!(
+        probes, 0,
+        "a zero-width request must not probe pool permits at all",
+    );
+
+    assert!(
+        select_admission_permits(
+            PermitAdmission::Cooperative,
+            &pool,
+            0,
+            1,
+            0,
+            &[],
+            |_| Ok(true),
+            |_| Ok(false),
+        )
+        .expect("select a zero-width shape under a one-permit floor")
+        .is_none(),
+        "an empty selection cannot clear a one-permit floor",
+    );
+}
+
+/// A claim-fenced attempt selects no CPUs, and permit selection is skipped
+/// for that zero-width plan. Both acquisition arms already refuse an empty
+/// selection, so the skip changes no outcome — its only observable effect is
+/// the registry snapshot the permit watch would otherwise take. Pin that:
+/// `discover_registered_placement_states` takes the single aggregate snapshot
+/// a fenced no-wait attempt is allowed, so the delta is exactly 1 (2 without
+/// the short-circuit). Uses `acquire_llc_plan_interruptible` because it is
+/// the entry point supplying `PermitAdmission::Cooperative`;
+/// `acquire_llc_plan_with_acquire_fn` hardcodes `PermitAdmission::None` and
+/// takes a different arm that never selected permits.
+#[test]
+fn claim_fenced_plan_takes_only_the_discover_registry_snapshot() {
+    let _llc_prefix = LlcLockPrefixGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0]);
+    let topo = synth_host_topo(&[(vec![0], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(1, 1);
+    let claim =
+        admission_protocol::ClaimSet::new([0usize], std::iter::empty(), FlockMode::Exclusive);
+    let watch = admission_protocol::ClaimSet::with_modes(
+        [0usize],
+        [0usize],
+        FlockMode::Exclusive,
+        FlockMode::Shared,
+    );
+    let coordinator =
+        match admission_protocol::register_ticket_or_acquire(claim, watch, None, |_| {
+            Ok::<Option<()>, anyhow::Error>(None)
+        })
+        .expect("register exclusive LLC claim")
+        {
+            admission_protocol::TicketWork::Coordinator(coordinator) => coordinator,
+            admission_protocol::TicketWork::Acquired(_) => {
+                panic!("fresh registry must elect a coordinator")
+            }
+        };
+    let registry_reads_before =
+        crate::vmm::host_topology::protocol::aggregate_snapshot_read_count_for_tests();
+    let error = acquire_llc_plan_interruptible(
+        &topo,
+        &test_topo,
+        Some(CpuCap::new(1).expect("cap=1 valid")),
+        PlacementPolicy::Consolidate,
+        false,
+        None,
+        None,
+        None,
+    )
+    .expect_err("a covering registered claim must fail fast");
+    assert!(error.downcast_ref::<ResourceContention>().is_some());
+    assert_eq!(
+        crate::vmm::host_topology::protocol::aggregate_snapshot_read_count_for_tests()
+            - registry_reads_before,
+        1,
+        "a claim-fenced attempt must read the aggregate exactly once (DISCOVER); \
+         selecting permits for a plan that funds no CPUs costs a second read",
+    );
+    drop(coordinator);
+}
+
+#[test]
+fn preparation_private_working_set_uses_two_chunks_and_preserves_conversion_headroom() {
+    assert_eq!(MEMORY_PERMIT_CHUNK_MIB, 256);
+    assert_eq!(PREPARATION_PRIVATE_WORKING_SET_MIB, 512);
+    assert_eq!(preparation_memory_chunks(), 2);
+
+    // Match the 376 GiB CI hosts which exposed the old 2 GiB-per-process
+    // preparation bottleneck. Host reserve policy leaves 1,353 memory chunks;
+    // a quarter can fund 169 two-chunk preparation owners instead of only 42
+    // eight-chunk owners. CPU capacity remains a separate upper bound.
+    let possible_width = 192usize;
+    let (usable_mib, memory_chunks) = memory_capacity_from_total(376 * 1024);
+    assert_eq!(usable_mib, 346_521);
+    assert_eq!(memory_chunks, 1_353);
+    let cpu_chunks = AdmissionPermitPool::for_host(possible_width).len();
+    let slots = preparation_slot_capacity(memory_chunks, cpu_chunks, possible_width);
+    assert_eq!(slots, 169);
+
+    let preparation_chunks = slots * preparation_memory_chunks();
+    assert!(
+        preparation_chunks <= memory_chunks / PREPARATION_MEMORY_FRACTION,
+        "a full preparation wave must never consume more than its quarter",
+    );
+    assert!(
+        memory_chunks - preparation_chunks >= memory_chunks * 3 / 4,
+        "at least three quarters of memory permits remain for guest conversion",
+    );
+}
+
+/// Preparation and run must derive the CPU-permit pool from the same host
+/// width. Permit identities are one host-wide lockfile namespace, so a run
+/// pool sized from the caller's (cgroup-narrowed) cpuset would stop short of
+/// the identities this process's own preparation phase already holds.
+#[test]
+fn run_permit_pool_covers_the_preparation_pool_under_a_narrow_cpuset() {
+    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
+    let preparation = AdmissionPermitPool::for_host(possible_cpu_width());
+    let run = VmPermitPool::new_with_preparation(1, 256, None).expect("construct run permit pool");
+    assert_eq!(
+        run.cpu.all().collect::<Vec<_>>(),
+        preparation.all().collect::<Vec<_>>(),
+        "the run CPU-permit pool must be the preparation pool",
+    );
+    assert_eq!(run.cpu.general, preparation.general);
+    assert_eq!(run.cpu.reserved, preparation.reserved);
+}
+
+#[test]
+fn required_chunks_charges_touch_ceiling_not_sized_ram_on_wide_cells() {
+    // The run claim charges `required_chunks(permit_memory)` where
+    // `permit_memory` is the touch ceiling (max'd with declared), not the
+    // sized RAM. On the 384 GB host the usable pool is ~1,380 chunks; a
+    // 224-vCPU cell sized at the 64 MiB/vCPU floor (14.3 GiB) would charge
+    // 56 chunks, capping concurrency at 24. Charging its ~2 GiB touch
+    // ceiling instead charges 8 chunks and lifts concurrency to ~170.
+    let (_usable_mib, memory_chunks) = memory_capacity_from_total(384 * 1024);
+    let memory = MemoryPermitPool {
+        permits: (0..memory_chunks).collect(),
+        usable_mib: memory_chunks * MEMORY_PERMIT_CHUNK_MIB,
+    };
+
+    let sized_mib = 224 * 64; // 14336 MiB, the 64 MiB/vCPU floor
+    let touch_mib = 2041; // touch ceiling for the wide cell
+
+    let sized_chunks = memory.required_chunks(sized_mib).expect("sized demand");
+    let touch_chunks = memory.required_chunks(touch_mib).expect("touch demand");
+    assert_eq!(sized_chunks, 56, "sized RAM charges 56 chunks");
+    assert_eq!(touch_chunks, 8, "touch ceiling charges 8 chunks");
+
+    // Projected concurrency from the same usable pool.
+    assert_eq!(memory_chunks / sized_chunks, 24);
+    assert!(
+        (168..=176).contains(&(memory_chunks / touch_chunks)),
+        "touch-ceiling concurrency should be ~170 (got {})",
+        memory_chunks / touch_chunks,
+    );
+}
+
+#[test]
+fn computed_guest_memory_replaces_fixed_preparation_weight() {
+    let cpu = AdmissionPermitPool::for_host(1);
+    let memory = MemoryPermitPool {
+        permits: (100..108).collect(),
+        usable_mib: 8 * MEMORY_PERMIT_CHUNK_MIB,
+    };
+    let preparation_owned = std::collections::BTreeSet::from([100usize, 101usize]);
+    let preferred_memory = preparation_owned.iter().copied().collect::<Vec<_>>();
+    let candidate_ready = |candidate: &admission_protocol::ClaimSet,
+                           externally_blocked: Option<usize>| {
+        let Some(external) = claim_without_owned_permits(candidate, &preparation_owned) else {
+            return Ok(true);
+        };
+        Ok(externally_blocked.is_none_or(|permit| !external.permits.contains(&permit)))
+    };
+
+    // A 256 MiB guest needs one chunk, not both chunks in the fixed
+    // preparation estimate. The surplus preparation OFD must not leak into
+    // the run reservation.
+    let small = select_vm_permits_grant_aware(
+        PermitAdmission::Cooperative,
+        &cpu,
+        Some(&memory),
+        1,
+        1,
+        memory.required_chunks(256).expect("256 MiB demand"),
+        0,
+        0,
+        &[],
+        &preferred_memory,
+        |candidate| candidate_ready(candidate, None),
+        |_| Ok(false),
+    )
+    .expect("select 256 MiB guest permits")
+    .expect("256 MiB guest must fit");
+    assert_eq!(small.memory_permits, vec![100]);
+
+    // Conversely, a 2 GiB guest must acquire all eight actual chunks. Owning
+    // the two preparation chunks is not permission to allocate the larger
+    // guest: one unavailable external chunk keeps the conversion pending.
+    let full_demand = memory.required_chunks(2048).expect("2 GiB demand");
+    assert_eq!(full_demand, 8);
+    assert!(
+        select_vm_permits_grant_aware(
+            PermitAdmission::Cooperative,
+            &cpu,
+            Some(&memory),
+            1,
+            1,
+            full_demand,
+            0,
+            0,
+            &[],
+            &preferred_memory,
+            |candidate| candidate_ready(candidate, Some(107)),
+            |_| Ok(false),
+        )
+        .expect("probe partially available 2 GiB demand")
+        .is_none(),
+        "fixed preparation ownership cannot authorize an under-reserved guest",
+    );
+
+    let large = select_vm_permits_grant_aware(
+        PermitAdmission::Cooperative,
+        &cpu,
+        Some(&memory),
+        1,
+        1,
+        full_demand,
+        0,
+        0,
+        &[],
+        &preferred_memory,
+        |candidate| candidate_ready(candidate, None),
+        |_| Ok(false),
+    )
+    .expect("select fully available 2 GiB demand")
+    .expect("2 GiB guest must fit once every actual chunk is available");
+    assert_eq!(large.memory_permits.len(), full_demand);
+    assert!(
+        preparation_owned.is_subset(&large.memory_permits.iter().copied().collect()),
+        "the atomic conversion should reuse preparation OFDs where possible",
+    );
+}
+
+#[test]
+fn owned_or_absent_permits_never_issue_an_empty_registry_query() {
+    let pool = AdmissionPermitPool::for_host(1);
+    let callback_count = std::cell::Cell::new(0usize);
+    let selection = select_vm_permits_grant_aware(
+        PermitAdmission::None,
+        &pool,
+        None,
+        1,
+        1,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |candidate| {
+            callback_count.set(callback_count.get() + 1);
+            assert!(
+                !candidate.is_empty(),
+                "registry readiness callbacks require a real resource claim",
+            );
+            Ok(true)
+        },
+        |_| Ok(false),
+    )
+    .expect("select a permitless admission shape")
+    .expect("permitless admission remains available");
+    assert!(selection.all_permits().is_empty());
+    assert_eq!(
+        callback_count.get(),
+        0,
+        "a permitless selection has no registry resource delta to query",
+    );
+
+    let candidate = permit_only_claim(&PermitSelection {
+        permits: vec![11],
+        admission_class: admission_protocol::AdmissionClass::Ordinary,
+    });
+    assert!(
+        claim_without_owned_permits(&candidate, &std::collections::BTreeSet::from([11usize]))
+            .is_none(),
+        "a fully reused preparation permit has no external contention claim",
+    );
+    let external = claim_without_owned_permits(
+        &permit_only_claim(&PermitSelection {
+            permits: vec![11, 12],
+            admission_class: admission_protocol::AdmissionClass::Ordinary,
+        }),
+        &std::collections::BTreeSet::from([11usize]),
+    )
+    .expect("a non-owned permit remains externally visible");
+    assert_eq!(
+        external.permits,
+        std::collections::BTreeSet::from([12usize])
+    );
+}
+
+#[test]
+fn build_permits_are_bounded_but_never_blocked_by_live_default_borrowers() {
+    let cooperative = AdmissionPermitPool::for_host(8);
+    let borrowed = cooperative
+        .reserved
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !borrowed.is_empty(),
+        "the fixture must expose borrowable default capacity"
+    );
+
+    let build = AdmissionPermitPool::for_build_host(8).expect("construct build-only namespace");
+    assert!(
+        build
+            .all()
+            .all(|permit| !cooperative.general.contains(&permit)
+                && !cooperative.reserved.contains(&permit)),
+        "build permits must be disjoint from both general and borrowed default capacity",
+    );
+    let selection = select_admission_permits(
+        PermitAdmission::Build,
+        &build,
+        1,
+        1,
+        0,
+        &[],
+        |candidate| Ok(candidate.permits.is_disjoint(&borrowed)),
+        |_| Ok(false),
+    )
+    .expect("select one build permit")
+    .expect("a live default borrower must not delay build admission");
+    assert_eq!(
+        selection.admission_class,
+        admission_protocol::AdmissionClass::Build
+    );
+    assert_eq!(selection.permits.len(), 1);
+}
+
+#[test]
+fn elastic_build_falls_back_to_one_cpu_when_every_build_permit_is_busy() {
+    let pool = AdmissionPermitPool::for_build_host(4).expect("construct build-only namespace");
+    let busy = pool.all().collect::<std::collections::BTreeSet<_>>();
+    let selection = select_plan_permits_grant_aware(
+        PermitAdmission::Build,
+        LlcPlanSizing::Elastic,
+        &pool,
+        None,
+        4,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |candidate| Ok(candidate.permits.is_disjoint(&busy)),
+        |_| Ok(false),
+    )
+    .expect("select an elastic build shape")
+    .expect("busy build permits must retain serial forward progress");
+
+    assert_eq!(selection.cpu_width, 1);
+    assert!(
+        selection.permits.all_permits().is_empty(),
+        "the serial fallback must not queue behind the saturated permit pool",
+    );
+    assert_eq!(
+        selection.permits.admission_class,
+        admission_protocol::AdmissionClass::Build,
+    );
+}
+
+#[test]
+fn elastic_build_uses_the_one_free_build_permit_before_serial_fallback() {
+    let pool = AdmissionPermitPool::for_build_host(4).expect("construct build-only namespace");
+    let free = pool.all().next().expect("build pool is non-empty");
+    let busy = pool
+        .all()
+        .filter(|permit| *permit != free)
+        .collect::<std::collections::BTreeSet<_>>();
+    let selection = select_plan_permits_grant_aware(
+        PermitAdmission::Build,
+        LlcPlanSizing::Elastic,
+        &pool,
+        None,
+        4,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |candidate| Ok(candidate.permits.is_disjoint(&busy)),
+        |_| Ok(false),
+    )
+    .expect("select an elastic build shape")
+    .expect("one free build permit must remain usable");
+
+    assert_eq!(selection.cpu_width, 1);
+    assert_eq!(selection.permits.cpu_permits, vec![free]);
+    assert_eq!(selection.permits.all_permits(), vec![free]);
+}
+
+#[test]
+fn elastic_build_acquires_serial_shared_plan_while_build_permits_are_saturated() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+    // Saturate the namespace the planner itself derives: build permits are
+    // sized from the host possible width, not this test's allowed cpuset.
+    let build_pool = AdmissionPermitPool::for_build_host(possible_cpu_width())
+        .expect("construct build-only namespace");
+    let busy_permits = build_pool.all().collect::<Vec<_>>();
+    let busy_claim = resource_claim_with_permits(
+        &[],
+        LlcLockMode::Shared,
+        &[],
+        FlockMode::Shared,
+        &busy_permits,
+        admission_protocol::AdmissionClass::Build,
+    );
+    let busy_locks = busy_permits
+        .iter()
+        .map(|permit| {
+            try_flock(permit_lock_path(*permit), FlockMode::Exclusive)
+                .expect("open build-permit lock")
+                .expect("reserve build permit")
+        })
+        .collect::<Vec<_>>();
+    let busy_holder = admission_protocol::publish_acquired(&busy_claim, busy_locks)
+        .expect("publish saturated build-permit pool");
+
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(4).unwrap()), None)
+            .expect("soft build permits must not block SH-compatible serial progress");
+
+    assert_eq!(plan.cpus.len(), 1);
+    assert_eq!(plan.locked_llcs.len(), 1);
+    assert!(plan.permits.is_empty());
+    assert_eq!(make_jobs_for_plan(&plan), 1);
+    assert_eq!(
+        plan.locks.len(),
+        plan.locked_llcs.len() + plan.cpus.len(),
+        "the fallback retains only its physical shared ownership",
+    );
+
+    drop(plan);
+    drop(busy_holder);
+}
+
+#[test]
+fn cooperative_selection_borrows_reserved_capacity_when_general_capacity_is_exhausted() {
+    let pool = AdmissionPermitPool::for_host(8);
+    assert!(!pool.general.is_empty() && !pool.reserved.is_empty());
+    let exhausted_general = pool
+        .general
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let selection = select_admission_permits(
+        PermitAdmission::Cooperative,
+        &pool,
+        1,
+        1,
+        0,
+        &[],
+        |candidate| Ok(candidate.permits.is_disjoint(&exhausted_general)),
+        |_| Ok(false),
+    )
+    .expect("select cooperative fallback capacity")
+    .expect("reserved capacity must remain a soft default fallback");
+    assert_eq!(
+        selection.admission_class,
+        admission_protocol::AdmissionClass::DefaultBorrow,
+    );
+    assert!(
+        selection
+            .permits
+            .iter()
+            .all(|permit| pool.reserved.contains(permit)),
+    );
+}
+
+/// A heavily SH-held LLC can satisfy the complete build maximum, but must not
+/// hide a disjoint idle LLC. Free-first eligibility is applied before LLC
+/// consolidation, so the build uses the idle domain rather than reproducing
+/// the busy-prefix/idle-host collapse.
+#[test]
+fn elastic_build_chooses_idle_cpus_before_a_sufficient_shared_llc() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+    let peer_claim = admission_protocol::ClaimSet::with_modes(
+        [0usize],
+        [0usize, 1],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let peer_physical = [llc_lock_path(0), cpu_lock_path(0), cpu_lock_path(1)]
+        .into_iter()
+        .map(|path| {
+            try_flock(path, FlockMode::Shared)
+                .expect("open peer SH resource")
+                .expect("acquire peer SH resource")
+        })
+        .collect::<Vec<_>>();
+    let peer = admission_protocol::publish_acquired(&peer_claim, peer_physical)
+        .expect("publish concurrent SH holder");
+
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(2).unwrap()), None)
+            .expect("two unshared CPUs must admit a two-CPU elastic build");
+
+    assert_eq!(
+        plan.locked_llcs,
+        vec![1],
+        "the shared LLC must be absent while the idle LLC carries the maximum",
+    );
+    assert_eq!(
+        plan.cpus
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [2usize, 3].into_iter().collect(),
+        "admitted CPUs must come entirely from the disjoint idle LLC",
+    );
+    drop(plan);
+    drop(peer);
+}
+
+#[test]
+fn elastic_build_width_prefers_unshared_capacity_then_falls_back_to_shared() {
+    let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let snapshots = vec![
+        LlcSnapshot {
+            llc_idx: 0,
+            holder_count: 1,
+            exclusive_held: false,
+            granted_count: 0,
+        },
+        LlcSnapshot {
+            llc_idx: 1,
+            holder_count: 1,
+            exclusive_held: false,
+            granted_count: 0,
+        },
+    ];
+    let compatible = (0usize..4).collect::<std::collections::BTreeSet<_>>();
+    let mut states = (0usize..4)
+        .map(|cpu| (cpu, CpuPlacementState::default()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    states.get_mut(&0).unwrap().other_holders = 2;
+    states.get_mut(&1).unwrap().other_holders = 1;
+
+    let unshared = live_cpu_capacity(
+        LlcPlanSizing::Elastic,
+        4,
+        &snapshots,
+        &topo,
+        &compatible,
+        &states,
+    )
+    .expect("two unshared CPUs provide live capacity");
+    assert_eq!(
+        unshared.target, 2,
+        "two unshared CPUs contract a four-CPU elastic maximum to two",
+    );
+    assert_eq!(
+        unshared.eligible,
+        [2usize, 3].into_iter().collect(),
+        "LLC planning and CPU selection must both see only unshared CPUs",
+    );
+
+    for state in states.values_mut() {
+        state.other_holders = 1;
+    }
+    let fallback = live_cpu_capacity(
+        LlcPlanSizing::Elastic,
+        4,
+        &snapshots,
+        &topo,
+        &compatible,
+        &states,
+    )
+    .expect("compatible shared CPUs provide fallback capacity");
+    assert_eq!(
+        fallback.target, 4,
+        "a fully occupied cooperative host retains the SH-compatible fallback",
+    );
+    assert_eq!(
+        fallback.eligible, compatible,
+        "zero unshared capacity restores the complete SH-compatible set",
+    );
+}
+
+/// A performance-shaped EX claim remains a hard fence even though elastic
+/// builds use SH locks and can overlap default/no-perf/build peers.
+#[test]
+fn elastic_build_excludes_a_hard_exclusive_llc() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+    let peer_claim = admission_protocol::ClaimSet::with_modes(
+        [0usize],
+        [0usize],
+        FlockMode::Exclusive,
+        FlockMode::Exclusive,
+    );
+    let peer_physical = [llc_lock_path(0), cpu_lock_path(0)]
+        .into_iter()
+        .map(|path| {
+            try_flock(path, FlockMode::Exclusive)
+                .expect("open peer EX resource")
+                .expect("acquire peer EX resource")
+        })
+        .collect::<Vec<_>>();
+    let peer = admission_protocol::publish_acquired(&peer_claim, peer_physical)
+        .expect("publish hard-exclusive holder");
+
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(1).unwrap()), None)
+            .expect("disjoint compatible LLC must admit the elastic build");
+    assert_eq!(
+        plan.locked_llcs,
+        vec![1],
+        "the build must not enter the hard-exclusive LLC",
+    );
+    assert!(
+        plan.cpus.iter().all(|cpu| [2usize, 3].contains(cpu)),
+        "the build CPU must come from the disjoint LLC: {:?}",
+        plan.cpus,
+    );
+    drop(plan);
+    drop(peer);
+}
+
+/// Once every compatible CPU already has a SH holder, an elastic build must
+/// still start by sharing rather than manufacturing an EX-like serialization
+/// point. The LLC footprint remains consolidated to one domain.
+#[test]
+fn elastic_build_uses_shared_capacity_when_no_cpu_is_unshared() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+    let peer_claim = admission_protocol::ClaimSet::with_modes(
+        [0usize, 1],
+        [0usize, 1, 2, 3],
+        FlockMode::Shared,
+        FlockMode::Shared,
+    );
+    let peer_physical = [
+        llc_lock_path(0),
+        llc_lock_path(1),
+        cpu_lock_path(0),
+        cpu_lock_path(1),
+        cpu_lock_path(2),
+        cpu_lock_path(3),
+    ]
+    .into_iter()
+    .map(|path| {
+        try_flock(path, FlockMode::Shared)
+            .expect("open peer SH resource")
+            .expect("acquire peer SH resource")
+    })
+    .collect::<Vec<_>>();
+    let peer = admission_protocol::publish_acquired(&peer_claim, peer_physical)
+        .expect("publish whole-host cooperative holder");
+
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(2).unwrap()), None)
+            .expect("SH fallback must admit a fully occupied cooperative host");
+    assert_eq!(
+        plan.locked_llcs,
+        vec![0],
+        "equal held LLCs consolidate deterministically onto the first domain",
+    );
+    assert_eq!(
+        plan.cpus
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [0usize, 1].into_iter().collect(),
+        "fallback CPUs must remain inside the consolidated footprint",
+    );
+    drop(plan);
+    drop(peer);
+}
+
+/// An elastic build must start immediately on every currently compatible CPU
+/// instead of joining the fixed-budget queue. Two exact VM-shaped holders own
+/// CPUs/LLCs 0 and 1; a 3-CPU build therefore contracts to the two free CPUs,
+/// carries matching SH locks plus build permits, and reports `-j2`.
+#[test]
+fn elastic_build_plan_takes_largest_immediately_available_subset() {
+    let _prefixes = LockPrefixesGuard::new();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+
+    let exact_holders: Vec<_> = [0usize, 1]
+        .into_iter()
+        .flat_map(|index| [llc_lock_path(index), cpu_lock_path(index)])
+        .map(|path| {
+            try_flock(&path, FlockMode::Exclusive)
+                .expect("open exact-holder lock")
+                .expect("reserve exact-holder resource")
+        })
+        .collect();
+
+    let plan =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(3).unwrap()), None)
+            .expect("two free CPUs must start an elastic three-CPU-max build");
+    assert_eq!(plan.locked_llcs, vec![2, 3]);
+    assert_eq!(plan.cpus, vec![2, 3]);
+    assert_eq!(
+        plan.permits.len(),
+        plan.cpus.len(),
+        "elastic width is bounded by one build permit per admitted CPU",
+    );
+    assert_eq!(
+        plan.locks.len(),
+        plan.locked_llcs.len() + plan.cpus.len() + plan.permits.len(),
+        "the elastic build retains its LLC, CPU, and build-permit ownership",
+    );
+    assert_eq!(
+        make_jobs_for_plan(&plan),
+        2,
+        "build parallelism must follow the contracted reservation",
+    );
+    for index in &plan.cpus {
+        assert!(
+            try_flock(cpu_lock_path(*index), FlockMode::Exclusive)
+                .expect("probe returned CPU lock")
+                .is_none(),
+            "the elastic plan must retain its exact SH CPU reservation",
+        );
+    }
+
+    drop(plan);
+    drop(exact_holders);
+    let full =
+        acquire_elastic_build_llc_plan(&topo, &test_topo, Some(CpuCap::new(3).unwrap()), None)
+            .expect("idle capacity must restore the configured elastic maximum");
+    assert_eq!(full.cpus.len(), 3);
+    assert_eq!(make_jobs_for_plan(&full), 3);
+}
+
+/// With every resource initially owned by exact VM-shaped EX holders, an
+/// elastic build queues. Releasing two of four CPUs must wake it into a 2-CPU
+/// plan even though its configured maximum is three; it must neither wait for
+/// a fixed three-CPU shape nor overlap the two holders that remain.
+#[test]
+fn elastic_build_wait_replans_to_largest_partial_release() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+
+    let mut exact_holders = Vec::new();
+    for index in 0usize..4 {
+        let llc = try_flock(llc_lock_path(index), FlockMode::Exclusive)
+            .expect("open exact-holder LLC lock")
+            .expect("reserve exact-holder LLC");
+        let cpu = try_flock(cpu_lock_path(index), FlockMode::Exclusive)
+            .expect("open exact-holder CPU lock")
+            .expect("reserve exact-holder CPU");
+        exact_holders.push((llc, cpu));
+    }
+    let mut released = Some(exact_holders.split_off(2));
+    let retained = exact_holders;
+    let proc_reads_before = crate::flock::proc_locks::proc_locks_read_count_for_tests();
+    let plan = acquire_elastic_build_llc_plan_with_coordinator_step_hook(
+        &topo,
+        &test_topo,
+        Some(CpuCap::new(3).unwrap()),
+        None,
+        || {
+            // Release exactly two CPUs only after the waiter has crossed
+            // registration and is executing its first coordinator replan.
+            // This replaces both the guessed 250 ms startup delay and the
+            // five-second "drop everything" escape hatch: success while
+            // `retained` is still live proves the partial release itself
+            // satisfied the elastic request.
+            drop(released.take());
+        },
+    )
+    .expect("the two-CPU release must satisfy an elastic build");
+    assert_eq!(plan.locked_llcs, vec![2, 3]);
+    assert_eq!(plan.cpus, vec![2, 3]);
+    assert_eq!(make_jobs_for_plan(&plan), 2);
+    assert_eq!(
+        crate::flock::proc_locks::proc_locks_read_count_for_tests(),
+        proc_reads_before,
+        "queued admission and coordinator wakes must not scan /proc/locks",
+    );
+
+    drop(plan);
+    drop(retained);
+}
+
+/// A direct (non-elastic, exact-width) kernel build must WAIT for its fixed
+/// width through the host queue instead of bailing after the four TOCTOU
+/// retries — the give-up-instead-of-wait regression that failed a CI lane
+/// (`acquire_llc_plan: could not reserve N CPU(s) after 4 attempts`). Every
+/// LLC/CPU is held so the fast phase cannot satisfy the request; with the
+/// wait routing the build registers and re-plans, and the release performed
+/// during its first coordinator step — while other holders stay live — is what
+/// satisfies it. Success without a bail proves the queue, not a retry timeout.
+#[test]
+fn direct_build_waits_for_exact_width_on_release_instead_of_bailing() {
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1, 2, 3]);
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let test_topo = crate::topology::TestTopology::synthetic(4, 1);
+
+    let mut holders = Vec::new();
+    for index in 0usize..4 {
+        let llc = try_flock(llc_lock_path(index), FlockMode::Exclusive)
+            .expect("open holder LLC lock")
+            .expect("reserve holder LLC");
+        let cpu = try_flock(cpu_lock_path(index), FlockMode::Exclusive)
+            .expect("open holder CPU lock")
+            .expect("reserve holder CPU");
+        holders.push((llc, cpu));
+    }
+    // An exact designation names a complete CANONICAL set even while busy
+    // (Consolidate -> the lowest two LLCs, 0 and 1), so release exactly those
+    // after the waiter has crossed registration and is executing its first
+    // coordinator replan; LLCs 2 and 3 stay held, so success proves the release
+    // of the designated width satisfied the queued exact build, not a timeout.
+    let retained = holders.split_off(2);
+    let mut released = Some(holders);
+    let plan = acquire_build_llc_plan_with_coordinator_step_hook(
+        &topo,
+        &test_topo,
+        Some(CpuCap::new(2).unwrap()),
+        None,
+        || {
+            drop(released.take());
+        },
+    )
+    .expect("a two-CPU release must satisfy a waiting exact build, never a bail");
+    assert_eq!(
+        plan.cpus,
+        vec![0, 1],
+        "the exact build takes its canonical width"
+    );
+    assert_eq!(make_jobs_for_plan(&plan), 2);
+
+    drop(plan);
+    drop(retained);
+}
+
+/// N direct kernel builds contending for the SAME exact width must all
+/// eventually reserve and complete by serializing through the host queue —
+/// none may give up the lane. Each wants the whole two-CPU LLC, so only one
+/// can hold at a time; with the wait routing the losers queue and each is
+/// granted in turn as the current holder releases. Before the fix they raced
+/// four TOCTOU attempts and failed a lane under exactly this overlap.
+#[test]
+fn many_contenders_for_one_exact_build_width_all_reserve_without_bailing() {
+    use std::sync::{Arc, Barrier};
+    let _prefixes = LockPrefixesGuard::new_real_wake();
+    let _allowed = AllowedCpusGuard::new(vec![0, 1]);
+    let llc_prefix = LLC_LOCK_PREFIX_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .expect("parent LLC prefix");
+    let cpu_prefix = CPU_LOCK_PREFIX_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .expect("parent CPU prefix");
+
+    const CONTENDERS: usize = 4;
+    let barrier = Arc::new(Barrier::new(CONTENDERS));
+    let handles: Vec<_> = (0..CONTENDERS)
+        .map(|_| {
+            let llc_prefix = llc_prefix.clone();
+            let cpu_prefix = cpu_prefix.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                // Thread-local test overrides do not inherit across spawn.
+                LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(llc_prefix));
+                CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(cpu_prefix));
+                ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![0, 1]));
+                let topo = synth_host_topo(&[(vec![0, 1], 0)]);
+                let test_topo = crate::topology::TestTopology::synthetic(2, 1);
+                // Start together to maximize the overlap the fast phase cannot
+                // satisfy — the exact shape that previously bailed a lane.
+                barrier.wait();
+                let plan = acquire_build_llc_plan(
+                    &topo,
+                    &test_topo,
+                    Some(CpuCap::new(2).unwrap()),
+                    true,
+                    None,
+                )
+                .expect("every contender must wait and reserve, never bail");
+                assert_eq!(plan.cpus, vec![0, 1]);
+                // Hold briefly, then release so the next queued contender is
+                // granted; the drop releases the LLC/CPU flocks and wakes the
+                // coordinator.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                drop(plan);
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle
+            .join()
+            .expect("every contender must reserve and complete without a bail");
+    }
 }
 
 /// `no_perf_cpu_budget` sizes a no-perf VM to its EXACT vCPU count
@@ -1505,7 +2740,7 @@ fn acquire_llc_plan_bails_when_no_llc_overlaps_allowed() {
     let _allowed = AllowedCpusGuard::new(vec![100, 101]);
     let topo = HostTopology::new_for_tests(&[(vec![0], 0), (vec![1], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
-    let err = acquire_llc_plan(&topo, &test_topo, None, PlacementPolicy::Consolidate, false)
+    let err = plan_llc_selection_only(&topo, &test_topo, None, PlacementPolicy::Consolidate)
         .expect_err("no LLC overlap must bail, not silently run");
     let msg = format!("{err:#}");
     assert!(
@@ -1544,9 +2779,9 @@ fn plan_from_snapshots_filters_llcs_outside_allowed_set() {
     let snapshots: Vec<LlcSnapshot> = (0..4)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
-            holders: Vec::new(),
             holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = [0, 1, 4, 5].into_iter().collect();
@@ -1582,12 +2817,15 @@ fn acquire_llc_plan_partial_take_last_llc_matches_exact_budget() {
     let topo = HostTopology::new_for_tests(&[(vec![0, 1, 2, 3], 0), (vec![4, 5, 6, 7], 0)]);
     let test_topo = crate::topology::TestTopology::synthetic(4, 1);
     let cap = CpuCap::new(5).expect("cap=5 valid");
-    let plan = acquire_llc_plan(
+    let plan = acquire_llc_plan_interruptible(
         &topo,
         &test_topo,
         Some(cap),
         PlacementPolicy::Consolidate,
         false,
+        None,
+        None,
+        None,
     )
     .expect("clean pool must allow SH on both LLCs");
 
@@ -1620,9 +2858,9 @@ fn plan_from_snapshots_partial_llc_overlap_counted_correctly() {
     let snapshots: Vec<LlcSnapshot> = (0..2)
         .map(|idx| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
-            holders: Vec::new(),
             holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
         })
         .collect();
     let allowed: std::collections::BTreeSet<usize> = [0, 2].into_iter().collect();
@@ -1669,12 +2907,15 @@ fn acquire_llc_plan_cross_node_spill_mems_union() {
     let test_topo = crate::topology::TestTopology::synthetic(4, 2);
     // Each LLC has 1 CPU, so cap=3 CPUs → exactly 3 LLCs.
     let cap = CpuCap::new(3).expect("cap=3 valid");
-    let plan = acquire_llc_plan(
+    let plan = acquire_llc_plan_interruptible(
         &topo,
         &test_topo,
         Some(cap),
         PlacementPolicy::Consolidate,
         false,
+        None,
+        None,
+        None,
     )
     .expect("clean pool must allow 3-CPU acquisition");
 
@@ -1719,13 +2960,15 @@ fn acquire_resource_locks_cargo_test_mode_bypasses_flock() {
     use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
     let _lock = lock_env();
     let _env = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "1");
-    let plan = PinningPlan {
-        assignments: vec![(0, 95100)],
-        service_cpu: None,
-        llc_indices: vec![95100],
-        locks: Vec::new(),
-    };
-    let outcome = acquire_resource_locks(&plan, &[95100usize], LlcLockMode::Exclusive).unwrap();
+    let outcome = acquire_resource_locks_waiting_impl(
+        &[95100usize],
+        LlcLockMode::Exclusive,
+        &[95100],
+        FlockMode::Exclusive,
+        false,
+        None,
+    )
+    .unwrap();
     let (llc_offset, locks) = unwrap_acquired(outcome, Some("in cargo-test mode"));
     assert_eq!(llc_offset, 95100);
     assert!(
@@ -1747,19 +2990,21 @@ fn acquire_resource_locks_cargo_test_mode_empty_string_inert() {
     let _lock = lock_env();
     let _env = EnvVarGuard::set(crate::KTSTR_CARGO_TEST_MODE_ENV, "");
     let _llc_prefix = LlcLockPrefixGuard::new();
-    let plan = PinningPlan {
-        assignments: vec![(0, 95200)],
-        service_cpu: None,
-        llc_indices: vec![95200],
-        locks: Vec::new(),
-    };
-    let outcome = acquire_resource_locks(&plan, &[95200usize], LlcLockMode::Exclusive).unwrap();
+    let outcome = acquire_resource_locks_waiting_impl(
+        &[95200usize],
+        LlcLockMode::Exclusive,
+        &[95200],
+        FlockMode::Exclusive,
+        false,
+        None,
+    )
+    .unwrap();
     let (_, locks) = unwrap_acquired(outcome, Some("with empty-string bypass inert"));
     assert_eq!(
         locks.len(),
-        1,
+        2,
         "empty-string cargo-test-mode is inert — expected the \
-         standard `Exclusive` path to take exactly one LLC fd, \
+         explicit `Exclusive` path to take one LLC fd plus its CPU bridge, \
          got {}",
         locks.len(),
     );
@@ -1777,9 +3022,9 @@ fn spread_snapshots(holder_counts: &[usize]) -> Vec<LlcSnapshot> {
         .enumerate()
         .map(|(idx, &holder_count)| LlcSnapshot {
             llc_idx: idx,
-            lockfile_path: std::path::PathBuf::from(format!("/tmp/ktstr-llc-{idx}.lock")),
-            holders: Vec::new(),
             holder_count,
+            exclusive_held: false,
+            granted_count: 0,
         })
         .collect()
 }
@@ -1808,6 +3053,127 @@ fn plan_from_snapshots_spread_prefers_least_held_llcs() {
         vec![2, 3],
         "spread must select the zero-holder LLCs, not the peer-held ones",
     );
+}
+
+/// A queue-only predecessor has no `/proc/locks` holder yet. Folding its
+/// exact claim into the planning snapshot must move a flexible no-perf waiter
+/// to a free alternative instead of republishing the same blocked claim.
+#[test]
+fn spread_deprioritizes_predecessor_claims_missing_from_proc_locks() {
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0)]);
+    let allowed: std::collections::BTreeSet<usize> = (0..3).collect();
+    let snapshots = avoid_preceding_claims_when_possible(
+        &spread_snapshots(&[0, 0, 0]),
+        1,
+        &topo,
+        &allowed,
+        admission_protocol::AdmissionClass::Ordinary,
+        |candidate| Ok(candidate.llcs.contains(&0)),
+    )
+    .expect("fold predecessor reservation into snapshots");
+    let selected = plan_from_snapshots(
+        &snapshots,
+        1,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Spread { rotation: 0 },
+    );
+    assert_eq!(
+        selected,
+        vec![1],
+        "LLC 0's queue-only reservation must not create head-of-line blocking",
+    );
+}
+
+#[test]
+fn consolidate_avoids_predecessor_claims_missing_from_proc_locks() {
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0)]);
+    let allowed: std::collections::BTreeSet<usize> = (0..3).collect();
+    let snapshots = avoid_preceding_claims_when_possible(
+        &spread_snapshots(&[0, 0, 0]),
+        1,
+        &topo,
+        &allowed,
+        admission_protocol::AdmissionClass::Ordinary,
+        |candidate| Ok(candidate.llcs.contains(&0)),
+    )
+    .expect("fold predecessor reservation into snapshots");
+    let selected = plan_from_snapshots(
+        &snapshots,
+        1,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Consolidate,
+    );
+    assert_eq!(
+        selected,
+        vec![1],
+        "Consolidate must not mistake a queue-only reservation for useful load",
+    );
+}
+
+#[test]
+fn predecessor_claims_remain_eligible_when_exact_budget_needs_them() {
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
+    let allowed: std::collections::BTreeSet<usize> = (0..2).collect();
+    let snapshots = avoid_preceding_claims_when_possible(
+        &spread_snapshots(&[0, 0]),
+        2,
+        &topo,
+        &allowed,
+        admission_protocol::AdmissionClass::Ordinary,
+        |candidate| Ok(candidate.llcs.contains(&0)),
+    )
+    .expect("retain a predecessor when the whole host is required");
+    let selected = plan_from_snapshots(
+        &snapshots,
+        2,
+        &topo,
+        &allowed,
+        |_, _| 10,
+        PlacementPolicy::Spread { rotation: 0 },
+    );
+    assert_eq!(selected, vec![0, 1]);
+}
+
+#[test]
+fn physical_replan_candidates_preserve_the_build_watch_class() {
+    let class = admission_protocol::AdmissionClass::Build;
+    let cpu = physical_candidate_for_watch(
+        std::iter::empty(),
+        [7usize],
+        FlockMode::Shared,
+        FlockMode::Shared,
+        class,
+    );
+    let llc = physical_candidate_for_watch(
+        [3usize],
+        std::iter::empty(),
+        FlockMode::Shared,
+        FlockMode::Shared,
+        class,
+    );
+    assert_eq!(cpu.admission_class, class);
+    assert_eq!(llc.admission_class, class);
+
+    let topo = synth_host_topo(&[(vec![0], 0)]);
+    let allowed = std::collections::BTreeSet::from([0usize]);
+    let mut observed = Vec::new();
+    avoid_preceding_claims_when_possible(
+        &spread_snapshots(&[0]),
+        1,
+        &topo,
+        &allowed,
+        class,
+        |candidate| {
+            observed.push(candidate.admission_class);
+            Ok(false)
+        },
+    )
+    .expect("filter build-watch predecessor claims");
+    assert_eq!(observed, vec![class]);
 }
 
 /// The pid-derived rotation breaks the zero-knowledge symmetry:
@@ -1916,4 +3282,1122 @@ fn spread_for_process_rotation_is_stable() {
         PlacementPolicy::spread_for_process(),
         PlacementPolicy::spread_for_process(),
     );
+}
+
+#[test]
+fn bounded_planner_stays_within_prime_host_resource_count() {
+    let groups = (0..7)
+        .map(|llc| {
+            let start = llc * 5;
+            (((start)..(start + 5)).collect::<Vec<_>>(), llc % 2)
+        })
+        .collect::<Vec<_>>();
+    let host = HostTopology::new_for_tests(&groups);
+    let allowed = host.online_cpus.clone();
+    let candidates = host
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 3, 1, 1), &allowed)
+        .expect("prime/coprime host shape must be plannable");
+    assert!(!candidates.is_empty());
+    assert!(
+        candidates.len() <= allowed.len().max(host.llc_groups.len()),
+        "planner work/output must be bounded by physical resources",
+    );
+}
+
+#[test]
+fn planner_selects_fragmented_preferred_cpus_exactly() {
+    let host = synth_host_topo(&[(vec![0, 1, 2, 3], 0)]);
+    let allowed = vec![0, 1, 2, 3];
+    let preferred = std::collections::BTreeSet::from([0usize, 2]);
+    let llcs = std::collections::BTreeSet::from([0usize]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(1, 1, 2, 1),
+            PinningKind::Default,
+            &allowed,
+            Some(PinningPreferences {
+                cpus: &preferred,
+                shared_llcs: &llcs,
+                exclusive_llcs: &llcs,
+            }),
+        )
+        .expect("fragmented exact CPU set must fit");
+    assert!(
+        candidates.iter().any(|candidate| {
+            candidate
+                .plan
+                .assignments
+                .iter()
+                .map(|&(_, cpu)| cpu)
+                .collect::<std::collections::BTreeSet<_>>()
+                == preferred
+        }),
+        "availability-aware matching must not require a contiguous window",
+    );
+}
+
+#[test]
+fn planner_rotates_sparse_cpu_ids_by_dense_rank() {
+    let host = synth_host_topo(&[(vec![0, 2, 4], 0)]);
+    let candidates = host
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 1, 1, 1), &[0, 2, 4])
+        .expect("sparse CPU IDs must expose every exact one-CPU placement");
+    let footprints = candidates
+        .iter()
+        .map(|candidate| candidate.cpu_reservations.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        footprints,
+        std::collections::BTreeSet::from([vec![0], vec![2], vec![4]]),
+        "numeric CPU IDs modulo CPU count must not collapse candidate rotation",
+    );
+}
+
+#[test]
+fn planner_rotates_sparse_host_numa_ids_by_dense_rank() {
+    let host = synth_host_topo(&[(vec![0], 0), (vec![1], 3), (vec![2], 6)]);
+    let candidates = host
+        .default_pinning_candidates_for_cpus(&Topology::new(2, 2, 1, 1), &[0, 1, 2])
+        .expect("two guest nodes fit on every pair of three sparse host nodes");
+    let host_node_pairs = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .plan
+                .assignments
+                .iter()
+                .map(|&(_, cpu)| host.cpu_to_node[&cpu])
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        host_node_pairs.iter().any(|nodes| nodes.contains(&6)),
+        "raw sparse node IDs modulo node count must not leave node 6 unseen",
+    );
+    assert_eq!(
+        host_node_pairs,
+        std::collections::BTreeSet::from([
+            std::collections::BTreeSet::from([0, 3]),
+            std::collections::BTreeSet::from([0, 6]),
+            std::collections::BTreeSet::from([3, 6]),
+        ]),
+    );
+}
+
+#[test]
+fn llc_partition_validation_rejects_every_malformed_shape() {
+    let error = validate_llc_partition(&[], &[]).unwrap_err();
+    assert!(error.to_string().contains("empty online CPU set"));
+
+    let error = validate_llc_partition(&[], &[0]).unwrap_err();
+    assert!(error.to_string().contains("zero LLC groups"));
+
+    let error = validate_llc_partition(&[LlcGroup { cpus: Vec::new() }], &[0]).unwrap_err();
+    assert!(error.to_string().contains("empty"));
+
+    let error = validate_llc_partition(&[LlcGroup { cpus: vec![0, 0] }], &[0]).unwrap_err();
+    assert!(error.to_string().contains("repeats CPU 0"));
+
+    let error = validate_llc_partition(
+        &[LlcGroup { cpus: vec![0, 1] }, LlcGroup { cpus: vec![1, 2] }],
+        &[0, 1, 2],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("more than one"));
+
+    let error = validate_llc_partition(&[LlcGroup { cpus: vec![0] }], &[0, 1]).unwrap_err();
+    assert!(error.to_string().contains("omit online CPUs [1]"));
+
+    let error = validate_llc_partition(&[LlcGroup { cpus: vec![0, 2] }], &[0, 1]).unwrap_err();
+    assert!(error.to_string().contains("non-online CPU 2"));
+}
+
+#[test]
+fn planner_collapses_a_full_domain_to_one_material_seed() {
+    let cpus = (0..192).collect::<Vec<_>>();
+    let host = synth_host_topo(&[(cpus.clone(), 0)]);
+    let candidates = host
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 1, 192, 1), &cpus)
+        .expect("a full-domain guest must fit exactly once");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "a 192-vCPU full-domain fit must not materialize 192 identical \
+         192-by-192 CPU matchings",
+    );
+    assert_eq!(candidates[0].cpu_reservations, cpus);
+    assert_eq!(
+        candidates[0]
+            .plan
+            .assignments
+            .iter()
+            .map(|&(_, cpu)| cpu)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        192,
+        "direct per-bin selection must retain one globally distinct host CPU \
+         per guest vCPU",
+    );
+}
+
+#[test]
+fn whole_domain_identity_and_cpu_bridge_are_cpuset_independent() {
+    let host = synth_host_topo(&[(vec![0, 1, 2], 0), (vec![3, 4, 5], 0)]);
+    let topology = Topology::new(1, 1, 1, 1);
+    let left = host
+        .performance_pinning_candidates_for_cpus(&topology, &[0, 1])
+        .expect("left slice of LLC 0 must fit")
+        .into_iter()
+        .find(|candidate| candidate.plan.llc_indices == vec![0])
+        .expect("left cpuset must retain physical LLC 0 identity");
+    let right = host
+        .performance_pinning_candidates_for_cpus(&topology, &[1, 2])
+        .expect("right slice of LLC 0 must fit")
+        .into_iter()
+        .find(|candidate| candidate.plan.llc_indices == vec![0])
+        .expect("right cpuset must retain physical LLC 0 identity");
+
+    assert_eq!(left.llc_mode, LlcLockMode::Exclusive);
+    assert_eq!(right.llc_mode, LlcLockMode::Exclusive);
+    assert_eq!(left.plan.llc_indices, right.plan.llc_indices);
+    assert_eq!(left.cpu_reservations, vec![0, 1, 2]);
+    assert_eq!(right.cpu_reservations, vec![0, 1, 2]);
+    assert_eq!(
+        left.claim().cpus,
+        [0, 1, 2].into_iter().collect(),
+        "the production whole-EX candidate claim must include the sibling \
+         outside either caller's allowed mask",
+    );
+}
+
+#[test]
+fn planner_seed_schedule_is_linear_on_heterogeneous_llcs() {
+    let mut groups = vec![((0..96).collect::<Vec<_>>(), 0)];
+    groups.extend((96..192).map(|cpu| (vec![cpu], 0)));
+    let host = synth_host_topo(&groups);
+    let allowed = (0..192).collect::<Vec<_>>();
+    let allowed_set = allowed.iter().copied().collect();
+    let demands = [GuestLlcDemand {
+        guest_llc: 0,
+        guest_node: 0,
+        vcpu_start: 0,
+        cpus: 1,
+    }];
+    let seeds = planner_seed_schedule(&host, &demands, PinningKind::Default, &allowed_set);
+    assert_eq!(
+        seeds.len(),
+        192,
+        "one 96-CPU LLC plus 96 singleton LLCs must produce a flattened \
+         192-grain schedule, not a 97-by-96 Cartesian product",
+    );
+    let candidates = host
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 1, 1, 1), &allowed)
+        .expect("every physical one-CPU grain must be materialized");
+    assert_eq!(candidates.len(), 192);
+}
+
+#[test]
+fn bin_matching_displaces_flexible_requests_instead_of_getting_stuck_greedily() {
+    let edges = std::collections::BTreeMap::from([
+        (0usize, vec![0usize, 1]),
+        (1usize, vec![0]),
+        (2usize, vec![1, 2]),
+    ]);
+    let matched = match_distinct(&edges, &[0, 1, 2])
+        .expect("augmenting paths must find the complete 0→1, 1→0, 2→2 match");
+    assert_eq!(
+        matched,
+        std::collections::BTreeMap::from([(0, 1), (1, 0), (2, 2)]),
+    );
+}
+
+#[test]
+fn preferred_snapshot_synthesizes_nonadjacent_ready_llc_combination() {
+    let host = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let preferred = std::collections::BTreeSet::from([0usize, 2]);
+    let all_llcs = std::collections::BTreeSet::from([0usize, 1, 2, 3]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(1, 2, 1, 1),
+            PinningKind::Default,
+            &[0, 1, 2, 3],
+            Some(PinningPreferences {
+                cpus: &preferred,
+                shared_llcs: &all_llcs,
+                exclusive_llcs: &all_llcs,
+            }),
+        )
+        .expect("two nonadjacent ready LLCs must form an exact candidate");
+    assert!(
+        candidates.iter().any(|candidate| {
+            candidate.plan.llc_indices == vec![0, 2] && candidate.cpu_reservations == vec![0, 2]
+        }),
+        "availability must outrank cyclic seed rotation so a coordinator can \
+         synthesize the simultaneously ready {{0,2}} placement",
+    );
+}
+
+#[test]
+fn preferred_llc_modes_synthesize_nonadjacent_whole_perf_combination() {
+    let host = synth_host_topo(&[
+        (vec![0, 1], 0),
+        (vec![2, 3], 0),
+        (vec![4, 5], 0),
+        (vec![6, 7], 0),
+    ]);
+    let cpus = (0..8).collect::<std::collections::BTreeSet<_>>();
+    let shared_llcs = std::collections::BTreeSet::from([0usize, 1, 2, 3]);
+    let exclusive_llcs = std::collections::BTreeSet::from([0usize, 2]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(1, 2, 1, 1),
+            PinningKind::Performance,
+            &(0..8).collect::<Vec<_>>(),
+            Some(PinningPreferences {
+                cpus: &cpus,
+                shared_llcs: &shared_llcs,
+                exclusive_llcs: &exclusive_llcs,
+            }),
+        )
+        .expect("whole-LLC availability must synthesize the free 0+2 pair");
+    assert!(candidates.iter().any(|candidate| {
+        candidate.llc_mode == LlcLockMode::Exclusive && candidate.plan.llc_indices == vec![0, 2]
+    }));
+}
+
+#[test]
+fn preferred_llc_modes_cover_service_only_whole_perf_domain() {
+    let host = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![3], 0)]);
+    let cpus = std::collections::BTreeSet::from([0usize, 1, 2, 3]);
+    let shared_llcs = std::collections::BTreeSet::from([0usize, 1, 2, 3]);
+    let exclusive_llcs = std::collections::BTreeSet::from([0usize, 2]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(1, 1, 1, 1),
+            PinningKind::Performance,
+            &[0, 1, 2, 3],
+            Some(PinningPreferences {
+                cpus: &cpus,
+                shared_llcs: &shared_llcs,
+                exclusive_llcs: &exclusive_llcs,
+            }),
+        )
+        .expect("vCPU and service may occupy the two nonadjacent free LLCs");
+    assert!(candidates.iter().any(|candidate| {
+        candidate.llc_mode == LlcLockMode::Exclusive
+            && candidate.plan.llc_indices == vec![0, 2]
+            && candidate.cpu_reservations == vec![0, 2]
+    }));
+}
+
+#[test]
+fn service_cpu_uses_a_ready_global_llc_before_a_busy_local_fallback() {
+    let host = synth_host_topo(&[
+        ((0..32).collect::<Vec<_>>(), 0),
+        ((32..64).collect::<Vec<_>>(), 0),
+    ]);
+    let preferred_cpus = std::collections::BTreeSet::from([0usize, 1, 32]);
+    let ready_llcs = std::collections::BTreeSet::from([0usize, 1]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(1, 1, 2, 1),
+            PinningKind::Performance,
+            &[0, 1, 2, 32],
+            Some(PinningPreferences {
+                cpus: &preferred_cpus,
+                shared_llcs: &ready_llcs,
+                exclusive_llcs: &ready_llcs,
+            }),
+        )
+        .expect("a free service CPU in another LLC must remain eligible");
+    assert!(candidates.iter().any(|candidate| {
+        candidate.llc_mode == LlcLockMode::Shared
+            && candidate.plan.service_cpu == Some(32)
+            && candidate.plan.llc_indices == vec![0, 1]
+            && candidate.cpu_reservations == vec![0, 1, 32]
+    }));
+}
+
+#[test]
+fn heterogeneous_grain_service_placement_is_demand_order_independent() {
+    let host = synth_host_topo(&[
+        ((0..32).collect::<Vec<_>>(), 0),
+        ((32..64).collect::<Vec<_>>(), 0),
+    ]);
+    let allowed = (0..15).chain([32, 33]).collect::<Vec<_>>();
+    let preferred_cpus = allowed.iter().copied().collect();
+    let shared_llcs = std::collections::BTreeSet::from([0usize, 1]);
+    let exclusive_llcs = std::collections::BTreeSet::new();
+
+    let plan = |llc_cores: &'static [u32]| {
+        let mut topology = Topology::new(1, 2, 16, 1);
+        topology.llc_cores = Some(llc_cores);
+        host.topology_pinning_candidates(
+            &topology,
+            PinningKind::Performance,
+            &allowed,
+            Some(PinningPreferences {
+                cpus: &preferred_cpus,
+                shared_llcs: &shared_llcs,
+                exclusive_llcs: &exclusive_llcs,
+            }),
+        )
+        .expect("service must fit on the one-CPU guest LLC's spare grain")
+        .into_iter()
+        .find(|candidate| {
+            candidate.llc_mode == LlcLockMode::Shared
+                && candidate.cpu_reservations == (0..15).chain([32, 33]).collect::<Vec<_>>()
+        })
+        .expect("SH-ready 15/2 footprint must be preferred over whole EX")
+    };
+
+    let large_first = plan(&[15, 1]);
+    let small_first = plan(&[1, 15]);
+    assert_eq!(large_first.plan.service_cpu, Some(33));
+    assert_eq!(small_first.plan.service_cpu, Some(33));
+    assert_eq!(large_first.plan.llc_indices, vec![0, 1]);
+    assert_eq!(small_first.plan.llc_indices, vec![0, 1]);
+    assert_eq!(
+        large_first.cpu_reservations, small_first.cpu_reservations,
+        "reversing guest LLC declaration order must not change the material \
+         SH-grain claim",
+    );
+
+    let mut static_topology = Topology::new(1, 2, 16, 1);
+    static_topology.llc_cores = Some(&[15, 1]);
+    let static_candidates = host
+        .topology_pinning_candidates(
+            &static_topology,
+            PinningKind::Performance,
+            &(0..64).collect::<Vec<_>>(),
+            None,
+        )
+        .expect("idle-host planning must preserve the available shared grain");
+    let static_first = static_candidates
+        .first()
+        .expect("idle-host planning must produce a candidate");
+    assert_eq!(
+        static_first.llc_mode,
+        LlcLockMode::Shared,
+        "when SH and EX are both ready, service locality must not turn a valid \
+         small-bin grain into a whole-domain reservation",
+    );
+    let small_guest_cpu = static_first
+        .plan
+        .assignments
+        .iter()
+        .find_map(|&(vcpu, cpu)| (vcpu == 15).then_some(cpu))
+        .expect("one-vCPU guest LLC assignment");
+    let service_cpu = static_first.plan.service_cpu.expect("service CPU");
+    assert!(
+        host.llc_groups
+            .iter()
+            .any(|group| group.cpus.contains(&small_guest_cpu)
+                && group.cpus.contains(&service_cpu)),
+        "the service CPU must preserve the shared grain by joining the \
+         one-vCPU guest LLC",
+    );
+}
+
+#[test]
+fn preferred_snapshot_guides_strict_numa_matching_to_nonadjacent_nodes() {
+    let host = synth_host_topo(&[(vec![0], 0), (vec![1], 1), (vec![2], 2), (vec![3], 3)]);
+    let preferred = std::collections::BTreeSet::from([0usize, 2]);
+    let preferred_llcs = std::collections::BTreeSet::from([0usize, 2]);
+    let all_llcs = std::collections::BTreeSet::from([0usize, 1, 2, 3]);
+    let candidates = host
+        .topology_pinning_candidates(
+            &Topology::new(2, 2, 1, 1),
+            PinningKind::Default,
+            &[0, 1, 2, 3],
+            Some(PinningPreferences {
+                cpus: &preferred,
+                shared_llcs: &preferred_llcs,
+                exclusive_llcs: &all_llcs,
+            }),
+        )
+        .expect("strict NUMA matching must use the simultaneously ready nodes");
+    assert!(candidates.iter().any(|candidate| {
+        candidate
+            .plan
+            .assignments
+            .iter()
+            .map(|&(_, cpu)| host.cpu_to_node[&cpu])
+            .collect::<std::collections::BTreeSet<_>>()
+            == std::collections::BTreeSet::from([0usize, 2])
+    }));
+}
+
+#[test]
+fn planner_matches_nonuniform_guest_llcs_largest_demand_first() {
+    let host = synth_host_topo(&[(vec![0], 0), (vec![1, 2, 3], 0)]);
+    let mut guest = Topology::new(1, 2, 3, 1);
+    guest.llc_cores = Some(&[3, 1]);
+    let candidate = host
+        .default_pinning_candidates_for_cpus(&guest, &[0, 1, 2, 3])
+        .expect("heterogeneous bins fit")
+        .into_iter()
+        .next()
+        .unwrap();
+    let large = candidate.plan.assignments[..3]
+        .iter()
+        .map(|&(_, cpu)| cpu)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(large, std::collections::BTreeSet::from([1, 2, 3]));
+    assert_eq!(candidate.plan.assignments[3].1, 0);
+}
+
+#[test]
+fn planner_uses_strict_numa_mapping_then_global_fallback() {
+    let strict_host = synth_host_topo(&[
+        (vec![0, 1], 0),
+        (vec![2, 3], 0),
+        (vec![4, 5], 1),
+        (vec![6, 7], 1),
+    ]);
+    let guest = Topology::new(2, 2, 1, 1);
+    let strict = strict_host
+        .default_pinning_candidates_for_cpus(&guest, &(0..8).collect::<Vec<_>>())
+        .unwrap();
+    assert!(strict.iter().all(|candidate| {
+        let first = strict_host.cpu_to_node[&candidate.plan.assignments[0].1];
+        let second = strict_host.cpu_to_node[&candidate.plan.assignments[1].1];
+        first != second
+    }));
+
+    let one_node_host = synth_host_topo(&[(vec![0, 1], 0), (vec![2, 3], 0), (vec![4, 5], 0)]);
+    assert!(
+        one_node_host
+            .default_pinning_candidates_for_cpus(&guest, &(0..6).collect::<Vec<_>>())
+            .is_ok(),
+        "strict NUMA failure must fall back to a global distinct-LLC mapping",
+    );
+}
+
+#[test]
+fn planner_covers_service_only_domain() {
+    let service_host = synth_host_topo(&[(vec![0], 0), (vec![1], 0)]);
+    let performance = service_host
+        .performance_pinning_candidates_for_cpus(&Topology::new(1, 1, 1, 1), &[0, 1])
+        .unwrap();
+    assert!(performance.iter().all(|candidate| {
+        candidate.plan.llc_indices.len() == 2
+            && candidate.cpu_reservations == vec![0, 1]
+            && candidate.plan.service_cpu.is_some()
+    }));
+}
+
+#[test]
+fn planner_reservation_matrix_is_explicit_and_canonical() {
+    let small = synth_host_topo(&[(vec![0, 1, 2, 3], 0)]);
+    let default = small
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 1, 2, 1), &[0, 1, 2, 3])
+        .unwrap();
+    assert_eq!(
+        default[0].claim().llc_mode,
+        admission_protocol::ClaimMode::Shared
+    );
+    assert_eq!(
+        default[0].claim().cpu_mode,
+        admission_protocol::ClaimMode::Exclusive,
+    );
+    assert_eq!(default[0].cpu_reservations.len(), 2);
+
+    let whole = small
+        .performance_pinning_candidates_for_cpus(&Topology::new(1, 1, 2, 1), &[0, 1, 2, 3])
+        .unwrap();
+    assert!(whole.iter().all(|candidate| {
+        candidate.llc_mode == LlcLockMode::Exclusive
+            && candidate.cpu_reservations == vec![0, 1, 2, 3]
+            && candidate.claim().llc_mode == admission_protocol::ClaimMode::Exclusive
+            && candidate.claim().cpu_mode == admission_protocol::ClaimMode::Exclusive
+    }));
+
+    let restricted = small
+        .performance_pinning_candidates_for_cpus(&Topology::new(1, 1, 1, 1), &[0, 1])
+        .unwrap();
+    assert!(
+        restricted
+            .iter()
+            .all(|candidate| { candidate.cpu_reservations == vec![0, 1, 2, 3] }),
+        "whole-LLC CPU bridge must cover sibling CPUs outside this process cpuset"
+    );
+    let unknown_topology_bridge = resource_claim_with_modes(
+        &[],
+        LlcLockMode::Shared,
+        &[0, 1, 2, 3],
+        FlockMode::Exclusive,
+    );
+    assert!(
+        unknown_topology_bridge.conflicts_with(&restricted[0].claim()),
+        "CPU EX alone must bridge a whole-perf reservation when LLCs are unknown",
+    );
+    let known_topology_bridge =
+        resource_claim_with_modes(&[0], LlcLockMode::Shared, &[0, 1], FlockMode::Exclusive);
+    assert_eq!(
+        known_topology_bridge.llc_mode,
+        admission_protocol::ClaimMode::Shared,
+    );
+    assert_eq!(
+        known_topology_bridge.cpu_mode,
+        admission_protocol::ClaimMode::Exclusive,
+    );
+
+    let monolith = synth_host_topo(&[((0..36).collect(), 0)]);
+    let grain = monolith
+        .performance_pinning_candidates_for_cpus(
+            &Topology::new(1, 1, 2, 1),
+            &(0..36).collect::<Vec<_>>(),
+        )
+        .unwrap();
+    assert!(grain.iter().all(|candidate| {
+        candidate.llc_mode == LlcLockMode::Shared
+            && candidate.cpu_reservations.len() == 3
+            && candidate.claim().cpu_mode == admission_protocol::ClaimMode::Exclusive
+    }));
+}
+
+#[test]
+fn build_and_runtime_entry_points_return_identical_claim_sets() {
+    let host = synth_host_topo(&[((0..36).collect(), 0), ((36..72).collect(), 1)]);
+    let guest = Topology::new(1, 1, 2, 1);
+    let allowed = (0..72).collect::<Vec<_>>();
+    let build = host
+        .performance_pinning_candidates_for_cpus(&guest, &allowed)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.claim())
+        .collect::<Vec<_>>();
+    let runtime = host
+        .performance_pinning_candidates_for_cpus(&guest, &allowed)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.claim())
+        .collect::<Vec<_>>();
+    assert_eq!(build, runtime);
+}
+
+#[test]
+fn physical_performance_reserve_is_deterministic_and_numa_balanced() {
+    let host = synth_host_topo(&[((0..32).collect(), 0), ((32..64).collect(), 1)]);
+    let allowed = (0..64).collect::<Vec<_>>();
+    let first = host.performance_reserved_cpus(&allowed);
+    let second = host.performance_reserved_cpus(&allowed);
+
+    assert_eq!(
+        first, second,
+        "the reserve cannot rotate by process or call"
+    );
+    assert_eq!(first.len(), 20, "30% of 64 CPUs rounds up to 20");
+    let per_node = first.iter().fold([0usize; 2], |mut counts, cpu| {
+        counts[host.cpu_to_node[cpu]] += 1;
+        counts
+    });
+    assert_eq!(
+        per_node,
+        [10, 10],
+        "CPU-grain reserve selection must round-robin NUMA nodes",
+    );
+}
+
+#[test]
+fn physical_performance_reserve_keeps_modest_llcs_indivisible() {
+    let host = synth_host_topo(&[
+        ((0..4).collect(), 0),
+        ((4..8).collect(), 1),
+        ((8..12).collect(), 0),
+        ((12..16).collect(), 1),
+    ]);
+    let allowed = (0..16).collect::<Vec<_>>();
+    let reserved = host.performance_reserved_cpus(&allowed);
+
+    assert_eq!(reserved.len(), 8, "whole-LLC rounding may exceed 30%");
+    for group in &host.llc_groups {
+        let selected = group
+            .cpus
+            .iter()
+            .filter(|cpu| reserved.contains(cpu))
+            .count();
+        assert!(
+            selected == 0 || selected == group.cpus.len(),
+            "a modest LLC reserve must contain either all or none of its CPUs",
+        );
+    }
+    let node0 = reserved
+        .iter()
+        .filter(|cpu| host.cpu_to_node[cpu] == 0)
+        .count();
+    let node1 = reserved.len() - node0;
+    assert_eq!((node0, node1), (4, 4));
+}
+
+#[test]
+fn every_performance_claim_mode_preserves_one_physical_reserve() {
+    // Ordering the huge LLC first makes the 30% reserve a CPU-grain subset of
+    // that domain. Small-LLC candidates remain whole-EX while huge-LLC
+    // candidates remain SH+CPU-EX, exercising both final footprint shapes.
+    let host = synth_host_topo(&[
+        ((0..64).collect(), 0),
+        ((64..72).collect(), 0),
+        ((72..80).collect(), 0),
+        ((80..88).collect(), 0),
+        ((88..96).collect(), 0),
+    ]);
+    let allowed = (0..96).collect::<Vec<_>>();
+    let reserved = host.performance_reserved_cpus(&allowed);
+    let candidates = host
+        .performance_pinning_candidates_for_cpus(&Topology::new(1, 1, 2, 1), &allowed)
+        .expect("both whole-LLC and grain performance placements must remain");
+
+    assert_eq!(reserved.len(), 29);
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.llc_mode == LlcLockMode::Shared),
+        "the huge LLC must expose CPU-grain performance candidates",
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|candidate| candidate.llc_mode == LlcLockMode::Exclusive),
+        "the modest LLCs must expose whole-domain performance candidates",
+    );
+    assert!(candidates.iter().all(|candidate| {
+        candidate
+            .cpu_reservations
+            .iter()
+            .all(|cpu| !reserved.contains(cpu))
+    }));
+
+    let defaults = host
+        .default_pinning_candidates_for_cpus(&Topology::new(1, 1, 1, 1), &allowed)
+        .expect("default pinning still sees the complete allowed host");
+    assert!(
+        defaults.iter().any(|candidate| {
+            candidate
+                .cpu_reservations
+                .iter()
+                .any(|cpu| reserved.contains(cpu))
+        }),
+        "the reserve is retained from performance, not forbidden to default work",
+    );
+}
+
+#[test]
+fn indivisible_small_host_preserves_performance_instead_of_reserving_it_all() {
+    let host = synth_host_topo(&[((0..4).collect(), 0)]);
+    let allowed = (0..4).collect::<Vec<_>>();
+    assert!(host.performance_reserved_cpus(&allowed).is_empty());
+    assert!(
+        host.performance_pinning_candidates_for_cpus(&Topology::new(1, 1, 2, 1), &allowed)
+            .is_ok(),
+        "an indivisible host LLC must retain its existing performance semantics",
+    );
+}
+
+#[test]
+fn performance_permit_pool_cannot_select_the_reserved_suffix() {
+    let ordinary = AdmissionPermitPool::for_host(8);
+    let performance = AdmissionPermitPool::for_performance_host(8);
+    assert!(!ordinary.reserved.is_empty());
+    assert_eq!(performance.general, ordinary.general);
+    assert!(performance.reserved.is_empty());
+
+    let selection = select_admission_permits(
+        PermitAdmission::Cooperative,
+        &performance,
+        performance.general.len(),
+        1,
+        0,
+        &ordinary.reserved,
+        |_| Ok(true),
+        |_| Ok(false),
+    )
+    .unwrap()
+    .expect("general performance permits remain selectable");
+    assert_eq!(selection.permits, performance.general);
+    assert_eq!(
+        selection.admission_class,
+        admission_protocol::AdmissionClass::Ordinary,
+    );
+}
+
+// ---------------------------------------------------------------
+// Grant-aware planning bias — in-flight grant charge is a
+// subordinate preference, never a fence or a primary key
+// ---------------------------------------------------------------
+
+/// CPU rank: among CPUs whose HELD holder count ties, the in-flight
+/// grant charge decides with a fixed ASC sign under BOTH policies,
+/// and the HELD-only primary key keeps its existing per-policy sign.
+#[test]
+fn cpu_rank_prefers_free_over_granted_within_equal_holders() {
+    let topo = synth_host_topo(&[(vec![0, 1, 2, 3], 0)]);
+    let eligible: std::collections::BTreeSet<usize> = (0..4).collect();
+    let states: std::collections::BTreeMap<usize, CpuPlacementState> = [
+        // cpu0: free but grant-charged once.
+        (
+            0,
+            CpuPlacementState {
+                exclusive_held: false,
+                other_holders: 0,
+                granted_holders: 1,
+            },
+        ),
+        // cpu1: completely free.
+        (
+            1,
+            CpuPlacementState {
+                exclusive_held: false,
+                other_holders: 0,
+                granted_holders: 0,
+            },
+        ),
+        // cpu2: free but grant-charged twice.
+        (
+            2,
+            CpuPlacementState {
+                exclusive_held: false,
+                other_holders: 0,
+                granted_holders: 2,
+            },
+        ),
+        // cpu3: one live HELD holder, no grant charge.
+        (
+            3,
+            CpuPlacementState {
+                exclusive_held: false,
+                other_holders: 1,
+                granted_holders: 0,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let (spread, _) = materialize_plan_cpus(
+        &[0],
+        &topo,
+        &eligible,
+        &states,
+        3,
+        CpuSelectionPolicy::WithinEachLlc(PlacementPolicy::Spread { rotation: 0 }),
+    )
+    .expect("spread materialization must satisfy the target");
+    assert_eq!(
+        spread,
+        vec![1, 0, 2],
+        "Spread: least-held first, then grant charge ASC among the free CPUs",
+    );
+    let (consolidate, _) = materialize_plan_cpus(
+        &[0],
+        &topo,
+        &eligible,
+        &states,
+        3,
+        CpuSelectionPolicy::WithinEachLlc(PlacementPolicy::Consolidate),
+    )
+    .expect("consolidate materialization must satisfy the target");
+    assert_eq!(
+        consolidate,
+        vec![3, 1, 0],
+        "Consolidate: HELD holders keep the DESC primary key (grant charge \
+         must not outrank them), then grant charge ASC among the free CPUs",
+    );
+}
+
+/// LLC rank: a granted-only LLC stays in the FRESH Consolidate
+/// partition (grant charge never joins the `holder_count > 0`
+/// primary partition key), and within each partition the charge is
+/// only a subordinate ASC preference.
+#[test]
+fn consolidate_llc_ordering_ignores_grant_charge_in_primary_key() {
+    let topo = synth_host_topo(&[(vec![0], 0), (vec![1], 0), (vec![2], 0)]);
+    let allowed: std::collections::BTreeSet<usize> = (0..3).collect();
+    // llc0: held by a peer. llc1: heavily grant-charged, no holder.
+    // llc2: completely free.
+    let snapshots = vec![
+        LlcSnapshot {
+            llc_idx: 0,
+            holder_count: 1,
+            exclusive_held: false,
+            granted_count: 0,
+        },
+        LlcSnapshot {
+            llc_idx: 1,
+            holder_count: 0,
+            exclusive_held: false,
+            granted_count: 5,
+        },
+        LlcSnapshot {
+            llc_idx: 2,
+            holder_count: 0,
+            exclusive_held: false,
+            granted_count: 0,
+        },
+    ];
+    // Target 1: the held LLC must still win — a granted-only LLC must
+    // not displace the consolidation partition.
+    assert_eq!(
+        plan_from_snapshots(
+            &snapshots,
+            1,
+            &topo,
+            &allowed,
+            |_, _| 10,
+            PlacementPolicy::Consolidate,
+        ),
+        vec![0],
+        "grant charge must not evict the peer-held consolidation winner",
+    );
+    // Target 2: within the fresh partition the grant-free LLC wins.
+    assert_eq!(
+        plan_from_snapshots(
+            &snapshots,
+            2,
+            &topo,
+            &allowed,
+            |_, _| 10,
+            PlacementPolicy::Consolidate,
+        ),
+        vec![0, 2],
+        "the fresh partition must prefer the grant-free LLC",
+    );
+    // Spread: holder count stays primary (llc1/llc2 before llc0), and
+    // the grant charge breaks the tie toward llc2.
+    assert_eq!(
+        plan_from_snapshots(
+            &snapshots,
+            1,
+            &topo,
+            &allowed,
+            |_, _| 10,
+            PlacementPolicy::Spread { rotation: 0 },
+        ),
+        vec![2],
+        "Spread must prefer the grant-free LLC among the least-held",
+    );
+}
+
+/// Two-tier permit selection: the grant-aware tier avoids charged
+/// permits while alternatives exist, and the grant-blind fallback
+/// fires — returning charged permits instead of `None` — when the
+/// charge covers the whole pool. The fallback is the livelock guard:
+/// a senior must be able to publish an overlapping claim to trigger
+/// the scan's ticket-order revoke.
+#[test]
+fn permit_selection_prefers_grant_free_and_falls_back() {
+    let pool = AdmissionPermitPool::for_host(2);
+    let all: Vec<usize> = pool.all().collect();
+    assert!(all.len() >= 3, "fixture needs at least 3 permits");
+    let charged: std::collections::BTreeSet<usize> = [all[0]].into_iter().collect();
+    let grant_conflicts = |charged: &std::collections::BTreeSet<usize>,
+                           candidate: &admission_protocol::ClaimSet| {
+        Ok(candidate
+            .permits
+            .iter()
+            .any(|permit| charged.contains(permit)))
+    };
+    let avoided = select_plan_permits_grant_aware(
+        PermitAdmission::Cooperative,
+        LlcPlanSizing::Exact,
+        &pool,
+        None,
+        2,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |_| Ok(true),
+        |candidate| grant_conflicts(&charged, candidate),
+    )
+    .expect("grant-aware permit selection")
+    .expect("a mostly-free pool must satisfy the request");
+    assert_eq!(avoided.permits.cpu_permits.len(), 2);
+    assert!(
+        !avoided
+            .permits
+            .cpu_permits
+            .iter()
+            .any(|permit| charged.contains(permit)),
+        "the grant-aware tier must avoid the charged permit while \
+         alternatives exist: {:?}",
+        avoided.permits.cpu_permits,
+    );
+    let all_charged: std::collections::BTreeSet<usize> = all.iter().copied().collect();
+    let fallback = select_plan_permits_grant_aware(
+        PermitAdmission::Cooperative,
+        LlcPlanSizing::Exact,
+        &pool,
+        None,
+        2,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |_| Ok(true),
+        |candidate| grant_conflicts(&all_charged, candidate),
+    )
+    .expect("grant-aware permit selection with a fully charged pool")
+    .expect("the grant-blind fallback must fire instead of returning None");
+    assert_eq!(
+        fallback.permits.cpu_permits.len(),
+        2,
+        "under total charge the fallback must restore today's selection",
+    );
+}
+
+/// The registration seed — the exact permit set a waiter publishes when it
+/// joins the registry — is sized exactly, so the grant charge can only reorder
+/// its walk. It must prefer the grant-free permits of each class while any
+/// remain, and must hand back exactly the grant-blind selection (width, class,
+/// and identities) once the charge covers the whole pool: a senior that never
+/// publishes an overlapping claim never triggers the scan's ticket-order
+/// revoke.
+#[test]
+fn registered_permit_seed_prefers_grant_free_permits_without_narrowing() {
+    let pool = VmPermitPool {
+        cpu: AdmissionPermitPool {
+            general: (0..4).collect(),
+            reserved: (4..6).collect(),
+        },
+        memory: MemoryPermitPool {
+            permits: (100..104).collect(),
+            usable_mib: 1024,
+        },
+        cpu_required: 2,
+        memory_required: 1,
+        cpu_rotation: 0,
+        memory_rotation: 0,
+        preferred_cpu: Vec::new(),
+        preferred_memory: Vec::new(),
+    };
+    let charges = |charged: std::collections::BTreeSet<usize>| {
+        move |candidate: &admission_protocol::ClaimSet| {
+            Ok(candidate
+                .permits
+                .iter()
+                .any(|permit| charged.contains(permit)))
+        }
+    };
+    let blind = pool
+        .select(|_| Ok(true))
+        .expect("grant-blind seed")
+        .expect("a free pool must seed a designation");
+    assert_eq!(blind.cpu_permits, vec![0, 1]);
+    assert_eq!(blind.memory_permits, vec![100]);
+
+    let biased = pool
+        .select_grant_aware(|_| Ok(true), charges([0, 1, 100].into_iter().collect()))
+        .expect("grant-aware seed")
+        .expect("a partly charged pool must still seed a designation");
+    assert_eq!(
+        (biased.cpu_permits, biased.memory_permits),
+        (vec![2, 3], vec![101]),
+        "the seed must walk past the permits an in-flight grant counts on",
+    );
+    assert_eq!(biased.admission_class, blind.admission_class);
+
+    let saturated = pool
+        .select_grant_aware(
+            |_| Ok(true),
+            charges(
+                (0..6)
+                    .chain(100..104)
+                    .collect::<std::collections::BTreeSet<_>>(),
+            ),
+        )
+        .expect("grant-aware seed against a fully charged pool")
+        .expect("a fully charged pool must still seed a complete designation");
+    assert_eq!(
+        (
+            saturated.cpu_permits,
+            saturated.memory_permits,
+            saturated.admission_class
+        ),
+        (
+            blind.cpu_permits,
+            blind.memory_permits,
+            blind.admission_class
+        ),
+        "under total charge the bias must restore the grant-blind seed exactly",
+    );
+}
+
+/// Width preservation: grant avoidance is a preference, never a filter
+/// that shrinks the request. `LlcPlanSizing::Elastic` floors a permit
+/// request at one, so a charge covering all but one permit lets a
+/// filtering tier answer a multi-permit request from that single permit
+/// — and an elastic selection's permit count *is* the CPU width
+/// `apply_plan_permit_width` truncates the plan to. The grant charge
+/// would then be deciding how many CPUs the plan funds, which is a
+/// capacity decision a subordinate bias must never make. Avoidance has
+/// to fill the requested width from the charged permits instead.
+#[test]
+fn grant_aware_permit_selection_preserves_elastic_plan_width() {
+    let pool = AdmissionPermitPool::for_host(2);
+    let all: Vec<usize> = pool.all().collect();
+    assert!(all.len() >= 3, "fixture needs at least 3 permits");
+    let grant_free = all[2];
+    let charged: std::collections::BTreeSet<usize> = all
+        .iter()
+        .copied()
+        .filter(|permit| *permit != grant_free)
+        .collect();
+    let selection = select_plan_permits_grant_aware(
+        PermitAdmission::Cooperative,
+        LlcPlanSizing::Elastic,
+        &pool,
+        None,
+        2,
+        0,
+        0,
+        0,
+        &[],
+        &[],
+        |_| Ok(true),
+        |candidate: &admission_protocol::ClaimSet| {
+            Ok(candidate
+                .permits
+                .iter()
+                .any(|permit| charged.contains(permit)))
+        },
+    )
+    .expect("grant-aware permit selection")
+    .expect("a fully available pool must satisfy the request");
+    assert_eq!(
+        selection.permits.cpu_permits.len(),
+        2,
+        "grant avoidance must fill the requested width from charged \
+         permits rather than return a short set: {:?}",
+        selection.permits.cpu_permits,
+    );
+    assert_eq!(
+        selection.cpu_width, 2,
+        "the funded CPU width must still be the requested width",
+    );
+    assert!(
+        selection.permits.cpu_permits.contains(&grant_free),
+        "the one grant-free permit must still be preferred: {:?}",
+        selection.permits.cpu_permits,
+    );
+    // The consequence the width guards: the plan keeps every CPU the
+    // selection was asked to fund.
+    let topo = HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
+    let mut selected_llcs = vec![0];
+    let mut selected_cpus = vec![0, 1];
+    apply_plan_permit_width(
+        LlcPlanSizing::Elastic,
+        &selection,
+        &topo,
+        &mut selected_llcs,
+        &mut selected_cpus,
+    );
+    assert_eq!(
+        selected_cpus,
+        vec![0, 1],
+        "a short permit selection truncates the CPU plan",
+    );
+    assert_eq!(selected_llcs, vec![0]);
 }

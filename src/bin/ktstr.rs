@@ -579,7 +579,7 @@ fn kernel_build(
             let total = versions.len();
             let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
             for (i, ver) in versions.iter().enumerate() {
-                eprintln!("ktstr: [{}/{total}] kernel build {ver}", i + 1);
+                ktstr::ktstr_status!("ktstr: [{}/{total}] kernel build {ver}", i + 1);
                 if let Err(e) = kernel_build_one(
                     Some(ver.clone()),
                     None,
@@ -589,7 +589,7 @@ fn kernel_build(
                     extra_content.as_deref(),
                     skip_sha256,
                 ) {
-                    eprintln!("ktstr: {ver}: {e:#}");
+                    ktstr::ktstr_status!("ktstr: {ver}: {e:#}");
                     failures.push((ver.clone(), e));
                 }
             }
@@ -658,7 +658,7 @@ fn kernel_build(
                 extra_content.as_deref(),
             )
             .map_err(|e| anyhow::anyhow!("build git+{url}#{git_ref}: {e:#}"))?;
-            eprintln!("ktstr: kernel cached at {}", dir.display());
+            ktstr::ktstr_status!("ktstr: kernel cached at {}", dir.display());
             Ok(())
         }
         Some(KernelId::CacheKey(key)) => anyhow::bail!(
@@ -689,7 +689,7 @@ fn kernel_build(
                 _ => unreachable!("arm guarded to Package | Distro"),
             }
             .map_err(|e| anyhow::anyhow!("acquire --kernel {id}: {e:#}"))?;
-            eprintln!("ktstr: prebuilt kernel cached at {}", dir.display());
+            ktstr::ktstr_status!("ktstr: prebuilt kernel cached at {}", dir.display());
             Ok(())
         }
     }
@@ -759,8 +759,8 @@ fn kernel_build_one(
             ktstr::cache_key_suffix_with_extra(extra_kconfig),
         );
         if !force && let Some(entry) = cli::cache_lookup(&cache, &cache_key, "ktstr") {
-            eprintln!("ktstr: cached kernel found: {}", entry.path.display());
-            eprintln!("ktstr: use --force to rebuild");
+            ktstr::ktstr_status!("ktstr: cached kernel found: {}", entry.path.display());
+            ktstr::ktstr_status!("ktstr: use --force to rebuild");
             return Ok(());
         }
         let result = fetch::download_tarball(
@@ -799,8 +799,8 @@ fn kernel_build_one(
         && !acquired.is_dirty
         && let Some(entry) = cli::cache_lookup(&cache, &acquired.cache_key, "ktstr")
     {
-        eprintln!("ktstr: cached kernel found: {}", entry.path.display());
-        eprintln!("ktstr: use --force to rebuild");
+        ktstr::ktstr_status!("ktstr: cached kernel found: {}", entry.path.display());
+        ktstr::ktstr_status!("ktstr: use --force to rebuild");
         return Ok(());
     }
 

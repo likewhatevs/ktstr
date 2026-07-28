@@ -483,6 +483,36 @@ pub fn initrd_compression_for_image(image: &Path) -> InitrdCompression {
     initrd_compression_for_config(&text)
 }
 
+/// Return the cached kernel config at the exact path libbpf probes in a guest.
+///
+/// Distro kernels commonly disable `CONFIG_IKCONFIG_PROC`, while BPF objects
+/// can still declare `CONFIG_*` kconfig externs. libbpf resolves those externs
+/// from `/boot/config-$(uname -r)` before trying `/proc/config.gz`. Cached
+/// package kernels already retain both the config and their exact release in
+/// `metadata.json`; expose that pair so every VM boot path can place the config
+/// in the immutable base initramfs.
+pub(crate) fn kernel_config_include_for_image(image: &Path) -> Option<(String, PathBuf)> {
+    let entry_dir = image.parent()?;
+    let metadata = super::housekeeping::read_metadata(entry_dir).ok()?;
+    if image.file_name()? != std::ffi::OsStr::new(&metadata.image_name) {
+        return None;
+    }
+    let release = metadata.version.as_deref()?;
+    let mut components = Path::new(release).components();
+    if release.is_empty()
+        || release.len() > 64
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return None;
+    }
+    let config = entry_dir.join("config");
+    std::fs::metadata(&config)
+        .ok()
+        .filter(|metadata| metadata.is_file())?;
+    Some((format!("boot/config-{release}"), config))
+}
+
 /// Pure core of [`initrd_compression_for_image`]: pick the best
 /// initrd compression from a kernel `.config`'s `CONFIG_RD_*` set.
 fn initrd_compression_for_config(text: &str) -> InitrdCompression {
@@ -717,6 +747,51 @@ mod tests {
             initrd_compression_for_image(&image),
             InitrdCompression::Zstd
         );
+    }
+
+    #[test]
+    fn cached_kernel_config_uses_libbpf_guest_path() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("bzImage");
+        let config = tmp.path().join("config");
+        fs::write(&image, b"fake image").unwrap();
+        fs::write(&config, b"CONFIG_PREEMPT_RCU=y\n").unwrap();
+        let metadata = test_metadata("7.0.0-14-generic");
+        fs::write(
+            tmp.path().join("metadata.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            kernel_config_include_for_image(&image),
+            Some(("boot/config-7.0.0-14-generic".to_string(), config))
+        );
+    }
+
+    #[test]
+    fn cached_kernel_config_rejects_non_release_paths_and_mismatched_images() {
+        let tmp = TempDir::new().unwrap();
+        let image = tmp.path().join("bzImage");
+        fs::write(&image, b"fake image").unwrap();
+        fs::write(tmp.path().join("config"), b"CONFIG_PREEMPT_RCU=y\n").unwrap();
+
+        let invalid = test_metadata("../host-config");
+        fs::write(
+            tmp.path().join("metadata.json"),
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kernel_config_include_for_image(&image), None);
+
+        let mut mismatch = test_metadata("7.0.0-test");
+        mismatch.image_name = "Image".to_string();
+        fs::write(
+            tmp.path().join("metadata.json"),
+            serde_json::to_vec(&mismatch).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kernel_config_include_for_image(&image), None);
     }
 
     // -- KernelMetadata serde --

@@ -1,0 +1,698 @@
+//! End-to-end coverage for bare `cargo ktstr verifier` workspace discovery.
+//!
+//! The discovery fixture uses two workspace members whose scheduler
+//! declarations live in differently named, feature-gated integration-test
+//! binaries. Both declare the same scheduler name with intentionally different
+//! guest execution settings. The real cargo-ktstr process must therefore:
+//!
+//! 1. widen a bare verifier invocation to the full workspace;
+//! 2. infer and package-qualify both optional-ktstr feature roots;
+//! 3. ask nextest to build both selected test binaries; and
+//! 4. probe both linked scheduler registries.
+//!
+//! Discovery then fails on the deliberate declaration conflict, before any
+//! scheduler prebuild or KVM cell can run. Observing both declaration payloads
+//! in that conflict is the end-to-end proof of recursive discovery.
+//!
+//! A second fixture links one compatible declaration into two separate test
+//! binaries plus a minimum-weight stand-in scheduler package (`scx-standin`,
+//! under `tests/fixtures/`). Its bare verifier invocation must continue through
+//! recursive discovery, the parent-owned scheduler prebuild and immutable
+//! artifact/ownership manifests, and exactly one generated KVM cell. This
+//! closes both the success-path gap left intentionally by the conflict fixture
+//! and the cross-binary duplicate cell/record-writer regression.
+//!
+//! Coverage trade: the stand-in is a genuine sched_ext scheduler (global FIFO
+//! through one shared DSQ) that really attaches in the guest — it is what makes
+//! `/sys/kernel/sched_ext/root/ops` non-empty and `state` read `enabled`, the
+//! cell's passing-attach signal — but it is deliberately NOT ktstr's real
+//! `scx-ktstr`. Building the real scheduler through the discovery/prebuild path
+//! (its scx_cargo/gix header-fetch stack) is what made this the whole CI
+//! matrix's wall; that build is already exercised by the main-suite
+//! real-scheduler cells and by actual scx usage. This fixture proves the
+//! discovery / prebuild / one-cell-election / attach-and-exit machinery at
+//! minimum weight.
+
+use std::path::{Path, PathBuf};
+
+const CARGO_KTSTR_BINARY: &str = env!("CARGO_BIN_EXE_cargo-ktstr");
+const FIXTURE_RESOLVER: &str = "3";
+const FIXTURE_TEST_DEBUG: &str = "line-tables-only";
+
+fn toml_string(path: &Path) -> String {
+    serde_json::to_string(&path.to_string_lossy()).expect("path JSON string")
+}
+
+fn shared_target_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("CARGO_TARGET_DIR") {
+        let path = PathBuf::from(path);
+        return if path.is_absolute() {
+            path
+        } else {
+            ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR")).join(path)
+        };
+    }
+
+    // Integration tests live at <target>/<profile>/deps/<binary>. Cached
+    // nextest runs place that binary in a private COW materialization; using
+    // its target root lets nested Cargo reuse compatible files without ever
+    // mutating the shared artifact-tree record.
+    std::env::current_exe()
+        .expect("current test executable")
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("integration test executable under target/<profile>/deps")
+        .to_path_buf()
+}
+
+/// Keep nested workspaces below the repository so Cargo discovers the same
+/// ancestor `.cargo/config.toml` (and therefore the same rustflags) as the
+/// parent build and every sibling fixture sharing its target directory.
+fn fixture_tempdir(ktstr_root: &Path) -> tempfile::TempDir {
+    let scratch = ktstr_root.join("target/verifier-discovery-fixtures");
+    std::fs::create_dir_all(&scratch).expect("create verifier fixture scratch directory");
+    tempfile::Builder::new()
+        .prefix("workspace-")
+        .tempdir_in(scratch)
+        .expect("fixture tempdir")
+}
+
+fn fixture_diagnostics_dir(temp: &tempfile::TempDir) -> PathBuf {
+    std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("verifier-discovery").join(
+                temp.path()
+                    .file_name()
+                    .expect("verifier fixture tempdir has a basename"),
+            )
+        })
+        .unwrap_or_else(|| temp.path().join("cargo-diagnostics"))
+}
+
+/// Return the relative path from one generated package to the containing
+/// ktstr checkout.
+///
+/// The stable Cargo source preserves root relationships rather than original
+/// absolute pathnames. Keeping this dependency relative therefore resolves to
+/// the captured ktstr root both in the live fixture and below
+/// `stable-sources-v2`; an absolute path would escape back into this runner's
+/// checkout and make otherwise identical fixtures compile from scratch.
+fn fixture_ktstr_relative_path(member_root: &Path, ktstr_root: &Path) -> PathBuf {
+    let suffix = member_root.strip_prefix(ktstr_root).unwrap_or_else(|_| {
+        panic!(
+            "fixture member {} is not below ktstr root {}",
+            member_root.display(),
+            ktstr_root.display(),
+        )
+    });
+    assert!(
+        !suffix.as_os_str().is_empty(),
+        "fixture package must be below the ktstr root",
+    );
+    let mut relative = PathBuf::new();
+    for _ in suffix.components() {
+        relative.push("..");
+    }
+    relative
+}
+
+/// Start a nested cargo-ktstr process without the package-local coordinates
+/// Cargo injected for this outer integration-test binary.
+///
+/// Those paths describe the already-running test executable, not any input to
+/// the nested workspace. Letting them reach artifact identity planning creates
+/// one key per outer feature/target directory. Compiler selection, wrappers,
+/// shared cache controls, and embedded ktstr artifact paths remain inherited.
+fn outer_cargo_test_local_environment(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    name.starts_with("CARGO_BIN_EXE_")
+        || name.starts_with("CARGO_PKG_")
+        || matches!(
+            name,
+            "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH" | "LD_LIBRARY_PATH" | "OUT_DIR"
+        )
+}
+
+fn fixture_verifier_command(workspace: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(CARGO_KTSTR_BINARY);
+    command.current_dir(workspace);
+    for (name, _) in std::env::vars_os() {
+        if outer_cargo_test_local_environment(&name) {
+            command.env_remove(name);
+        }
+    }
+    command
+}
+
+/// Render the one optional ktstr edge used by a generated fixture package.
+///
+/// The conflict fixture only reads declaration metadata and aborts before BPF
+/// or KVM setup, so it needs no ktstr feature. The success fixture executes a
+/// real cell and therefore needs functional vendored BPF skeletons. Neither
+/// shape depends on the outer test matrix's `integration`/`wprof` features.
+fn fixture_ktstr_dependency(
+    dependency: &str,
+    member_root: &Path,
+    ktstr_root: &Path,
+    vendored: bool,
+) -> String {
+    let features = if vendored { &["vendored"][..] } else { &[] };
+    let relative_ktstr = fixture_ktstr_relative_path(member_root, ktstr_root);
+    format!(
+        "{dependency} = {{ package = \"ktstr\", path = {}, optional = true, \
+         default-features = false, features = {} }}",
+        toml_string(&relative_ktstr),
+        serde_json::to_string(&features).expect("serialize fixture feature list"),
+    )
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination)
+        .unwrap_or_else(|error| panic!("create {}: {error}", destination.display()));
+    for entry in std::fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+    {
+        let entry = entry.expect("read fixture source entry");
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .unwrap_or_else(|error| panic!("inspect {}: {error}", source.display()));
+        if file_type.is_dir() {
+            copy_tree(&source, &destination);
+        } else if file_type.is_file() {
+            std::fs::copy(&source, &destination).unwrap_or_else(|error| {
+                panic!(
+                    "copy {} to {}: {error}",
+                    source.display(),
+                    destination.display()
+                )
+            });
+        } else {
+            panic!("unsupported fixture source entry {}", source.display());
+        }
+    }
+}
+
+/// Match nextest's one-cell success summary after removing presentation-only
+/// ANSI CSI sequences. Parsing the count tokens (rather than merely searching
+/// for a substring) keeps this an exact-once assertion: multi-cell summaries,
+/// failed cells, and duplicate summary lines all reject.
+fn exactly_one_verifier_cell_passed(stderr: &str) -> bool {
+    let stderr = ktstr::test_support::strip_ansi_csi(stderr);
+    stderr
+        .lines()
+        .filter(|line| {
+            let Some((before, after)) = line.split_once(" test run: ") else {
+                return false;
+            };
+            if before.split_whitespace().next_back() != Some("1") {
+                return false;
+            }
+            let mut result = after.split_whitespace();
+            result.next() == Some("1")
+                && result
+                    .next()
+                    .is_some_and(|status| status.trim_end_matches(',') == "passed")
+        })
+        .count()
+        == 1
+}
+
+/// Dependency aliases must describe the same deliberately lean ktstr unit.
+/// The end-to-end tests prove smart feature activation independently: their
+/// declaration binaries have `required-features`, so neither the conflict nor
+/// the generated cell can be observed unless the package-qualified roots were
+/// enabled.
+#[test]
+fn nested_fixture_dependency_aliases_have_identical_cargo_fingerprint_inputs() {
+    let ktstr_root = ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"));
+    let member_root = ktstr_root
+        .join("target/verifier-discovery-fixtures/workspace-example/workspace/verifier-member");
+    let direct = fixture_ktstr_dependency("ktstr", &member_root, &ktstr_root, false);
+    let aliased = fixture_ktstr_dependency("test_harness", &member_root, &ktstr_root, false);
+    let direct_value = direct
+        .split_once(" = ")
+        .expect("direct dependency assignment")
+        .1;
+    let aliased_value = aliased
+        .split_once(" = ")
+        .expect("aliased dependency assignment")
+        .1;
+    assert_eq!(
+        direct_value, aliased_value,
+        "dependency aliases must not create distinct nested ktstr variants",
+    );
+    assert!(
+        direct_value.contains("default-features = false") && direct_value.contains("features = []"),
+        "conflict fixtures must not inherit the outer ktstr feature matrix",
+    );
+    let success = fixture_ktstr_dependency("test_harness", &member_root, &ktstr_root, true);
+    assert!(
+        success.contains("default-features = false")
+            && success.contains("features = [\"vendored\"]"),
+        "the real-cell fixture needs vendored BPF without unrelated outer features",
+    );
+
+    let relative = fixture_ktstr_relative_path(&member_root, &ktstr_root);
+    assert_eq!(
+        relative,
+        Path::new("../../../../.."),
+        "random fixture basenames must not enter the dependency edge",
+    );
+    assert_eq!(
+        member_root.ancestors().nth(relative.components().count()),
+        Some(ktstr_root.as_path()),
+        "the relative dependency must resolve to the live ktstr root",
+    );
+    // `plan_source_layout` gives this four-level-outside root three padding
+    // anchors plus `primary`: the generated member therefore has the same five
+    // parent edges to the captured repository root as it has in the live tree.
+    let stable_ktstr_root = Path::new("source");
+    let stable_member_root = Path::new("source/anchor-0/anchor-1/anchor-2/primary/verifier-member");
+    assert_eq!(
+        stable_member_root
+            .ancestors()
+            .nth(relative.components().count()),
+        Some(stable_ktstr_root),
+        "the same dependency must resolve to the captured stable ktstr root",
+    );
+    let another_member_root = ktstr_root
+        .join("target/verifier-discovery-fixtures/workspace-another/workspace/verifier-member");
+    assert_eq!(
+        fixture_ktstr_relative_path(&another_member_root, &ktstr_root),
+        relative,
+        "temporary workspace names must not change Cargo fingerprint inputs",
+    );
+
+    let root_manifest =
+        std::fs::read_to_string(ktstr_root.join("Cargo.toml")).expect("read root manifest");
+    assert!(
+        root_manifest.contains(&format!(
+            "[workspace]\nmembers = [\".\", \"ktstr-macros\", \"scx-ktstr\"]\n\
+             resolver = \"{FIXTURE_RESOLVER}\"",
+        )),
+        "root and nested fixture workspaces must use the same resolver",
+    );
+    assert!(
+        root_manifest.contains(&format!("[profile.test]\ndebug = \"{FIXTURE_TEST_DEBUG}\"",)),
+        "root and nested fixture workspaces must use the same test profile",
+    );
+}
+
+#[test]
+fn exact_one_cell_summary_accepts_ansi_without_weakening_counts() {
+    let colored = concat!(
+        "\u{1b}[1mSummary\u{1b}[0m [ 28.848s] ",
+        "\u{1b}[32m1 test run\u{1b}[0m: ",
+        "\u{1b}[32m1 passed\u{1b}[0m, 306 skipped\n",
+    );
+    assert!(
+        exactly_one_verifier_cell_passed(colored),
+        "ANSI styling must not hide an exact one-cell success",
+    );
+
+    for not_exactly_one in [
+        "Summary [ 1.000s] 2 test run: 2 passed",
+        "Summary [ 1.000s] 11 test run: 1 passed",
+        "Summary [ 1.000s] 1 test run: 0 passed",
+        "Summary [ 1.000s] 1 test run: 1 failed",
+        "Summary [ 1.000s] 1 test run: 1 passed\n\
+         Summary [ 1.000s] 1 test run: 1 passed",
+    ] {
+        assert!(
+            !exactly_one_verifier_cell_passed(not_exactly_one),
+            "non-exact summary must reject: {not_exactly_one:?}",
+        );
+    }
+}
+
+#[test]
+fn nested_fixture_strips_only_outer_cargo_test_local_environment() {
+    for stripped in [
+        "CARGO_BIN_EXE_cargo-ktstr",
+        "CARGO_MANIFEST_DIR",
+        "CARGO_MANIFEST_PATH",
+        "CARGO_PKG_NAME",
+        "LD_LIBRARY_PATH",
+        "OUT_DIR",
+    ] {
+        assert!(
+            outer_cargo_test_local_environment(stripped.as_ref()),
+            "outer Cargo test-local coordinate must be stripped: {stripped}",
+        );
+    }
+    for inherited in [
+        "CARGO",
+        "CARGO_HOME",
+        "CARGO_TARGET_DIR",
+        "KTSTR_BUILD_BTF",
+        "KTSTR_BUSYBOX_BIN",
+        "KTSTR_CACHE_DIR",
+        "KTSTR_WPROF_BIN",
+        "RUSTC_WRAPPER",
+        "RUSTFLAGS",
+        "SCCACHE_DIR",
+    ] {
+        assert!(
+            !outer_cargo_test_local_environment(inherited.as_ref()),
+            "compiler/cache/embedded producer input must remain inherited: {inherited}",
+        );
+    }
+}
+
+fn write_member(
+    workspace: &Path,
+    package: &str,
+    dependency: &str,
+    feature: &str,
+    identity: &str,
+    sysctl_value: &str,
+    ktstr_root: &Path,
+) {
+    let root = workspace.join(package);
+    std::fs::create_dir_all(root.join("tests")).expect("create member tests directory");
+    let dependency_spec = fixture_ktstr_dependency(dependency, &root, ktstr_root, false);
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "{package}"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+{feature} = ["dep:{dependency}"]
+
+[dependencies]
+{dependency_spec}
+
+[[test]]
+name = "{package}_scheduler_declaration"
+path = "tests/scheduler.rs"
+required-features = ["{feature}"]
+"#,
+        ),
+    )
+    .expect("write member manifest");
+    let dependency_alias = if dependency == "ktstr" {
+        String::new()
+    } else {
+        format!("extern crate {dependency} as ktstr;\n\n")
+    };
+    std::fs::write(
+        root.join("tests/scheduler.rs"),
+        format!(
+            r#"{dependency_alias}use ktstr::declare_scheduler;
+use ktstr::test_support::Sysctl;
+
+declare_scheduler!(RECURSIVE_DISCOVERY_SCHEDULER, {{
+    name = "recursive-discovery-shared",
+    binary_path = "/bin/true",
+    sched_args = ["--shared"],
+    sysctls = [Sysctl::new("kernel.numa_balancing", "{sysctl_value}")],
+    kargs = ["identity={identity}"],
+    cgroup_parent = "/{identity}",
+    config_file = "{identity}.toml",
+}});
+
+#[test]
+fn declaration_binary_was_built() {{}}
+"#,
+        ),
+    )
+    .expect("write feature-gated scheduler declaration");
+}
+
+fn write_success_member(workspace: &Path, ktstr_root: &Path) {
+    let root = workspace.join("verifier-e2e");
+    std::fs::create_dir_all(root.join("tests")).expect("create success member tests directory");
+    std::fs::create_dir_all(root.join("src")).expect("create success member source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "verifier-e2e"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+verification-tests = ["dep:test_harness"]
+
+[dependencies]
+{}
+
+[[test]]
+name = "recursive_scheduler_declaration"
+path = "tests/scheduler.rs"
+required-features = ["verification-tests"]
+
+[[test]]
+name = "recursive_scheduler_declaration_duplicate"
+path = "tests/scheduler_duplicate.rs"
+required-features = ["verification-tests"]
+"#,
+            fixture_ktstr_dependency("test_harness", &root, ktstr_root, true),
+        ),
+    )
+    .expect("write success member manifest");
+    let declaration = r#"#![cfg(feature = "verification-tests")]
+
+extern crate test_harness as ktstr;
+
+use ktstr::declare_scheduler;
+use ktstr::test_support::TopologyConstraints;
+
+declare_scheduler!(RECURSIVE_DISCOVERY_SUCCESS_SCHEDULER, {
+    name = "recursive-discovery-success",
+    binary = "scx-standin",
+    topology = (1, 1, 4, 1),
+    constraints = TopologyConstraints {
+        min_numa_nodes: 1,
+        max_numa_nodes: Some(1),
+        min_llcs: 1,
+        max_llcs: Some(1),
+        requires_smt: false,
+        min_cpus: 4,
+        max_cpus: Some(4),
+    },
+});
+"#;
+    std::fs::write(root.join("src/lib.rs"), declaration)
+        .expect("write dependency-level feature-gated scheduler declaration");
+
+    let integration_test = r#"use verifier_e2e::RECURSIVE_DISCOVERY_SUCCESS_SCHEDULER;
+
+#[test]
+fn declaration_binary_was_built() {
+    assert_eq!(
+        RECURSIVE_DISCOVERY_SUCCESS_SCHEDULER.name,
+        "recursive-discovery-success",
+    );
+}
+"#;
+    std::fs::write(root.join("tests/scheduler.rs"), integration_test)
+        .expect("write successful feature-gated scheduler consumer");
+    std::fs::write(root.join("tests/scheduler_duplicate.rs"), integration_test)
+        .expect("write duplicate feature-gated scheduler consumer");
+}
+
+#[test]
+fn bare_verifier_recursively_discovers_feature_gated_workspace_test_binaries() {
+    let ktstr_root = ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"));
+    let temp = fixture_tempdir(&ktstr_root);
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("create fixture workspace");
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            "[workspace]\n\
+             members = [\"alpha\", \"beta\"]\n\
+             resolver = \"{FIXTURE_RESOLVER}\"\n\n\
+             [profile.test]\n\
+             debug = \"{FIXTURE_TEST_DEBUG}\"\n",
+        ),
+    )
+    .expect("write workspace manifest");
+    std::fs::copy(ktstr_root.join("Cargo.lock"), workspace.join("Cargo.lock"))
+        .expect("seed fixture with ktstr's toolchain-compatible dependency lock");
+
+    write_member(
+        &workspace,
+        "alpha",
+        "ktstr",
+        "scheduler-tests",
+        "alpha",
+        "0",
+        &ktstr_root,
+    );
+    write_member(
+        &workspace,
+        "beta",
+        "test_harness",
+        "verifier-fixtures",
+        "beta",
+        "1",
+        &ktstr_root,
+    );
+
+    // Bare verifier resolution accepts a preselected kernel directory through
+    // KTSTR_KERNEL. The conflict is reached before a VM opens this image, so a
+    // correctly named placeholder keeps the fixture host- and KVM-independent.
+    let kernel = temp.path().join("kernel");
+    std::fs::create_dir(&kernel).expect("create kernel fixture");
+    #[cfg(target_arch = "x86_64")]
+    std::fs::write(kernel.join("bzImage"), b"discovery-only").expect("write kernel placeholder");
+    #[cfg(target_arch = "aarch64")]
+    std::fs::write(kernel.join("Image"), b"discovery-only").expect("write kernel placeholder");
+    let diagnostics = fixture_diagnostics_dir(&temp);
+
+    let output = fixture_verifier_command(&workspace)
+        .args(["ktstr", "verifier"])
+        .env("CARGO_TARGET_DIR", shared_target_dir())
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("KTSTR_BYPASS_LLC_LOCKS", "1")
+        .env("KTSTR_RUNS_ROOT", temp.path().join("runs"))
+        .env("KTSTR_BUILD_DIAGNOSTICS_DIR", &diagnostics)
+        .env(ktstr::KTSTR_KERNEL_ENV, &kernel)
+        // The parent nextest process exports its selected profile. This
+        // nested, hermetic workspace deliberately has no project nextest
+        // config, so inheriting (for example) CI's `ci` profile would make
+        // discovery fail before cargo-ktstr can inspect either registry.
+        .env_remove("NEXTEST_PROFILE")
+        .output()
+        .expect("run bare cargo ktstr verifier");
+
+    assert!(
+        !output.status.success(),
+        "the deliberately conflicting declarations must fail discovery",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conflicting declarations for scheduler")
+            && stderr.contains("recursive-discovery-shared"),
+        "both registries should meet at declaration conflict detection:\n{stderr}",
+    );
+    for marker in [
+        "kernel.numa_balancing",
+        "identity=alpha",
+        "identity=beta",
+        "/alpha",
+        "/beta",
+        "alpha.toml",
+        "beta.toml",
+    ] {
+        assert!(
+            stderr.contains(marker),
+            "the conflict must include execution-identity marker {marker:?} from both \
+             feature-gated test binaries:\n{stderr}",
+        );
+    }
+    assert!(
+        !stderr.contains("dispatching to nextest (verifier/ cells only)"),
+        "the discovery conflict must abort before the KVM-running nextest phase:\n{stderr}",
+    );
+}
+
+#[test]
+fn bare_verifier_runs_recursively_discovered_scheduler_cell_end_to_end() {
+    if let Err(error) = ktstr::cli::check_kvm() {
+        eprintln!("skipping recursive verifier KVM e2e: {error:#}");
+        return;
+    }
+    let Some(kernel) = ktstr::find_kernel().expect("resolve verifier e2e kernel") else {
+        eprintln!("skipping recursive verifier KVM e2e: no bootable kernel is available");
+        return;
+    };
+    #[cfg(target_arch = "x86_64")]
+    let expected_image_name = "bzImage";
+    #[cfg(target_arch = "aarch64")]
+    let expected_image_name = "Image";
+    if kernel.file_name().and_then(|name| name.to_str()) != Some(expected_image_name) {
+        eprintln!(
+            "skipping recursive verifier KVM e2e: {} is not a ktstr-built {expected_image_name}",
+            kernel.display(),
+        );
+        return;
+    }
+    let kernel_dir = kernel
+        .parent()
+        .expect("a resolved ktstr kernel image has a parent directory");
+
+    let ktstr_root = ktstr::writable_source_path(env!("CARGO_MANIFEST_DIR"));
+    let temp = fixture_tempdir(&ktstr_root);
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("create success fixture workspace");
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        format!(
+            r#"[workspace]
+members = ["verifier-e2e", "scx-standin"]
+resolver = "{FIXTURE_RESOLVER}"
+
+[profile.test]
+debug = "{FIXTURE_TEST_DEBUG}"
+"#,
+        ),
+    )
+    .expect("write success workspace manifest");
+    std::fs::copy(ktstr_root.join("Cargo.lock"), workspace.join("Cargo.lock"))
+        .expect("seed success fixture with ktstr's dependency lock");
+    // The stand-in scheduler package is a real, minimum-weight sched_ext
+    // scheduler kept out of the main workspace (see `workspace.exclude`); copy
+    // it in as the discovered/prebuilt member. No `build_support`/`scx-ktstr`
+    // is needed because the stand-in vendors nothing from scx.
+    copy_tree(
+        &ktstr_root.join("tests/fixtures/scx_standin"),
+        &workspace.join("scx-standin"),
+    );
+    write_success_member(&workspace, &ktstr_root);
+    let diagnostics = fixture_diagnostics_dir(&temp);
+
+    let output = fixture_verifier_command(&workspace)
+        // Intentionally bare: the already-resolved kernel is supplied through
+        // ktstr's normal environment contract, while metadata must discover
+        // the feature-gated declaration and scheduler workspace without any
+        // Cargo or verifier selector.
+        .args(["ktstr", "verifier"])
+        .env("CARGO_TARGET_DIR", shared_target_dir())
+        .env("KTSTR_RUNS_ROOT", temp.path().join("runs"))
+        .env("KTSTR_BUILD_DIAGNOSTICS_DIR", &diagnostics)
+        .env(ktstr::KTSTR_KERNEL_ENV, kernel_dir)
+        // The parent nextest process exports its selected profile, but the
+        // nested fixture has no matching project profile. The verifier command
+        // owns the inner nextest profile independently.
+        .env_remove("NEXTEST_PROFILE")
+        .output()
+        .expect("run successful bare cargo ktstr verifier");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "bare cargo ktstr verifier must execute its recursively discovered cell\n\
+         status: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status.code(),
+    );
+    assert!(
+        stderr.contains("prebuilding 1 scheduler package(s)")
+            && stderr.contains("dispatching to nextest (verifier/ cells only)"),
+        "the successful path must cross scheduler prebuild and generated-cell dispatch:\n{stderr}",
+    );
+    assert!(
+        exactly_one_verifier_cell_passed(&stderr),
+        "two warmed binaries carrying the same full declaration must elect one lister, \
+         one VM launch, and therefore one result writer:\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stdout.contains("recursive-discovery-success: 1 ✅  0 ❌")
+            && stdout.contains("4cpu-1llc-nosmt"),
+        "the parent result grid must prove the generated KVM cell completed successfully:\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+}

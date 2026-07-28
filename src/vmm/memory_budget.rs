@@ -535,6 +535,24 @@ pub(crate) fn read_kernel_version_from_metadata_sidecar(
 /// right-sized figure derived from the actual section sizes).
 const WORKLOAD_MIB: u64 = 256;
 
+/// Per-vCPU host-residency reserve (MiB) added to the touch ceiling
+/// ([`touch_ceiling_mib`]).
+///
+/// A running guest faults in per-vCPU kernel state — kernel stacks,
+/// percpu allocations, and per-CPU page-table / slab pages — that scales
+/// with vCPU count rather than with the guest's advertised RAM.
+///
+/// Calibration: a 224-vCPU cell shows ~1.5 GiB steady host residency. The
+/// image/kernel base (`uncompressed + compressed + init_size`, ~440 MiB on
+/// the production image) and the post-boot workload budget
+/// ([`WORKLOAD_MIB`], 256 MiB) account for ~700 MiB, leaving
+/// ~800 MiB / 224 ≈ 3.6 MiB/vCPU of per-vCPU kernel state. The constant is
+/// set to 6 MiB/vCPU — measured-with-margin — so the permit never
+/// under-charges a genuinely resident cell. Over-charging is the safe
+/// direction (it costs a little admission headroom); under-charging risks
+/// host OOM under a VM storm.
+const PER_VCPU_KERNEL_TOUCH_MIB: u64 = 6;
+
 pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
     let ceil_mib = |bytes: u64| -> u64 { bytes.saturating_add((1 << 20) - 1) >> 20 };
 
@@ -594,6 +612,75 @@ pub(crate) fn initramfs_min_memory_mib(budget: &MemoryBudget) -> u32 {
             "initramfs_min_memory_mib: computed floor {total_mib}MiB exceeds u32 \
              (boot={boot_mib}MiB, workload={WORKLOAD_MIB}MiB, \
              coverage_reserve={coverage_reserve_mib}MiB)"
+        )
+    })
+}
+
+/// Host physical memory (MiB) a *trusted deferred* guest is expected to
+/// make resident — the memory-PERMIT ceiling, deliberately distinct from
+/// the guest's sized RAM ([`initramfs_min_memory_mib`]).
+///
+/// The admission permit reserves what the workload actually touches, not
+/// the guest's advertised size. Default/no-perf guest RAM is
+/// `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE` demand-paged (see
+/// `super::numa_mem::anonymous_node_map_flags` and its oversubscription
+/// note): untouched pages cost no host memory and are free to
+/// oversubscribe, so charging the full sized RAM would reject useful
+/// concurrency for memory the guest never faults in. On a wide cell the
+/// sized RAM is the `64 MiB/vCPU` floor (e.g. 14.3 GiB at 224 vCPU) while
+/// the resident set is a small fraction of it.
+///
+/// The ceiling sums:
+/// - the image/kernel base — `uncompressed + compressed + init_size` —
+///   faulted in to load and unpack the initramfs. The unpack peak holds
+///   the compressed archive and its uncompressed expansion together (the
+///   archive is freed only after `unpack_to_rootfs` completes), and
+///   `init_size` covers kernel decompression + workspace. The
+///   tmpfs-fraction multiplier from [`initramfs_min_memory_mib`] is
+///   deliberately EXCLUDED here: it sizes the guest's rootfs tmpfs
+///   *limit*, not host residency.
+/// - [`WORKLOAD_MIB`] — the same post-boot working-set budget the SIZE
+///   formula reserves (single source of truth).
+/// - a per-vCPU kernel-state reserve ([`PER_VCPU_KERNEL_TOUCH_MIB`] per
+///   vCPU).
+/// - the coverage-instrumented reserve when present: an instrumented
+///   `/init` keeps its profile-counter sections resident, so those bytes
+///   are genuinely touched and must be charged (mirrors
+///   [`initramfs_min_memory_mib`]).
+///
+/// The caller charges `required_chunks(max(touch_ceiling, declared))`, so a
+/// test that legitimately touches more than this must declare it via
+/// `.memory_mib(...)`; the only OOM exposure is an undeclared
+/// over-allocating test.
+pub(crate) fn touch_ceiling_mib(budget: &MemoryBudget, vcpus: u32) -> u32 {
+    let ceil_mib = |bytes: u64| -> u64 { bytes.saturating_add((1 << 20) - 1) >> 20 };
+
+    // Image/kernel base actually faulted in to boot and unpack. Unlike the
+    // SIZE formula, uncompressed is charged once (host residency, not the
+    // tmpfs limit) and the *64/63 struct-page factor is omitted (that
+    // overhead scales with sized RAM, which the touch ceiling is not).
+    let image_base_mib = ceil_mib(budget.uncompressed_initramfs_bytes)
+        .saturating_add(ceil_mib(budget.compressed_initrd_bytes))
+        .saturating_add(ceil_mib(budget.kernel_init_size));
+
+    let per_vcpu_mib = u64::from(vcpus).saturating_mul(PER_VCPU_KERNEL_TOUCH_MIB);
+
+    let coverage_reserve_mib = if budget.init_coverage_instrumented {
+        ceil_mib(budget.instrumented_reserve_bytes)
+    } else {
+        0
+    };
+
+    let total_mib = image_base_mib
+        .saturating_add(WORKLOAD_MIB)
+        .saturating_add(per_vcpu_mib)
+        .saturating_add(coverage_reserve_mib);
+    u32::try_from(total_mib).unwrap_or_else(|_| {
+        panic!(
+            "touch_ceiling_mib: computed ceiling {total_mib}MiB exceeds u32 \
+             (image_base={image_base_mib}MiB, workload={WORKLOAD_MIB}MiB, \
+             per_vcpu={per_vcpu_mib}MiB, coverage_reserve={coverage_reserve_mib}MiB, \
+             vcpus={vcpus})"
         )
     })
 }
@@ -691,7 +778,12 @@ mod tests {
             instrumented_reserve_bytes: 0,
             tmpfs_fraction: TmpfsFraction::Half,
         };
-        assert_eq!(initramfs_min_memory_mib(&budget), 744);
+        let memory_mib = initramfs_min_memory_mib(&budget);
+        assert_eq!(memory_mib, 744);
+        assert!(
+            memory_mib < 2048,
+            "deferred sizing must be allowed to choose a right-sized sub-2-GiB VM"
+        );
     }
 
     /// Coverage-instrumented shape: a GiB-scale instrumented `/init`
@@ -851,6 +943,134 @@ mod tests {
         //   content = 1664; boot = ceil(1664*64/63) = 1691;
         //   total = 1691 + 256 = 1947.
         assert_eq!(ninety, 1947, "90% floor: 1691 boot + 256 workload");
+    }
+
+    /// `touch_ceiling_mib` sums the image/kernel base (uncompressed +
+    /// compressed + init_size, each once), the workload budget, and the
+    /// per-vCPU reserve. Production wide-cell shape: uncompressed=280 MiB,
+    /// compressed=121 MiB, init_size=40 MiB, 224 vCPUs.
+    /// Trace:
+    ///   image_base = 280 + 121 + 40 = 441
+    ///   per_vcpu   = 224 * 6         = 1344
+    ///   total     = 441 + 256 (WORKLOAD_MIB) + 1344 = 2041
+    #[test]
+    fn touch_ceiling_mib_wide_cell_shape() {
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: 280 * (1 << 20),
+            compressed_initrd_bytes: 121 * (1 << 20),
+            kernel_init_size: 40 * (1 << 20),
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 0,
+            tmpfs_fraction: TmpfsFraction::Half,
+        };
+        assert_eq!(touch_ceiling_mib(&budget, 224), 2041);
+    }
+
+    /// The whole point of the SIZE/PERMIT split: on a wide cell the sized
+    /// RAM is the 64 MiB/vCPU floor (14.3 GiB) but the touch ceiling is a
+    /// small fraction of it. Charged in 256 MiB permit chunks, a 224-vCPU
+    /// cell drops from 56 chunks (sized) to 8 (touch), lifting projected
+    /// pool concurrency on the 384 GB host (~1380 usable chunks) from ~24
+    /// to ~170. This test pins the chunk arithmetic that
+    /// `MemoryPermitPool::required_chunks` performs at admission.
+    #[test]
+    fn touch_ceiling_mib_wide_cell_permit_chunk_drop() {
+        const CHUNK_MIB: u32 = 256; // MEMORY_PERMIT_CHUNK_MIB
+        const USABLE_CHUNKS: u32 = 1380; // 384 GB host after the host reserve
+
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: 280 * (1 << 20),
+            compressed_initrd_bytes: 121 * (1 << 20),
+            kernel_init_size: 40 * (1 << 20),
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 0,
+            tmpfs_fraction: TmpfsFraction::Half,
+        };
+        let vcpus = 224u32;
+
+        // Sized RAM = max(initramfs_min, 64 MiB/vCPU floor) = 14336 MiB.
+        let initramfs_min = initramfs_min_memory_mib(&budget);
+        let cpu_scaled = vcpus * 64;
+        let sized = initramfs_min.max(cpu_scaled);
+        assert_eq!(sized, 14336, "wide cell sizes to the 64 MiB/vCPU floor");
+        assert_eq!(sized.div_ceil(CHUNK_MIB), 56, "sized RAM charges 56 chunks");
+
+        // Touch ceiling = 2041 MiB -> 8 chunks.
+        let touch = touch_ceiling_mib(&budget, vcpus);
+        assert_eq!(touch, 2041);
+        assert_eq!(
+            touch.div_ceil(CHUNK_MIB),
+            8,
+            "touch ceiling charges 8 chunks"
+        );
+
+        // Projected concurrency on the wide host.
+        assert_eq!(USABLE_CHUNKS / sized.div_ceil(CHUNK_MIB), 24);
+        assert_eq!(USABLE_CHUNKS / touch.div_ceil(CHUNK_MIB), 172);
+    }
+
+    /// The touch ceiling is host-residency, so it must NOT depend on the
+    /// tmpfs fraction (that fraction sizes the guest's rootfs tmpfs limit,
+    /// not what the host makes resident). Same payload, both fractions ->
+    /// identical ceiling. This is the SIZE/PERMIT distinction the split
+    /// exists for: `initramfs_min_memory_mib` differs across fractions (see
+    /// `ninety_percent_fraction_sizes_less_ram_than_half`), the ceiling does
+    /// not.
+    #[test]
+    fn touch_ceiling_mib_ignores_tmpfs_fraction() {
+        let make = |frac: TmpfsFraction| MemoryBudget {
+            uncompressed_initramfs_bytes: 280 * (1 << 20),
+            compressed_initrd_bytes: 121 * (1 << 20),
+            kernel_init_size: 40 * (1 << 20),
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 0,
+            tmpfs_fraction: frac,
+        };
+        assert_eq!(
+            touch_ceiling_mib(&make(TmpfsFraction::Half), 224),
+            touch_ceiling_mib(&make(TmpfsFraction::NinetyPercent), 224),
+        );
+    }
+
+    /// A coverage-instrumented `/init` keeps its profile-counter sections
+    /// resident, so those bytes are genuinely touched and raise the ceiling
+    /// (mirrors `initramfs_min_memory_mib`). Flag off ignores the reserve;
+    /// flag on adds it (MiB-ceil).
+    #[test]
+    fn touch_ceiling_mib_charges_instrumented_reserve() {
+        let base = MemoryBudget {
+            uncompressed_initramfs_bytes: 280 * (1 << 20),
+            compressed_initrd_bytes: 121 * (1 << 20),
+            kernel_init_size: 40 * (1 << 20),
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 500 * (1 << 20),
+            tmpfs_fraction: TmpfsFraction::Half,
+        };
+        let instrumented = MemoryBudget {
+            init_coverage_instrumented: true,
+            ..base
+        };
+        // Flag off: reserve ignored -> the 224-vCPU ceiling from above.
+        assert_eq!(touch_ceiling_mib(&base, 224), 2041);
+        // Flag on: + 500 MiB resident profile sections.
+        assert_eq!(touch_ceiling_mib(&instrumented, 224), 2541);
+    }
+
+    /// Degenerate all-zero image at zero vCPUs collapses to just the
+    /// workload budget; the per-vCPU term scales linearly from there.
+    #[test]
+    fn touch_ceiling_mib_zeros_and_per_vcpu_scaling() {
+        let budget = MemoryBudget {
+            uncompressed_initramfs_bytes: 0,
+            compressed_initrd_bytes: 0,
+            kernel_init_size: 0,
+            init_coverage_instrumented: false,
+            instrumented_reserve_bytes: 0,
+            tmpfs_fraction: TmpfsFraction::Half,
+        };
+        assert_eq!(touch_ceiling_mib(&budget, 0), WORKLOAD_MIB as u32);
+        // 4 vCPUs add 4 * 6 = 24 MiB.
+        assert_eq!(touch_ceiling_mib(&budget, 4), WORKLOAD_MIB as u32 + 24);
     }
 
     /// `read_kernel_init_size` on x86_64 reads 4 little-endian bytes

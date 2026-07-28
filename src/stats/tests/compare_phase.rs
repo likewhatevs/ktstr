@@ -267,12 +267,12 @@ fn format_per_group_pass_counts_empty_returns_empty_string() {
 #[test]
 fn format_per_group_pass_counts_renders_every_group_with_n_over_m() {
     let avg_a = vec![
-        group("alpha", "tiny-1llc", "SpinWait", 5, 5),
-        group("beta", "tiny-1llc", "SpinWait", 3, 5),
+        group("alpha", "4cpu-1llc-nosmt", "SpinWait", 5, 5),
+        group("beta", "4cpu-1llc-nosmt", "SpinWait", 3, 5),
     ];
     let avg_b = vec![
-        group("alpha", "tiny-1llc", "SpinWait", 4, 5),
-        group("beta", "tiny-1llc", "SpinWait", 5, 5),
+        group("alpha", "4cpu-1llc-nosmt", "SpinWait", 4, 5),
+        group("beta", "4cpu-1llc-nosmt", "SpinWait", 5, 5),
     ];
     let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
     // Header line present.
@@ -282,11 +282,11 @@ fn format_per_group_pass_counts_renders_every_group_with_n_over_m() {
     );
     // Both groups render with their per-side N/M counters.
     assert!(
-        out.contains("alpha/tiny-1llc/SpinWait: a=5/5 b=4/5"),
+        out.contains("alpha/4cpu-1llc-nosmt/SpinWait: a=5/5 b=4/5"),
         "alpha group line missing; got: {out:?}",
     );
     assert!(
-        out.contains("beta/tiny-1llc/SpinWait: a=3/5 b=5/5"),
+        out.contains("beta/4cpu-1llc-nosmt/SpinWait: a=3/5 b=5/5"),
         "beta group line missing; got: {out:?}",
     );
     // Trailing newline so the next section reads cleanly.
@@ -305,15 +305,15 @@ fn format_per_group_pass_counts_renders_every_group_with_n_over_m() {
 /// missing.
 #[test]
 fn format_per_group_pass_counts_one_side_missing_renders_dash() {
-    let avg_a = vec![group("only_a", "tiny-1llc", "SpinWait", 5, 5)];
-    let avg_b = vec![group("only_b", "tiny-1llc", "SpinWait", 3, 5)];
+    let avg_a = vec![group("only_a", "4cpu-1llc-nosmt", "SpinWait", 5, 5)];
+    let avg_b = vec![group("only_b", "4cpu-1llc-nosmt", "SpinWait", 3, 5)];
     let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
     assert!(
-        out.contains("only_a/tiny-1llc/SpinWait: a=5/5 b=-"),
+        out.contains("only_a/4cpu-1llc-nosmt/SpinWait: a=5/5 b=-"),
         "A-only group must render b=-; got: {out:?}",
     );
     assert!(
-        out.contains("only_b/tiny-1llc/SpinWait: a=- b=3/5"),
+        out.contains("only_b/4cpu-1llc-nosmt/SpinWait: a=- b=3/5"),
         "B-only group must render a=-; got: {out:?}",
     );
 }

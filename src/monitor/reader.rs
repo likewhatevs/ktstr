@@ -33,6 +33,37 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
 
+/// RAII sensor armed for the lifetime of the host monitor thread.
+///
+/// A monitor may leave through an ordinary error path or by unwinding, so a
+/// tail call cannot reliably publish the terminal edge. Keeping this guard
+/// alive for the whole thread makes both paths converge in [`Drop`].
+/// Kill-driven shutdown is the expected terminal path and must not be
+/// reported as a monitor failure, so the run kill flag gates publication.
+pub(crate) struct MonitorTerminalGuard<'a> {
+    ledger: &'a ProgressLedger,
+    kill: &'a AtomicBool,
+}
+
+impl<'a> MonitorTerminalGuard<'a> {
+    /// Arm the terminal sensor for one monitor thread.
+    ///
+    /// Construct this as the first local in the spawned monitor closure.
+    /// Monitor setup paths which return without spawning a thread should
+    /// instead call [`ProgressLedger::publish_monitor_terminal`] directly.
+    pub(crate) fn new(ledger: &'a ProgressLedger, kill: &'a AtomicBool) -> Self {
+        Self { ledger, kill }
+    }
+}
+
+impl Drop for MonitorTerminalGuard<'_> {
+    fn drop(&mut self) {
+        if !self.kill.load(Ordering::Acquire) {
+            self.ledger.publish_monitor_terminal();
+        }
+    }
+}
+
 /// Per-NUMA-node host memory region within a GuestMem.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MemRegion {
@@ -704,6 +735,11 @@ impl GuestMem {
     /// Read a u8 at DRAM offset `pa + offset`.
     pub fn read_u8(&self, pa: u64, offset: usize) -> u8 {
         u8::from_ne_bytes(self.read_scalar::<1>(pa, offset))
+    }
+
+    /// Read a u16 at DRAM offset `pa + offset`.
+    pub fn read_u16(&self, pa: u64, offset: usize) -> u16 {
+        u16::from_ne_bytes(self.read_scalar::<2>(pa, offset))
     }
 
     /// Read a u32 at DRAM offset `pa + offset`.
@@ -1640,9 +1676,10 @@ pub(crate) fn resolve_event_pcpu_pas(
 /// stuck CPUs (vCPU running but clock stuck) from host preemption
 /// (vCPU not scheduled, clock can't advance).
 pub(crate) struct VcpuTiming {
-    /// pthread_t handles for each vCPU, indexed by vCPU ID.
-    /// Used with `pthread_getcpuclockid()` + `clock_gettime()`.
-    pub pthreads: Vec<libc::pthread_t>,
+    /// CPU clock IDs for each vCPU, indexed by vCPU ID. Resolved exactly once
+    /// from the live pthread handles when the monitor is created; the hot
+    /// sampling loop only calls `clock_gettime()`.
+    clock_ids: Vec<Option<libc::clockid_t>>,
     /// Shared contention recorder. The monitor only feeds its O(1) CPU-PSI
     /// interval sampler; lifecycle dispatch owns the rare O(vCPU) schedstat
     /// boundary snapshots. `None` in pthread-clock-only unit fixtures.
@@ -1650,6 +1687,41 @@ pub(crate) struct VcpuTiming {
 }
 
 impl VcpuTiming {
+    /// Resolve each vCPU pthread's CPU clock once for this monitor lifetime.
+    ///
+    /// POSIX pthread APIs return their error number directly rather than
+    /// setting `errno`, so a failed `pthread_getcpuclockid` is reported from
+    /// `ret` itself. Keeping the resulting clock IDs avoids an O(vCPU)
+    /// pthread lookup on every monitor tick.
+    pub(crate) fn from_pthreads(
+        pthreads: Vec<libc::pthread_t>,
+        contention_recorder: Option<Arc<crate::vmm::freeze_coord::ContentionWitnessRecorder>>,
+    ) -> Self {
+        let clock_ids = pthreads
+            .into_iter()
+            .enumerate()
+            .map(|(vcpu, pt)| {
+                let mut clock_id: libc::clockid_t = 0;
+                let ret = unsafe { libc::pthread_getcpuclockid(pt, &mut clock_id) };
+                if ret == 0 {
+                    Some(clock_id)
+                } else {
+                    tracing::warn!(
+                        vcpu,
+                        errno = ret,
+                        error = %std::io::Error::from_raw_os_error(ret),
+                        "pthread_getcpuclockid failed; stuck gating unavailable for this vCPU"
+                    );
+                    None
+                }
+            })
+            .collect();
+        Self {
+            clock_ids,
+            contention_recorder,
+        }
+    }
+
     /// Read CPU time for each vCPU thread. Returns `Some(ns)` per vCPU
     /// on success, `None` when the per-thread clock could not be read.
     ///
@@ -1668,31 +1740,16 @@ impl VcpuTiming {
     /// `reported_err`) naming the failing syscall + errno so a user
     /// can diagnose why stuck gating has degraded to "no data".
     fn read_cpu_times(&self, reported_err: &mut [bool]) -> Vec<Option<u64>> {
-        self.pthreads
+        self.clock_ids
             .iter()
             .enumerate()
-            .map(|(vcpu, &pt)| {
-                let mut clk: libc::clockid_t = 0;
-                let ret = unsafe { libc::pthread_getcpuclockid(pt, &mut clk) };
-                if ret != 0 {
-                    if let Some(slot) = reported_err.get_mut(vcpu)
-                        && !*slot
-                    {
-                        tracing::warn!(
-                            vcpu,
-                            ret,
-                            errno = std::io::Error::last_os_error().raw_os_error(),
-                            "pthread_getcpuclockid failed; stuck gating unavailable for this vCPU"
-                        );
-                        *slot = true;
-                    }
-                    return None;
-                }
+            .map(|(vcpu, clock_id)| {
+                let &clock_id = clock_id.as_ref()?;
                 let mut ts = libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 0,
                 };
-                let ret = unsafe { libc::clock_gettime(clk, &mut ts) };
+                let ret = unsafe { libc::clock_gettime(clock_id, &mut ts) };
                 if ret != 0 {
                     if let Some(slot) = reported_err.get_mut(vcpu)
                         && !*slot
@@ -1991,8 +2048,10 @@ pub(crate) struct RqRefresh {
 /// observes `None`. Refresh each iteration so the first sample
 /// after scheduler attach picks up real PAs.
 pub(crate) struct EventRefresh {
-    /// PA of the `scx_root` global pointer (text mapping).
-    pub scx_root_pa: u64,
+    /// Link-time KVA of the `scx_root` global pointer (kernel-image
+    /// mapping). Translated to a PA per iteration against the live
+    /// bases, never baked at construction — see [`RqRefresh`].
+    pub scx_root_kva: u64,
     /// BTF-resolved offsets within `scx_sched` and the per-CPU
     /// stats struct. See [`ScxEventOffsets`] for version-specific
     /// indirection.
@@ -2007,37 +2066,47 @@ pub(crate) struct EventRefresh {
 ///   `scx_sched` struct, then write at the BTF-resolved offset.
 ///   Re-derefs each iteration because `scx_sched` is reallocated on
 ///   scheduler (re)load.
-/// - pre-7.1 (`StaticGlobal`): write directly to the PA of the
+/// - pre-7.1 (`StaticGlobal`): write directly to the
 ///   `scx_watchdog_timeout` static global. No deref needed — the
-///   address is fixed for the kernel's lifetime.
+///   symbol is fixed for the kernel's lifetime.
+///
+/// Every address here is a LINK-TIME KVA, not a PA: the loop translates
+/// each one per iteration against the live kernel-image base and
+/// `phys_base` (see [`RqRefresh`]). A construction-time bake pinned
+/// these to whatever `phys_base` the monitor's bounded KERN_ADDRS wait
+/// had produced, and a guest that publishes after that wait times out
+/// left every one of them pointing at the wrong physical page for the
+/// whole run — the `scx_root` read then returned stable non-null
+/// garbage, so the null guard below did not fire and the override was
+/// written into (and read back from) an address outside guest DRAM.
 pub(crate) enum WatchdogOverride {
     /// 7.1+ path: deref `scx_root` -> `scx_sched` -> write at offset.
     ScxSched {
-        /// PA of the `scx_root` global pointer (text mapping).
-        scx_root_pa: u64,
+        /// Link-time KVA of the `scx_root` global pointer.
+        scx_root_kva: u64,
         /// Byte offset of `watchdog_timeout` within `struct scx_sched`.
         watchdog_offset: usize,
         /// Jiffies value to write.
         jiffies: u64,
-        /// PA of `scx_watchdog_interval` global.
-        interval_pa: Option<u64>,
-        /// PA of `scx_watchdog_timestamp` global.
-        timestamp_pa: Option<u64>,
-        /// PA of `jiffies_64` global (to read current time).
-        jiffies_64_pa: Option<u64>,
+        /// Link-time KVA of the `scx_watchdog_interval` global.
+        interval_kva: Option<u64>,
+        /// Link-time KVA of the `scx_watchdog_timestamp` global.
+        timestamp_kva: Option<u64>,
+        /// Link-time KVA of `jiffies_64` (to read current time).
+        jiffies_64_kva: Option<u64>,
     },
-    /// Pre-7.1 path: write directly to the static global's PA.
+    /// Pre-7.1 path: write directly to the static global.
     StaticGlobal {
-        /// PA of the `scx_watchdog_timeout` static global (text mapping).
-        watchdog_timeout_pa: u64,
+        /// Link-time KVA of the `scx_watchdog_timeout` static global.
+        watchdog_timeout_kva: u64,
         /// Jiffies value to write.
         jiffies: u64,
-        /// PA of `scx_watchdog_interval` global.
-        interval_pa: Option<u64>,
-        /// PA of `scx_watchdog_timestamp` global.
-        timestamp_pa: Option<u64>,
-        /// PA of `jiffies_64` global.
-        jiffies_64_pa: Option<u64>,
+        /// Link-time KVA of the `scx_watchdog_interval` global.
+        interval_kva: Option<u64>,
+        /// Link-time KVA of the `scx_watchdog_timestamp` global.
+        timestamp_kva: Option<u64>,
+        /// Link-time KVA of `jiffies_64`.
+        jiffies_64_kva: Option<u64>,
     },
 }
 
@@ -2087,6 +2156,42 @@ enum ForgeAction {
 fn clamp_original_timeout(raw: u64, wd_jiffies: u64) -> u64 {
     let clamp = wd_jiffies.saturating_mul(6);
     if raw == 0 || raw > clamp { clamp } else { raw }
+}
+
+/// Record the `scx_sched.watchdog_timeout` write-then-read-back that
+/// [`super::WatchdogObservation`] carries to the host verdict, keeping the
+/// FIRST readable observation.
+///
+/// "Readable" is the whole point. The write lands at `kva_to_pa(*scx_root,
+/// page_offset) + watchdog_offset`; while the monitor is still racing guest
+/// boot — `page_offset` not yet resolved, or `*scx_root` pointing at a
+/// scx_sched the kernel has not finished initialising — that PA falls
+/// outside guest DRAM, where [`GuestMem::write_u64`] silently no-ops and
+/// [`GuestMem::read_u64`] bounds-returns 0. Latching that first sample
+/// unconditionally pinned an unreadable address as the run's verdict, so a
+/// run whose override did land was reported as `observed_jiffies == 0` —
+/// "the host-write missed the field" — purely because the monitor's first
+/// sample happened to precede the boot state it needs.
+///
+/// A zero is therefore provisional, not final: keep re-recording while the
+/// stored observation still reads 0 so a later sample against a resolved
+/// scx_sched replaces it. It is NOT discarded — a genuinely unwritable
+/// field (the kernel refactor that moved `watchdog_offset`, which this
+/// observation exists to catch) leaves 0 in place through the last sample
+/// and still fails the verdict loudly. Once a nonzero value is stored the
+/// observation is final, so a scheduler that legitimately overwrites the
+/// override with its own nonzero default is reported as the mismatch it is.
+fn record_watchdog_observation(
+    slot: &mut Option<super::WatchdogObservation>,
+    expected_jiffies: u64,
+    observed_jiffies: u64,
+) {
+    if slot.is_none_or(|o| o.observed_jiffies == 0) {
+        *slot = Some(super::WatchdogObservation {
+            expected_jiffies,
+            observed_jiffies,
+        });
+    }
 }
 
 /// Decide whether to forge `scx_watchdog_timestamp` this iteration, given
@@ -2261,6 +2366,12 @@ pub(crate) struct PsiCaptureCfg {
 /// Bundles the parameters that `monitor_loop` needs beyond the
 /// required `mem`, `rq_pas`, `offsets`, `interval`, `kill`, and `run_start`.
 pub(crate) struct MonitorConfig<'a> {
+    /// Unit-test sampling budget. Production loops terminate through the VM
+    /// kill edge; tests that exercise an exact number of state-machine
+    /// transitions use this service-progress bound instead of racing a
+    /// wall-clock sleeper against the sampler.
+    #[cfg(test)]
+    pub sample_limit: Option<usize>,
     /// Per-CPU physical addresses of `scx_sched_pcpu` (or
     /// `scx_event_stats` on pre-6.18 kernels). When `rq_refresh` is
     /// `None` and `event_offsets` exist, each sample includes event
@@ -2322,7 +2433,7 @@ pub(crate) struct MonitorConfig<'a> {
     pub psi: Option<PsiCaptureCfg>,
     /// Optional scheduler-attach watchdog reset. When `Some`, the
     /// loop reads `*scx_root` each iteration via
-    /// [`WatchdogReset::scx_root_pa`] and, on the first 0 →
+    /// [`WatchdogReset::scx_root_kva`] and, on the first 0 →
     /// non-zero transition, stores `(now - run_start +
     /// workload_duration).as_nanos()` into the shared atomic so
     /// the host-side VM watchdog can recompute its hard deadline
@@ -2362,16 +2473,16 @@ pub(crate) struct MonitorConfig<'a> {
 /// All fields move together — none of them are useful alone — so
 /// they're bundled to keep [`MonitorConfig`] flat. Construction is
 /// owned by [`crate::vmm::freeze_coord`] inside `start_monitor`, where
-/// `scx_root_pa` is the text-mapped PA of the kernel's `scx_root`
+/// `scx_root_kva` is the link-time address of the kernel's `scx_root`
 /// global, `workload_duration` flows from
 /// [`crate::vmm::KtstrVm::workload_duration`] (which mirrors the
 /// test entry's `duration`), and `reset_ns` / `reset_tag` are shared
 /// with the watchdog thread.
 pub(crate) struct WatchdogReset<'a> {
-    /// PA of the `scx_root` global pointer (text mapping). The
-    /// loop reads `mem.read_u64(scx_root_pa, 0)` each iteration
-    /// and detects the 0 → non-zero edge.
-    pub scx_root_pa: u64,
+    /// Link-time KVA of the `scx_root` global pointer. The loop
+    /// translates it against the live bases and reads it each
+    /// iteration, detecting the 0 → non-zero edge.
+    pub scx_root_kva: u64,
     /// Workload time budget the watchdog should reset to. Encoded
     /// as nanoseconds since `run_start` (added to `Instant::now()
     /// - run_start` at attach time and stored into [`reset_ns`]).
@@ -3380,7 +3491,7 @@ pub(crate) fn monitor_loop(
     // See [`crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker`].
     let mut trickle_tracker = crate::vmm::freeze_coord::watchdog_step::CpuTrickleTracker::new();
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
-        .map(|vt| vec![false; vt.pthreads.len()])
+        .map(|vt| vec![false; vt.clock_ids.len()])
         .unwrap_or_default();
     let shm_entries: Vec<crate::vmm::wire::ShmEntry> = Vec::new();
     let mut watchdog_observation: Option<super::WatchdogObservation> = None;
@@ -3639,6 +3750,15 @@ pub(crate) fn monitor_loop(
                 page_offset = architectural_page_offset;
             }
         }
+        // Translate a kernel-image (text/data) link-time KVA against THIS
+        // iteration's live bases. Both inputs can resolve after the monitor
+        // thread was constructed — `phys_base` when the guest's KERN_ADDRS
+        // publish outlives the bounded pre-loop wait, `iter_start_kernel_map`
+        // when the aarch64 BSP programs TCR_EL1 late — so every consumer
+        // below re-derives rather than carrying a construction-time bake.
+        let text_pa = |kva: u64| {
+            super::symbols::text_kva_to_pa_with_base(kva, iter_start_kernel_map, phys_base)
+        };
         // Scheduler-attach watchdog reset. Read `*scx_root` and,
         // on the first 0 → non-zero transition, store the encoded
         // attach-moment deadline so the watchdog thread can
@@ -3646,14 +3766,14 @@ pub(crate) fn monitor_loop(
         // (instead of from VM boot, which wastes the budget on
         // boot + BPF verifier time). Runs each iteration until
         // the latch fires; the read itself is cheap (one bounded
-        // [`GuestMem::read_u64`]) and `scx_root_pa` is text-mapped
-        // so the read is valid throughout the run regardless of
-        // the per-iteration `data_valid` gate above. Fires
-        // independently of `watchdog_override`: a kernel without
-        // a resolvable `scx_sched.watchdog_timeout` BTF field
-        // still gets a correct outer kill timer.
+        // [`GuestMem::read_u64`]) and the kernel-image translation
+        // above is independent of the `data_valid` gate, so the read
+        // is valid throughout the run. Fires independently of
+        // `watchdog_override`: a kernel without a resolvable
+        // `scx_sched.watchdog_timeout` BTF field still gets a
+        // correct outer kill timer.
         if let Some(reset) = cfg.watchdog_reset.as_ref() {
-            let scx_sched_kva = mem.read_u64(reset.scx_root_pa, 0);
+            let scx_sched_kva = mem.read_u64(text_pa(reset.scx_root_kva), 0);
             if scx_sched_kva != 0 && !watchdog_reset_signaled {
                 let elapsed = run_start.elapsed();
                 let target_ns = elapsed
@@ -3700,12 +3820,12 @@ pub(crate) fn monitor_loop(
         if let Some(wd) = watchdog_override {
             let (write_pa, write_offset, wd_jiffies) = match wd {
                 WatchdogOverride::ScxSched {
-                    scx_root_pa,
+                    scx_root_kva,
                     watchdog_offset,
                     jiffies,
                     ..
                 } => {
-                    let sch_kva = mem.read_u64(*scx_root_pa, 0);
+                    let sch_kva = mem.read_u64(text_pa(*scx_root_kva), 0);
                     if sch_kva == 0 {
                         (None, 0, *jiffies)
                     } else {
@@ -3714,24 +3834,28 @@ pub(crate) fn monitor_loop(
                     }
                 }
                 WatchdogOverride::StaticGlobal {
-                    watchdog_timeout_pa,
+                    watchdog_timeout_kva,
                     jiffies,
                     ..
-                } => (Some(*watchdog_timeout_pa), 0, *jiffies),
+                } => (Some(text_pa(*watchdog_timeout_kva)), 0, *jiffies),
             };
             let (interval_pa, timestamp_pa, jiffies_64_pa) = match wd {
                 WatchdogOverride::ScxSched {
-                    interval_pa,
-                    timestamp_pa,
-                    jiffies_64_pa,
+                    interval_kva,
+                    timestamp_kva,
+                    jiffies_64_kva,
                     ..
                 }
                 | WatchdogOverride::StaticGlobal {
-                    interval_pa,
-                    timestamp_pa,
-                    jiffies_64_pa,
+                    interval_kva,
+                    timestamp_kva,
+                    jiffies_64_kva,
                     ..
-                } => (*interval_pa, *timestamp_pa, *jiffies_64_pa),
+                } => (
+                    interval_kva.map(&text_pa),
+                    timestamp_kva.map(&text_pa),
+                    jiffies_64_kva.map(&text_pa),
+                ),
             };
             if let Some(pa) = write_pa {
                 // Capture the guest's original `watchdog_timeout` ONCE,
@@ -3784,13 +3908,11 @@ pub(crate) fn monitor_loop(
                         mem.write_u64(ts_pa, 0, v);
                     }
                 }
-                if watchdog_observation.is_none() {
-                    let observed = mem.read_u64(pa, write_offset);
-                    watchdog_observation = Some(super::WatchdogObservation {
-                        expected_jiffies: wd_jiffies,
-                        observed_jiffies: observed,
-                    });
-                }
+                record_watchdog_observation(
+                    &mut watchdog_observation,
+                    wd_jiffies,
+                    mem.read_u64(pa, write_offset),
+                );
             }
         }
         // Per-iteration refresh of `__per_cpu_offset[]` and the
@@ -4033,7 +4155,13 @@ pub(crate) fn monitor_loop(
             // is zero and `resolve_event_pcpu_pas` returns `None` —
             // event counters stay absent for that sample.
             event_pcpu_pas_buf = refresh.event.as_ref().and_then(|ev| {
-                resolve_event_pcpu_pas(mem, ev.scx_root_pa, &ev.event_offsets, &fresh, page_offset)
+                resolve_event_pcpu_pas(
+                    mem,
+                    text_pa(ev.scx_root_kva),
+                    &ev.event_offsets,
+                    &fresh,
+                    page_offset,
+                )
             });
             per_cpu_offsets_buf = fresh;
         }
@@ -4407,9 +4535,11 @@ pub(crate) fn monitor_loop(
                 evidence_channels_live,
             );
             // NO progress-epoch bump here. `progress_epoch` is
-            // MILESTONE-ONLY: bumped exclusively by lifecycle stage
-            // advances (the dispatch thread's `advance_phase` /
-            // boot-heartbeat frames). Kernel scheduling noise is NEVER
+            // MILESTONE-ONLY: bumped by lifecycle stage advances, boot
+            // heartbeats, and accepted generation-tagged attach boundaries
+            // (the dispatch thread's `advance_phase`,
+            // `record_boot_progress`, and `reanchor_phase_cpu`). Kernel
+            // scheduling noise is NEVER
             // progress — a live guest kernel bumps ttwu_count /
             // sched_count / pcount every tick from background kthread
             // wakeups (RCU, timers, workqueues, ktstr's own guest poll
@@ -4438,6 +4568,14 @@ pub(crate) fn monitor_loop(
             prog_stats,
             psi_irq,
         });
+
+        #[cfg(test)]
+        if cfg
+            .sample_limit
+            .is_some_and(|sample_limit| samples.len() >= sample_limit)
+        {
+            break;
+        }
 
         // Block until the next tick or a kill_evt write. -1 timeout
         // is OK because both fds carry hard wakes — a missing
@@ -4491,6 +4629,62 @@ mod tests {
     use std::os::unix::thread::JoinHandleExt;
 
     const THRESHOLD_NS: u64 = 10_000_000;
+
+    #[test]
+    fn monitor_terminal_guard_publishes_on_unexpected_return() {
+        let ledger = ProgressLedger::default();
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        {
+            let _guard = MonitorTerminalGuard::new(&ledger, &kill);
+        }
+        assert!(ledger.snapshot().monitor_terminal);
+    }
+
+    #[test]
+    fn monitor_terminal_guard_publishes_during_unwind() {
+        let ledger = ProgressLedger::default();
+        let kill = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = MonitorTerminalGuard::new(&ledger, &kill);
+            panic!("exercise monitor terminal unwind guard");
+        }));
+        assert!(result.is_err());
+        assert!(ledger.snapshot().monitor_terminal);
+    }
+
+    #[test]
+    fn monitor_terminal_guard_ignores_kill_driven_exit() {
+        let ledger = ProgressLedger::default();
+        let kill = AtomicBool::new(false);
+        {
+            let _guard = MonitorTerminalGuard::new(&ledger, &kill);
+            kill.store(true, Ordering::Release);
+        }
+        assert!(!ledger.snapshot().monitor_terminal);
+    }
+
+    /// A monitor resolves its pthread CPU clocks once, then every sample reads
+    /// the cached IDs directly. Pin the live-thread success path and the
+    /// monotonic CPU-time contract without involving guest memory.
+    #[test]
+    fn vcpu_timing_caches_clock_ids_for_monitor_lifetime() {
+        let timing = VcpuTiming::from_pthreads(vec![unsafe { libc::pthread_self() }], None);
+        assert_eq!(timing.clock_ids.len(), 1);
+        assert!(
+            timing.clock_ids[0].is_some(),
+            "the current live pthread must expose a CPU clock"
+        );
+
+        let mut reported_err = vec![false];
+        let first =
+            timing.read_cpu_times(&mut reported_err)[0].expect("cached clock ID must be readable");
+        std::hint::black_box((0..10_000).fold(0usize, |acc, n| acc.wrapping_add(n)));
+        let second = timing.read_cpu_times(&mut reported_err)[0]
+            .expect("cached clock ID must remain readable");
+
+        assert!(second >= first, "pthread CPU clocks are monotonic");
+        assert!(!reported_err[0]);
+    }
 
     /// `select_cr3` prefers the live `cr3_cache` value (masked `& !0xFFF`,
     /// preserving bit 12 — the guest is mitigations=off so bit 12 is a real
@@ -4683,13 +4877,31 @@ mod tests {
     /// tick (typically 10 ms in tests) wakes `epoll_wait` within
     /// one interval — but production callers MUST write so the
     /// shutdown latency stays in the microsecond range.
+    fn kill_after(
+        kill: &std::sync::Arc<AtomicBool>,
+        after: Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let kill = std::sync::Arc::clone(kill);
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            kill.store(true, Ordering::Release);
+        })
+    }
+
     fn test_kill_evt() -> vmm_sys_util::eventfd::EventFd {
         vmm_sys_util::eventfd::EventFd::new(vmm_sys_util::eventfd::EFD_NONBLOCK)
             .expect("create kill EventFd")
     }
 
+    /// Link-time KVA whose kernel-image translation under `test_config()`'s
+    /// bases (`START_KERNEL_MAP`, `phys_base = 0`) is the fixture PA `pa`.
+    fn test_text_kva(pa: u64) -> u64 {
+        pa.wrapping_add(super::super::symbols::START_KERNEL_MAP)
+    }
+
     fn test_config() -> MonitorConfig<'static> {
         MonitorConfig {
+            sample_limit: None,
             event_pcpu_pas: None,
             dump_trigger: None,
             watchdog_override: None,
@@ -4872,13 +5084,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(50));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -4988,6 +5194,7 @@ mod tests {
         // rq_refresh: None => data_valid latches true from tick 1, so the
         // capture block fires immediately.
         let cfg = MonitorConfig {
+            sample_limit: None,
             event_pcpu_pas: None,
             dump_trigger: None,
             watchdog_override: None,
@@ -5007,13 +5214,7 @@ mod tests {
         let kernel_offsets = test_offsets();
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(50));
         let result = monitor_loop(
             &mem,
             &[0],
@@ -5153,13 +5354,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(50));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -5196,13 +5391,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(200));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -5434,13 +5623,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let ev_pas = vec![ev_pa];
         let cfg = MonitorConfig {
@@ -5478,13 +5661,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -5567,13 +5744,7 @@ mod tests {
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             rq_refresh: Some(&refresh),
@@ -5676,13 +5847,7 @@ mod tests {
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             rq_refresh: Some(&refresh),
@@ -5825,6 +5990,124 @@ mod tests {
         assert_eq!(latched.cpus[0].nr_running, 55);
     }
 
+    /// Sibling of the test above for the watchdog-override path: the
+    /// `scx_root` deref must translate its LINK-TIME KVA against the live
+    /// `phys_base` every tick, not against a construction-time bake.
+    ///
+    /// The bake was the whole failure. On a contended host the guest's
+    /// KERN_ADDRS publish routinely lands after the monitor's bounded
+    /// pre-loop wait, so the override was resolved against `phys_base = 0`
+    /// and every later write went to a fixed wrong page for the rest of the
+    /// run — `ktstr/watchdog_override_timing_precision` then read back 0
+    /// while the guest ran on the scheduler's own compiled-in timeout.
+    ///
+    /// Shape mirrors the pco test: `cfg.phys_base` carries the wrong
+    /// displacement, so the `scx_root` read lands outside the fixture
+    /// (bounds-zero → treated as "no scheduler attached", no observation).
+    /// Mid-run the authoritative base is published into the Arc; the next
+    /// tick must adopt it, reach the real `scx_root`, deref to the
+    /// `scx_sched` stub, and land the write. A regression to a once-baked
+    /// PA leaves `watchdog_observation` at `None`.
+    #[test]
+    fn monitor_loop_watchdog_override_adopts_late_phys_base_publish() {
+        let offsets = test_offsets();
+        const TABLE_PA: u64 = 24;
+        const KERNEL_HALF: u64 = 1u64 << 63;
+        const WATCHDOG_OFFSET: usize = 16;
+        const WD_JIFFIES: u64 = 2000;
+        let rq0_buf = make_rq_buffer(&offsets, 55, 1, 1, 6543, 0);
+        let rq0_pa = TABLE_PA + 8; // after the 1-slot (8-byte) table
+        let pco0 = KERNEL_HALF | rq0_pa;
+
+        let mut combined = vec![0u8; TABLE_PA as usize];
+        combined.extend_from_slice(&pco0.to_ne_bytes());
+        combined.extend_from_slice(&rq0_buf);
+        // `scx_root` pointer slot, then the `scx_sched` stub it points at.
+        let scx_root_pa = combined.len() as u64;
+        let sch_pa = scx_root_pa + 8;
+        combined.extend_from_slice(&(KERNEL_HALF | sch_pa).to_ne_bytes());
+        combined.extend_from_slice(&[0u8; 64]);
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        let s = super::super::symbols::START_KERNEL_MAP;
+        let good_p: u64 = 0x10_0000; // authoritative guest phys_base
+        let bad_p: u64 = 0x40_0000; // construction fallback's garbage
+        let per_cpu_offset_kva = TABLE_PA.wrapping_add(s).wrapping_sub(good_p);
+        // Resolves to `scx_root_pa` only under the authoritative base.
+        let scx_root_kva = scx_root_pa.wrapping_add(s).wrapping_sub(good_p);
+
+        let phys_base_arc = std::sync::Arc::new(AtomicU64::new(0));
+        let refresh = RqRefresh {
+            per_cpu_offset_kva,
+            tcr_el1: None,
+            runqueues_kva: 0,
+            num_cpus: 1,
+            page_offset_base_kva: None,
+            memstart_addr_kva: None,
+            kern_phys_base: Some(phys_base_arc.clone()),
+            phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
+            event: None,
+            kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
+        };
+        let wd = WatchdogOverride::ScxSched {
+            scx_root_kva,
+            watchdog_offset: WATCHDOG_OFFSET,
+            jiffies: WD_JIFFIES,
+            interval_kva: None,
+            timestamp_kva: None,
+            jiffies_64_kva: None,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            let arc = phys_base_arc.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(40));
+                arc.store(good_p.wrapping_add(1), Ordering::Release);
+                std::thread::sleep(Duration::from_millis(80));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            watchdog_override: Some(&wd),
+            page_offset: KERNEL_HALF,
+            start_kernel_map: s,
+            phys_base: bad_p, // the garbage the bounded wait latched
+            ..test_config()
+        };
+        let MonitorLoopResult {
+            watchdog_observation,
+            ..
+        } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        let observation = watchdog_observation.expect(
+            "no watchdog observation after the authoritative phys_base \
+             publish — the scx_root deref regressed to a construction-baked \
+             PA and never reached guest memory",
+        );
+        assert_eq!(observation.expected_jiffies, WD_JIFFIES);
+        assert_eq!(observation.observed_jiffies, WD_JIFFIES);
+    }
+
     /// Regression: the monitor must RE-READ the KASLR-slide Arc each
     /// iteration, not snapshot it at `RqRefresh` construction. On aarch64
     /// the slide has a single no-retry publisher, and the monitor's
@@ -5911,13 +6194,7 @@ mod tests {
                 kaslr.store(SLIDE + 1, Ordering::Release);
             })
         };
-        let stopper = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(120));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let stopper = kill_after(&kill, Duration::from_millis(120));
 
         let cfg = MonitorConfig {
             rq_refresh: Some(&refresh),
@@ -6007,13 +6284,7 @@ mod tests {
             kaslr_offset: std::sync::Arc::new(AtomicU64::new(0)),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             rq_refresh: Some(&refresh),
@@ -6089,21 +6360,15 @@ mod tests {
         let kill_evt = test_kill_evt();
 
         let wd = WatchdogOverride::ScxSched {
-            scx_root_pa,
+            scx_root_kva: test_text_kva(scx_root_pa),
             watchdog_offset,
             jiffies: 99999,
-            interval_pa: None,
-            timestamp_pa: None,
-            jiffies_64_pa: None,
+            interval_kva: None,
+            timestamp_kva: None,
+            jiffies_64_kva: None,
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_override: Some(&wd),
@@ -6154,21 +6419,15 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
         let wd = WatchdogOverride::ScxSched {
-            scx_root_pa,
+            scx_root_kva: test_text_kva(scx_root_pa),
             watchdog_offset: 16,
             jiffies: 0xDEADBEEF,
-            interval_pa: None,
-            timestamp_pa: None,
-            jiffies_64_pa: None,
+            interval_kva: None,
+            timestamp_kva: None,
+            jiffies_64_kva: None,
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_override: Some(&wd),
@@ -6226,19 +6485,13 @@ mod tests {
         let reset_ns = AtomicU64::new(0);
         let reset_tag = std::sync::atomic::AtomicU8::new(0);
         let wr = WatchdogReset {
-            scx_root_pa,
+            scx_root_kva: test_text_kva(scx_root_pa),
             workload_duration: Duration::from_secs(60),
             reset_ns: &reset_ns,
             reset_tag: &reset_tag,
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_reset: Some(wr),
@@ -6297,19 +6550,13 @@ mod tests {
             crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm as u8;
         let reset_tag = std::sync::atomic::AtomicU8::new(guest_confirm_tag);
         let wr = WatchdogReset {
-            scx_root_pa,
+            scx_root_kva: test_text_kva(scx_root_pa),
             workload_duration: Duration::from_secs(60),
             reset_ns: &reset_ns,
             reset_tag: &reset_tag,
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_reset: Some(wr),
@@ -6355,20 +6602,14 @@ mod tests {
         let kill_evt = test_kill_evt();
 
         let wd = WatchdogOverride::StaticGlobal {
-            watchdog_timeout_pa: watchdog_pa,
+            watchdog_timeout_kva: test_text_kva(watchdog_pa),
             jiffies: 77777,
-            interval_pa: None,
-            timestamp_pa: None,
-            jiffies_64_pa: None,
+            interval_kva: None,
+            timestamp_kva: None,
+            jiffies_64_kva: None,
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_override: Some(&wd),
@@ -6412,6 +6653,44 @@ mod tests {
         assert_eq!(clamp_original_timeout(0, wd), 3000);
         // Garbage above the ceiling falls back to the clamp.
         assert_eq!(clamp_original_timeout(u64::MAX, wd), 3000);
+    }
+
+    /// A zero read-back is provisional: it is stored (so a field that
+    /// never becomes readable still fails the verdict rather than
+    /// vanishing into a skip) but a later readable sample replaces it.
+    /// The first nonzero observation is final — a scheduler that
+    /// overwrites the override with its own default must be reported as
+    /// the mismatch it is, not overwritten by a later sample.
+    #[test]
+    fn record_watchdog_observation_upgrades_past_unreadable_samples() {
+        let mut slot = None;
+        // Boot race: the write landed outside guest DRAM, so the
+        // read-back bounds-returned 0. Stored, but provisional.
+        record_watchdog_observation(&mut slot, 2000, 0);
+        assert_eq!(slot.map(|o| o.observed_jiffies), Some(0));
+        // Next sample, scx_sched now resolved: the real value replaces it.
+        record_watchdog_observation(&mut slot, 2000, 2000);
+        assert_eq!(
+            slot,
+            Some(super::super::WatchdogObservation {
+                expected_jiffies: 2000,
+                observed_jiffies: 2000,
+            })
+        );
+        // Final: a later sample cannot rewrite a readable observation.
+        record_watchdog_observation(&mut slot, 2000, 1500);
+        assert_eq!(slot.map(|o| o.observed_jiffies), Some(2000));
+    }
+
+    /// A genuine mismatch (the guest's own nonzero default won) latches on
+    /// the first sample and is never upgraded away — this is the
+    /// regression the observation exists to catch.
+    #[test]
+    fn record_watchdog_observation_keeps_first_readable_mismatch() {
+        let mut slot = None;
+        record_watchdog_observation(&mut slot, 2000, 20000);
+        record_watchdog_observation(&mut slot, 2000, 2000);
+        assert_eq!(slot.map(|o| o.observed_jiffies), Some(20000));
     }
 
     #[test]
@@ -6515,20 +6794,14 @@ mod tests {
         let kill_evt = test_kill_evt();
 
         let wd = WatchdogOverride::StaticGlobal {
-            watchdog_timeout_pa: timeout_pa,
+            watchdog_timeout_kva: test_text_kva(timeout_pa),
             jiffies: 500, // override = 5 s @ HZ=100
-            interval_pa: Some(interval_pa),
-            timestamp_pa: Some(timestamp_pa),
-            jiffies_64_pa: Some(jiffies_64_pa),
+            interval_kva: Some(test_text_kva(interval_pa)),
+            timestamp_kva: Some(test_text_kva(timestamp_pa)),
+            jiffies_64_kva: Some(test_text_kva(jiffies_64_pa)),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let cfg = MonitorConfig {
             watchdog_override: Some(&wd),
@@ -6582,7 +6855,7 @@ mod tests {
         // SAFETY: combined is a live local buffer (Vec<u8> or stack
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
-        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill = AtomicBool::new(false);
         let kill_evt = test_kill_evt();
 
         let virtio_con = test_virtio_console();
@@ -6596,15 +6869,8 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
-
         let cfg = MonitorConfig {
+            sample_limit: Some(3),
             dump_trigger: Some(&trigger),
             ..test_config()
         };
@@ -6618,9 +6884,8 @@ mod tests {
             Instant::now(),
             &cfg,
         );
-        handle.join().unwrap();
 
-        assert!(!samples.is_empty());
+        assert_eq!(samples.len(), 3);
         // Check `SIGNAL_VC_DUMP` was queued for the guest. Without
         // DRIVER_OK on the queue the byte stays in `port0_pending_rx`
         // — that's the observable for tests.
@@ -6649,7 +6914,7 @@ mod tests {
         // SAFETY: combined is a live local buffer (Vec<u8> or stack
         // array) whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
-        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill = AtomicBool::new(false);
         let kill_evt = test_kill_evt();
 
         let virtio_con = test_virtio_console();
@@ -6664,15 +6929,8 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
-
         let cfg = MonitorConfig {
+            sample_limit: Some(3),
             dump_trigger: Some(&trigger),
             ..test_config()
         };
@@ -6686,14 +6944,10 @@ mod tests {
             Instant::now(),
             &cfg,
         );
-        handle.join().unwrap();
 
-        // Should have enough samples for 2+ stuck pairs.
-        assert!(
-            samples.len() >= 3,
-            "need >= 3 samples for 2 stuck pairs, got {}",
-            samples.len()
-        );
+        // Three completed sampling passes are exactly the two stuck pairs
+        // required by sustained_samples=2.
+        assert_eq!(samples.len(), 3);
         // Dump should have fired due to sustained stuck condition.
         let pending = virtio_con.lock().pending_rx_bytes_for_test();
         assert!(
@@ -6731,13 +6985,7 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(200));
 
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
@@ -6797,10 +7045,7 @@ mod tests {
             .unwrap();
 
         let pt = sleeper.as_pthread_t() as libc::pthread_t;
-        let vcpu_timing = VcpuTiming {
-            pthreads: vec![pt],
-            contention_recorder: None,
-        };
+        let vcpu_timing = VcpuTiming::from_pthreads(vec![pt], None);
 
         let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
@@ -6814,13 +7059,7 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(150));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(150));
 
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
@@ -6885,10 +7124,7 @@ mod tests {
             .unwrap();
 
         let pt = spinner.as_pthread_t() as libc::pthread_t;
-        let vcpu_timing = VcpuTiming {
-            pthreads: vec![pt],
-            contention_recorder: None,
-        };
+        let vcpu_timing = VcpuTiming::from_pthreads(vec![pt], None);
 
         let virtio_con = test_virtio_console();
         let trigger = DumpTrigger {
@@ -6913,13 +7149,7 @@ mod tests {
         // assertion would succeed, the test still pays the full
         // budget in wall time, but that's a one-time cost per test
         // run and a non-flake outcome is worth the seconds.
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(2));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_secs(2));
 
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
@@ -6992,13 +7222,7 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(200));
 
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
@@ -7079,13 +7303,7 @@ mod tests {
             virtio_con: Some(virtio_con.clone()),
         };
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(200));
 
         let cfg = MonitorConfig {
             dump_trigger: Some(&trigger),
@@ -7252,13 +7470,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -7291,13 +7503,7 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
 
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(30));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(30));
 
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
@@ -8370,9 +8576,7 @@ mod tests {
         let topo = Topology::new(1, 2, 4, 2);
         let gap = Some((0xC000_0000u64, 0x1_0000_0000u64));
         let layout = NumaMemoryLayout::compute(&topo, 4096, 0, gap).unwrap();
-        let kvm = kvm_ioctls::Kvm::new().unwrap();
-        let vm_fd = kvm.create_vm().unwrap();
-        let alloc = layout.allocate_and_register(&vm_fd, false, false).unwrap();
+        let alloc = layout.allocate(false, false).unwrap();
         let mem = GuestMem::from_layout(&layout, &alloc.guest_mem);
         // Offset extent = high region offset (4 GiB) + its size (1 GiB) =
         // 5 GiB; RAM total is only 4 GiB.
@@ -8722,13 +8926,7 @@ mod tests {
         };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(run_ms));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(run_ms));
         let _ = monitor_loop(
             &mem,
             &[0],
@@ -8845,10 +9043,7 @@ mod tests {
             use std::os::unix::thread::JoinHandleExt;
             spinner.as_pthread_t() as libc::pthread_t
         };
-        let vcpu_timing = VcpuTiming {
-            pthreads: vec![pt],
-            contention_recorder: None,
-        };
+        let vcpu_timing = VcpuTiming::from_pthreads(vec![pt], None);
 
         let ledger = ProgressLedger::default();
         let cfg = MonitorConfig {
@@ -8859,13 +9054,7 @@ mod tests {
         };
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
-        let handle = {
-            let kill = std::sync::Arc::clone(&kill);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(80));
-                kill.store(true, Ordering::Release);
-            })
-        };
+        let handle = kill_after(&kill, Duration::from_millis(80));
         let MonitorLoopResult { samples, .. } = monitor_loop(
             &mem,
             &[],

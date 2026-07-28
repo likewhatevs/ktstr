@@ -46,10 +46,8 @@ use tempfile::TempDir;
 fn synthetic_report() -> FailureDumpReport {
     FailureDumpReport {
         schema: SCHEMA_DUAL.to_string(),
-        active_map_kvas: Vec::new(),
         maps: vec![FailureDumpMap {
             name: "synthetic.bss".into(),
-            map_kva: 0,
             map_type: BPF_MAP_TYPE_ARRAY,
             value_size: 8,
             max_entries: 1,
@@ -57,39 +55,9 @@ fn synthetic_report() -> FailureDumpReport {
                 bits: 32,
                 value: 0xCAFE,
             }),
-            entries: Vec::new(),
-            array_entries: Vec::new(),
-            percpu_entries: Vec::new(),
-            percpu_hash_entries: Vec::new(),
-            arena: None,
-            ringbuf: None,
-            stack_trace: None,
-            fd_array: None,
-            error: None,
+            ..Default::default()
         }],
-        vcpu_regs: Vec::new(),
-        sdt_allocations: Vec::new(),
-        sdt_alloc_unavailable: None,
-        prog_runtime_stats: Vec::new(),
-        prog_runtime_stats_unavailable: None,
-        per_cpu_time: Vec::new(),
-        cgroup_psi: Vec::new(),
-        per_node_numa: Vec::new(),
-        per_node_numa_unavailable: None,
-        task_enrichments: Vec::new(),
-        task_enrichments_unavailable: None,
-        event_counter_timeline: Vec::new(),
-        rq_scx_states: Vec::new(),
-        dsq_states: Vec::new(),
-        scx_sched_state: None,
-        scx_walker_unavailable: None,
-        vcpu_perf_at_freeze: Vec::new(),
-        dump_truncated_at_us: None,
-        maps_truncated: 0,
-        probe_counters: None,
-        scx_static_ranges: Default::default(),
-        is_placeholder: false,
-        active_obj_name: None,
+        ..Default::default()
     }
 }
 

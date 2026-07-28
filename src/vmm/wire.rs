@@ -174,6 +174,22 @@ pub enum MsgType {
     /// log region between the `-- BEGIN/END PROG LOAD LOG --` markers)
     /// typically lands here.
     SchedStderr,
+    /// Guest→host authoritative terminal scheduler-STDOUT chunk.
+    ///
+    /// Live [`Self::SchedStdout`] frames are best-effort and may be
+    /// deliberately suppressed while scheduler lifecycle control boundaries
+    /// own the bulk channel. Once the child and both pipe forwarders have
+    /// exited, the guest replays the complete stdout sidecar through this
+    /// message type only if a live frame was suppressed or failed. Each
+    /// payload carries a total-length/offset header, so the host accepts only
+    /// complete terminal streams and can fall back to the live stream when a
+    /// terminal replay is interrupted.
+    SchedStdoutFinal,
+    /// Guest→host authoritative terminal scheduler-STDERR chunk.
+    ///
+    /// Same completion-aware terminal semantics as
+    /// [`Self::SchedStdoutFinal`], applied to the scheduler child's stderr.
+    SchedStderrFinal,
     /// Guest→host lifecycle phase event. Payload: 1-byte
     /// [`LifecyclePhase`] discriminant followed by an optional
     /// UTF-8 reason buffer (used by `SchedulerNotAttached`'s
@@ -283,6 +299,18 @@ pub enum MsgType {
     /// scheduler before the instrumentation needed to observe that crash is
     /// live. Coordinator-internal: carries no test verdict.
     BpfMapWriteReady,
+    /// Guest→host boundary for a finite prerequisite/readiness wait.
+    ///
+    /// Payload is the fixed-size [`ReadinessWaitEvent`] encoding. A
+    /// generation-tagged `Started` event transfers ordinary watchdog
+    /// progress ownership to that finite wait immediately before the guest
+    /// blocks; the matching `Finished` event returns ownership after
+    /// readiness or failure. The watchdog policy is deliberately independent
+    /// of [`ReadinessWaitKind`].
+    ///
+    /// Coordinator-internal: carries accounting control only, never a test
+    /// verdict.
+    ReadinessWait,
     /// Guest→host scheduler-swap notification (payload: empty).
     ///
     /// Emitted by the guest's `kill_current_scheduler`
@@ -300,6 +328,18 @@ pub enum MsgType {
     /// the post-swap periodic-capture defer window. Coordinator-internal:
     /// carries no test verdict.
     SchedSwapNotify,
+    /// Guest→host scheduler-attach attempt boundary.
+    ///
+    /// Payload is the fixed-size [`AttachAttemptEvent`] encoding. A
+    /// `Started` event opens one host-side attach-budget generation and a
+    /// matching `Finished` event closes it. This is deliberately separate
+    /// from [`Self::Lifecycle`]: scheduler lifecycle Ops can attach while the
+    /// coarse guest lifecycle is already in `Body`, and that coarse stage is
+    /// forward-only.
+    ///
+    /// Coordinator-internal: the frame drives host watchdog accounting and
+    /// carries no test verdict.
+    AttachAttempt,
 }
 
 impl MsgType {
@@ -329,12 +369,16 @@ impl MsgType {
             MsgType::KernelOpReply => MSG_TYPE_KERNEL_OP_REPLY,
             MsgType::SysRdy => MSG_TYPE_SYS_RDY,
             MsgType::BpfMapWriteReady => MSG_TYPE_BPF_MAP_WRITE_READY,
+            MsgType::ReadinessWait => MSG_TYPE_READINESS_WAIT,
             MsgType::SchedSwapNotify => MSG_TYPE_SCHED_SWAP_NOTIFY,
+            MsgType::AttachAttempt => MSG_TYPE_ATTACH_ATTEMPT,
             MsgType::Stdout => MSG_TYPE_STDOUT,
             MsgType::Stderr => MSG_TYPE_STDERR,
             MsgType::SchedLog => MSG_TYPE_SCHED_LOG,
             MsgType::SchedStdout => MSG_TYPE_SCHED_STDOUT,
             MsgType::SchedStderr => MSG_TYPE_SCHED_STDERR,
+            MsgType::SchedStdoutFinal => MSG_TYPE_SCHED_STDOUT_FINAL,
+            MsgType::SchedStderrFinal => MSG_TYPE_SCHED_STDERR_FINAL,
             MsgType::Lifecycle => MSG_TYPE_LIFECYCLE,
             MsgType::ExecExit => MSG_TYPE_EXEC_EXIT,
             MsgType::Dmesg => MSG_TYPE_DMESG,
@@ -369,12 +413,16 @@ impl MsgType {
             MSG_TYPE_KERNEL_OP_REPLY => Some(MsgType::KernelOpReply),
             MSG_TYPE_SYS_RDY => Some(MsgType::SysRdy),
             MSG_TYPE_BPF_MAP_WRITE_READY => Some(MsgType::BpfMapWriteReady),
+            MSG_TYPE_READINESS_WAIT => Some(MsgType::ReadinessWait),
             MSG_TYPE_SCHED_SWAP_NOTIFY => Some(MsgType::SchedSwapNotify),
+            MSG_TYPE_ATTACH_ATTEMPT => Some(MsgType::AttachAttempt),
             MSG_TYPE_STDOUT => Some(MsgType::Stdout),
             MSG_TYPE_STDERR => Some(MsgType::Stderr),
             MSG_TYPE_SCHED_LOG => Some(MsgType::SchedLog),
             MSG_TYPE_SCHED_STDOUT => Some(MsgType::SchedStdout),
             MSG_TYPE_SCHED_STDERR => Some(MsgType::SchedStderr),
+            MSG_TYPE_SCHED_STDOUT_FINAL => Some(MsgType::SchedStdoutFinal),
+            MSG_TYPE_SCHED_STDERR_FINAL => Some(MsgType::SchedStderrFinal),
             MSG_TYPE_LIFECYCLE => Some(MsgType::Lifecycle),
             MSG_TYPE_EXEC_EXIT => Some(MsgType::ExecExit),
             MSG_TYPE_DMESG => Some(MsgType::Dmesg),
@@ -420,6 +468,11 @@ impl MsgType {
     ///     verdict.
     ///   - [`MsgType::BpfMapWriteReady`] — releases the configured
     ///     host-side map writer after guest instrumentation is armed.
+    ///   - [`MsgType::ReadinessWait`] — opens or closes the generic finite
+    ///     guest-prerequisite watchdog overlay.
+    ///   - [`MsgType::AttachAttempt`] — opens or closes the
+    ///     generation-tagged host scheduler-attach watchdog overlay; carries
+    ///     accounting control only, never a test verdict.
     pub const fn is_coordinator_internal(self) -> bool {
         matches!(
             self,
@@ -431,8 +484,430 @@ impl MsgType {
                 | MsgType::TeardownBarrierAck
                 | MsgType::SysRdy
                 | MsgType::BpfMapWriteReady
+                | MsgType::ReadinessWait
                 | MsgType::SchedSwapNotify
+                | MsgType::AttachAttempt
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finite guest prerequisite/readiness-wait protocol
+// ---------------------------------------------------------------------------
+
+/// Version byte in the fixed-size [`ReadinessWaitEvent`] payload.
+pub const READINESS_WAIT_WIRE_VERSION: u8 = 1;
+
+/// Fixed payload size for [`ReadinessWaitEvent`]:
+/// `version:u8, transition:u8, kind:u8, reserved:u8, generation:u64_le`.
+pub const READINESS_WAIT_PAYLOAD_SIZE: usize = 12;
+
+/// Diagnostic identity of a finite guest prerequisite.
+///
+/// The host watchdog does not branch on this value: every kind uses the same
+/// explicit finite-wait ownership policy. The kind exists so the host can
+/// close the matching wait when it publishes readiness and so diagnostics
+/// identify the prerequisite that owned progress.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ReadinessWaitKind {
+    ProbeDump,
+}
+
+impl ReadinessWaitKind {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::ProbeDump => 1,
+        }
+    }
+
+    pub const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::ProbeDump),
+            _ => None,
+        }
+    }
+}
+
+/// Boundary represented by one [`ReadinessWaitEvent`].
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum ReadinessWaitTransition {
+    Started,
+    Finished,
+}
+
+impl ReadinessWaitTransition {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Started => 1,
+            Self::Finished => 2,
+        }
+    }
+
+    pub const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Started),
+            2 => Some(Self::Finished),
+            _ => None,
+        }
+    }
+}
+
+/// One generation-tagged finite guest prerequisite boundary.
+///
+/// A generation is non-zero and monotonically allocated by the guest.
+/// Matching the finish prevents a delayed duplicate from closing a newer wait.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct ReadinessWaitEvent {
+    pub transition: ReadinessWaitTransition,
+    pub kind: ReadinessWaitKind,
+    pub generation: u64,
+}
+
+impl ReadinessWaitEvent {
+    pub fn to_payload(self) -> [u8; READINESS_WAIT_PAYLOAD_SIZE] {
+        let mut payload = [0u8; READINESS_WAIT_PAYLOAD_SIZE];
+        payload[0] = READINESS_WAIT_WIRE_VERSION;
+        payload[1] = self.transition.wire_value();
+        payload[2] = self.kind.wire_value();
+        payload[4..12].copy_from_slice(&self.generation.to_le_bytes());
+        payload
+    }
+
+    /// Decode an exact canonical payload. Unknown versions/discriminants,
+    /// non-zero reserved data, zero generations, and size mismatches are
+    /// rejected.
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        if payload.len() != READINESS_WAIT_PAYLOAD_SIZE
+            || payload[0] != READINESS_WAIT_WIRE_VERSION
+            || payload[3] != 0
+        {
+            return None;
+        }
+        let transition = ReadinessWaitTransition::from_wire(payload[1])?;
+        let kind = ReadinessWaitKind::from_wire(payload[2])?;
+        let generation = u64::from_le_bytes(payload[4..12].try_into().ok()?);
+        if generation == 0 {
+            return None;
+        }
+        Some(Self {
+            transition,
+            kind,
+            generation,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler attach-attempt control protocol
+// ---------------------------------------------------------------------------
+
+/// Version byte in the fixed-size [`AttachAttemptEvent`] payload.
+pub const ATTACH_ATTEMPT_WIRE_VERSION: u8 = 1;
+
+/// Fixed payload size for [`AttachAttemptEvent`]:
+/// `version:u8, transition:u8, kind:u8, reserved:u8, generation:u64_le`.
+pub const ATTACH_ATTEMPT_PAYLOAD_SIZE: usize = 12;
+
+/// Which scheduler spawn path opened an attach attempt.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum AttachAttemptKind {
+    /// Initial scheduler spawned by guest init.
+    Boot,
+    /// `Op::AttachScheduler`.
+    Attach,
+    /// `Op::RestartScheduler`.
+    Restart,
+    /// `Op::ReplaceScheduler`.
+    Replace,
+}
+
+impl AttachAttemptKind {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Boot => 1,
+            Self::Attach => 2,
+            Self::Restart => 3,
+            Self::Replace => 4,
+        }
+    }
+
+    pub const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Boot),
+            2 => Some(Self::Attach),
+            3 => Some(Self::Restart),
+            4 => Some(Self::Replace),
+            _ => None,
+        }
+    }
+}
+
+/// Boundary represented by one [`AttachAttemptEvent`].
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum AttachAttemptTransition {
+    /// Start charging one attach generation.
+    Started,
+    /// Stop charging the attach body and enter the host's separately
+    /// service-accounted `Finishing` rendezvous state.
+    Finished,
+    /// The guest consumed the exact [`AttachControlPacket::FinishedAck`] and
+    /// the host may now close the overlay and resume coarse accounting.
+    Settled,
+}
+
+impl AttachAttemptTransition {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::Started => 1,
+            Self::Finished => 2,
+            Self::Settled => 3,
+        }
+    }
+
+    pub const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Started),
+            2 => Some(Self::Finished),
+            3 => Some(Self::Settled),
+            _ => None,
+        }
+    }
+}
+
+/// One generation-tagged scheduler attach boundary.
+///
+/// The generation is allocated monotonically by the guest and must be
+/// non-zero. Tagging both directions prevents a delayed host cancellation
+/// for an old scheduler from cancelling a later Attach/Replace/Restart.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct AttachAttemptEvent {
+    pub transition: AttachAttemptTransition,
+    pub kind: AttachAttemptKind,
+    pub generation: u64,
+}
+
+impl AttachAttemptEvent {
+    /// Encode the byte-stable fixed-size guest→host payload.
+    pub fn to_payload(self) -> [u8; ATTACH_ATTEMPT_PAYLOAD_SIZE] {
+        let mut payload = [0u8; ATTACH_ATTEMPT_PAYLOAD_SIZE];
+        payload[0] = ATTACH_ATTEMPT_WIRE_VERSION;
+        payload[1] = self.transition.wire_value();
+        payload[2] = self.kind.wire_value();
+        // payload[3] is reserved and remains zero.
+        payload[4..12].copy_from_slice(&self.generation.to_le_bytes());
+        payload
+    }
+
+    /// Decode an exact, canonical payload. Unknown versions/discriminants,
+    /// non-zero reserved data, zero generations, and size mismatches are
+    /// rejected rather than partially interpreted.
+    pub fn from_payload(payload: &[u8]) -> Option<Self> {
+        if payload.len() != ATTACH_ATTEMPT_PAYLOAD_SIZE
+            || payload[0] != ATTACH_ATTEMPT_WIRE_VERSION
+            || payload[3] != 0
+        {
+            return None;
+        }
+        let transition = AttachAttemptTransition::from_wire(payload[1])?;
+        let kind = AttachAttemptKind::from_wire(payload[2])?;
+        let generation = u64::from_le_bytes(payload[4..12].try_into().ok()?);
+        if generation == 0 {
+            return None;
+        }
+        Some(Self {
+            transition,
+            kind,
+            generation,
+        })
+    }
+}
+
+/// Host-authoritative reason for cancelling an attach attempt.
+///
+/// The discriminant is carried by the control packet's prefix rather than in
+/// an untagged side channel, so a guest diagnostic can never accidentally
+/// describe one host budget as another. Scheduler attach currently has one
+/// valid cancellation authority: delivered max-vCPU service.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum AttachCancelCause {
+    ServiceBudget,
+}
+
+impl AttachCancelCause {
+    /// Stable diagnostic label used by the guest's typed failure report.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ServiceBudget => "host-vcpu-service-budget",
+        }
+    }
+}
+
+/// Port-0 prefix for a max-vCPU-service-budget attach cancellation.
+pub const SIGNAL_ATTACH_CANCEL_SERVICE_BUDGET: u8 = 0xAF;
+
+/// Backwards-compatible name for the only currently valid cancellation
+/// prefix. New decoding should use [`AttachControlPacket`].
+pub const SIGNAL_ATTACH_CANCEL: u8 = SIGNAL_ATTACH_CANCEL_SERVICE_BUDGET;
+
+/// Port-0 prefix acknowledging that the host accepted and re-anchored an
+/// attach `Started` boundary.
+pub const SIGNAL_ATTACH_STARTED_ACK: u8 = 0xB0;
+
+/// Port-0 prefix acknowledging that the host accepted and re-anchored an
+/// attach `Finished` boundary.
+pub const SIGNAL_ATTACH_FINISHED_ACK: u8 = 0xB1;
+
+/// Fixed port-0 packet size: one typed prefix plus 16 lowercase hexadecimal
+/// generation digits.
+///
+/// ASCII is intentional: unlike raw `u64` bytes, the suffix cannot alias any
+/// legacy high-byte hvc0 control signal while a split packet is buffered.
+pub const ATTACH_CONTROL_PACKET_SIZE: usize = 17;
+
+pub const ATTACH_CANCEL_PACKET_SIZE: usize = ATTACH_CONTROL_PACKET_SIZE;
+pub const ATTACH_STARTED_ACK_PACKET_SIZE: usize = ATTACH_CONTROL_PACKET_SIZE;
+pub const ATTACH_FINISHED_ACK_PACKET_SIZE: usize = ATTACH_CONTROL_PACKET_SIZE;
+
+/// One typed, generation-tagged host→guest scheduler-attach control packet.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum AttachControlPacket {
+    StartedAck {
+        generation: u64,
+    },
+    FinishedAck {
+        generation: u64,
+    },
+    Cancel {
+        generation: u64,
+        cause: AttachCancelCause,
+    },
+}
+
+impl AttachControlPacket {
+    pub const fn generation(self) -> u64 {
+        match self {
+            Self::StartedAck { generation }
+            | Self::FinishedAck { generation }
+            | Self::Cancel { generation, .. } => generation,
+        }
+    }
+
+    pub const fn signal(self) -> u8 {
+        match self {
+            Self::StartedAck { .. } => SIGNAL_ATTACH_STARTED_ACK,
+            Self::FinishedAck { .. } => SIGNAL_ATTACH_FINISHED_ACK,
+            Self::Cancel {
+                cause: AttachCancelCause::ServiceBudget,
+                ..
+            } => SIGNAL_ATTACH_CANCEL_SERVICE_BUDGET,
+        }
+    }
+
+    pub const fn from_signal(signal: u8, generation: u64) -> Option<Self> {
+        if generation == 0 {
+            return None;
+        }
+        match signal {
+            SIGNAL_ATTACH_STARTED_ACK => Some(Self::StartedAck { generation }),
+            SIGNAL_ATTACH_FINISHED_ACK => Some(Self::FinishedAck { generation }),
+            SIGNAL_ATTACH_CANCEL_SERVICE_BUDGET => Some(Self::Cancel {
+                generation,
+                cause: AttachCancelCause::ServiceBudget,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a byte begins one of the fixed-size attach control packets.
+pub const fn is_attach_control_signal(signal: u8) -> bool {
+    matches!(
+        signal,
+        SIGNAL_ATTACH_STARTED_ACK
+            | SIGNAL_ATTACH_FINISHED_ACK
+            | SIGNAL_ATTACH_CANCEL_SERVICE_BUDGET
+    )
+}
+
+fn encode_generation_control(signal: u8, generation: u64) -> [u8; ATTACH_CONTROL_PACKET_SIZE] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut packet = [b'0'; ATTACH_CONTROL_PACKET_SIZE];
+    packet[0] = signal;
+    for (index, slot) in packet[1..].iter_mut().enumerate() {
+        let shift = (15 - index) * 4;
+        *slot = HEX[((generation >> shift) & 0xf) as usize];
+    }
+    packet
+}
+
+fn decode_generation_control(packet: &[u8]) -> Option<(u8, u64)> {
+    if packet.len() != ATTACH_CONTROL_PACKET_SIZE || !is_attach_control_signal(packet[0]) {
+        return None;
+    }
+    let mut generation = 0u64;
+    for &digit in &packet[1..] {
+        let nibble = match digit {
+            b'0'..=b'9' => digit - b'0',
+            b'a'..=b'f' => digit - b'a' + 10,
+            _ => return None,
+        };
+        generation = generation.checked_mul(16)?.checked_add(u64::from(nibble))?;
+    }
+    (generation != 0).then_some((packet[0], generation))
+}
+
+/// Encode any typed generation control packet.
+pub fn encode_attach_control(packet: AttachControlPacket) -> [u8; ATTACH_CONTROL_PACKET_SIZE] {
+    encode_generation_control(packet.signal(), packet.generation())
+}
+
+/// Decode one exact typed generation control packet.
+pub fn decode_attach_control(packet: &[u8]) -> Option<AttachControlPacket> {
+    let (signal, generation) = decode_generation_control(packet)?;
+    AttachControlPacket::from_signal(signal, generation)
+}
+
+/// Encode a generation-tagged host→guest attach cancellation packet.
+pub fn encode_attach_cancel(
+    generation: u64,
+    cause: AttachCancelCause,
+) -> [u8; ATTACH_CANCEL_PACKET_SIZE] {
+    encode_attach_control(AttachControlPacket::Cancel { generation, cause })
+}
+
+/// Decode one exact host→guest attach cancellation packet.
+pub fn decode_attach_cancel(packet: &[u8]) -> Option<(u64, AttachCancelCause)> {
+    match decode_attach_control(packet)? {
+        AttachControlPacket::Cancel { generation, cause } => Some((generation, cause)),
+        AttachControlPacket::StartedAck { .. } | AttachControlPacket::FinishedAck { .. } => None,
+    }
+}
+
+/// Encode the host rendezvous which proves it accepted and re-anchored the
+/// matching attach `Started` generation.
+pub fn encode_attach_started_ack(generation: u64) -> [u8; ATTACH_STARTED_ACK_PACKET_SIZE] {
+    encode_attach_control(AttachControlPacket::StartedAck { generation })
+}
+
+/// Decode one exact generation-tagged attach Started acknowledgement.
+pub fn decode_attach_started_ack(packet: &[u8]) -> Option<u64> {
+    match decode_attach_control(packet)? {
+        AttachControlPacket::StartedAck { generation } => Some(generation),
+        AttachControlPacket::FinishedAck { .. } | AttachControlPacket::Cancel { .. } => None,
+    }
+}
+
+/// Encode the host rendezvous which proves it accepted and re-anchored the
+/// matching attach `Finished` generation.
+pub fn encode_attach_finished_ack(generation: u64) -> [u8; ATTACH_FINISHED_ACK_PACKET_SIZE] {
+    encode_attach_control(AttachControlPacket::FinishedAck { generation })
+}
+
+/// Decode one exact generation-tagged attach Finished acknowledgement.
+pub fn decode_attach_finished_ack(packet: &[u8]) -> Option<u64> {
+    match decode_attach_control(packet)? {
+        AttachControlPacket::FinishedAck { generation } => Some(generation),
+        AttachControlPacket::StartedAck { .. } | AttachControlPacket::Cancel { .. } => None,
     }
 }
 
@@ -620,6 +1095,13 @@ pub const MSG_TYPE_SYS_RDY: u32 = 0x5352_4459; // "SRDY"
 /// ready, immediately before ScenarioStart.
 pub const MSG_TYPE_BPF_MAP_WRITE_READY: u32 = 0x424D_5259; // "BMRY"
 
+/// Guest→host finite prerequisite/readiness-wait boundary.
+///
+/// Tag spelled `"RDWT"` (ReaDiness WaiT). The payload is
+/// [`READINESS_WAIT_PAYLOAD_SIZE`] bytes and decodes through
+/// [`ReadinessWaitEvent::from_payload`].
+pub const MSG_TYPE_READINESS_WAIT: u32 = 0x5244_5754; // "RDWT"
+
 /// Guest→host scheduler-swap notification (payload: empty).
 ///
 /// Tag spelled `"SCSW"` (SCheduler SWap) in hex digits; on-wire bytes
@@ -630,6 +1112,13 @@ pub const MSG_TYPE_BPF_MAP_WRITE_READY: u32 = 0x424D_5259; // "BMRY"
 /// CRC-valid frame. See [`MsgType::SchedSwapNotify`] for the protocol
 /// contract.
 pub const MSG_TYPE_SCHED_SWAP_NOTIFY: u32 = 0x5343_5357; // "SCSW"
+
+/// Guest→host scheduler attach-attempt boundary.
+///
+/// Tag spelled `"ATTA"` (ATtach ATtempt) in hex digits. The payload is
+/// [`ATTACH_ATTEMPT_PAYLOAD_SIZE`] bytes and decodes through
+/// [`AttachAttemptEvent::from_payload`].
+pub const MSG_TYPE_ATTACH_ATTEMPT: u32 = 0x4154_5441; // "ATTA"
 
 /// Guest→host stdout chunk (payload: opaque UTF-8 bytes).
 ///
@@ -671,6 +1160,61 @@ pub const MSG_TYPE_SCHED_STDOUT: u32 = 0x5353_544f; // "SSTO"
 /// including the BPF verifier log region — typically lands). See
 /// [`MsgType::SchedStderr`].
 pub const MSG_TYPE_SCHED_STDERR: u32 = 0x5353_5445; // "SSTE"
+
+/// Guest→host authoritative terminal scheduler-STDOUT chunk.
+///
+/// The payload begins with [`SCHED_STREAM_FINAL_CHUNK_HEADER_SIZE`] bytes:
+/// total stream length (`u64` LE), then this chunk's byte offset (`u64` LE),
+/// followed by the raw stdout bytes. A zero-length stream is represented by
+/// one header-only frame with both fields zero. The host selects the terminal
+/// stream only after receiving a contiguous `0..total_len` transaction.
+pub const MSG_TYPE_SCHED_STDOUT_FINAL: u32 = 0x5353_4f46; // "SSOF"
+
+/// Guest→host authoritative terminal scheduler-STDERR chunk.
+///
+/// Same completion-aware payload format as
+/// [`MSG_TYPE_SCHED_STDOUT_FINAL`], applied to stderr.
+pub const MSG_TYPE_SCHED_STDERR_FINAL: u32 = 0x5353_4546; // "SSEF"
+
+/// Header bytes prepended to every authoritative terminal scheduler-stream
+/// chunk: total stream length (`u64` LE) + chunk offset (`u64` LE).
+pub const SCHED_STREAM_FINAL_CHUNK_HEADER_SIZE: usize = 16;
+
+/// Encode one authoritative terminal scheduler-stream chunk.
+///
+/// `offset + bytes.len()` must stay within `total_len`. The transport's TLV
+/// CRC authenticates the complete returned payload; the embedded lengths let
+/// the host reject an interrupted multi-frame replay as a whole.
+pub(crate) fn encode_sched_stream_final_chunk(
+    total_len: u64,
+    offset: u64,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let chunk_end = offset
+        .checked_add(bytes.len() as u64)
+        .expect("scheduler stream chunk offset overflowed u64");
+    assert!(
+        chunk_end <= total_len,
+        "scheduler stream chunk {offset}..{chunk_end} exceeds total length {total_len}"
+    );
+    let mut payload = Vec::with_capacity(SCHED_STREAM_FINAL_CHUNK_HEADER_SIZE + bytes.len());
+    payload.extend_from_slice(&total_len.to_le_bytes());
+    payload.extend_from_slice(&offset.to_le_bytes());
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+/// Decode one authoritative terminal scheduler-stream chunk.
+///
+/// Returns `(total_len, offset, bytes)` only when the fixed-width header is
+/// present and the chunk range is contained by `total_len`.
+pub(crate) fn decode_sched_stream_final_chunk(payload: &[u8]) -> Option<(u64, u64, &[u8])> {
+    let (header, bytes) = payload.split_at_checked(SCHED_STREAM_FINAL_CHUNK_HEADER_SIZE)?;
+    let total_len = u64::from_le_bytes(header[..8].try_into().ok()?);
+    let offset = u64::from_le_bytes(header[8..].try_into().ok()?);
+    let chunk_end = offset.checked_add(bytes.len() as u64)?;
+    (chunk_end <= total_len).then_some((total_len, offset, bytes))
+}
 
 /// Guest→host lifecycle phase event.
 ///
@@ -1688,10 +2232,16 @@ mod tests {
             MSG_TYPE_KERNEL_OP_REPLY,
             MSG_TYPE_SYS_RDY,
             MSG_TYPE_BPF_MAP_WRITE_READY,
+            MSG_TYPE_READINESS_WAIT,
             MSG_TYPE_SCHED_SWAP_NOTIFY,
+            MSG_TYPE_ATTACH_ATTEMPT,
             MSG_TYPE_STDOUT,
             MSG_TYPE_STDERR,
             MSG_TYPE_SCHED_LOG,
+            MSG_TYPE_SCHED_STDOUT,
+            MSG_TYPE_SCHED_STDERR,
+            MSG_TYPE_SCHED_STDOUT_FINAL,
+            MSG_TYPE_SCHED_STDERR_FINAL,
             MSG_TYPE_LIFECYCLE,
             MSG_TYPE_EXEC_EXIT,
             MSG_TYPE_DMESG,
@@ -1738,6 +2288,31 @@ mod tests {
         assert_eq!(std::mem::size_of::<ShmMessage>(), 16);
     }
 
+    #[test]
+    fn scheduler_stream_final_chunk_header_round_trips_and_bounds_ranges() {
+        let payload = encode_sched_stream_final_chunk(11, 5, b" world");
+        assert_eq!(payload.len(), SCHED_STREAM_FINAL_CHUNK_HEADER_SIZE + 6);
+        assert_eq!(
+            decode_sched_stream_final_chunk(&payload),
+            Some((11, 5, b" world".as_slice()))
+        );
+        assert_eq!(
+            decode_sched_stream_final_chunk(&encode_sched_stream_final_chunk(0, 0, b"")),
+            Some((0, 0, b"".as_slice())),
+            "an empty authoritative stream needs an explicit complete frame"
+        );
+        assert!(
+            decode_sched_stream_final_chunk(&payload[..15]).is_none(),
+            "a truncated fixed-width header must be rejected"
+        );
+        let mut out_of_range = payload;
+        out_of_range[..8].copy_from_slice(&10u64.to_le_bytes());
+        assert!(
+            decode_sched_stream_final_chunk(&out_of_range).is_none(),
+            "offset + chunk bytes beyond total_len must be rejected"
+        );
+    }
+
     /// Every [`MsgType`] variant round-trips through
     /// `wire_value` → `from_wire`.
     #[test]
@@ -1765,12 +2340,16 @@ mod tests {
             MsgType::KernelOpReply,
             MsgType::SysRdy,
             MsgType::BpfMapWriteReady,
+            MsgType::ReadinessWait,
             MsgType::SchedSwapNotify,
+            MsgType::AttachAttempt,
             MsgType::Stdout,
             MsgType::Stderr,
             MsgType::SchedLog,
             MsgType::SchedStdout,
             MsgType::SchedStderr,
+            MsgType::SchedStdoutFinal,
+            MsgType::SchedStderrFinal,
             MsgType::Lifecycle,
             MsgType::ExecExit,
             MsgType::Dmesg,
@@ -1845,11 +2424,20 @@ mod tests {
             MsgType::BpfMapWriteReady.wire_value(),
             MSG_TYPE_BPF_MAP_WRITE_READY
         );
+        assert_eq!(MsgType::ReadinessWait.wire_value(), MSG_TYPE_READINESS_WAIT);
         assert_eq!(MsgType::Stdout.wire_value(), MSG_TYPE_STDOUT);
         assert_eq!(MsgType::Stderr.wire_value(), MSG_TYPE_STDERR);
         assert_eq!(MsgType::SchedLog.wire_value(), MSG_TYPE_SCHED_LOG);
         assert_eq!(MsgType::SchedStdout.wire_value(), MSG_TYPE_SCHED_STDOUT);
         assert_eq!(MsgType::SchedStderr.wire_value(), MSG_TYPE_SCHED_STDERR);
+        assert_eq!(
+            MsgType::SchedStdoutFinal.wire_value(),
+            MSG_TYPE_SCHED_STDOUT_FINAL
+        );
+        assert_eq!(
+            MsgType::SchedStderrFinal.wire_value(),
+            MSG_TYPE_SCHED_STDERR_FINAL
+        );
         assert_eq!(MsgType::Lifecycle.wire_value(), MSG_TYPE_LIFECYCLE);
         assert_eq!(MsgType::ExecExit.wire_value(), MSG_TYPE_EXEC_EXIT);
         assert_eq!(MsgType::Dmesg.wire_value(), MSG_TYPE_DMESG);
@@ -1858,12 +2446,14 @@ mod tests {
             MsgType::SchedSwapNotify.wire_value(),
             MSG_TYPE_SCHED_SWAP_NOTIFY
         );
+        assert_eq!(MsgType::AttachAttempt.wire_value(), MSG_TYPE_ATTACH_ATTEMPT);
     }
 
     /// `is_coordinator_internal` flips on for SnapshotRequest,
     /// SnapshotReply, KernelOpRequest, KernelOpReply, TeardownBarrier,
-    /// TeardownBarrierAck, SysRdy, BpfMapWriteReady, and SchedSwapNotify
-    /// and stays off for every test-verdict-bearing
+    /// TeardownBarrierAck, SysRdy, BpfMapWriteReady, ReadinessWait,
+    /// SchedSwapNotify, and AttachAttempt and stays off for every
+    /// test-verdict-bearing
     /// variant. The
     /// Reply variants are host→guest only on port-1 RX; a guest TX
     /// frame stamped with one of those tags is illegitimate and
@@ -1886,7 +2476,9 @@ mod tests {
             MsgType::TeardownBarrierAck,
             MsgType::SysRdy,
             MsgType::BpfMapWriteReady,
+            MsgType::ReadinessWait,
             MsgType::SchedSwapNotify,
+            MsgType::AttachAttempt,
         ];
         let verdict = [
             MsgType::Stimulus,
@@ -1908,6 +2500,8 @@ mod tests {
             MsgType::SchedLog,
             MsgType::SchedStdout,
             MsgType::SchedStderr,
+            MsgType::SchedStdoutFinal,
+            MsgType::SchedStderrFinal,
             MsgType::Lifecycle,
             MsgType::ExecExit,
             MsgType::Dmesg,
@@ -1940,6 +2534,157 @@ mod tests {
         );
         assert_eq!(MsgType::SchedSwapNotify.wire_value(), 0x5343_5357);
         assert!(MsgType::SchedSwapNotify.is_coordinator_internal());
+    }
+
+    #[test]
+    fn readiness_wait_protocol_round_trips_and_rejects_noncanonical_payloads() {
+        for transition in [
+            ReadinessWaitTransition::Started,
+            ReadinessWaitTransition::Finished,
+        ] {
+            let event = ReadinessWaitEvent {
+                transition,
+                kind: ReadinessWaitKind::ProbeDump,
+                generation: u64::MAX,
+            };
+            assert_eq!(
+                ReadinessWaitEvent::from_payload(&event.to_payload()),
+                Some(event)
+            );
+        }
+
+        let canonical = ReadinessWaitEvent {
+            transition: ReadinessWaitTransition::Started,
+            kind: ReadinessWaitKind::ProbeDump,
+            generation: 1,
+        }
+        .to_payload();
+        for index in [0usize, 1, 2, 3] {
+            let mut malformed = canonical;
+            malformed[index] = 0xff;
+            assert_eq!(ReadinessWaitEvent::from_payload(&malformed), None);
+        }
+        let mut zero_generation = canonical;
+        zero_generation[4..12].fill(0);
+        assert_eq!(ReadinessWaitEvent::from_payload(&zero_generation), None);
+        assert_eq!(
+            ReadinessWaitEvent::from_payload(&canonical[..canonical.len() - 1]),
+            None
+        );
+    }
+
+    #[test]
+    fn attach_attempt_protocol_round_trips_and_rejects_noncanonical_payloads() {
+        for transition in [
+            AttachAttemptTransition::Started,
+            AttachAttemptTransition::Finished,
+            AttachAttemptTransition::Settled,
+        ] {
+            for kind in [
+                AttachAttemptKind::Boot,
+                AttachAttemptKind::Attach,
+                AttachAttemptKind::Restart,
+                AttachAttemptKind::Replace,
+            ] {
+                let event = AttachAttemptEvent {
+                    transition,
+                    kind,
+                    generation: u64::MAX,
+                };
+                assert_eq!(
+                    AttachAttemptEvent::from_payload(&event.to_payload()),
+                    Some(event)
+                );
+            }
+        }
+
+        let canonical = AttachAttemptEvent {
+            transition: AttachAttemptTransition::Started,
+            kind: AttachAttemptKind::Boot,
+            generation: 1,
+        }
+        .to_payload();
+        for index in [0usize, 1, 2, 3] {
+            let mut malformed = canonical;
+            malformed[index] = 0xff;
+            assert_eq!(AttachAttemptEvent::from_payload(&malformed), None);
+        }
+        let mut zero_generation = canonical;
+        zero_generation[4..12].fill(0);
+        assert_eq!(AttachAttemptEvent::from_payload(&zero_generation), None);
+        assert_eq!(
+            AttachAttemptEvent::from_payload(&canonical[..canonical.len() - 1]),
+            None
+        );
+    }
+
+    #[test]
+    fn attach_cancel_packet_is_generation_tagged_ascii_and_strict() {
+        for generation in [1, 0xAFD3_BFAC_ADAE_D1D3, u64::MAX] {
+            let packet = encode_attach_cancel(generation, AttachCancelCause::ServiceBudget);
+            assert_eq!(packet[0], SIGNAL_ATTACH_CANCEL);
+            assert!(packet[1..].iter().all(u8::is_ascii_hexdigit));
+            assert_eq!(
+                decode_attach_cancel(&packet),
+                Some((generation, AttachCancelCause::ServiceBudget))
+            );
+            assert_eq!(
+                decode_attach_control(&packet),
+                Some(AttachControlPacket::Cancel {
+                    generation,
+                    cause: AttachCancelCause::ServiceBudget,
+                })
+            );
+            // None of the generation bytes can alias a legacy high-byte hvc0
+            // signal while the guest buffers a split cancellation packet.
+            assert!(packet[1..].iter().all(|byte| *byte < 0x80));
+        }
+
+        assert_eq!(
+            decode_attach_cancel(&encode_attach_cancel(0, AttachCancelCause::ServiceBudget)),
+            None
+        );
+        let mut uppercase = encode_attach_cancel(1, AttachCancelCause::ServiceBudget);
+        uppercase[1] = b'A';
+        assert_eq!(decode_attach_cancel(&uppercase), None);
+        assert_eq!(
+            decode_attach_cancel(
+                &encode_attach_cancel(1, AttachCancelCause::ServiceBudget)
+                    [..ATTACH_CANCEL_PACKET_SIZE - 1]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn attach_boundary_acks_are_generation_tagged_ascii_and_disjoint() {
+        let generation = 0x1234_abcd_9876_ef01;
+        let started = encode_attach_started_ack(generation);
+        let finished = encode_attach_finished_ack(generation);
+        let cancel = encode_attach_cancel(generation, AttachCancelCause::ServiceBudget);
+        assert_eq!(started[0], SIGNAL_ATTACH_STARTED_ACK);
+        assert_eq!(finished[0], SIGNAL_ATTACH_FINISHED_ACK);
+        assert!(started[1..].iter().all(u8::is_ascii_hexdigit));
+        assert!(finished[1..].iter().all(u8::is_ascii_hexdigit));
+        assert_eq!(decode_attach_started_ack(&started), Some(generation));
+        assert_eq!(decode_attach_finished_ack(&finished), Some(generation));
+        assert_eq!(decode_attach_finished_ack(&started), None);
+        assert_eq!(decode_attach_started_ack(&finished), None);
+        assert_eq!(decode_attach_cancel(&started), None);
+        assert_eq!(decode_attach_cancel(&finished), None);
+        assert_eq!(decode_attach_started_ack(&cancel), None,);
+        assert_eq!(
+            decode_attach_started_ack(&encode_attach_started_ack(0)),
+            None
+        );
+        assert_eq!(
+            decode_attach_finished_ack(&encode_attach_finished_ack(0)),
+            None
+        );
+        assert_eq!(
+            decode_attach_control(&[crate::vmm::virtio_console::SIGNAL_VC_DUMP]),
+            None
+        );
     }
 
     /// `LifecyclePhase` round-trips through `wire_value` →

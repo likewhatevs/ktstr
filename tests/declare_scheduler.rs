@@ -20,8 +20,9 @@
 use ktstr::assert::Assert;
 use ktstr::declare_scheduler;
 use ktstr::test_support::{
-    BinaryKindJson, KTSTR_SCHEDULERS, Scheduler, SchedulerJson, SchedulerSpec, Sysctl,
-    TopologyConstraints, find_scheduler,
+    BinaryKindJson, KTSTR_SCHEDULERS, SCHEDULER_MANIFEST_PROBE_ARG, Scheduler, SchedulerJson,
+    SchedulerManifestProbe, SchedulerSpec, Sysctl, TopologyConstraints, find_scheduler,
+    read_scheduler_manifest_stamp,
 };
 
 // -- minimal expansion --
@@ -50,6 +51,113 @@ fn minimal_expansion_emits_scheduler() {
     assert!(DECLARE_SCHEDULER_MINIMAL.cgroup_parent.is_none());
 }
 
+/// The final-ELF stamp must reproduce the existing runtime registry projection
+/// exactly without starting the binary during production discovery.
+#[test]
+fn scheduler_manifest_elf_stamp_matches_runtime_probe() {
+    let executable = std::env::current_exe().expect("locate integration-test executable");
+    let stamped = read_scheduler_manifest_stamp(&executable)
+        .expect("read scheduler-manifest ELF stamp")
+        .expect("integration-test binary must carry the v1 stamp");
+    let profile_dir = tempfile::tempdir().expect("runtime parity profile directory");
+    let output = std::process::Command::new(&executable)
+        .arg(SCHEDULER_MANIFEST_PROBE_ARG)
+        .env(
+            "LLVM_PROFILE_FILE",
+            profile_dir.path().join("runtime-%p-%m.profraw"),
+        )
+        .output()
+        .expect("run retained runtime parity oracle");
+    assert!(
+        output.status.success(),
+        "runtime manifest probe failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let runtime: SchedulerManifestProbe =
+        serde_json::from_slice(&output.stdout).expect("decode runtime manifest probe");
+    assert_eq!(stamped, runtime);
+}
+
+/// A corrupt nested descriptor must identify the precise declaration field
+/// instead of degrading into an empty manifest or process execution.
+#[test]
+fn scheduler_manifest_elf_stamp_rejects_out_of_range_string() {
+    let executable = std::env::current_exe().expect("locate integration-test executable");
+    let mut bytes = std::fs::read(&executable).expect("read integration-test executable");
+    let record_offset = {
+        let elf = goblin::elf::Elf::parse(&bytes).expect("parse integration-test ELF");
+        let section = elf
+            .section_headers
+            .iter()
+            .find(|section| {
+                elf.shdr_strtab.get_at(section.sh_name)
+                    == Some("linkme_KTSTR_SCHEDULER_MANIFEST_DECLARATIONS_V1")
+            })
+            .expect("declaration stamp section");
+        let section_offset = usize::try_from(section.sh_offset).expect("section offset");
+        let record_size =
+            std::mem::size_of::<ktstr::test_support::SchedulerManifestDeclarationStampV1>();
+        (0..usize::try_from(section.sh_size).expect("section size") / record_size)
+            .map(|index| section_offset + index * record_size)
+            // StampHeaderV1.kind is the little-endian u16 at byte 10.
+            .find(|offset| bytes[*offset + 10..*offset + 12] == 1u16.to_le_bytes())
+            .expect("at least one declaration record")
+    };
+    // StampHeaderV1 is 16 bytes and the first field is StampStr { ptr, len };
+    // overwrite that name length while leaving the relocation-backed pointer
+    // intact.
+    bytes[record_offset + 24..record_offset + 32].copy_from_slice(&u64::MAX.to_le_bytes());
+    let temp = tempfile::NamedTempFile::new().expect("temporary corrupt ELF");
+    std::fs::write(temp.path(), bytes).expect("write corrupt ELF");
+    let error = read_scheduler_manifest_stamp(temp.path()).expect_err("corrupt stamp must fail");
+    assert!(
+        error.contains("declaration record") && error.contains(".name"),
+        "corruption diagnostic must identify the declaration name: {error}",
+    );
+}
+
+/// The same allocated record graph is valid in ET_EXEC as well as Rust's
+/// default PIE (ET_DYN) test binaries.
+#[test]
+fn scheduler_manifest_elf_stamp_accepts_et_exec() {
+    let executable = std::env::current_exe().expect("locate integration-test executable");
+    let expected = read_scheduler_manifest_stamp(&executable)
+        .expect("read PIE scheduler-manifest stamp")
+        .expect("integration-test binary must carry the v1 stamp");
+    let mut bytes = std::fs::read(&executable).expect("read integration-test executable");
+    // ELF64 e_type is the little-endian u16 at byte offset 16. Nothing in the
+    // stamp graph depends on PIE load bias; its relocation addends and PT_LOAD
+    // virtual addresses remain the same under this ET_EXEC fixture.
+    bytes[16..18].copy_from_slice(&goblin::elf::header::ET_EXEC.to_le_bytes());
+    let temp = tempfile::NamedTempFile::new().expect("temporary ET_EXEC ELF");
+    std::fs::write(temp.path(), bytes).expect("write ET_EXEC ELF");
+    let actual = read_scheduler_manifest_stamp(temp.path())
+        .expect("read ET_EXEC scheduler-manifest stamp")
+        .expect("ET_EXEC fixture must retain v1 stamp");
+    assert_eq!(actual, expected);
+}
+
+/// Discovery is file introspection, not a disguised child launch: a readable
+/// copy with every execute bit cleared still yields the complete manifest.
+#[cfg(unix)]
+#[test]
+fn scheduler_manifest_elf_stamp_reads_non_executable_copy() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let executable = std::env::current_exe().expect("locate integration-test executable");
+    let expected = read_scheduler_manifest_stamp(&executable)
+        .expect("read original scheduler-manifest stamp")
+        .expect("integration-test binary must carry the v1 stamp");
+    let temp = tempfile::NamedTempFile::new().expect("temporary non-executable ELF");
+    std::fs::copy(&executable, temp.path()).expect("copy integration-test ELF");
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o644))
+        .expect("clear execute bits");
+    let actual = read_scheduler_manifest_stamp(temp.path())
+        .expect("read non-executable scheduler-manifest stamp")
+        .expect("non-executable copy must retain v1 stamp");
+    assert_eq!(actual, expected);
+}
+
 // -- full field set --
 
 declare_scheduler!(DECLARE_SCHEDULER_FULL, {
@@ -57,7 +165,7 @@ declare_scheduler!(DECLARE_SCHEDULER_FULL, {
     binary = "scx-full",
     sched_args = ["--a", "--b"],
     kernels = ["6.14", "7.0..7.2"],
-    verifier_exclude_topologies = ["240cpu-15llc-smt2", "240cpu-15llc-nosmt"],
+    verifier_exclude_topologies = ["240cpu-15llc-smt", "240cpu-15llc-nosmt"],
     cgroup_parent = "/declare_scheduler_full",
     kargs = ["nosmt"],
     sysctls = [Sysctl::new("kernel.k", "v")],
@@ -78,7 +186,7 @@ fn full_field_set_roundtrips() {
     assert_eq!(DECLARE_SCHEDULER_FULL.kernels, &["6.14", "7.0..7.2"]);
     assert_eq!(
         DECLARE_SCHEDULER_FULL.verifier_exclude_topologies,
-        &["240cpu-15llc-smt2", "240cpu-15llc-nosmt"],
+        &["240cpu-15llc-smt", "240cpu-15llc-nosmt"],
     );
     assert_eq!(DECLARE_SCHEDULER_FULL.kargs, &["nosmt"]);
     assert_eq!(DECLARE_SCHEDULER_FULL.sysctls.len(), 1);
@@ -638,10 +746,19 @@ fn scheduler_json_serde_roundtrip() {
         BinaryKindJson::Discover("scx-full".to_string())
     );
     assert_eq!(back.sched_args, vec!["--a", "--b"]);
+    assert_eq!(back.sysctls.len(), 1);
+    assert_eq!(back.sysctls[0].key, "kernel.k");
+    assert_eq!(back.sysctls[0].value, "v");
+    assert_eq!(back.kargs, vec!["nosmt"]);
+    assert_eq!(
+        back.cgroup_parent.as_deref(),
+        Some("/declare_scheduler_full"),
+    );
+    assert_eq!(back.config_file.as_deref(), Some("cfg.toml"));
     assert_eq!(back.kernels, vec!["6.14", "7.0..7.2"]);
     assert_eq!(
         back.verifier_exclude_topologies,
-        vec!["240cpu-15llc-smt2", "240cpu-15llc-nosmt"],
+        vec!["240cpu-15llc-smt", "240cpu-15llc-nosmt"],
     );
     assert_eq!(back.constraints.min_llcs, 1);
     assert_eq!(back.constraints.max_llcs, Some(8));

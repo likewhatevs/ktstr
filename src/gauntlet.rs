@@ -15,8 +15,11 @@ pub struct TopoPreset {
     #[allow(dead_code)]
     pub description: &'static str,
     pub topology: Topology,
-    /// Memory budget for this preset's VM; read by preset-audit tests only.
-    #[allow(dead_code)]
+    /// Memory budget for this preset's verifier VM.
+    ///
+    /// This caps the topology-derived 64 MiB/vCPU floor; deferred initramfs
+    /// sizing may still raise the actual guest allocation when the test
+    /// binary, kernel, or boot modules require more memory.
     pub memory_mib: usize,
     /// Forced no-perf host-CPU budget for cells running this preset.
     /// `None` (every stock preset) leaves budget resolution to the
@@ -26,7 +29,7 @@ pub struct TopoPreset {
     /// of host size, so a preset whose vCPU count exceeds `n` ALWAYS
     /// time-slices (deliberate, continuous overcommit). Consumed by the
     /// verifier cell path ([`crate::verifier::collect_verifier_output`]).
-    /// The only preset that sets it (uneven-11llc) is also non-uniform,
+    /// The only preset that sets it (192cpu-11llc-smt) is also non-uniform,
     /// hence verifier-only (the gauntlet path skips `llc_cores` presets —
     /// see `for_each_gauntlet_variant`), so the forced budget is realized
     /// exclusively in the verifier battery. A future uniform forced-budget
@@ -37,16 +40,16 @@ pub struct TopoPreset {
 
 /// Topology presets used by gauntlet mode.
 ///
-/// Covers topologies from `tiny-1llc` (4 CPUs) up through the
-/// `252cpu-14llc-smt2` / `252cpu-14llc-nosmt` presets (252 CPUs,
-/// near the KVM vCPU limit), plus `uneven-11llc` (192 CPUs across 11
+/// Covers topologies from `4cpu-1llc-nosmt` (4 CPUs) up through the
+/// `252cpu-14llc-smt` / `252cpu-14llc-nosmt` presets (252 CPUs,
+/// near the KVM vCPU limit), plus `192cpu-11llc-smt` (192 CPUs across 11
 /// NON-uniform LLCs), spanning SMT, non-SMT (`-nosmt`), and multi-NUMA
-/// (`numa2-*`, `numa4-*`) families. The stock presets are built from
-/// the `defs` / `numa_defs` tuple tables; `uneven-11llc` is appended
+/// (`2numa-*`, `4numa-*`) families. The stock presets are built from
+/// the `defs` / `numa_defs` tuple tables; `192cpu-11llc-smt` is appended
 /// explicitly because it carries per-LLC core counts and a forced CPU
 /// budget the uniform tuple shape cannot express.
 ///
-/// `uneven-11llc` targets schedulers whose per-LLC math assumes
+/// `192cpu-11llc-smt` targets schedulers whose per-LLC math assumes
 /// equal-sized caches: ten LLCs of 18 logical CPUs and one of 12
 /// (`llc_cores = [9;10] + [6]`, packing width 9). It is VERIFIER-ONLY —
 /// the gauntlet execution path reconstructs topology from a uniform
@@ -61,7 +64,7 @@ pub struct TopoPreset {
 /// The full set is returned unconditionally; the only filter applied
 /// here is the aarch64 retain below, which drops SMT presets
 /// (`threads_per_core > 1`) because ARM64 CPUs have no SMT (the
-/// non-SMT medium/large/max presets keep ARM64's topology scale
+/// non-SMT scale presets keep ARM64's topology scale
 /// coverage). The multi-NUMA presets are *not* filtered here: the
 /// default [`crate::test_support::TopologyConstraints`]
 /// (`max_numa_nodes: Some(1)`) excludes them at test-selection time
@@ -69,19 +72,19 @@ pub struct TopoPreset {
 /// the bound.
 pub fn gauntlet_presets() -> Vec<TopoPreset> {
     let defs: &[(&str, &str, u32, u32, u32, usize)] = &[
-        ("tiny-1llc", "4 CPUs, 1 LLC", 1, 4, 1, 2048),
-        ("tiny-2llc", "4 CPUs, 2 LLCs", 2, 2, 1, 2048),
-        ("odd-3llc", "9 CPUs, 3 LLCs (odd)", 3, 3, 1, 2048),
-        ("odd-5llc", "15 CPUs, 5 LLCs (prime)", 5, 3, 1, 2048),
-        ("odd-7llc", "14 CPUs, 7 LLCs (prime)", 7, 2, 1, 2048),
-        ("smt-2llc", "8 CPUs, 2 LLCs with SMT", 2, 2, 2, 2048),
-        ("smt-3llc", "12 CPUs, 3 LLCs with SMT", 3, 2, 2, 2048),
-        ("medium-4llc", "32 CPUs, 4 LLCs", 4, 4, 2, 2048),
-        ("medium-8llc", "64 CPUs, 8 LLCs", 8, 4, 2, 2048),
-        ("large-4llc", "128 CPUs, 4 LLCs", 4, 16, 2, 2048),
-        ("large-8llc", "128 CPUs, 8 LLCs", 8, 8, 2, 2048),
+        ("4cpu-1llc-nosmt", "4 CPUs, 1 LLC", 1, 4, 1, 2048),
+        ("4cpu-2llc-nosmt", "4 CPUs, 2 LLCs", 2, 2, 1, 2048),
+        ("9cpu-3llc-nosmt", "9 CPUs, 3 LLCs (odd)", 3, 3, 1, 2048),
+        ("15cpu-5llc-nosmt", "15 CPUs, 5 LLCs (prime)", 5, 3, 1, 2048),
+        ("14cpu-7llc-nosmt", "14 CPUs, 7 LLCs (prime)", 7, 2, 1, 2048),
+        ("8cpu-2llc-smt", "8 CPUs, 2 LLCs with SMT", 2, 2, 2, 2048),
+        ("12cpu-3llc-smt", "12 CPUs, 3 LLCs with SMT", 3, 2, 2, 2048),
+        ("32cpu-4llc-smt", "32 CPUs, 4 LLCs", 4, 4, 2, 2048),
+        ("64cpu-8llc-smt", "64 CPUs, 8 LLCs", 8, 4, 2, 2048),
+        ("128cpu-4llc-smt", "128 CPUs, 4 LLCs", 4, 16, 2, 2048),
+        ("128cpu-8llc-smt", "128 CPUs, 8 LLCs", 8, 8, 2, 2048),
         (
-            "240cpu-15llc-smt2",
+            "240cpu-15llc-smt",
             "240 CPUs, 15 LLCs with SMT",
             15,
             8,
@@ -89,17 +92,17 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "252cpu-14llc-smt2",
+            "252cpu-14llc-smt",
             "252 CPUs, 14 LLCs (near KVM vCPU limit)",
             14,
             9,
             2,
             4096,
         ),
-        // Non-SMT medium/large/scale presets for ARM64 coverage.
+        // Non-SMT scale presets for ARM64 coverage.
         // These also run on x86_64 to test non-SMT topologies at scale.
         (
-            "medium-4llc-nosmt",
+            "32cpu-4llc-nosmt",
             "32 CPUs, 4 LLCs (no SMT)",
             4,
             8,
@@ -107,7 +110,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "medium-8llc-nosmt",
+            "64cpu-8llc-nosmt",
             "64 CPUs, 8 LLCs (no SMT)",
             8,
             8,
@@ -115,7 +118,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "large-4llc-nosmt",
+            "128cpu-4llc-nosmt",
             "128 CPUs, 4 LLCs (no SMT)",
             4,
             32,
@@ -123,7 +126,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "large-8llc-nosmt",
+            "128cpu-8llc-nosmt",
             "128 CPUs, 8 LLCs (no SMT)",
             8,
             16,
@@ -155,7 +158,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
         // the verifier under `accepts_verifier` (default numa cap
         // ignored).
         (
-            "numa2-2llc",
+            "2numa-32cpu-2llc-smt",
             "32 CPUs, 2 NUMA nodes, 2 LLCs (one LLC per node, SMT)",
             2,
             2,
@@ -164,7 +167,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "numa2-4llc",
+            "2numa-16cpu-4llc-nosmt",
             "16 CPUs, 2 NUMA nodes, 4 LLCs",
             2,
             4,
@@ -173,7 +176,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "numa2-8llc",
+            "2numa-128cpu-8llc-smt",
             "128 CPUs, 2 NUMA nodes, 8 LLCs",
             2,
             8,
@@ -182,7 +185,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "numa2-8llc-nosmt",
+            "2numa-128cpu-8llc-nosmt",
             "128 CPUs, 2 NUMA nodes, 8 LLCs (no SMT)",
             2,
             8,
@@ -191,7 +194,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "numa4-8llc",
+            "4numa-32cpu-8llc-nosmt",
             "32 CPUs, 4 NUMA nodes, 8 LLCs",
             4,
             8,
@@ -200,7 +203,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
             2048,
         ),
         (
-            "numa4-12llc",
+            "4numa-192cpu-12llc-smt",
             "192 CPUs, 4 NUMA nodes, 12 LLCs",
             4,
             12,
@@ -244,7 +247,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
         }))
         .collect();
 
-    // uneven-11llc: 11 LLCs, ten with 9 cores (18 logical CPUs) and one
+    // 192cpu-11llc-smt: 11 LLCs, ten with 9 cores (18 logical CPUs) and one
     // with 6 (12 logical CPUs) = 192 CPUs. NON-uniform LLC sizing (the
     // point): schedulers that assume equal-sized LLCs mis-place work on
     // the short cache. Packing width `cores_per_llc = 9` reserves a
@@ -257,7 +260,7 @@ pub fn gauntlet_presets() -> Vec<TopoPreset> {
     // express only uniform shapes with no forced budget).
     static UNEVEN_11LLC_CORES: [u32; 11] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 6];
     presets.push(TopoPreset {
-        name: "uneven-11llc",
+        name: "192cpu-11llc-smt",
         description: "192 CPUs, 11 LLCs (uneven: ten 18-CPU + one 12-CPU, SMT)",
         topology: Topology {
             llcs: 11,
@@ -330,44 +333,44 @@ mod tests {
     fn gauntlet_presets_topology_pinned() {
         // (name, expected LLCs, expected total CPUs)
         let expected: &[(&str, u32, u32)] = &[
-            ("tiny-1llc", 1, 4),
-            ("tiny-2llc", 2, 4),
-            ("odd-3llc", 3, 9),
-            ("odd-5llc", 5, 15),
-            ("odd-7llc", 7, 14),
+            ("4cpu-1llc-nosmt", 1, 4),
+            ("4cpu-2llc-nosmt", 2, 4),
+            ("9cpu-3llc-nosmt", 3, 9),
+            ("15cpu-5llc-nosmt", 5, 15),
+            ("14cpu-7llc-nosmt", 7, 14),
             #[cfg(not(target_arch = "aarch64"))]
-            ("smt-2llc", 2, 8),
+            ("8cpu-2llc-smt", 2, 8),
             #[cfg(not(target_arch = "aarch64"))]
-            ("smt-3llc", 3, 12),
+            ("12cpu-3llc-smt", 3, 12),
             #[cfg(not(target_arch = "aarch64"))]
-            ("medium-4llc", 4, 32),
+            ("32cpu-4llc-smt", 4, 32),
             #[cfg(not(target_arch = "aarch64"))]
-            ("medium-8llc", 8, 64),
+            ("64cpu-8llc-smt", 8, 64),
             #[cfg(not(target_arch = "aarch64"))]
-            ("large-4llc", 4, 128),
+            ("128cpu-4llc-smt", 4, 128),
             #[cfg(not(target_arch = "aarch64"))]
-            ("large-8llc", 8, 128),
+            ("128cpu-8llc-smt", 8, 128),
             #[cfg(not(target_arch = "aarch64"))]
-            ("240cpu-15llc-smt2", 15, 240),
+            ("240cpu-15llc-smt", 15, 240),
             #[cfg(not(target_arch = "aarch64"))]
-            ("252cpu-14llc-smt2", 14, 252),
+            ("252cpu-14llc-smt", 14, 252),
             #[cfg(not(target_arch = "aarch64"))]
-            ("uneven-11llc", 11, 192),
-            ("medium-4llc-nosmt", 4, 32),
-            ("medium-8llc-nosmt", 8, 64),
-            ("large-4llc-nosmt", 4, 128),
-            ("large-8llc-nosmt", 8, 128),
+            ("192cpu-11llc-smt", 11, 192),
+            ("32cpu-4llc-nosmt", 4, 32),
+            ("64cpu-8llc-nosmt", 8, 64),
+            ("128cpu-4llc-nosmt", 4, 128),
+            ("128cpu-8llc-nosmt", 8, 128),
             ("240cpu-15llc-nosmt", 15, 240),
             ("252cpu-14llc-nosmt", 14, 252),
-            ("numa2-4llc", 4, 16),
+            ("2numa-16cpu-4llc-nosmt", 4, 16),
             #[cfg(not(target_arch = "aarch64"))]
-            ("numa2-2llc", 2, 32),
+            ("2numa-32cpu-2llc-smt", 2, 32),
             #[cfg(not(target_arch = "aarch64"))]
-            ("numa2-8llc", 8, 128),
-            ("numa2-8llc-nosmt", 8, 128),
-            ("numa4-8llc", 8, 32),
+            ("2numa-128cpu-8llc-smt", 8, 128),
+            ("2numa-128cpu-8llc-nosmt", 8, 128),
+            ("4numa-32cpu-8llc-nosmt", 8, 32),
             #[cfg(not(target_arch = "aarch64"))]
-            ("numa4-12llc", 12, 192),
+            ("4numa-192cpu-12llc-smt", 12, 192),
         ];
         let presets = gauntlet_presets();
         assert_eq!(
@@ -449,51 +452,28 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_arch = "aarch64"))]
-    fn gauntlet_presets_smt_presets_have_threads() {
-        let presets = gauntlet_presets();
-        for p in &presets {
-            if p.name.starts_with("smt-") {
-                assert_eq!(
-                    p.topology.threads_per_core, 2,
-                    "{} should have 2 threads per core",
-                    p.name
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn gauntlet_presets_odd_presets_are_odd() {
-        let presets = gauntlet_presets();
-        for p in &presets {
-            if p.name.starts_with("odd-") {
-                assert!(
-                    p.topology.llcs % 2 != 0,
-                    "{}: odd-* presets must have odd LLC count, got {} LLCs",
-                    p.name,
-                    p.topology.llcs
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn gauntlet_presets_numa_presets_have_correct_nodes() {
+    fn gauntlet_preset_names_encode_topology() {
         for p in &gauntlet_presets() {
-            if p.name.starts_with("numa2") {
-                assert_eq!(
-                    p.topology.numa_nodes, 2,
-                    "{}: expected 2 NUMA nodes",
-                    p.name
-                );
-            } else if p.name.starts_with("numa4") {
-                assert_eq!(
-                    p.topology.numa_nodes, 4,
-                    "{}: expected 4 NUMA nodes",
-                    p.name
-                );
-            }
+            let smt = if p.topology.threads_per_core > 1 {
+                "smt"
+            } else {
+                "nosmt"
+            };
+            let expected = if p.topology.numa_nodes > 1 {
+                format!(
+                    "{}numa-{}cpu-{}llc-{smt}",
+                    p.topology.numa_nodes,
+                    p.topology.total_cpus(),
+                    p.topology.num_llcs(),
+                )
+            } else {
+                format!(
+                    "{}cpu-{}llc-{smt}",
+                    p.topology.total_cpus(),
+                    p.topology.num_llcs(),
+                )
+            };
+            assert_eq!(p.name, expected, "preset name must encode its topology");
         }
     }
 
@@ -509,16 +489,16 @@ mod tests {
     }
 
     #[test]
-    fn gauntlet_presets_forced_budget_only_on_uneven_11llc() {
+    fn gauntlet_presets_forced_budget_only_on_192cpu_11llc_smt() {
         // Regression pin: the forced-overcommit budget is opt-in per
-        // preset. Exactly `uneven-11llc` carries it; every stock preset
+        // preset. Exactly `192cpu-11llc-smt` carries it; every stock preset
         // leaves it `None` so their cell budgets resolve unchanged.
         for p in &gauntlet_presets() {
             match p.name {
-                "uneven-11llc" => assert_eq!(
+                "192cpu-11llc-smt" => assert_eq!(
                     p.forced_cpu_budget,
                     Some(96),
-                    "uneven-11llc must force a 96-CPU budget"
+                    "192cpu-11llc-smt must force a 96-CPU budget"
                 ),
                 other => assert_eq!(
                     p.forced_cpu_budget, None,
@@ -530,13 +510,13 @@ mod tests {
 
     #[test]
     #[cfg(not(target_arch = "aarch64"))]
-    fn gauntlet_presets_uneven_11llc_is_non_uniform_and_overcommits() {
+    fn gauntlet_presets_192cpu_11llc_smt_is_non_uniform_and_overcommits() {
         let p = gauntlet_presets()
             .into_iter()
-            .find(|p| p.name == "uneven-11llc")
-            .expect("uneven-11llc present on x86_64");
+            .find(|p| p.name == "192cpu-11llc-smt")
+            .expect("192cpu-11llc-smt present on x86_64");
         let t = &p.topology;
-        t.validate().expect("uneven-11llc must validate");
+        t.validate().expect("192cpu-11llc-smt must validate");
         assert_eq!(t.num_llcs(), 11);
         assert_eq!(t.total_cpus(), 192);
         // Ten 18-CPU LLCs + one 12-CPU LLC: NOT uniform.

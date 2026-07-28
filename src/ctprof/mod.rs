@@ -2954,6 +2954,67 @@ fn capture_with(
     sys_root: &Path,
     use_syscall_affinity: bool,
 ) -> CtprofSnapshot {
+    capture_with_pool_builder(
+        proc_root,
+        cgroup_root,
+        sys_root,
+        use_syscall_affinity,
+        |max_threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(max_threads)
+                .build()
+                .map_err(|e| e.to_string())
+        },
+    )
+}
+
+/// [`capture_with`] with an injected phase-1 pool builder.
+///
+/// Production supplies Rayon's bounded [`rayon::ThreadPoolBuilder`].
+/// Tests inject a deterministic build failure to exercise the
+/// resource-exhaustion fallback without manipulating process limits.
+fn capture_with_pool_builder<B>(
+    proc_root: &Path,
+    cgroup_root: &Path,
+    sys_root: &Path,
+    use_syscall_affinity: bool,
+    build_pool: B,
+) -> CtprofSnapshot
+where
+    B: FnOnce(usize) -> Result<rayon::ThreadPool, String>,
+{
+    capture_with_pool_builder_and_capacity(
+        proc_root,
+        cgroup_root,
+        sys_root,
+        use_syscall_affinity,
+        build_pool,
+        || {
+            std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(4)
+        },
+    )
+}
+
+/// [`capture_with_pool_builder`] with an injected logical-CPU capacity.
+///
+/// The extra seam keeps pool-width and failed-builder tests independent of the
+/// host cpuset: a one-CPU CI worker correctly takes the sequential production
+/// path, while the regression test can still force the multi-item builder path
+/// without changing process affinity.
+fn capture_with_pool_builder_and_capacity<B, C>(
+    proc_root: &Path,
+    cgroup_root: &Path,
+    sys_root: &Path,
+    use_syscall_affinity: bool,
+    build_pool: B,
+    available_parallelism: C,
+) -> CtprofSnapshot
+where
+    B: FnOnce(usize) -> Result<rayon::ThreadPool, String>,
+    C: FnOnce() -> usize,
+{
     let captured_at_unix_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -3004,6 +3065,11 @@ fn capture_with(
     // the new upper-layer inode — so the cache misses correctly
     // and re-resolves the rewritten binary.
     let tgids = iter_tgids_at(proc_root);
+    let eligible_tgids: Vec<i32> = tgids
+        .iter()
+        .copied()
+        .filter(|&tgid| tgid != self_pid)
+        .collect();
     let probe_cache: std::sync::Mutex<std::collections::HashMap<(u64, u64), CachedAttachResult>> =
         std::sync::Mutex::new(std::collections::HashMap::new());
     let summary_mutex = std::sync::Mutex::new(ProbeSummary::default());
@@ -3011,232 +3077,231 @@ fn capture_with(
     let probe_map: std::collections::HashMap<i32, Option<crate::host_thread_probe::JemallocProbe>> =
         if use_syscall_affinity {
             use rayon::prelude::*;
-            // Scale parallelism by available CPU headroom: read
-            // `<proc_root>/loadavg`, subtract from online CPU count,
-            // clamp to [1, num_cpus/2 + 1]. Avoids drowning a hot
-            // host. Routing the read through `proc_root` (rather
-            // than `/proc` directly) keeps the parameterised-root
-            // contract intact so synthetic-tree tests can stage
-            // their own loadavg shape.
-            let max_threads = {
-                let num_cpus = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                let load = std::fs::read_to_string(proc_root.join("loadavg"))
-                    .ok()
-                    .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                let headroom = (num_cpus as f64 - load).max(1.0) as usize;
-                headroom.clamp(1, num_cpus / 2 + 1)
-            };
-            // ThreadPoolBuilder::build can fail when the OS rejects
-            // the per-thread `pthread_create` (RLIMIT_NPROC, kernel
-            // task table at PID_MAX). Fall back to the global rayon
-            // pool on Err — capture still completes, only loses the
-            // bounded-headroom guarantee.
-            let pool_result = rayon::ThreadPoolBuilder::new()
-                .num_threads(max_threads)
-                .build();
-            let work = || {
-                tgids
-                    .par_iter()
-                    .copied()
-                    .filter(|&tgid| tgid != self_pid)
-                    .map(|tgid| {
-                        // Catch panics from the per-tgid attach pipeline so
-                        // a single rogue worker (fd exhaustion, OOM during
-                        // DWARF parse, or any panic-on-bug under
-                        // `attach_jemalloc_at`) cannot tear down
-                        // `pool.install` and the surrounding capture call.
-                        // Without this guard, `rayon::ThreadPool::install`
-                        // re-throws worker panics into the calling thread,
-                        // collapsing the entire snapshot into an unwind on
-                        // a single tgid's failure. On panic we record a
-                        // `worker-panic` attach tag against the summary
-                        // (counted under `failed`, surfaced in
-                        // `dominant_failure` when it dominates) and return
-                        // `(tgid, None)` so phase 2 still walks the tgid's
-                        // threads with the absent-counter default. The tag
-                        // is treated as actionable — a panicking attach is
-                        // a bug or resource-exhaustion signal, distinct
-                        // from the benign `jemalloc-not-found` /
-                        // `readlink-failure` outcomes the dominant-tag
-                        // filter suppresses.
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let cache_key =
-                                std::fs::metadata(proc_root.join(tgid.to_string()).join("exe"))
-                                    .ok()
-                                    .map(|m| {
-                                        use std::os::unix::fs::MetadataExt;
-                                        (m.dev(), m.ino())
-                                    });
+            let attach_one = |tgid: i32| {
+                // Catch panics from the per-tgid attach pipeline so
+                // a single rogue worker (fd exhaustion, OOM during
+                // DWARF parse, or any panic-on-bug under
+                // `attach_jemalloc_at`) cannot tear down
+                // `pool.install` and the surrounding capture call.
+                // Without this guard, `rayon::ThreadPool::install`
+                // re-throws worker panics into the calling thread,
+                // collapsing the entire snapshot into an unwind on
+                // a single tgid's failure. On panic we record a
+                // `worker-panic` attach tag against the summary
+                // (counted under `failed`, surfaced in
+                // `dominant_failure` when it dominates) and return
+                // `(tgid, None)` so phase 2 still walks the tgid's
+                // threads with the absent-counter default. The tag
+                // is treated as actionable — a panicking attach is
+                // a bug or resource-exhaustion signal, distinct
+                // from the benign `jemalloc-not-found` /
+                // `readlink-failure` outcomes the dominant-tag
+                // filter suppresses.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let cache_key = std::fs::metadata(proc_root.join(tgid.to_string()).join("exe"))
+                        .ok()
+                        .map(|m| {
+                            use std::os::unix::fs::MetadataExt;
+                            (m.dev(), m.ino())
+                        });
 
-                            if let Some(key) = cache_key {
-                                // `unwrap_or_else(into_inner)` on every
-                                // shared-mutex lock so a prior worker
-                                // panic that poisoned a lock cannot
-                                // cascade-poison every subsequent worker
-                                // — the catch_unwind arm below records
-                                // the failure as a `worker-panic`
-                                // attach-tag bump, and surviving workers
-                                // should still make progress on the
-                                // partially-mutated state rather than
-                                // re-panicking out of `pool.install` and
-                                // collapsing the snapshot.
-                                let cached = probe_cache.lock_unpoisoned().get(&key).cloned();
-                                if let Some(cached_result) = cached {
-                                    let mut s = summary_mutex.lock_unpoisoned();
-                                    s.tgids_walked += 1;
-                                    match &cached_result.failed_tag {
-                                        None => {
-                                            // Success path — original miss
-                                            // already credited
-                                            // `jemalloc_detected`. Re-apply
-                                            // here so cache hits stay
-                                            // symmetric with cache misses;
-                                            // without this, only the first
-                                            // sharer of a `(dev, ino)`
-                                            // would count toward
-                                            // `jemalloc_detected` and
-                                            // every subsequent reuse
-                                            // would silently undercount.
-                                            s.jemalloc_detected += 1;
-                                            tracing::debug!(
-                                                tgid,
-                                                "ctprof probe: cache hit (jemalloc)"
-                                            );
-                                        }
-                                        Some(tag) => {
-                                            // Failure path — re-apply the
-                                            // SAME bookkeeping
-                                            // [`record_attach_outcome`]
-                                            // applied on the original
-                                            // miss: bump
-                                            // `attach_tag_counts[tag]`
-                                            // unconditionally, and
-                                            // `failed` for actionable
-                                            // tags only (matching the
-                                            // dominant-tag filter in
-                                            // [`ProbeSummary::dominant_tag`]).
-                                            // Without this, repeat hits
-                                            // on a failed binary would
-                                            // credit only `tgids_walked`
-                                            // and the dominant-failure
-                                            // signal would degrade as
-                                            // shared-inode reuse climbs.
-                                            // Logging stays at debug level
-                                            // — the original miss already
-                                            // emitted the warn-level event
-                                            // for actionable tags; spamming
-                                            // a warn per cache hit would
-                                            // drown the operator log.
-                                            *s.attach_tag_counts.entry(tag).or_insert(0) += 1;
-                                            if !matches!(
-                                                *tag,
-                                                "jemalloc-not-found" | "readlink-failure"
-                                            ) {
-                                                s.failed += 1;
-                                            }
-                                            tracing::debug!(
-                                                tgid,
-                                                tag,
-                                                "ctprof probe: cache hit (prior failure)"
-                                            );
-                                        }
-                                    }
-                                    cached_result.probe
-                                } else {
-                                    // Stateless attach (the expensive ELF parse +
-                                    // DWARF walk) runs OUTSIDE the summary mutex
-                                    // so rayon workers parallelise it. The lock
-                                    // is only held for the cheap counter +
-                                    // tracing application via `record_attach_outcome`.
-                                    //
-                                    // Shared-inode cache misses can produce
-                                    // duplicate parses when N workers enter
-                                    // simultaneously — all run the attach before
-                                    // any inserts. The cache fully amortises
-                                    // subsequent lookups; the duplicate work is
-                                    // bounded by the rayon pool size.
-                                    let outcome = attach_probe_for_tgid_at(proc_root, tgid);
-                                    let mut s = summary_mutex.lock_unpoisoned();
-                                    let res = record_attach_outcome(tgid, outcome, &mut s);
-                                    drop(s);
-                                    let probe = res.probe.clone();
-                                    probe_cache.lock_unpoisoned().insert(key, res);
-                                    probe
+                    if let Some(key) = cache_key {
+                        // `unwrap_or_else(into_inner)` on every
+                        // shared-mutex lock so a prior worker
+                        // panic that poisoned a lock cannot
+                        // cascade-poison every subsequent worker
+                        // — the catch_unwind arm below records
+                        // the failure as a `worker-panic`
+                        // attach-tag bump, and surviving workers
+                        // should still make progress on the
+                        // partially-mutated state rather than
+                        // re-panicking out of `pool.install` and
+                        // collapsing the snapshot.
+                        let cached = probe_cache.lock_unpoisoned().get(&key).cloned();
+                        if let Some(cached_result) = cached {
+                            let mut s = summary_mutex.lock_unpoisoned();
+                            s.tgids_walked += 1;
+                            match &cached_result.failed_tag {
+                                None => {
+                                    // Success path — original miss
+                                    // already credited
+                                    // `jemalloc_detected`. Re-apply
+                                    // here so cache hits stay
+                                    // symmetric with cache misses;
+                                    // without this, only the first
+                                    // sharer of a `(dev, ino)`
+                                    // would count toward
+                                    // `jemalloc_detected` and
+                                    // every subsequent reuse
+                                    // would silently undercount.
+                                    s.jemalloc_detected += 1;
+                                    tracing::debug!(tgid, "ctprof probe: cache hit (jemalloc)");
                                 }
-                            } else {
-                                // No cache key — exe symlink unreadable. Same
-                                // attach-outside-lock pattern as the cache-miss
-                                // branch above; result is not cached because
-                                // there's no key to file it under.
-                                let outcome = attach_probe_for_tgid_at(proc_root, tgid);
-                                let mut s = summary_mutex.lock_unpoisoned();
-                                record_attach_outcome(tgid, outcome, &mut s).probe
+                                Some(tag) => {
+                                    // Failure path — re-apply the
+                                    // SAME bookkeeping
+                                    // [`record_attach_outcome`]
+                                    // applied on the original
+                                    // miss: bump
+                                    // `attach_tag_counts[tag]`
+                                    // unconditionally, and
+                                    // `failed` for actionable
+                                    // tags only (matching the
+                                    // dominant-tag filter in
+                                    // [`ProbeSummary::dominant_tag`]).
+                                    // Without this, repeat hits
+                                    // on a failed binary would
+                                    // credit only `tgids_walked`
+                                    // and the dominant-failure
+                                    // signal would degrade as
+                                    // shared-inode reuse climbs.
+                                    // Logging stays at debug level
+                                    // — the original miss already
+                                    // emitted the warn-level event
+                                    // for actionable tags; spamming
+                                    // a warn per cache hit would
+                                    // drown the operator log.
+                                    *s.attach_tag_counts.entry(tag).or_insert(0) += 1;
+                                    if !matches!(*tag, "jemalloc-not-found" | "readlink-failure") {
+                                        s.failed += 1;
+                                    }
+                                    tracing::debug!(
+                                        tgid,
+                                        tag,
+                                        "ctprof probe: cache hit (prior failure)"
+                                    );
+                                }
                             }
-                        }));
-                        let probe = match result {
-                            Ok(p) => p,
-                            Err(panic_payload) => {
-                                // Recover the panic message string for
-                                // the operator log. The payload is a
-                                // `Box<dyn Any + Send>` whose runtime
-                                // type is `&'static str` for `panic!("…")`
-                                // with a literal and `String` for
-                                // `panic!("{…}", …)` with formatted args.
-                                // Both of `attach_jemalloc_at`'s likely
-                                // panic sites (and the test seam in
-                                // `attach_probe_for_tgid_at`) panic with
-                                // a formatted message → `String`. Other
-                                // panic types (typed values, custom
-                                // payloads) collapse to a placeholder so
-                                // the log line still surfaces the tgid.
-                                let panic_msg = panic_payload
-                                    .downcast_ref::<&str>()
-                                    .copied()
-                                    .or_else(|| {
-                                        panic_payload.downcast_ref::<String>().map(|s| s.as_str())
-                                    })
-                                    .unwrap_or("<non-string panic payload>");
-                                // Bump counters to mirror what
-                                // `record_attach_outcome` would have done
-                                // for an attach error: tgids_walked++,
-                                // worker-panic tag++, failed++. The lock
-                                // may be poisoned if the inner panic
-                                // happened mid-update of the summary, so
-                                // recover via
-                                // [`crate::sync::MutexExt::lock_unpoisoned`]
-                                // rather than `.unwrap()` — bumping a
-                                // counter on partially-mutated state is
-                                // strictly less bad than re-panicking out
-                                // of the worker and tearing down
-                                // `pool.install`.
-                                let mut s = summary_mutex.lock_unpoisoned();
-                                s.tgids_walked += 1;
-                                *s.attach_tag_counts.entry("worker-panic").or_insert(0) += 1;
-                                s.failed += 1;
-                                tracing::error!(
-                                    tgid,
-                                    panic_msg,
-                                    "ctprof probe: attach worker panicked; tgid skipped",
-                                );
-                                None
-                            }
-                        };
-                        (tgid, probe)
-                    })
-                    .collect()
+                            cached_result.probe
+                        } else {
+                            // Stateless attach (the expensive ELF parse +
+                            // DWARF walk) runs OUTSIDE the summary mutex
+                            // so rayon workers parallelise it. The lock
+                            // is only held for the cheap counter +
+                            // tracing application via `record_attach_outcome`.
+                            //
+                            // Shared-inode cache misses can produce
+                            // duplicate parses when N workers enter
+                            // simultaneously — all run the attach before
+                            // any inserts. The cache fully amortises
+                            // subsequent lookups; the duplicate work is
+                            // bounded by the rayon pool size.
+                            let outcome = attach_probe_for_tgid_at(proc_root, tgid);
+                            let mut s = summary_mutex.lock_unpoisoned();
+                            let res = record_attach_outcome(tgid, outcome, &mut s);
+                            drop(s);
+                            let probe = res.probe.clone();
+                            probe_cache.lock_unpoisoned().insert(key, res);
+                            probe
+                        }
+                    } else {
+                        // No cache key — exe symlink unreadable. Same
+                        // attach-outside-lock pattern as the cache-miss
+                        // branch above; result is not cached because
+                        // there's no key to file it under.
+                        let outcome = attach_probe_for_tgid_at(proc_root, tgid);
+                        let mut s = summary_mutex.lock_unpoisoned();
+                        record_attach_outcome(tgid, outcome, &mut s).probe
+                    }
+                }));
+                let probe = match result {
+                    Ok(p) => p,
+                    Err(panic_payload) => {
+                        // Recover the panic message string for
+                        // the operator log. The payload is a
+                        // `Box<dyn Any + Send>` whose runtime
+                        // type is `&'static str` for `panic!("…")`
+                        // with a literal and `String` for
+                        // `panic!("{…}", …)` with formatted args.
+                        // Both of `attach_jemalloc_at`'s likely
+                        // panic sites (and the test seam in
+                        // `attach_probe_for_tgid_at`) panic with
+                        // a formatted message → `String`. Other
+                        // panic types (typed values, custom
+                        // payloads) collapse to a placeholder so
+                        // the log line still surfaces the tgid.
+                        let panic_msg = panic_payload
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic_payload.downcast_ref::<String>().map(|s| s.as_str()))
+                            .unwrap_or("<non-string panic payload>");
+                        // Bump counters to mirror what
+                        // `record_attach_outcome` would have done
+                        // for an attach error: tgids_walked++,
+                        // worker-panic tag++, failed++. The lock
+                        // may be poisoned if the inner panic
+                        // happened mid-update of the summary, so
+                        // recover via
+                        // [`crate::sync::MutexExt::lock_unpoisoned`]
+                        // rather than `.unwrap()` — bumping a
+                        // counter on partially-mutated state is
+                        // strictly less bad than re-panicking out
+                        // of the worker and tearing down
+                        // `pool.install`.
+                        let mut s = summary_mutex.lock_unpoisoned();
+                        s.tgids_walked += 1;
+                        *s.attach_tag_counts.entry("worker-panic").or_insert(0) += 1;
+                        s.failed += 1;
+                        tracing::error!(
+                            tgid,
+                            panic_msg,
+                            "ctprof probe: attach worker panicked; tgid skipped",
+                        );
+                        None
+                    }
+                };
+                (tgid, probe)
             };
-            match pool_result {
-                Ok(pool) => pool.install(work),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        max_threads,
-                        "rayon ThreadPoolBuilder failed; falling back to global pool"
-                    );
-                    work()
+
+            // Select the exact work set before considering a worker pool.
+            // Empty and single-TGID captures stay on the caller and never
+            // initialize Rayon. Larger captures retain the existing
+            // CPU-headroom cap, additionally bounded by actual eligible
+            // TGIDs so a sparse proc tree cannot create a host-sized idle
+            // pool.
+            if eligible_tgids.len() <= 1 {
+                eligible_tgids.iter().copied().map(&attach_one).collect()
+            } else {
+                // Scale parallelism by available CPU headroom: read
+                // `<proc_root>/loadavg`, subtract from online CPU count,
+                // clamp to [1, num_cpus/2 + 1]. Routing the read through
+                // `proc_root` keeps synthetic-tree tests deterministic.
+                let configured_max_threads = {
+                    let num_cpus = available_parallelism().max(1);
+                    let load = std::fs::read_to_string(proc_root.join("loadavg"))
+                        .ok()
+                        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let headroom = (num_cpus as f64 - load).max(1.0) as usize;
+                    headroom.clamp(1, num_cpus / 2 + 1)
+                };
+                let max_threads = configured_max_threads.min(eligible_tgids.len());
+
+                if max_threads <= 1 {
+                    eligible_tgids.iter().copied().map(&attach_one).collect()
+                } else {
+                    // A failed private-pool build must remain sequential:
+                    // using `par_iter` outside `pool.install` would lazily
+                    // create Rayon's host-sized global pool precisely while
+                    // the process is resource constrained.
+                    match build_pool(max_threads) {
+                        Ok(pool) => pool.install(|| {
+                            eligible_tgids
+                                .par_iter()
+                                .copied()
+                                .map(&attach_one)
+                                .collect()
+                        }),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                max_threads,
+                                work_items = eligible_tgids.len(),
+                                "rayon ThreadPoolBuilder failed; falling back to sequential probe attach"
+                            );
+                            eligible_tgids.iter().copied().map(&attach_one).collect()
+                        }
+                    }
                 }
             }
         } else {

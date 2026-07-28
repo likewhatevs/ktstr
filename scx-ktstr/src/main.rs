@@ -249,3 +249,42 @@ fn main() -> Result<()> {
 
     run(shutdown).map(|_| ())
 }
+
+#[cfg(test)]
+mod tests {
+    const BPF_SOURCE: &str = include_str!("bpf/main.bpf.c");
+
+    #[test]
+    fn enqueue_routes_every_kernel_thread_locally_before_shared_dsq() {
+        let enqueue = BPF_SOURCE
+            .split_once("void BPF_STRUCT_OPS(ktstr_enqueue")
+            .expect("ktstr_enqueue must remain present")
+            .1
+            .split_once("void BPF_STRUCT_OPS(ktstr_dispatch")
+            .expect("ktstr_dispatch must follow ktstr_enqueue")
+            .0;
+        let kernel_thread_route = enqueue
+            .find("if (p->flags & PF_KTHREAD)")
+            .expect("ktstr_enqueue must route kernel threads unconditionally");
+        let kernel_thread_body = enqueue[kernel_thread_route..]
+            .split_once("return;")
+            .expect("kernel-thread enqueue route must return before workload routing")
+            .0;
+        let shared_dsq_route = enqueue
+            .find("scx_bpf_dsq_insert(p, SHARED_DSQ")
+            .expect("ktstr_enqueue must retain the workload SHARED_DSQ path");
+
+        assert!(
+            kernel_thread_body.contains("scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL"),
+            "kernel threads must be inserted directly into a local DSQ"
+        );
+        assert!(
+            kernel_thread_route < shared_dsq_route,
+            "kernel threads must be diverted before the workload SHARED_DSQ insertion"
+        );
+        assert!(
+            !enqueue.contains("stall && (p->flags & PF_KTHREAD)"),
+            "kernel-thread routing must not depend on stall already being active"
+        );
+    }
+}

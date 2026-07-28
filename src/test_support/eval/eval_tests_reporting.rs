@@ -58,6 +58,64 @@ fn read_primary_exit_kind_reads_stall_from_writer_path() {
     );
 }
 
+#[test]
+fn retry_archives_preceding_primary_and_repro_without_copying_over_them() {
+    let dir = TempDir::new().unwrap();
+    let primary = dir.path().join("retry-000000000000000a.failure-dump.json");
+    let repro = dir
+        .path()
+        .join("retry-000000000000000a.repro.failure-dump.json");
+    let primary_evidence = br#"{"attempt":1,"evidence":"real-primary"}"#;
+    let repro_evidence = br#"{"attempt":1,"evidence":"real-repro"}"#;
+    std::fs::write(&primary, primary_evidence).unwrap();
+    std::fs::write(&repro, repro_evidence).unwrap();
+
+    prepare_failure_dump_path(&primary, Some(2));
+    prepare_failure_dump_path(&repro, Some(2));
+
+    let primary_archive = archived_failure_dump_path(&primary, 1);
+    let repro_archive = archived_failure_dump_path(&repro, 1);
+    assert!(!primary.exists(), "canonical path must be free for retry 2");
+    assert!(
+        !repro.exists(),
+        "canonical repro path must be free for retry 2"
+    );
+    assert_eq!(std::fs::read(&primary_archive).unwrap(), primary_evidence);
+    assert_eq!(std::fs::read(&repro_archive).unwrap(), repro_evidence);
+    assert_eq!(
+        primary_archive.file_name().unwrap(),
+        "retry-000000000000000a.attempt-1.failure-dump.json",
+    );
+    assert_eq!(
+        repro_archive.file_name().unwrap(),
+        "retry-000000000000000a.repro.attempt-1.failure-dump.json",
+    );
+
+    // A less-informative retry-2 placeholder occupies only the canonical
+    // path and cannot destroy retry 1's useful evidence.
+    write_placeholder_failure_dump_reason_if_missing(&primary, "retry 2 never reached guest init");
+    assert_eq!(std::fs::read(&primary_archive).unwrap(), primary_evidence);
+    assert_ne!(std::fs::read(&primary).unwrap(), primary_evidence);
+}
+
+#[test]
+fn first_or_direct_attempt_clears_only_the_canonical_dump() {
+    let dir = TempDir::new().unwrap();
+    let canonical = dir.path().join("retry-000000000000000a.failure-dump.json");
+    let archive = archived_failure_dump_path(&canonical, 1);
+    std::fs::write(&canonical, b"stale canonical").unwrap();
+    std::fs::write(&archive, b"historical archive").unwrap();
+
+    prepare_failure_dump_path(&canonical, Some(1));
+
+    assert!(!canonical.exists());
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        b"historical archive",
+        "first-attempt preparation must not erase separately archived evidence",
+    );
+}
+
 // -- write_placeholder_failure_dump_if_missing --
 //
 // Pins the spec-promise that every failed test leaves a JSON
@@ -211,6 +269,50 @@ fn placeholder_dump_reason_omits_bug_summary_when_none() {
         !reason.contains("BUG SUMMARY"),
         "reason must not mention BUG SUMMARY when no actionable text was extracted: {reason}",
     );
+}
+
+#[test]
+fn placeholder_dump_preserves_structured_sigsegv_diagnostic() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test_sigsegv.failure-dump.json");
+    let result = vmm::VmResult {
+        success: false,
+        crash_message: Some(
+            "fatal signal SIGSEGV: addr=0x200 relative_ip=0x467eed\nbacktrace frame".to_string(),
+        ),
+        ..vmm::VmResult::test_fixture()
+    };
+
+    write_placeholder_failure_dump_if_missing(&path, &result);
+
+    let body = std::fs::read_to_string(&path).unwrap();
+    let report: crate::monitor::dump::FailureDumpReport = serde_json::from_str(&body).unwrap();
+    let reason = report.sdt_alloc_unavailable.as_deref().unwrap();
+    assert!(reason.contains("RUNTIME DIAGNOSTIC:"));
+    assert!(reason.contains("fatal signal SIGSEGV"));
+    assert!(reason.contains("relative_ip=0x467eed"));
+}
+
+#[test]
+fn host_error_placeholder_preserves_queue_diagnostic_and_is_bounded() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test_host_error.failure-dump.json");
+    let diagnostic = format!(
+        "host failed before VM result: queue designated an unknown default placement {}",
+        "x".repeat(MAX_FAILURE_DUMP_DIAGNOSTIC_BYTES * 2),
+    );
+
+    write_placeholder_failure_dump_reason_if_missing(
+        &path,
+        bounded_failure_dump_diagnostic(&diagnostic),
+    );
+
+    let body = std::fs::read_to_string(&path).unwrap();
+    let report: crate::monitor::dump::FailureDumpReport = serde_json::from_str(&body).unwrap();
+    let reason = report.sdt_alloc_unavailable.as_deref().unwrap();
+    assert!(reason.contains("queue designated an unknown default placement"));
+    assert!(reason.ends_with("… [truncated]"));
+    assert!(reason.len() <= MAX_FAILURE_DUMP_DIAGNOSTIC_BYTES + "… [truncated]".len(),);
 }
 
 /// Pin both production call sites of

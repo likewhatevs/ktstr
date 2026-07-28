@@ -5,6 +5,12 @@ fn ktstr() -> Command {
     Command::cargo_bin("ktstr").unwrap()
 }
 
+fn is_host_resource_contention(stderr: &str) -> bool {
+    stderr.contains("LLC slots busy")
+        || stderr.contains("acquire_llc_plan: could not reserve")
+        || stderr.contains("CPU") && stderr.contains("busy")
+}
+
 // -- help output --
 
 #[test]
@@ -215,13 +221,16 @@ fn shell_exec_echo() {
         eprintln!("skipping shell_exec_echo: no cached kernel");
         return;
     }
+    // The shell's own --exec timeout bounds guest execution after admission.
+    // Do not add a parent-process timeout here: under cargo-ktstr the child is
+    // an ordinary late queue participant, and nextest owns the intentionally
+    // admission-inclusive process deadline for this test.
     let output = ktstr()
         .args(["shell", "--exec", "echo hello-from-guest"])
-        .timeout(std::time::Duration::from_secs(120))
         .output()
         .expect("failed to run ktstr shell");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("LLC slots busy") || stderr.contains("CPU") && stderr.contains("busy") {
+    if is_host_resource_contention(&stderr) {
         eprintln!("skipping shell_exec_echo: host resource contention");
         return;
     }
@@ -235,6 +244,13 @@ fn shell_exec_echo() {
         stdout.contains("hello-from-guest"),
         "stdout missing greeting: {stdout}"
     );
+}
+
+#[test]
+fn shell_exec_recognizes_current_resource_contention_diagnostic() {
+    let stderr = "Error: acquire_llc_plan: could not reserve 2 CPU(s) after 4 attempts; \
+                  holders: LLC 0: pid=123";
+    assert!(is_host_resource_contention(stderr));
 }
 
 #[test]
@@ -720,4 +736,50 @@ fn ctprof_compare_invalid_sort_by_direction_errors() {
         .failure()
         .stderr(predicate::str::contains("invalid direction"))
         .stderr(predicate::str::contains("bogus"));
+}
+
+/// A binary that links ktstr but declares no schedulers or ktstr tests still
+/// carries both v1 sentinels. This distinguishes a valid empty registry from
+/// an unrelated/old binary with no stamp.
+#[test]
+fn scheduler_manifest_stamp_represents_a_valid_empty_binary() {
+    // Inspect a separately linked binary which never calls the reader itself.
+    // This proves link retention, rather than accidentally retaining the
+    // sentinels because this integration-test target references their module.
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_ktstr"));
+    let manifest = ktstr::test_support::read_scheduler_manifest_stamp(executable)
+        .expect("read empty scheduler-manifest stamp")
+        .expect("ktstr-linked binary must carry v1 sentinels");
+    assert!(manifest.declarations.is_empty());
+    assert!(manifest.artifact_requirements.is_empty());
+    assert!(manifest.tests.is_empty());
+}
+
+/// Corrupting a versioned record is a hard, local diagnostic rather than an
+/// attempted process launch or a silent "no declarations" result.
+#[test]
+fn scheduler_manifest_stamp_rejects_corrupt_record_magic() {
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_ktstr"));
+    let mut bytes = std::fs::read(executable).expect("read standalone ktstr executable");
+    let offset = {
+        let elf = goblin::elf::Elf::parse(&bytes).expect("parse integration-test ELF");
+        let section = elf
+            .section_headers
+            .iter()
+            .find(|section| {
+                elf.shdr_strtab.get_at(section.sh_name)
+                    == Some("linkme_KTSTR_SCHEDULER_MANIFEST_DECLARATIONS_V1")
+            })
+            .expect("declaration stamp section");
+        usize::try_from(section.sh_offset).expect("section offset")
+    };
+    bytes[offset] ^= 0xff;
+    let temp = tempfile::NamedTempFile::new().expect("temporary corrupt ELF");
+    std::fs::write(temp.path(), bytes).expect("write corrupt ELF");
+    let error = ktstr::test_support::read_scheduler_manifest_stamp(temp.path())
+        .expect_err("corrupt stamp must fail");
+    assert!(
+        error.contains("invalid magic"),
+        "corruption diagnostic must name the invalid magic: {error}",
+    );
 }

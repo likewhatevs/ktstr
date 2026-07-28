@@ -272,23 +272,40 @@ for the wider skip/fail triage.
 The workspace ships a `ci` profile in `.config/nextest.toml`. VM
 boots on a contended runner run slower and flake differently than on
 a dev box, so the CI profile trades latency for stability — longer
-slow-timeouts, one more retry, deferred failure output, and no
-fail-fast:
+slow-timeouts, one more retry, every failure printed as it happens and
+repeated in the final report, and no fail-fast:
 
 ```toml
 [profile.ci]
 slow-timeout = { period = "90s", terminate-after = 3 }
 retries = { backoff = "exponential", count = 6, delay = "1s", jitter = true, max-delay = "3s" }
-failure-output = "final"
+test-threads = 1_000_000
+status-level = "pass"
+final-status-level = "flaky"
+failure-output = "immediate-final"
 fail-fast = false
 
-# Heavier test classes get their own budgets, e.g.:
+# Heavier test classes get their own budgets. Generated cell names are
+# slash-delimited, so filters that target them anchor on that shape — the
+# substring form `test(verifier_)` matches none of them:
 [[profile.ci.overrides]]
-filter = "test(verifier_)"
+filter = "binary(compile_fail) & test(=compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 3 }
 ```
 
-Use it with `--profile ci`. If a test in your repo drives an
+`test-threads` is an admission budget, not a worker count: ktstr's own
+resource registry decides which VM cell starts next, so nextest must not
+impose a second, CPU-sized queue above it (see
+[cargo ktstr](running-tests/cargo-ktstr.md)). Ordinary host tests stay
+CPU-bounded through a `host-tests` group instead.
+
+Use it with `--profile ci`. Overrides resolve **first match per
+setting**, and the shipped config opens each profile's override list
+with one full-suite-drain block covering every resource-taking cell —
+`verifier/` cells included — at `180s × 12`. An override placed below
+that block still contributes `retries`, `test-group`, and the rest, but
+it cannot win `slow-timeout` back for a filter the drain block already
+covers; it has to sit above it. If a test in your repo drives an
 unusually slow boot (huge topology, nested VM), give it its own
 override rather than raising the profile-wide timeout.
 

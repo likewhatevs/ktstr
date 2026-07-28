@@ -150,6 +150,42 @@ const TEARDOWN_IDLE_WIDE_SCHED: Scheduler =
 const TEARDOWN_SPIN_WIDE_SCHED: Scheduler =
     Scheduler::named("progress_wd_teardown_spin_wide").kargs(&["KTSTR_FAULT_TEARDOWN_WEDGE=spin"]);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WedgeRunDisposition {
+    NeverReached,
+    EscapedWithoutTimeout,
+    ReachedAndTimedOut,
+}
+
+fn classify_wedge_run(
+    final_guest_phase: GuestLifecyclePhase,
+    timed_out: bool,
+) -> WedgeRunDisposition {
+    if final_guest_phase < GuestLifecyclePhase::Teardown {
+        WedgeRunDisposition::NeverReached
+    } else if !timed_out {
+        WedgeRunDisposition::EscapedWithoutTimeout
+    } else {
+        WedgeRunDisposition::ReachedAndTimedOut
+    }
+}
+
+#[test]
+fn boot_before_wedge_is_a_non_verdict_even_without_a_timeout() {
+    assert_eq!(
+        classify_wedge_run(GuestLifecyclePhase::Boot, false),
+        WedgeRunDisposition::NeverReached,
+    );
+    assert_eq!(
+        classify_wedge_run(GuestLifecyclePhase::Teardown, false),
+        WedgeRunDisposition::EscapedWithoutTimeout,
+    );
+    assert_eq!(
+        classify_wedge_run(GuestLifecyclePhase::Teardown, true),
+        WedgeRunDisposition::ReachedAndTimedOut,
+    );
+}
+
 /// Shared mechanism gate for the wedge fixtures — the (a)-(d) verdict
 /// logic from the module doc. Asserts WHICH rule killed the run, never
 /// how long the kill took (see "Mechanism assertions, not wall bounds").
@@ -168,21 +204,15 @@ fn assert_wedge_kill_mechanism(
     expected: WatchdogKillReason,
     wedge_desc: &str,
 ) -> Result<()> {
-    // (d) Not killed at all: the watchdog let a forever-wedge escape to
-    // the harness bound — the machinery failed open.
-    anyhow::ensure!(
-        result.timed_out,
-        "expected the progress watchdog to fire (timed_out) on the injected \
-         {wedge_desc}, but the run did not time out — the watchdog let the \
-         wedge escape"
-    );
     // (b) The guest never reached the Teardown wedge phase: the injected
     // fault never executed, so no wedge-detection claim — for or against —
     // is testable. Environmental (observed: an arm64 cell at ~0.3% host
     // CPU share sat in Boot for 172 s; nothing can boot at that share).
     // SKIP, not FAIL: the deadman bounding such a cell is the DESIGNED
     // degradation, not a detection regression.
-    if result.final_guest_phase < GuestLifecyclePhase::Teardown {
+    if classify_wedge_run(result.final_guest_phase, result.timed_out)
+        == WedgeRunDisposition::NeverReached
+    {
         return Err(post_vm_skip(format!(
             "guest never reached the Teardown wedge phase \
              (final_guest_phase={:?}, progress_epoch={}, kill={:?} at \
@@ -195,6 +225,15 @@ fn assert_wedge_kill_mechanism(
             result.duration.as_secs_f64(),
         )));
     }
+    // (d) Reached the wedge but was not killed: the watchdog let a
+    // forever-wedge escape to the harness bound — the machinery failed open.
+    anyhow::ensure!(
+        classify_wedge_run(result.final_guest_phase, result.timed_out)
+            == WedgeRunDisposition::ReachedAndTimedOut,
+        "expected the progress watchdog to fire (timed_out) on the injected \
+         {wedge_desc}, but the run did not time out — the watchdog let the \
+         wedge escape"
+    );
     // (a) Killed by the expected tier: mechanism proven, at any host
     // dilation — a CPU budget stretches across wall proportionally to
     // starvation by design (observed on-spec at ~14% share: Tier-1 at
@@ -266,8 +305,23 @@ fn assert_tier1_spin_kill(result: &VmResult) -> Result<()> {
 
 /// Host-side gate for the Body-exemption control: a guest that sat fully
 /// idle for most of its declared duration in the Body stage MUST survive.
-/// An `Err` here rides the `PostVmAssertionFailure` marker → hard fail.
+/// A guest that never reached Body is an environmental non-verdict, matching
+/// the pre-wedge handling in [`assert_wedge_kill_mechanism`]. Once Body was
+/// reached, an `Err` rides the `PostVmAssertionFailure` marker → hard fail.
 fn assert_idle_body_survived(result: &VmResult) -> Result<()> {
+    if result.final_guest_phase < GuestLifecyclePhase::Body {
+        return Err(post_vm_skip(format!(
+            "guest never reached the idle Body control \
+             (final_guest_phase={:?}, progress_epoch={}, kill={:?} at \
+             {:.1}s): the host was too starved for the guest to boot to \
+             the phase under test — environmental non-verdict, the Body \
+             exemption was never exercised",
+            result.final_guest_phase,
+            result.final_progress_epoch,
+            result.watchdog_kill_reason,
+            result.duration.as_secs_f64(),
+        )));
+    }
     anyhow::ensure!(
         !result.timed_out,
         "a fully-idle Body-stage guest was killed under the watchdog — the \

@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn non_uniform_llc_cores_total_and_partition() {
-        // uneven-11llc's shape: ten LLCs of 9 cores + one of 6, SMT-2.
+        // 192cpu-11llc-smt's shape: ten LLCs of 9 cores + one of 6, SMT-2.
         static CORES: [u32; 11] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 6];
         let t = Topology {
             llcs: 11,

@@ -43,20 +43,19 @@
 //!   subdirectory) so the lock infrastructure cannot pollute
 //!   `cargo ktstr stats list` output or claim the "most recent
 //!   run" bucket.
-//! - [`pre_clear_run_dir_once`]: shallow-wipe `*.ktstr.json` files
-//!   in the run directory at the FIRST write of each test
-//!   process so a re-run at the same `{kernel}-{project_commit}`
-//!   key produces a last-writer-wins snapshot rather than an
-//!   append-only archive. Subsequent writes in the same process
-//!   are gated by an internal `Mutex<HashSet<PathBuf>>` so only
-//!   the first call per key per process clears.
-//! - [`acquire_run_dir_flock`]: cross-process `LOCK_EX` on the
-//!   per-run-key sentinel
-//!   (`{runs_root}/.locks/{key}.lock`) held for the duration of
-//!   the pre-clear + serialize + write cycle. Two concurrent
-//!   ktstr processes targeting the same key serialize through
-//!   this lock so neither tears the other's mid-write
-//!   sidecars. The override branch (operator-chosen
+//! - [`reset_run_dir_for_session`]: shallow-wipe `*.ktstr.json`
+//!   files when the run epoch changes so a re-run at the same
+//!   `{kernel}-{project_commit}` key produces a last-writer-wins
+//!   snapshot rather than an append-only archive. Raw no-token
+//!   calls retain a process-local once gate.
+//! - [`acquire_run_dir_publication_lock`]: cross-process publication
+//!   rail on `{runs_root}/.locks/{key}.lock`. Writers whose run-epoch
+//!   sentinel already matches take `LOCK_SH` and publish concurrently;
+//!   the first writer or an epoch transition takes `LOCK_EX` for
+//!   wipe -> sentinel -> first publication. Holding SH through atomic
+//!   rename prevents an EX reset from crossing either the primary write
+//!   or its final-verdict rewrite.
+//!   The override branch (operator-chosen
 //!   `KTSTR_SIDECAR_DIR`) skips the flock for the same reason
 //!   it skips pre-clear: the operator owns the directory's
 //!   contents.
@@ -1327,7 +1326,7 @@ pub(crate) fn format_kvm_stats(sidecars: &[SidecarResult]) -> String {
 /// (e.g. re-running the same suite without committing changes) reuse
 /// the same directory, with the second run pre-clearing any
 /// `*.ktstr.json` files left by the first via
-/// `pre_clear_run_dir_once` — the directory is a last-writer-wins
+/// `reset_run_dir_for_session` — the directory is a last-writer-wins
 /// snapshot keyed on (kernel, project commit), not an append-only
 /// archive of every invocation.
 pub fn sidecar_dir() -> PathBuf {
@@ -1547,14 +1546,13 @@ pub(crate) struct FailedTest {
     /// multiple failing variants this is a representative one; the
     /// full per-variant set is in `stats_sidecars`.
     pub(crate) topology: Option<String>,
-    /// `{test}-{variant_hash}.failure-dump.json` for whichever variant
-    /// the run-dir scan classified last (unsorted read_dir order);
-    /// single-slot. The fail signal keys off the per-variant
-    /// `dump_hashes` set, not this path.
-    pub(crate) failure_dump: Option<PathBuf>,
-    /// `{test}-{variant_hash}.repro.failure-dump.json` for whichever
-    /// variant the scan classified last (auto-repro retry).
-    pub(crate) repro_failure_dump: Option<PathBuf>,
+    /// Every primary failure dump for this test, sorted. This includes
+    /// attempt-qualified nextest retry archives as well as the final
+    /// attempt's canonical path.
+    pub(crate) failure_dumps: Vec<PathBuf>,
+    /// Every auto-repro failure dump for this test, sorted, including
+    /// attempt-qualified nextest retry archives.
+    pub(crate) repro_failure_dumps: Vec<PathBuf>,
     /// Every `{test}-{variant_hash}.ktstr.json` stats sidecar for
     /// this test, sorted — one per gauntlet variant (distinct
     /// variant hashes coexist). Empty for a dump-only failure.
@@ -1669,11 +1667,12 @@ fn split_variant_stem(stem: &str) -> (&str, u64) {
 /// is ALWAYS variant-keyed by [`write_sidecar`], so a non-hashed one is
 /// malformed and is dropped (`None`).
 ///
-/// Suffix order is load-bearing: the `.repro.` shapes are checked
-/// BEFORE their bare counterparts so `{test}-{hash}.repro.failure-dump.json`
-/// classifies as [`RunArtifactKind::ReproFailureDump`] with
-/// `test_name = {test}` rather than the bare-`.failure-dump.json`
-/// branch stripping less and yielding `{test}-{hash}.repro`.
+/// Failure dumps may include an attempt archive suffix:
+/// `{test}-{hash}.attempt-N.failure-dump.json` or
+/// `{test}-{hash}.repro.attempt-N.failure-dump.json`. The attempt is
+/// intentionally not part of variant identity: every retry is the
+/// same nextest test variant and is correlated with the same stats
+/// sidecar hash.
 fn classify_run_artifact(name: &str) -> Option<(&str, u64, RunArtifactKind)> {
     if let Some(stem) = name.strip_suffix(".host-skip.json") {
         let (test, hash) = split_variant_stem(stem);
@@ -1687,13 +1686,24 @@ fn classify_run_artifact(name: &str) -> Option<(&str, u64, RunArtifactKind)> {
         let (test, hash) = split_variant_stem(stem);
         return Some((test, hash, RunArtifactKind::ExpectErrLoad));
     }
-    if let Some(stem) = name.strip_suffix(".repro.failure-dump.json") {
-        let (test, hash) = split_variant_stem(stem);
-        return Some((test, hash, RunArtifactKind::ReproFailureDump));
-    }
     if let Some(stem) = name.strip_suffix(".failure-dump.json") {
+        let stem = match stem.rsplit_once(".attempt-") {
+            Some((base, attempt))
+                if attempt
+                    .parse::<u32>()
+                    .ok()
+                    .is_some_and(|attempt| attempt > 0) =>
+            {
+                base
+            }
+            _ => stem,
+        };
+        let (stem, kind) = match stem.strip_suffix(".repro") {
+            Some(base) => (base, RunArtifactKind::ReproFailureDump),
+            None => (stem, RunArtifactKind::FailureDump),
+        };
         let (test, hash) = split_variant_stem(stem);
-        return Some((test, hash, RunArtifactKind::FailureDump));
+        return Some((test, hash, kind));
     }
     if let Some(stem) = name.strip_suffix(".repro.wprof.pb") {
         let (test, hash) = split_variant_stem(stem);
@@ -1725,7 +1735,7 @@ fn classify_run_artifact(name: &str) -> Option<(&str, u64, RunArtifactKind)> {
 /// The mtime gate is the freshness boundary: a run directory is
 /// keyed `{kernel}-{project_commit}` (see [`sidecar_dir`]), so
 /// re-running the same suite reuses the directory, and
-/// [`pre_clear_run_dir_once`] wipes only `*.ktstr.json` — stale
+/// [`reset_run_dir_for_session`] wipes only `*.ktstr.json` — stale
 /// `*.failure-dump.json` / `*.wprof.pb` from an earlier run linger.
 /// Filtering on `mtime >= since` (where `since` is captured before
 /// the nextest build+run begins, so genuine artifacts — written
@@ -1741,13 +1751,11 @@ fn summarize_one_run_dir(
     use std::collections::{BTreeMap, BTreeSet};
     #[derive(Default)]
     struct Acc {
-        // The writer names these per-variant (hashed, `{test}-{hash}.…`);
-        // each is a single Option collapsed to whichever variant the
-        // read_dir scan classified last (unsorted order). The fail
-        // signal below does NOT rely on them — it keys off the
-        // per-variant `dump_hashes` set.
-        failure_dump: Option<PathBuf>,
-        repro_failure_dump: Option<PathBuf>,
+        // Every per-variant dump, including nextest attempt archives.
+        // The fail signal below keys off `dump_hashes`; these vectors
+        // retain all concrete evidence paths for the footer.
+        failure_dumps: Vec<PathBuf>,
+        repro_failure_dumps: Vec<PathBuf>,
         wprof: Option<PathBuf>,
         repro_wprof: Option<PathBuf>,
         // EVERY variant's stats sidecar (distinct variant-hash
@@ -1812,11 +1820,11 @@ fn summarize_one_run_dir(
         match kind {
             RunArtifactKind::FailureDump => {
                 acc.dump_hashes.insert(variant_hash);
-                acc.failure_dump = Some(path);
+                acc.failure_dumps.push(path);
             }
             RunArtifactKind::ReproFailureDump => {
                 acc.dump_hashes.insert(variant_hash);
-                acc.repro_failure_dump = Some(path);
+                acc.repro_failure_dumps.push(path);
             }
             RunArtifactKind::Wprof => {
                 wprof_traces += 1;
@@ -1939,13 +1947,15 @@ fn summarize_one_run_dir(
         };
         // Sort so the rendered footer is deterministic regardless of
         // `read_dir` order.
+        acc.failure_dumps.sort();
+        acc.repro_failure_dumps.sort();
         acc.stats_sidecars.sort();
         failed.push(FailedTest {
             test_name,
             scheduler,
             topology,
-            failure_dump: acc.failure_dump,
-            repro_failure_dump: acc.repro_failure_dump,
+            failure_dumps: acc.failure_dumps,
+            repro_failure_dumps: acc.repro_failure_dumps,
             stats_sidecars: acc.stats_sidecars,
             wprof: acc.wprof,
             repro_wprof: acc.repro_wprof,
@@ -2040,10 +2050,10 @@ pub fn format_run_artifact_footer(
                 _ => String::new(),
             };
             out.push_str(&format!("    FAILED  {}{variant}\n", f.test_name));
-            if let Some(p) = &f.failure_dump {
+            for p in &f.failure_dumps {
                 out.push_str(&format!("      {:<13} {}\n", "failure dump", p.display()));
             }
-            if let Some(p) = &f.repro_failure_dump {
+            for p in &f.repro_failure_dumps {
                 out.push_str(&format!("      {:<13} {}\n", "repro dump", p.display()));
             }
             for p in &f.stats_sidecars {
@@ -2285,7 +2295,8 @@ pub(crate) fn detect_kernel_version() -> Option<String> {
 /// accurate semantic anyway: "what code produced this sidecar"
 /// depends on the cwd at test launch (which crate is exercising
 /// ktstr), not the build host.
-pub(crate) fn detect_project_commit() -> Option<String> {
+#[doc(hidden)]
+pub fn detect_project_commit() -> Option<String> {
     // Explicit override: an orchestrator (perf-delta) that checked the
     // project tree out WITHOUT a `.git` — a plain gix checkout of a baseline
     // commit into a temp dir — passes the commit label via
@@ -2479,16 +2490,23 @@ pub fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
                         check_dirty: false,
                     })
                     .index_worktree_options_mut(|opts| {
-                        opts.dirwalk_options = None;
+                        configure_dirty_status_options(opts);
                     })
                     .into_index_worktree_iter(Vec::new())
                     .ok()
-                    .map(|mut iter| iter.next().is_some())
+                    .map(crate::git_status::consume_has_any)
             })
             .unwrap_or(false)
     };
 
     Some(index_dirty || worktree_dirty)
+}
+
+/// Configure the tracked-file-only sidecar probe while reusing the shared
+/// gix worker policy.
+fn configure_dirty_status_options(options: &mut gix::status::index_worktree::Options) {
+    options.dirwalk_options = None;
+    crate::git_status::configure_index_worktree_parallelism(options);
 }
 
 /// Detect the kernel SOURCE TREE's git HEAD at sidecar-write time.
@@ -2541,16 +2559,11 @@ pub fn repo_is_dirty(repo: &gix::Repository) -> Option<bool> {
 /// "treat as clean" rather than aborting the probe, because
 /// metadata must not gate sidecar writes.
 ///
-/// `pub` (not `pub(crate)`) + `#[doc(hidden)]` for the same reason as
-/// `repo_is_dirty`: `cargo-ktstr` is a separate `[[bin]]` crate that
-/// consumes `ktstr` as a dependency and calls this in `run_cargo` once
-/// per resolved kernel to pre-compute the `dir=commit` map it exports
-/// via [`crate::KTSTR_KERNEL_COMMIT_ENV`], letting each per-test process
-/// skip its own gix dirty-walk. Hidden from rustdoc — a probe helper
-/// with no stable API contract. The env fast-path that CONSUMES that
-/// map lives at the sidecar call site (`kernel_commit_for_sidecar`), not
-/// here, so this stays a pure directory→commit walk safe for the
-/// orchestrator to call while building the map.
+/// `pub` (not `pub(crate)`) + `#[doc(hidden)]` because cargo-ktstr is a
+/// separate `[[bin]]` crate that consumes `ktstr` as a dependency. Its
+/// resolved-kernel provenance helper falls back to this walk for raw source
+/// trees and legacy cache entries. Hidden from rustdoc — a probe helper with
+/// no stable API contract.
 #[doc(hidden)]
 pub fn detect_kernel_commit(kernel_dir: &std::path::Path) -> Option<String> {
     // Per-process, path-keyed memoization of the SUCCESS case
@@ -2755,6 +2768,7 @@ pub(crate) fn apply_archive_source_override(pool: &mut [SidecarResult]) {
 ///
 /// Returns `None` when the env var is unset, when no source
 /// tree path is recoverable, or when the cache lookup fails.
+#[cfg(test)]
 fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
     source_dir_for(&crate::ktstr_kernel_env()?)
 }
@@ -2763,14 +2777,9 @@ fn resolve_kernel_source_dir() -> Option<std::path::PathBuf> {
 /// tree whose git HEAD is the kernel's commit (or `None` for transient
 /// Range/Git specs or an unrecoverable cache lookup).
 ///
-/// `pub` + `#[doc(hidden)]` for the same reason as `detect_kernel_commit`:
-/// the cargo-ktstr `[[bin]]` calls this in `run_cargo` to pre-compute the
-/// [`crate::KTSTR_KERNEL_COMMIT_ENV`] map. Computing the map value via THIS
-/// function (then `detect_kernel_commit`) makes the map identical to the
-/// sidecar's own fallback (`resolve_kernel_source_dir().and_then(
-/// detect_kernel_commit)`), so a clean Path kernel — whose resolved dir is
-/// a cache entry, not a git tree — still gets its real source commit into
-/// the map instead of re-paying a per-test walk.
+/// `pub` + `#[doc(hidden)]` because the cargo-ktstr `[[bin]]` is a separate
+/// crate. [`kernel_commit_for_resolved`] uses this for raw source trees and
+/// legacy Local cache entries after taking the cache-metadata fast path.
 #[doc(hidden)]
 pub fn source_dir_for(raw: &str) -> Option<std::path::PathBuf> {
     use crate::kernel_path::KernelId;
@@ -2797,11 +2806,58 @@ pub fn source_dir_for(raw: &str) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Pure helper for [`resolve_kernel_source_dir`] that takes the
+/// Resolve the commit which built one already-resolved kernel directory.
+///
+/// A normal cargo-ktstr resolution returns a kernel cache-entry directory.
+/// Its `metadata.json` already records the source commit captured when the
+/// kernel was built, so that value is both more authoritative and much
+/// cheaper than walking the current source worktree again. In particular,
+/// concurrent CI lanes no longer each scan the same Linux checkout before
+/// starting nextest.
+///
+/// Local cache metadata written before `git_hash` was populated retains its
+/// historical fallback: probe the recorded `source_tree_path`. A raw source
+/// path (no valid cache metadata) likewise uses [`source_dir_for`] followed by
+/// [`detect_kernel_commit`]. Valid non-local metadata without a commit has no
+/// on-disk source to probe and returns `None`.
+///
+/// `pub` + `#[doc(hidden)]` lets the cargo-ktstr binary and sidecar writer use
+/// the exact same provenance decision when producing/consuming the shared
+/// [`crate::KTSTR_KERNEL_COMMIT_ENV`] map.
+#[doc(hidden)]
+pub fn kernel_commit_for_resolved(raw: &str) -> Option<String> {
+    let resolved = std::path::Path::new(raw);
+    if let Ok(bytes) = std::fs::read(resolved.join("metadata.json"))
+        && let Ok(metadata) = serde_json::from_slice::<crate::cache::KernelMetadata>(&bytes)
+    {
+        return match metadata.source {
+            crate::cache::KernelSource::Local {
+                git_hash: Some(hash),
+                ..
+            }
+            | crate::cache::KernelSource::Git {
+                git_hash: Some(hash),
+                ..
+            } => Some(hash),
+            crate::cache::KernelSource::Local {
+                source_tree_path: Some(source),
+                git_hash: None,
+            } => detect_kernel_commit(&source),
+            crate::cache::KernelSource::Local { .. }
+            | crate::cache::KernelSource::Git { .. }
+            | crate::cache::KernelSource::Tarball
+            | crate::cache::KernelSource::DistroPackage { .. }
+            | crate::cache::KernelSource::LocalPackage { .. } => None,
+        };
+    }
+    source_dir_for(raw).and_then(|source| detect_kernel_commit(&source))
+}
+
+/// Pure helper for [`source_dir_for`] that takes the
 /// parsed `KernelId` and an opened `CacheDir`, returning the source
 /// tree path if recoverable.
 ///
-/// Split out from [`resolve_kernel_source_dir`] so tests can pin a
+/// Split out from [`source_dir_for`] so tests can pin a
 /// `CacheDir` at a tempdir root without mutating env vars (which
 /// would race other tests reading `KTSTR_KERNEL` /
 /// `KTSTR_CACHE_DIR`).
@@ -2880,7 +2936,7 @@ fn resolve_kernel_source_dir_with_cache(
 }
 
 /// The kernel commit recorded in a sidecar: the env fast-path first,
-/// then the in-process gix walk.
+/// then resolved-kernel provenance metadata or the raw-source fallback.
 ///
 /// cargo-ktstr pre-probes every resolved kernel's HEAD once and exports
 /// a `dir=commit;...` map in [`crate::KTSTR_KERNEL_COMMIT_ENV`], keyed
@@ -2892,19 +2948,15 @@ fn resolve_kernel_source_dir_with_cache(
 /// nextest processes (so without the map each of N processes re-pays
 /// it).
 ///
-/// Keying on `ktstr_kernel_env()` (the raw `KTSTR_KERNEL`) rather than
-/// on `resolve_kernel_source_dir()` is deliberate — that is exactly the
-/// key cargo-ktstr used. The map's commit VALUE matches this function's
-/// own fallback because cargo-ktstr computes it via the SAME resolution
-/// (`source_dir_for` then `detect_kernel_commit`); a kernel with no
-/// recoverable source tree is simply absent from the map, so the miss
-/// falls through to the identical resolve-and-walk here.
+/// Keying on `ktstr_kernel_env()` (the raw `KTSTR_KERNEL`) is deliberate —
+/// that is exactly the key cargo-ktstr used. The map's commit VALUE matches
+/// this function's own fallback because both call
+/// [`kernel_commit_for_resolved`].
 ///
-/// Miss / absent env / empty commit → the walk. Optimization only.
+/// Miss / empty commit → the shared provenance resolver. Optimization only.
 fn kernel_commit_for_sidecar() -> Option<String> {
-    if let Some(self_dir) = crate::ktstr_kernel_env()
-        && let Ok(raw) = std::env::var(crate::KTSTR_KERNEL_COMMIT_ENV)
-    {
+    let self_dir = crate::ktstr_kernel_env()?;
+    if let Ok(raw) = std::env::var(crate::KTSTR_KERNEL_COMMIT_ENV) {
         for seg in raw.split(';') {
             if let Some((dir, commit)) = seg.rsplit_once('=')
                 && dir == self_dir
@@ -2914,7 +2966,7 @@ fn kernel_commit_for_sidecar() -> Option<String> {
             }
         }
     }
-    resolve_kernel_source_dir().and_then(|d| detect_kernel_commit(&d))
+    kernel_commit_for_resolved(&self_dir)
 }
 
 /// Compute a stable 64-bit discriminator over the fields that
@@ -3139,15 +3191,11 @@ fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
 /// `sidecar_variant_hash` hashes the discriminating fields into a
 /// short stable suffix so each variant gets its own sidecar file.
 ///
-/// On the first call PER UNIQUE DIRECTORY within a process,
-/// [`pre_clear_run_dir_once`] removes any pre-existing
-/// `*.ktstr.json` files in the resolved directory so the run is a
-/// clean snapshot rather than a mosaic of sidecars carried over
-/// from a prior invocation that shared the same
-/// `{kernel}-{project_commit}` key (e.g. re-running the suite
-/// without committing changes).
-/// Subsequent writes within the same process to the same directory
-/// append into the cleared directory.
+/// On an orchestrated run-epoch mismatch,
+/// [`acquire_run_dir_publication_lock`] removes any pre-existing
+/// `*.ktstr.json` files before publishing the new sentinel so the
+/// run is a clean snapshot rather than a mosaic of prior invocations.
+/// Matching-epoch writes append concurrently.
 ///
 /// Pre-clear is SKIPPED when `KTSTR_SIDECAR_DIR` is set: the
 /// operator chose that directory and owns its contents — silent
@@ -3162,37 +3210,26 @@ fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
 /// and causing the second call to re-fire pre-clear and wipe the
 /// first call's sidecars.
 ///
-/// CROSS-PROCESS SERIALIZATION: on the default path (override
-/// unset), the call acquires advisory `LOCK_EX` on a per-run-key
-/// sentinel file (`{runs_root}/.locks/{key}.lock`) before
-/// pre-clear runs and holds it for the duration of the
-/// pre-clear + serialize + write cycle. The lock prevents
-/// process B's `pre_clear_run_dir_once` from interleaving with
-/// process A's mid-write `std::fs::write` — the kernel-flock
-/// critical section makes the (read_dir + remove_file) +
-/// (serialize + write) sequence atomic with respect to peer
-/// processes targeting the same `{kernel}-{project_commit}`
-/// directory. The override path skips the lock for the same
-/// reason it skips pre-clear: operator-chosen directories are
-/// owned by the operator, so we do not place a `.locks/` sibling
-/// inside (or above) their custom layout.
+/// CROSS-PROCESS PUBLICATION: on the default path (override unset),
+/// writers with a matching [`crate::KTSTR_RUN_EPOCH_ENV`] sentinel
+/// acquire advisory `LOCK_SH` on
+/// `{runs_root}/.locks/{key}.lock`, recheck the token under that
+/// lock, and retain SH through their atomic rename. Matching writers
+/// therefore publish concurrently. A first writer or epoch change
+/// acquires `LOCK_EX`, rechecks, then performs wipe -> sentinel ->
+/// first publication. Since EX conflicts with every matching
+/// writer's SH, an epoch reset cannot cross the validated-token ->
+/// rename interval. The override path skips the lock for the same
+/// reason it skips pre-clear: operator-chosen directories are owned
+/// by the operator, so we do not place a `.locks/` sibling inside
+/// (or above) their custom layout.
 ///
-/// EX-around-the-whole-cycle (not just pre-clear) is the correct
-/// choice: it makes the (read_dir + remove_file) + (serialize +
-/// write) sequence atomic against concurrent peers, so no peer
-/// observes a half-cleared directory or a mid-write sidecar.
-///
-/// A later peer process still RUNS its own pre-clear (its
-/// `OnceLock` is process-local), but `pre_clear_run_dir_once` skips
-/// the wipe when the dir's `.ktstr_run_epoch` sentinel already
-/// records this session's [`crate::KTSTR_RUN_EPOCH_ENV`] token (a
-/// peer cleared it earlier this session), sparing every
-/// `{test}-{hash}.ktstr.json` written THIS session. Without that
-/// sentinel a later peer's pre-clear would delete an earlier peer's
-/// freshly-written sidecar — silent stats loss; the session token
-/// closes that window. (Raw `cargo nextest run` sets no token, so
-/// its peers fall back to wipe-everything and the loss can recur —
-/// the orchestrated path is the supported one.)
+/// A later peer whose sentinel already matches bypasses pre-clear
+/// and takes only the shared publication rail. Without that sentinel
+/// a later peer's pre-clear would delete an earlier peer's freshly
+/// written sidecar — silent stats loss. Raw `cargo nextest run` sets
+/// no token, so its peers retain the serialized wipe-everything
+/// behavior.
 ///
 /// PER-FILE ATOMICITY (both branches): the JSON is written to a
 /// `<final>.tmp.<pid>.<run_id>` sibling and then `rename(2)`'d into
@@ -3239,22 +3276,6 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
     // the relative-vs-absolute split.
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create sidecar dir {}", dir.display()))?;
-    // Acquire the per-run-key cross-process flock for the duration
-    // of the pre-clear + write cycle. The override branch (operator-
-    // chosen directory) skips the lock for the same reason it skips
-    // pre-clear — see the function-level doc. `_run_dir_lock` is
-    // scoped to this function body so the kernel-side flock releases
-    // via `OwnedFd::drop` when the function returns (success or
-    // error path), making the lock RAII-managed without an explicit
-    // unlock call.
-    let _run_dir_lock = if do_pre_clear {
-        Some(acquire_run_dir_flock(&dir)?)
-    } else {
-        None
-    };
-    if do_pre_clear {
-        pre_clear_run_dir_once(&dir);
-    }
     let variant_hash = sidecar_variant_hash(sidecar);
     let path = dir.join(format!(
         "{}-{:016x}.ktstr.json",
@@ -3279,8 +3300,37 @@ fn serialize_and_write_sidecar(sidecar: &SidecarResult, label: &str) -> anyhow::
         "{}-{:016x}.ktstr.json.tmp.{pid}.{}",
         sidecar.test_name, variant_hash, sidecar.run_id,
     ));
-    std::fs::write(&staging, &json)
-        .with_context(|| format!("write {label} staging {}", staging.display()))?;
+
+    // Serialize before admission to keep both the shared publication
+    // interval and the exclusive epoch-reset interval limited to filesystem
+    // mutation. On the orchestrated path, a matching epoch takes LOCK_SH:
+    // all peer writers publish concurrently, while an epoch reset's LOCK_EX
+    // cannot cross the validated-token -> rename interval. A missing or
+    // mismatched epoch takes LOCK_EX, rechecks under that lock, then performs
+    // wipe -> sentinel before publishing. Raw no-token runs retain the
+    // historical exclusive, pre-clear-once behavior. The override branch
+    // skips both coordination and pre-clear.
+    let session_token = if do_pre_clear {
+        run_session_token()
+    } else {
+        None
+    };
+    let _publication_lock = if do_pre_clear {
+        Some(acquire_run_dir_publication_lock(
+            &dir,
+            session_token.as_deref(),
+        )?)
+    } else {
+        None
+    };
+    if let Err(error) = std::fs::write(&staging, &json) {
+        // `write` may have created or partially filled the staging inode
+        // before reporting an error. Never leave that residue for the rest
+        // of the epoch; the next reset is not guaranteed to happen soon.
+        let _ = std::fs::remove_file(&staging);
+        return Err(anyhow::Error::from(error)
+            .context(format!("write {label} staging {}", staging.display())));
+    }
     if let Err(e) = std::fs::rename(&staging, &path) {
         // Best-effort cleanup of the staged payload; ignore the
         // unlink error so the rename failure is what surfaces
@@ -3328,7 +3378,10 @@ pub(crate) fn take_last_sidecar_path() -> Option<PathBuf> {
 /// [`crate::test_support::dispatch::Verdict::sidecar_bits`] — and set
 /// [`SidecarResult::expected_failure`] when an actual scenario
 /// failure/inconclusive was inverted to a pass/skip. Rewrites the file
-/// atomically (temp + rename).
+/// atomically (temp + rename) under the same publication rail as the
+/// primary write. Matching orchestrated epochs take SH; a stale token
+/// returns without touching the path, raw no-token runs take EX, and
+/// explicit sidecar-directory overrides remain unlocked.
 ///
 /// A no-op when the final verdict already matches what was persisted (an
 /// ordinary pass/fail/skip — no `expect_err`/`expect_auto_repro`
@@ -3341,6 +3394,64 @@ pub(crate) fn finalize_sidecar_verdict(
     skipped: bool,
     inconclusive: bool,
 ) {
+    let coordinated = sidecar_dir_override().is_none();
+    let session_token = if coordinated {
+        run_session_token()
+    } else {
+        None
+    };
+    finalize_sidecar_verdict_inner(
+        path,
+        passed,
+        skipped,
+        inconclusive,
+        coordinated,
+        session_token.as_deref(),
+        || {},
+    );
+}
+
+fn finalize_sidecar_verdict_inner<F>(
+    path: &std::path::Path,
+    passed: bool,
+    skipped: bool,
+    inconclusive: bool,
+    coordinated: bool,
+    session_token: Option<&str>,
+    before_rename: F,
+) where
+    F: FnOnce(),
+{
+    // Finalization is a second publication of the same sidecar. Keep it on
+    // the same epoch rail as the primary write: an orchestrated finalizer
+    // takes SH and rechecks its exact token, a raw no-token finalizer takes
+    // EX, and an explicit override remains unlocked. A token mismatch means
+    // another invocation reset the directory after this run's primary write;
+    // returning before even reading the old path prevents a stale finalizer
+    // from recreating a file on the far side of that reset.
+    let _publication_lock = if coordinated {
+        let Some(dir) = path.parent() else {
+            eprintln!(
+                "ktstr: finalize_sidecar_verdict: sidecar has no parent {}",
+                path.display()
+            );
+            return;
+        };
+        match acquire_run_dir_finalize_lock(dir, session_token) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!(
+                    "ktstr: finalize_sidecar_verdict: admission for {} failed: {error:#}",
+                    path.display()
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     let Ok(json) = std::fs::read_to_string(path) else {
         return;
     };
@@ -3373,21 +3484,24 @@ pub(crate) fn finalize_sidecar_verdict(
     // Stage with a `.ktstr.json.tmp.…` suffix (append, NOT
     // `with_extension`, which would drop `.json`) so a hard-crash orphan
     // — write succeeded but rename did not — is reaped by
-    // `pre_clear_run_dir_once` via `is_sidecar_staging_filename`, the
+    // the epoch-reset sweep via `is_sidecar_staging_filename`, the
     // same way the primary write's staging file is.
     let pid = std::process::id();
     let mut staging = path.as_os_str().to_owned();
     staging.push(format!(".tmp.finalize.{pid}"));
     let staging = std::path::PathBuf::from(staging);
-    if std::fs::write(&staging, &out).is_ok() && std::fs::rename(&staging, path).is_err() {
+    if std::fs::write(&staging, &out).is_err() {
+        let _ = std::fs::remove_file(&staging);
+        return;
+    }
+    before_rename();
+    if std::fs::rename(&staging, path).is_err() {
         let _ = std::fs::remove_file(&staging);
     }
 }
 
-/// Remove the failure-dump artifacts
-/// (`{test}-{variant_hash}.failure-dump.json` and
-/// `{test}-{variant_hash}.repro.failure-dump.json`) for `test_name` in
-/// the current sidecar dir.
+/// Remove every failure-dump artifact for this exact test variant,
+/// including nextest retry archives.
 ///
 /// Called when a run's FINAL outcome is a pass/skip but it wrote NO
 /// sidecar — the run crashed before the guest produced a parseable
@@ -3402,11 +3516,173 @@ pub(crate) fn finalize_sidecar_verdict(
 /// (final = Fail) does NOT call this, so its dump still flags.
 pub(crate) fn suppress_failure_dumps(test_name: &str, variant_hash: u64) {
     let dir = sidecar_dir();
-    // Remove THIS variant's dumps by the precise `{test}-{hash}` key, not
-    // a `{test}-*` glob: a glob would also delete a SIBLING gauntlet
-    // preset's legitimately-failing dump in the same run dir.
-    for suffix in [".failure-dump.json", ".repro.failure-dump.json"] {
-        let _ = std::fs::remove_file(dir.join(format!("{test_name}-{variant_hash:016x}{suffix}")));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((candidate, hash, kind)) = classify_run_artifact(name) else {
+            continue;
+        };
+        if candidate == test_name
+            && hash == variant_hash
+            && matches!(
+                kind,
+                RunArtifactKind::FailureDump | RunArtifactKind::ReproFailureDump
+            )
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// How many periodic-snapshot files a FAILING attempt keeps per dump
+/// base (primary and `.repro.` are bounded independently).
+///
+/// The freeze coordinator writes one `{base}.snapshot.periodic_NNN.json`
+/// per fired boundary (up to [`crate::scenario::snapshot::MAX_STORED_SNAPSHOTS`] = 64),
+/// each multi-megabyte. NOTHING on disk reads them back: `eval` and the
+/// cast-analysis pipeline both consume the in-process
+/// [`crate::scenario::snapshot::SnapshotBridge`] (which FIFO-caps at 64
+/// on its own), never these files — they exist solely as CI forensic
+/// artifacts for human inspection. The documented floor for *meaningful*
+/// periodic coverage is `num_snapshots >= 2` (see
+/// `crate::assert::temporal` / `crate::stats::metric_id`); keeping the
+/// most-recent 8 leaves a 4x margin of trajectory approaching the
+/// failure while bounding a 64-deep pile to 8 files. The most recent
+/// samples (highest `periodic_NNN` index) are retained because they
+/// bracket the failure; the periodic tag is zero-padded 3-digit, so
+/// lexical index order is chronological.
+pub(crate) const RETAINED_PERIODIC_SNAPSHOTS: usize = 8;
+
+/// Filename prefix shared by every on-disk snapshot for one test
+/// variant: `{test_name}-{variant_hash:016x}`. The freeze coordinator
+/// derives snapshot names from the failure-dump base by stripping
+/// `.failure-dump` (see `vmm::freeze_coord::snapshot::snapshot_tagged_path`),
+/// so the primary base yields `{prefix}.snapshot.{tag}.json` and the
+/// repro base yields `{prefix}.repro.snapshot.{tag}.json`. The trailing
+/// `-{hash:016x}` makes the prefix an exact variant boundary — `foo`'s
+/// prefix cannot match `foobar`'s files, and a sibling gauntlet preset
+/// (different hash) is untouched.
+fn snapshot_base_prefix(test_name: &str, variant_hash: u64) -> String {
+    format!("{test_name}-{variant_hash:016x}")
+}
+
+/// `true` when `name` is any snapshot file (`.snapshot.{tag}.json`,
+/// primary or `.repro.` base) for the variant identified by `prefix`.
+fn is_snapshot_file_for(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let rest = rest.strip_prefix(".repro").unwrap_or(rest);
+    rest.starts_with(".snapshot.") && rest.ends_with(".json")
+}
+
+/// `Some(index)` when `name` is a PERIODIC snapshot file for `prefix`,
+/// returning the zero-padded 3-digit `periodic_NNN` index for recency
+/// ordering. `None` for a non-matching file or a non-periodic snapshot
+/// tag (e.g. `.snapshot.mid_run.json`, `.snapshot.early-degraded.json`),
+/// which are single-shot and never bounded. The 3-digit / all-ASCII-digit
+/// gate matches the coordinator's `format!("periodic_{:03}", idx)`
+/// emission exactly, so a user-chosen `Op::CaptureSnapshot { name:
+/// "periodic_kaslr" }` tag cannot be mistaken for a periodic sample.
+fn periodic_snapshot_index_for(name: &str, prefix: &str) -> Option<u32> {
+    let rest = name.strip_prefix(prefix)?;
+    let rest = rest.strip_prefix(".repro").unwrap_or(rest);
+    let tag = rest.strip_prefix(".snapshot.")?.strip_suffix(".json")?;
+    let digits = tag.strip_prefix("periodic_")?;
+    if digits.len() == 3 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        digits.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Remove EVERY on-disk snapshot file for this exact test variant
+/// (primary + `.repro.` bases, periodic and one-shot tags alike).
+///
+/// Two callers, both best-effort (a missing dir or file is fine, and
+/// nothing here ever fails a test):
+/// - **Pass/skip finalize** ([`crate::test_support::eval`]): a run whose
+///   FINAL verdict is pass/skip needs no periodic forensics, so the whole
+///   pile is dropped before the process exits (and thus before CI uploads
+///   artifacts). This is the dominant reclaim — most e2e tests pass, and
+///   each was writing dozens of multi-MB snapshots that nothing consumed.
+/// - **Attempt-prepare reap**: called before boot so a new attempt starts
+///   from a clean snapshot slate. A prior attempt that fired MORE
+///   boundaries — or was SIGKILL'd by the watchdog mid-run — leaves stale
+///   higher-index snapshots the coordinator's tag-keyed overwrite would
+///   not reclaim; this reaps them. It is the crash-safety mechanism: a
+///   killed process cannot clean up after itself, so the NEXT attempt's
+///   prepare does it (mirrors [`super::eval`]'s `prepare_failure_dump_path`).
+pub(crate) fn cleanup_snapshots(test_name: &str, variant_hash: u64) {
+    let dir = sidecar_dir();
+    let prefix = snapshot_base_prefix(test_name, variant_hash);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if is_snapshot_file_for(name, &prefix) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Bound the periodic snapshots for a FAILING attempt to the most recent
+/// `keep` per dump base, deleting the older ones. Primary and `.repro.`
+/// bases are bounded independently (each keeps its own `keep`). One-shot
+/// snapshot tags (`mid_run`, degraded) are never touched — they are
+/// single files, not an unbounded periodic series. Best-effort; never
+/// fails a test.
+///
+/// The retained failure DUMP is the primary evidence and is untouched
+/// here; these periodic samples are supplementary trajectory, so the
+/// most-recent `keep` (bracketing the failure) suffice. See
+/// [`RETAINED_PERIODIC_SNAPSHOTS`] for the floor rationale.
+pub(crate) fn bound_periodic_snapshots(test_name: &str, variant_hash: u64, keep: usize) {
+    let dir = sidecar_dir();
+    let prefix = snapshot_base_prefix(test_name, variant_hash);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    // Bucket by base so the repro series does not evict the primary's.
+    let mut primary: Vec<(u32, PathBuf)> = Vec::new();
+    let mut repro: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(idx) = periodic_snapshot_index_for(name, &prefix) else {
+            continue;
+        };
+        let is_repro = name
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|rest| rest.starts_with(".repro."));
+        if is_repro {
+            repro.push((idx, path));
+        } else {
+            primary.push((idx, path));
+        }
+    }
+    for mut set in [primary, repro] {
+        if set.len() <= keep {
+            continue;
+        }
+        // Ascending by index == chronological; drop the oldest overflow,
+        // keep the newest `keep`.
+        set.sort_by_key(|(idx, _)| *idx);
+        let drop_count = set.len() - keep;
+        for (_, path) in set.into_iter().take(drop_count) {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -3516,113 +3792,24 @@ fn warn_unknown_project_commit_inner(
     });
 }
 
-/// Remove PRIOR-SESSION `*.ktstr.json` files (and orphaned staging
-/// files) in the resolved run directory, exactly once per unique
-/// directory per process.
+/// Direct-test wrapper for the process-local pre-clear behavior.
 ///
-/// "Prior-session" is gated on the [`crate::KTSTR_RUN_EPOCH_ENV`]
-/// session token: when set (the orchestrated `cargo ktstr test`
-/// path) the first process to clear a dir records the token in the
-/// `.ktstr_run_epoch` sentinel, and a later peer process whose token
-/// matches SKIPS the wipe entirely — sparing every sidecar this
-/// session's peers wrote (nextest is process-per-test). A
-/// differing/absent sentinel (new session, or raw `cargo nextest
-/// run` with no token) wipes every `*.ktstr.json` match and records
-/// the token — see the CONCURRENT WRITERS (cross-process) section.
-///
-/// The run-key format is `{kernel}-{project_commit}` (see
-/// [`sidecar_dir`]), so two `cargo ktstr test` invocations sharing
-/// the same kernel and project commit (the typical "re-run the
-/// suite without committing changes" loop) resolve to the same
-/// directory. Without
-/// pre-clearing, each subsequent run would land its sidecars next
-/// to the previous run's, leaving downstream `cargo ktstr stats`
-/// readers to see a mosaic of two distinct test outcomes for the
-/// same variant — the variant-hash suffix on each filename
-/// prevents overwrites within a single run, but ALSO prevents the
-/// next run from naturally clobbering the previous one's files
-/// when the test set or pass/fail mix changes. Wiping
-/// `*.ktstr.json` once at first-write makes each run a clean
-/// snapshot of (kernel, project commit) — last-SESSION-wins (a new
-/// session's full sidecar set replaces the prior session's, while
-/// peers within one session coexist via the epoch gate).
-///
-/// PER-DIRECTORY KEYING: the cache is a `Mutex<HashSet<PathBuf>>`
-/// keyed on the canonicalized `dir` (with raw `dir` as fallback
-/// when canonicalize fails — e.g. the directory does not yet
-/// exist). A `OnceLock<()>` would fire once for the FIRST
-/// directory only, leaving subsequent writes to other directories
-/// unprotected. The HashSet ensures every distinct directory the
-/// process writes to gets pre-cleared exactly once, regardless of
-/// ordering. Canonicalization collapses symlink aliases so two
-/// path spellings of the same on-disk dir share one entry.
-///
-/// In production today only the default-path
-/// `runs_root().join({kernel}-{project_commit})` is fed into this
-/// function (the override path skips pre-clear entirely via
-/// [`sidecar_dir_override`]), so per-process cache size
-/// stays at exactly 1 entry. The HashSet shape is the
-/// future-proof keying for direct unit-test fixtures (which
-/// rotate tempdir paths through this helper) and any future
-/// production code path that writes default-path sidecars from
-/// multiple distinct (kernel, commit) pairs in one process.
-///
-/// SCOPE: only `*.ktstr.json` sidecars and orphaned `.tmp` staging
-/// files in the immediate directory are removed. Subdirectories
-/// (per-job gauntlet layouts written by external orchestrators) and
-/// non-sidecar files are left untouched — pre-clear is shallow. Note
-/// that `collect_sidecars` walks one level of subdirectories, so
-/// stale sidecars left in subdirectories from a prior run will still
-/// appear in `cargo ktstr stats` output until the operator removes
-/// them. The function never deletes the directory itself; production
-/// callers (`serialize_and_write_sidecar`) materialize the directory
-/// via `create_dir_all` BEFORE invoking this helper. Beyond the
-/// wipe, the only other side effect is writing the `.ktstr_run_epoch`
-/// session sentinel (when a token is set — see CONCURRENT WRITERS).
-///
-/// CONCURRENT WRITERS (intra-process): the per-process
-/// `Mutex<HashSet>` guards against multiple writes within a single
-/// process re-clearing the same directory. The cache mutex is held
-/// ACROSS the `read_dir` walk and per-file removals — releasing it
-/// after the cache insert but before the walk would open a TOCTOU
-/// window where a sibling thread observes the cached entry, skips
-/// its own pre-clear, writes a sidecar, and then the original
-/// thread's still-pending walk deletes that sibling's fresh file.
-/// Holding the lock across the bounded walk closes the window.
-///
-/// CONCURRENT WRITERS (cross-process): nextest is process-per-test,
-/// so distinct `#[ktstr_test]` functions run as separate processes
-/// sharing one `{kernel}-{project_commit}` dir. Each has its own
-/// `OnceLock` and runs its own pre-clear. The
-/// [`crate::KTSTR_RUN_EPOCH_ENV`] session token is what keeps a
-/// later peer from deleting an earlier peer's fresh sidecar: the
-/// first process records the token in the `.ktstr_run_epoch`
-/// sentinel; a peer whose token matches SKIPS its wipe, sparing
-/// every `{test}-{hash}.ktstr.json` this session wrote.
-/// `serialize_and_write_sidecar`'s `LOCK_EX` serializes the
-/// pre-clear+write cycle so the sentinel read/wipe/write is atomic
-/// against peers — but serialization ALONE does NOT spare A's
-/// already-written file from B's later wipe (B runs after A released
-/// the lock); the sentinel does. Without a token (raw `cargo nextest
-/// run`) peers fall back to wipe-everything and can lose each other's
-/// sidecars — the orchestrated path is the supported one.
-///
-/// FAILURE: `read_dir` errors are silently ignored — defensive
-/// behavior for direct callers (e.g. unit tests probing the
-/// missing-dir edge); production callers materialize the
-/// directory before invoking this helper, so the missing-dir
-/// branch is unreachable in production today. Metadata probes
-/// must not gate sidecar writes. Per-file `remove_file`
-/// errors are also silently ignored — a partial pre-clear leaves
-/// either an overwrite (when the new run reproduces a stale
-/// file's exact `{test_name}-{variant_hash}.ktstr.json` name —
-/// the desired outcome) or a coexistence (when the new run's
-/// variant set differs from the prior run's, leaving stale
-/// sidecars next to fresh ones — the undesired outcome that
-/// pre-clear was meant to prevent). Coexistence is the acceptable
-/// degradation here: a noisy pre-clear failure should not abort
-/// the test run.
+/// Production orchestrated writes initialize/reset epochs through
+/// [`acquire_run_dir_publication_lock`]. Raw no-token writes use the
+/// token-stable inner helper below while holding EX.
+#[cfg(test)]
 fn pre_clear_run_dir_once(dir: &std::path::Path) {
+    let session_token = run_session_token();
+    pre_clear_run_dir_once_for_session(dir, session_token.as_deref());
+}
+
+/// Token-stable raw/pre-clear implementation.
+///
+/// The serializer captures the epoch once so an unrelated environment
+/// mutation cannot change identity between admission and sentinel publication.
+/// Direct tests use the wrapper above, which snapshots the environment at
+/// entry.
+fn pre_clear_run_dir_once_for_session(dir: &std::path::Path, session_token: Option<&str>) {
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
@@ -3658,10 +3845,8 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
     // never be observed without the wipe having succeeded. `guard`
     // is dropped at end-of-scope so the lock release happens after
     // the loop completes.
-    let session_token = run_session_token();
-    let sentinel = dir.join(SESSION_SENTINEL);
-    if let Some(token) = &session_token
-        && std::fs::read_to_string(&sentinel).is_ok_and(|recorded| recorded == *token)
+    if let Some(token) = session_token
+        && session_sentinel_matches(dir, token)
     {
         // A peer test process in THIS session already cleared the dir
         // (the sentinel records the session token under the flock);
@@ -3670,45 +3855,106 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
         guard.insert(cache_key);
         return;
     }
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
+    // Raw no-token pre-clear is deliberately best-effort. Token-bearing
+    // orchestrated initialization does not use this once-gated wrapper; its
+    // publication caller propagates reset and sentinel failures.
+    let _ = reset_run_dir_for_session(dir, session_token);
+    // Record the raw/helper attempt only after it returns. Its historical
+    // best-effort contract deliberately treats filesystem errors as a
+    // completed attempt; the orchestrated token-bearing path bypasses this
+    // process-local cache and propagates those errors instead.
+    guard.insert(cache_key);
+    drop(guard);
+}
+
+/// Wipe one run directory and, when present, publish its exact epoch token.
+///
+/// Production callers hold the run-dir exclusive flock. Unlike
+/// the process-local pre-clear helper, this deliberately has no
+/// process-local once gate: an observed token mismatch is authoritative even
+/// when this process wrote to the same directory earlier.
+fn reset_run_dir_for_session(
+    dir: &std::path::Path,
+    session_token: Option<&str>,
+) -> anyhow::Result<()> {
+    reset_run_dir_for_session_with_remover(dir, session_token, |path| std::fs::remove_file(path))
+}
+
+/// Testable implementation of [`reset_run_dir_for_session`].
+///
+/// A token-bearing caller uses the sentinel as an authoritative statement
+/// that the old epoch was completely removed. Every enumeration, metadata,
+/// and unlink failure must therefore abort before sentinel publication. Raw
+/// no-token callers preserve their historical best-effort behavior by
+/// explicitly discarding this result in [`pre_clear_run_dir_once_for_session`].
+fn reset_run_dir_for_session_with_remover<F>(
+    dir: &std::path::Path,
+    session_token: Option<&str>,
+    mut remove_file: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&std::path::Path) -> std::io::Result<()>,
+{
+    let Some(token) = session_token else {
+        // Preserve the raw `cargo nextest run` contract exactly: unreadable
+        // directories/entries, metadata failures, and individual unlink
+        // failures are ignored while the sweep continues wherever possible.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file()
+                    && (is_sidecar_filename(&path) || is_sidecar_staging_filename(&path))
+                {
+                    let _ = remove_file(&path);
+                }
             }
-            // Two file shapes are reaped here (current-session peers
-            // were already spared by the sentinel skip above, so a
-            // file reaching this point is prior-session or orphaned
-            // residue):
-            // - `<test>-<hash>.ktstr.json` — sidecars from a PRIOR
-            //   session sharing this `{kernel}-{project_commit}` key.
-            // - `<test>-<hash>.ktstr.json.tmp.<pid>.<run_id>` —
-            //   orphaned staging from a writer that died between
-            //   `write` and `rename` in `serialize_and_write_sidecar`
-            //   (`is_sidecar_filename` excludes these — the extension
-            //   is `<run_id>`, not `json` — so the staging sweep is
-            //   what reaps them). The flock makes reaping an in-flight
-            //   stage impossible: a live peer holds the lock we hold.
-            if is_sidecar_filename(&path) || is_sidecar_staging_filename(&path) {
-                let _ = std::fs::remove_file(&path);
-            }
+        }
+        return Ok(());
+    };
+
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("enumerate run directory for epoch reset {}", dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("enumerate run directory entry {}", dir.display()))?;
+        let path = entry.path();
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("inspect run directory entry {}", path.display()))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        // Two file shapes are reaped here (current-session peers
+        // were already spared by the sentinel skip above, so a
+        // file reaching this point is prior-session or orphaned
+        // residue):
+        // - `<test>-<hash>.ktstr.json` — sidecars from a PRIOR
+        //   session sharing this `{kernel}-{project_commit}` key.
+        // - `<test>-<hash>.ktstr.json.tmp.<pid>.<run_id>` —
+        //   orphaned staging from a writer that died between
+        //   `write` and `rename` in `serialize_and_write_sidecar`
+        //   (`is_sidecar_filename` excludes these — the extension
+        //   is `<run_id>`, not `json` — so the staging sweep is
+        //   what reaps them). The flock makes reaping an in-flight
+        //   stage impossible: a live peer holds the lock we hold.
+        if is_sidecar_filename(&path) || is_sidecar_staging_filename(&path) {
+            remove_file(&path)
+                .with_context(|| format!("remove prior-epoch artifact {}", path.display()))?;
         }
     }
     // Record this session's token so peer processes skip re-wiping.
-    // Best-effort: if the write fails, a later peer won't see the
-    // token and re-wipes (the pre-fix behavior) — no worse than the
-    // unfixed code, just the cross-test loss left unfixed for this
-    // dir. Written AFTER the wipe so a crash mid-wipe leaves no
-    // stale sentinel falsely claiming the dir was cleared.
-    if let Some(token) = &session_token {
-        let _ = std::fs::write(&sentinel, token);
-    }
-    // Record completion AFTER the wipe finishes, not before. If a
-    // panic interrupts the loop above, the cache remains empty so
-    // a subsequent call retries the wipe rather than skipping it
-    // on the assumption that a prior call already cleared the dir.
-    guard.insert(cache_key);
-    drop(guard);
+    // Token-bearing orchestrated initialization treats this write as
+    // authoritative: publishing a sidecar without its epoch would collapse
+    // the herd back into repeated EX resets. Written AFTER the wipe so a
+    // crash mid-wipe leaves no stale sentinel falsely claiming completion.
+    let sentinel = dir.join(SESSION_SENTINEL);
+    std::fs::write(&sentinel, token)
+        .with_context(|| format!("publish run epoch sentinel {}", sentinel.display()))?;
+    Ok(())
+}
+
+/// Whether the on-disk sentinel records `token` byte-for-byte.
+fn session_sentinel_matches(dir: &std::path::Path, token: &str) -> bool {
+    std::fs::read_to_string(dir.join(SESSION_SENTINEL)).is_ok_and(|recorded| recorded == token)
 }
 
 /// Filename of the per-run-directory session sentinel that records
@@ -3726,8 +3972,8 @@ const SESSION_SENTINEL: &str = ".ktstr_run_epoch";
 /// every child test process.
 ///
 /// `None` when the variable is unset or empty (raw `cargo nextest
-/// run` — no orchestrator); [`pre_clear_run_dir_once`] then wipes
-/// every sidecar match (status quo for the unorchestrated path).
+/// run` — no orchestrator); the publication helper then serializes
+/// the process-local pre-clear behavior.
 /// `Some` lets pre-clear record/match the `.ktstr_run_epoch`
 /// sentinel so a later peer process skips re-wiping a dir this
 /// session already cleared, sparing the peers' sidecars.
@@ -3743,7 +3989,7 @@ fn run_session_token() -> Option<String> {
 /// True iff the filename matches the `<test>-<hash>.ktstr.json.tmp.…`
 /// shape — `is_sidecar_filename` rejects these because the
 /// extension is `<run_id>` rather than `json`, so a separate
-/// predicate is needed for the [`pre_clear_run_dir_once`] sweep
+/// predicate is needed for the epoch-reset sweep
 /// that reaps orphaned staging files. Filename-component check
 /// (rather than full-path string) for the same load-bearing reason
 /// `is_sidecar_filename` uses `Path::file_name()`: a `.ktstr.json.tmp.`
@@ -3754,18 +4000,13 @@ fn is_sidecar_staging_filename(path: &std::path::Path) -> bool {
         .is_some_and(|n| n.contains(".ktstr.json.tmp."))
 }
 
-/// Wall-clock timeout for [`acquire_run_dir_flock`] before it gives
-/// up and returns an error. 30 s is generous for the per-write
-/// critical section: each peer writer holds the lock for at most
-/// one (read_dir + bounded removes) + one (serialize + write)
-/// cycle, all measured in milliseconds. A holder that does not
-/// release within 30 s has stalled (a stuck filesystem, a panic
-/// inside the locked section that somehow survived the RAII
-/// drop, etc.) and surfacing that as an actionable error beats
-/// hanging the test run indefinitely. The timeout is asymmetric
-/// with the cache-store 300 s (5 minute) timeout because
-/// cache-store waits for tens of test runs to drain whereas this
-/// lock waits for at most one peer write.
+/// Wall-clock timeout for [`acquire_run_dir_publication_lock`].
+/// Matching writers normally take SH immediately; EX is held only
+/// for an epoch reset and its first atomic publication. A holder
+/// that does not release within 30 s has stalled, and surfacing that
+/// as an actionable error beats hanging the test run indefinitely.
+/// The timeout is asymmetric with the cache-store 300 s timeout
+/// because this rail protects only bounded run-directory metadata I/O.
 const RUN_DIR_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Compute the per-run-key flock sentinel path for `dir`.
@@ -3798,17 +4039,111 @@ fn run_dir_lock_path(dir: &std::path::Path) -> Option<PathBuf> {
     Some(parent.join(crate::flock::LOCK_DIR_NAME).join(filename))
 }
 
-/// Acquire `LOCK_EX` on the per-run-key flock sentinel for `dir`.
-/// Default-timeout wrapper over [`acquire_run_dir_flock_with_timeout`];
-/// see that helper's doc for the full behavior contract. The
-/// timeout split exists so tests can exercise the contention /
-/// timeout path with a sub-second deadline rather than waiting
-/// 30 s of real time per assertion.
-fn acquire_run_dir_flock(dir: &std::path::Path) -> anyhow::Result<std::os::fd::OwnedFd> {
-    acquire_run_dir_flock_with_timeout(dir, RUN_DIR_LOCK_TIMEOUT)
+/// Acquire publication ownership for a verdict rewrite.
+///
+/// Unlike a primary write, finalization must never initialize or reset an
+/// epoch: its sidecar belongs to the epoch that published it. A matching token
+/// retains SH through rename; a mismatch returns `Ok(None)` without touching
+/// the file. Raw no-token finalization retains the historical EX rail.
+fn acquire_run_dir_finalize_lock(
+    dir: &std::path::Path,
+    session_token: Option<&str>,
+) -> anyhow::Result<Option<std::os::fd::OwnedFd>> {
+    let Some(token) = session_token else {
+        return acquire_run_dir_flock_with_timeout(dir, RUN_DIR_LOCK_TIMEOUT).map(Some);
+    };
+    let shared = acquire_run_dir_flock_mode_with_timeout(
+        dir,
+        crate::flock::FlockMode::Shared,
+        RUN_DIR_LOCK_TIMEOUT,
+    )?;
+    if session_sentinel_matches(dir, token) {
+        Ok(Some(shared))
+    } else {
+        drop(shared);
+        Ok(None)
+    }
 }
 
-/// Test-parametrizable inner of [`acquire_run_dir_flock`].
+/// Acquire the run-directory publication rail.
+///
+/// A matching orchestrated epoch takes `LOCK_SH`, validates the sentinel while
+/// holding it, and returns the fd for the caller to retain through atomic
+/// rename. Peer writers for that epoch therefore publish concurrently. An
+/// epoch reset requires `LOCK_EX`, so it cannot cross the token-validation to
+/// rename interval.
+///
+/// A missing or mismatched epoch makes one non-blocking `LOCK_EX` election.
+/// Losers wait for SH so a same-epoch initializer wakes the whole herd; a
+/// genuinely different epoch proceeds to EX, rechecks, then performs
+/// wipe -> sentinel exactly once. Raw no-token callers retain the historical
+/// exclusive pre-clear-once path.
+fn acquire_run_dir_publication_lock(
+    dir: &std::path::Path,
+    session_token: Option<&str>,
+) -> anyhow::Result<(std::os::fd::OwnedFd, crate::flock::FlockMode)> {
+    acquire_run_dir_publication_lock_with_timeout(dir, session_token, RUN_DIR_LOCK_TIMEOUT)
+}
+
+/// Timeout-parametrizable inner of [`acquire_run_dir_publication_lock`].
+fn acquire_run_dir_publication_lock_with_timeout(
+    dir: &std::path::Path,
+    session_token: Option<&str>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<(std::os::fd::OwnedFd, crate::flock::FlockMode)> {
+    use crate::flock::FlockMode;
+
+    let Some(token) = session_token else {
+        let fd = acquire_run_dir_flock_with_timeout(dir, timeout)?;
+        pre_clear_run_dir_once_for_session(dir, None);
+        return Ok((fd, FlockMode::Exclusive));
+    };
+
+    loop {
+        // Unlocked read is only a fast-path hint. The matching result is
+        // authoritative only after the shared acquire and recheck below.
+        if session_sentinel_matches(dir, token) {
+            let shared = acquire_run_dir_flock_mode_with_timeout(dir, FlockMode::Shared, timeout)?;
+            if session_sentinel_matches(dir, token) {
+                return Ok((shared, FlockMode::Shared));
+            }
+            drop(shared);
+        }
+
+        // On an uninitialized directory exactly one member of a same-epoch
+        // herd wins this non-blocking EX attempt. Losers wait for SH instead
+        // of queueing for EX: once the winner publishes the sentinel and
+        // releases, every loser wakes as a concurrent matching writer.
+        if let Some(exclusive) = try_run_dir_flock(dir, FlockMode::Exclusive)? {
+            if session_sentinel_matches(dir, token) {
+                drop(exclusive);
+                continue;
+            }
+            reset_run_dir_for_session(dir, Some(token))?;
+            return Ok((exclusive, FlockMode::Exclusive));
+        }
+
+        let shared = acquire_run_dir_flock_mode_with_timeout(dir, FlockMode::Shared, timeout)?;
+        if session_sentinel_matches(dir, token) {
+            return Ok((shared, FlockMode::Shared));
+        }
+        drop(shared);
+
+        // The incompatible holder was a different epoch's shared writer, not
+        // an initializer. Wait for reset ownership, then recheck because a
+        // same-epoch peer may have initialized while we were parked.
+        let exclusive = acquire_run_dir_flock_with_timeout(dir, timeout)?;
+        if session_sentinel_matches(dir, token) {
+            drop(exclusive);
+            continue;
+        }
+        reset_run_dir_for_session(dir, Some(token))?;
+        return Ok((exclusive, FlockMode::Exclusive));
+    }
+}
+
+/// Test-parametrizable exclusive wrapper over
+/// [`acquire_run_dir_flock_mode_with_timeout`].
 ///
 /// Resolves the per-run-key lockfile path via [`run_dir_lock_path`]
 /// then delegates to [`crate::flock::acquire_flock_with_timeout`],
@@ -3837,6 +4172,15 @@ fn acquire_run_dir_flock_with_timeout(
     dir: &std::path::Path,
     timeout: std::time::Duration,
 ) -> anyhow::Result<std::os::fd::OwnedFd> {
+    acquire_run_dir_flock_mode_with_timeout(dir, crate::flock::FlockMode::Exclusive, timeout)
+}
+
+/// Mode-parametrizable run-directory flock acquire used by publication.
+fn acquire_run_dir_flock_mode_with_timeout(
+    dir: &std::path::Path,
+    mode: crate::flock::FlockMode,
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::os::fd::OwnedFd> {
     let lock_path = run_dir_lock_path(dir).ok_or_else(|| {
         anyhow::anyhow!(
             "cannot derive run-dir lock path from {} (no parent or no file_name component)",
@@ -3846,7 +4190,7 @@ fn acquire_run_dir_flock_with_timeout(
     let context = format!("run-dir {}", dir.display());
     crate::flock::acquire_flock_with_timeout(
         &lock_path,
-        crate::flock::FlockMode::Exclusive,
+        mode,
         timeout,
         &context,
         Some(
@@ -3855,6 +4199,24 @@ fn acquire_run_dir_flock_with_timeout(
              finish or kill it, then retry.",
         ),
     )
+}
+
+/// One non-blocking acquire against the run-directory lockfile.
+fn try_run_dir_flock(
+    dir: &std::path::Path,
+    mode: crate::flock::FlockMode,
+) -> anyhow::Result<Option<std::os::fd::OwnedFd>> {
+    let lock_path = run_dir_lock_path(dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot derive run-dir lock path from {} (no parent or no file_name component)",
+            dir.display(),
+        )
+    })?;
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create lock subdirectory {}", parent.display()))?;
+    }
+    crate::flock::try_flock(&lock_path, mode)
 }
 
 /// Emit a minimal sidecar for a PRE-VM-BOOT skip path.

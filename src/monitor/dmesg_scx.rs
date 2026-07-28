@@ -155,7 +155,7 @@ const ANCHOR_PREFIX: &str = "sched_ext: BPF scheduler \"";
 /// follow-on lines (typically `<N>` or `[ts]` prefixed kernel print
 /// continuation) until the next non-stack-looking line or the next
 /// anchor. Stack-trace `%pS` tokens are extracted from the
-/// collected lines via [`extract_stack_symbols`].
+/// collected lines via `extract_stack_symbols`.
 ///
 /// Multiple events in one window produce multiple records — the
 /// kernel can emit several `disable` events back-to-back (especially

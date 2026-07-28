@@ -1,5 +1,656 @@
 use super::*;
 
+#[test]
+fn interactive_run_guard_drop_signals_wakes_and_joins_every_helper() {
+    use std::sync::atomic::AtomicUsize;
+
+    let kill = Arc::new(AtomicBool::new(false));
+    let kill_evt = Arc::new(
+        vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .expect("interactive guard kill eventfd"),
+    );
+    let freeze = Arc::new(AtomicBool::new(true));
+    let bsp_done = Arc::new(AtomicBool::new(false));
+    let (stdin_read, stdin_write) = nix::unistd::pipe().expect("stdin wake pipe");
+    let dmesg_wakeup =
+        Arc::new(vmm_sys_util::eventfd::EventFd::new(0).expect("dmesg wake eventfd"));
+    let joined = Arc::new(AtomicUsize::new(0));
+
+    let exec_kill = Arc::clone(&kill);
+    let exec_joined = Arc::clone(&joined);
+    let deadline_publisher = std::thread::spawn(move || {
+        while !exec_kill.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        exec_joined.fetch_or(1 << 0, Ordering::AcqRel);
+    });
+
+    let stdin_joined = Arc::clone(&joined);
+    let stdin = std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            nix::unistd::read(&stdin_read, &mut byte).expect("stdin wake read"),
+            0,
+            "guard closes the writer so poll/read observes EOF",
+        );
+        stdin_joined.fetch_or(1 << 1, Ordering::AcqRel);
+    });
+
+    let stdout_kill = Arc::clone(&kill);
+    let stdout_joined = Arc::clone(&joined);
+    let stdout = std::thread::spawn(move || {
+        while !stdout_kill.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        stdout_joined.fetch_or(1 << 2, Ordering::AcqRel);
+        true
+    });
+
+    let dmesg_evt = Arc::clone(&dmesg_wakeup);
+    let dmesg_joined = Arc::clone(&joined);
+    let dmesg = std::thread::spawn(move || {
+        dmesg_evt.read().expect("dmesg shutdown wake");
+        dmesg_joined.fetch_or(1 << 3, Ordering::AcqRel);
+    });
+
+    let mut guard = InteractiveRunGuard::new(
+        Vec::new(),
+        stdin_write,
+        Arc::clone(&kill),
+        Arc::clone(&kill_evt),
+        Arc::clone(&bsp_done),
+        Arc::clone(&freeze),
+    );
+    guard.deadline_publisher = Some(deadline_publisher);
+    guard.stdin = Some(stdin);
+    guard.stdout = Some(stdout);
+    guard.dmesg = Some(dmesg);
+    guard.dmesg_wakeup = Some(dmesg_wakeup);
+
+    drop(guard);
+
+    assert!(kill.load(Ordering::Acquire));
+    assert!(bsp_done.load(Ordering::Acquire));
+    assert!(!freeze.load(Ordering::Acquire));
+    assert_eq!(
+        kill_evt
+            .read()
+            .expect("done and kill eventfd edges were signaled"),
+        2,
+    );
+    assert_eq!(
+        joined.load(Ordering::Acquire),
+        0b1111,
+        "Drop must join every owned helper before returning",
+    );
+}
+
+const INTERACTIVE_RELAY_CHILD_ENV: &str = "KTSTR_INTERACTIVE_RELAY_CHILD";
+const INTERACTIVE_RELAY_DEADLINE_MODE: &str = "deadline";
+const INTERACTIVE_RELAY_STDOUT_MODE: &str = "stdout-failure";
+const INTERACTIVE_RELAY_AP_FATAL_MODE: &str = "ap-fatal";
+const INTERACTIVE_RELAY_SETUP_FAILURE_MODE: &str = "setup-failure";
+const INTERACTIVE_RELAY_READY: &str = "KTSTR_INTERACTIVE_RELAY_READY";
+const INTERACTIVE_RELAY_CHILD_FAILURE: i32 = 75;
+
+fn interactive_runtime_threads() -> std::collections::BTreeMap<u32, String> {
+    std::fs::read_dir("/proc/self/task")
+        .expect("enumerate process tasks")
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let tid = entry.file_name().to_string_lossy().parse().ok()?;
+            let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+            Some((tid, comm.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// Subprocess-only real-KVM driver for the interactive relay regressions below.
+///
+/// `_exit` is deliberate: the stdout-failure case closes the test process's
+/// stdout while the VM runs. Returning through libtest would make the harness's
+/// own trailing status write—not the VMM—fail on the closed pipe.
+#[test]
+fn interactive_kill_relay_subprocess_helper() {
+    let Ok(mode) = std::env::var(INTERACTIVE_RELAY_CHILD_ENV) else {
+        return;
+    };
+
+    INTERACTIVE_BSP_ENTERED.store(false, Ordering::Release);
+    INJECT_INTERACTIVE_AP_FATAL.store(mode == INTERACTIVE_RELAY_AP_FATAL_MODE, Ordering::Release);
+    FAIL_INTERACTIVE_AFTER_AP_SPAWN.store(
+        mode == INTERACTIVE_RELAY_SETUP_FAILURE_MODE,
+        Ordering::Release,
+    );
+    let baseline_threads =
+        (mode == INTERACTIVE_RELAY_SETUP_FAILURE_MODE).then(interactive_runtime_threads);
+
+    let kernel = crate::test_support::require_kernel();
+    let payload = crate::resolve_current_exe().expect("resolve test binary for shell init");
+    let busybox = blobs::load_busybox_bytes().expect("load busybox for shell initramfs");
+    let topology = if matches!(
+        mode.as_str(),
+        INTERACTIVE_RELAY_AP_FATAL_MODE | INTERACTIVE_RELAY_SETUP_FAILURE_MODE
+    ) {
+        Topology::new(1, 1, 2, 1)
+    } else {
+        Topology::new(1, 1, 1, 1)
+    };
+    let exec_cmd = match mode.as_str() {
+        INTERACTIVE_RELAY_DEADLINE_MODE | INTERACTIVE_RELAY_AP_FATAL_MODE => "sleep 60",
+        INTERACTIVE_RELAY_SETUP_FAILURE_MODE => "true",
+        INTERACTIVE_RELAY_STDOUT_MODE => {
+            "echo KTSTR_INTERACTIVE_RELAY_READY; while :; do echo KTSTR_INTERACTIVE_RELAY_SPAM; done"
+        }
+        other => {
+            eprintln!("unknown interactive relay child mode: {other}");
+            // SAFETY: this is an isolated subprocess test driver.
+            unsafe { libc::_exit(INTERACTIVE_RELAY_CHILD_FAILURE) };
+        }
+    };
+    let exec_timeout = if mode == INTERACTIVE_RELAY_DEADLINE_MODE {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(60)
+    };
+    let topo_arg = if matches!(
+        mode.as_str(),
+        INTERACTIVE_RELAY_AP_FATAL_MODE | INTERACTIVE_RELAY_SETUP_FAILURE_MODE
+    ) {
+        "KTSTR_MODE=shell KTSTR_TOPO=1,1,2,1"
+    } else {
+        "KTSTR_MODE=shell KTSTR_TOPO=1,1,1,1"
+    };
+
+    let vm = match KtstrVm::builder()
+        .kernel(&kernel)
+        .init_binary(payload)
+        .busybox(Some(busybox))
+        .topology(topology)
+        .memory_deferred_min(128)
+        .cmdline(topo_arg)
+        .exec_cmd(exec_cmd)
+        .exec_timeout(exec_timeout)
+        .no_perf_mode(true)
+        .build()
+    {
+        Ok(vm) => vm,
+        Err(error) => {
+            eprintln!("interactive relay child VM build failed: {error:#}");
+            // SAFETY: this is an isolated subprocess test driver.
+            unsafe { libc::_exit(INTERACTIVE_RELAY_CHILD_FAILURE) };
+        }
+    };
+
+    let started = Instant::now();
+    let outcome = vm.run_interactive();
+    let no_setup_leaks = baseline_threads.as_ref().is_none_or(|baseline| {
+        interactive_runtime_threads()
+            .into_iter()
+            .all(|(tid, name)| baseline.contains_key(&tid) || !interactive_runtime_thread(&name))
+    });
+    if !no_setup_leaks {
+        eprintln!("interactive setup failure returned with live vCPU/helper tasks");
+    }
+    let expected = match mode.as_str() {
+        INTERACTIVE_RELAY_DEADLINE_MODE => outcome
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("exec-timeout")),
+        INTERACTIVE_RELAY_STDOUT_MODE | INTERACTIVE_RELAY_AP_FATAL_MODE => outcome.is_err(),
+        INTERACTIVE_RELAY_SETUP_FAILURE_MODE => {
+            outcome.as_ref().is_err_and(|error| {
+                error
+                    .to_string()
+                    .contains("injected interactive setup failure after AP spawn")
+            }) && no_setup_leaks
+        }
+        _ => false,
+    };
+    if !expected {
+        eprintln!(
+            "interactive relay child returned an unexpected result after {:?}: {outcome:?}",
+            started.elapsed(),
+        );
+    }
+
+    INJECT_INTERACTIVE_AP_FATAL.store(false, Ordering::Release);
+    FAIL_INTERACTIVE_AFTER_AP_SPAWN.store(false, Ordering::Release);
+    INTERACTIVE_BSP_ENTERED.store(false, Ordering::Release);
+    // SAFETY: skip libtest teardown because stdout is intentionally invalid in
+    // one mode and encode the semantic result directly in the child status.
+    unsafe {
+        libc::_exit(if expected {
+            0
+        } else {
+            INTERACTIVE_RELAY_CHILD_FAILURE
+        })
+    };
+}
+
+fn spawn_interactive_relay_child(
+    mode: &str,
+    stdout: std::process::Stdio,
+) -> (std::process::Child, std::thread::JoinHandle<Vec<u8>>) {
+    use std::io::Read;
+
+    let exact = "vmm::tests::interactive_kill_relay_subprocess_helper";
+    let mut child = std::process::Command::new(
+        std::env::current_exe().expect("resolve current unit-test executable"),
+    )
+    .arg("--exact")
+    .arg(exact)
+    .arg("--nocapture")
+    // Libtest's parallel runner starts a 60-second timeout reporter even
+    // when only one exact test is selected. The stdout-failure regression
+    // deliberately closes this process's stdout after the guest readiness
+    // marker; under admission delay that reporter can then win the EPIPE
+    // race and exit 101 before the VMM observes the broken output sink.
+    // One harness thread selects libtest's synchronous path, which has no
+    // concurrent timeout writer. This does not serialize any VMM worker:
+    // the helper still creates the same vCPU and interactive relay threads.
+    .arg("--test-threads=1")
+    .env(INTERACTIVE_RELAY_CHILD_ENV, mode)
+    .stdin(std::process::Stdio::null())
+    .stdout(stdout)
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("spawn interactive relay subprocess");
+    let mut stderr = child.stderr.take().expect("capture relay child stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    (child, stderr_reader)
+}
+
+#[derive(Debug, Default)]
+struct InteractiveChildServiceSample {
+    tasks: std::collections::BTreeMap<u32, (u64, u64)>,
+    serviceable_tasks: usize,
+    runtime_started: bool,
+}
+
+fn interactive_runtime_thread(comm: &str) -> bool {
+    comm.starts_with("vcpu-") || comm.starts_with("interactive-") || comm.starts_with("ktstr-exec-")
+}
+
+fn interactive_task_is_serviceable(stat: &[u8]) -> bool {
+    let Some(state) = stat
+        .windows(2)
+        .rposition(|window| window == b") ")
+        .and_then(|close| stat.get(close + 2))
+    else {
+        return false;
+    };
+    // A runnable task is waiting for host CPU service. An uninterruptible
+    // task is waiting for kernel I/O service and is equally incapable of
+    // responding to the relay until that service completes. Neither state
+    // proves a wedged userspace VMM.
+    matches!(state, b'R' | b'D')
+}
+
+fn interactive_child_service_sample(pid: u32) -> InteractiveChildServiceSample {
+    let mut sample = InteractiveChildServiceSample::default();
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return sample;
+    };
+    for task in tasks.flatten() {
+        let Ok(tid) = task.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let task_path = task.path();
+        if let Ok(comm) = std::fs::read_to_string(task_path.join("comm")) {
+            sample.runtime_started |= interactive_runtime_thread(comm.trim());
+        }
+        if let Ok(schedstat) = std::fs::read_to_string(task_path.join("schedstat")) {
+            let mut fields = schedstat.split_whitespace();
+            if let (Some(cpu), Some(delay)) = (
+                fields.next().and_then(|v| v.parse::<u64>().ok()),
+                fields.next().and_then(|v| v.parse::<u64>().ok()),
+            ) {
+                sample.tasks.insert(tid, (cpu, delay));
+            }
+        }
+        if let Ok(stat) = std::fs::read(task_path.join("stat"))
+            && interactive_task_is_serviceable(&stat)
+        {
+            sample.serviceable_tasks += 1;
+        }
+    }
+    sample
+}
+
+struct InteractiveChildWatchdog {
+    previous: InteractiveChildServiceSample,
+    runtime_started: bool,
+    charged_cpu_ns: u64,
+    blocked_watch: InteractiveBlockedServiceWatch,
+    cpu_budget: Duration,
+}
+
+fn interactive_observer_cpu_time_ns() -> Result<u64, String> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `timestamp` is a valid out-pointer and `clock_gettime` only
+    // writes the sampled clock value through it.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timestamp) } != 0 {
+        return Err(format!(
+            "sample interactive relay observer CPU service: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if timestamp.tv_sec < 0 || timestamp.tv_nsec < 0 {
+        return Err(format!(
+            "sample interactive relay observer CPU service: negative timestamp \
+             {}.{:09}",
+            timestamp.tv_sec, timestamp.tv_nsec
+        ));
+    }
+    Ok((timestamp.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(timestamp.tv_nsec as u64))
+}
+
+#[derive(Debug, Default)]
+struct InteractiveBlockedServiceWatch {
+    observer_anchor_ns: Option<u64>,
+}
+
+impl InteractiveBlockedServiceWatch {
+    fn observe(&mut self, armed: bool, made_progress: bool, observer_service_ns: u64) -> u64 {
+        if !armed || made_progress {
+            self.observer_anchor_ns = None;
+            return 0;
+        }
+        let anchor = self.observer_anchor_ns.get_or_insert(observer_service_ns);
+        observer_service_ns.saturating_sub(*anchor)
+    }
+}
+
+impl InteractiveChildWatchdog {
+    fn new(child: &std::process::Child, cpu_budget: Duration) -> Self {
+        let previous = interactive_child_service_sample(child.id());
+        let runtime_started = previous.runtime_started;
+        Self {
+            previous,
+            runtime_started,
+            charged_cpu_ns: 0,
+            blocked_watch: InteractiveBlockedServiceWatch::default(),
+            cpu_budget,
+        }
+    }
+
+    fn poll(
+        &mut self,
+        child: &mut std::process::Child,
+    ) -> Result<Option<std::process::ExitStatus>, String> {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("poll interactive relay child: {error}"))?
+        {
+            return Ok(Some(status));
+        }
+
+        let current = interactive_child_service_sample(child.id());
+        self.runtime_started |= current.runtime_started;
+        let task_set_changed = !current.tasks.keys().eq(self.previous.tasks.keys());
+        let mut counters_changed = false;
+        for (tid, &(cpu_ns, delay_ns)) in &current.tasks {
+            if let Some(&(previous_cpu_ns, previous_delay_ns)) = self.previous.tasks.get(tid) {
+                self.charged_cpu_ns = self
+                    .charged_cpu_ns
+                    .saturating_add(cpu_ns.saturating_sub(previous_cpu_ns));
+                counters_changed |= cpu_ns != previous_cpu_ns || delay_ns != previous_delay_ns;
+            }
+        }
+        let made_progress = task_set_changed || counters_changed || current.serviceable_tasks > 0;
+        self.previous = current;
+
+        if self.charged_cpu_ns >= self.cpu_budget.as_nanos() as u64 {
+            return Err(format!(
+                "interactive relay subprocess consumed {:?} of task CPU service \
+                 without completing (budget {:?})",
+                Duration::from_nanos(self.charged_cpu_ns),
+                self.cpu_budget,
+            ));
+        }
+
+        // A runnable task is delayed host service, not a VMM hang. Likewise,
+        // changing task CPU/run-delay counters prove forward scheduler
+        // service. Only a process whose complete task set remains blocked and
+        // unchanged is eligible for the stall verdict. Charge that verdict to
+        // CPU service delivered to this observer, not host wall time: a
+        // descheduled observer cannot prove that a blocked child remained
+        // unchanged during the interval it did not inspect. Admission happens
+        // before the VMM creates any runtime threads and may legitimately
+        // block for longer than this detector's budget, so do not arm the
+        // VMM-stall detector until one of those threads has been observed.
+        const BLOCKED_OBSERVER_SERVICE_BUDGET: Duration = Duration::from_millis(250);
+        let observer_service_ns = interactive_observer_cpu_time_ns()?;
+        let blocked_observer_service_ns =
+            self.blocked_watch
+                .observe(self.runtime_started, made_progress, observer_service_ns);
+        if blocked_observer_service_ns >= BLOCKED_OBSERVER_SERVICE_BUDGET.as_nanos() as u64 {
+            return Err(format!(
+                "interactive relay subprocess made no task-service progress \
+                 while every task was blocked and the observer received {:?} \
+                 of CPU service (budget {BLOCKED_OBSERVER_SERVICE_BUDGET:?})",
+                Duration::from_nanos(blocked_observer_service_ns),
+            ));
+        }
+        Ok(None)
+    }
+}
+
+#[test]
+fn interactive_blocked_watch_ignores_unobserved_wall_time() {
+    let mut watch = InteractiveBlockedServiceWatch::default();
+    assert_eq!(watch.observe(true, false, 10), 0);
+    assert_eq!(watch.observe(true, false, 10), 0);
+}
+
+#[test]
+fn interactive_runtime_thread_recognizes_linux_truncated_names() {
+    assert!(interactive_runtime_thread("vcpu-1"));
+    assert!(interactive_runtime_thread("interactive-kil"));
+    assert!(interactive_runtime_thread("ktstr-exec-dead"));
+    assert!(!interactive_runtime_thread("vmm::tests::boot"));
+}
+
+#[test]
+fn interactive_task_service_state_includes_uninterruptible_io() {
+    assert!(interactive_task_is_serviceable(b"123 (vmm worker) R 1 2 3"));
+    assert!(interactive_task_is_serviceable(
+        b"123 (vmm (worker)) D 1 2 3"
+    ));
+    assert!(!interactive_task_is_serviceable(
+        b"123 (vmm worker) S 1 2 3"
+    ));
+    assert!(!interactive_task_is_serviceable(b"malformed"));
+}
+
+#[test]
+fn interactive_blocked_watch_does_not_arm_before_vmm_runtime() {
+    let mut watch = InteractiveBlockedServiceWatch::default();
+    assert_eq!(watch.observe(false, false, 10), 0);
+    assert_eq!(watch.observe(false, false, 10_000), 0);
+    assert_eq!(watch.observe(true, false, 20_000), 0);
+    assert_eq!(watch.observe(true, false, 20_100), 100);
+}
+
+#[test]
+fn interactive_blocked_watch_charges_only_delivered_observer_service() {
+    let mut watch = InteractiveBlockedServiceWatch::default();
+    assert_eq!(watch.observe(true, false, 10), 0);
+    assert_eq!(watch.observe(true, false, 110), 100);
+}
+
+#[test]
+fn interactive_blocked_watch_reanchors_on_child_progress() {
+    let mut watch = InteractiveBlockedServiceWatch::default();
+    assert_eq!(watch.observe(true, false, 10), 0);
+    assert_eq!(watch.observe(true, false, 110), 100);
+    assert_eq!(watch.observe(true, true, 120), 0);
+    assert_eq!(watch.observe(true, false, 10_000), 0);
+}
+
+fn terminate_interactive_relay_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let reap_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < reap_deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_interactive_relay_child(
+    child: &mut std::process::Child,
+    watchdog: &mut InteractiveChildWatchdog,
+) -> Result<std::process::ExitStatus, String> {
+    loop {
+        match watchdog.poll(child) {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                terminate_interactive_relay_child(child);
+                return Err(error);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_interactive_relay_child(mode: &str) {
+    let (mut child, stderr_reader) =
+        spawn_interactive_relay_child(mode, std::process::Stdio::null());
+    let mut watchdog = InteractiveChildWatchdog::new(&child, Duration::from_secs(20));
+    let outcome = wait_interactive_relay_child(&mut child, &mut watchdog);
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let status = outcome.unwrap_or_else(|error| {
+        panic!(
+            "interactive relay {mode} child watchdog failed: {error}; stderr={}",
+            String::from_utf8_lossy(&stderr),
+        )
+    });
+    assert!(
+        status.success(),
+        "interactive relay {mode} child failed with {status}; stderr={}",
+        String::from_utf8_lossy(&stderr),
+    );
+}
+
+#[test]
+fn boot_kernel_interactive_deadline_relay_exits_blocked_bsp() {
+    if !crate::test_support::cargo_ktstr_orchestrated() {
+        skip!("real-KVM interactive deadline relay regression requires cargo-ktstr orchestration");
+    }
+    assert_interactive_relay_child(INTERACTIVE_RELAY_DEADLINE_MODE);
+}
+
+#[test]
+fn boot_kernel_interactive_ap_fatal_relay_exits_blocked_bsp() {
+    if !crate::test_support::cargo_ktstr_orchestrated() {
+        skip!("real-KVM interactive AP-fatal relay regression requires cargo-ktstr orchestration");
+    }
+    assert_interactive_relay_child(INTERACTIVE_RELAY_AP_FATAL_MODE);
+}
+
+#[test]
+fn boot_kernel_interactive_stdout_failure_relay_exits_blocked_bsp() {
+    use std::io::BufRead;
+
+    if !crate::test_support::cargo_ktstr_orchestrated() {
+        skip!(
+            "real-KVM interactive stdout-failure relay regression requires cargo-ktstr orchestration"
+        );
+    }
+
+    let (mut child, stderr_reader) =
+        spawn_interactive_relay_child(INTERACTIVE_RELAY_STDOUT_MODE, std::process::Stdio::piped());
+    let mut watchdog = InteractiveChildWatchdog::new(&child, Duration::from_secs(20));
+    let stdout = child.stdout.take().expect("capture relay child stdout");
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let stdout_reader = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+                Ok(_) if line.contains(INTERACTIVE_RELAY_READY) => {
+                    let _ = ready_tx.send(true);
+                    // Dropping the only read end makes the VMM's next guest
+                    // output write observe EPIPE/BrokenPipe.
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+            }
+        }
+    });
+
+    let ready = loop {
+        match ready_rx.try_recv() {
+            Ok(ready) => break Ok(ready),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break Ok(false),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        match watchdog.poll(&mut child) {
+            Ok(Some(status)) => {
+                break Err(format!(
+                    "interactive relay child exited with {status} before the stdout marker"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                terminate_interactive_relay_child(&mut child);
+                break Err(error);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if ready != Ok(true) {
+        terminate_interactive_relay_child(&mut child);
+        let _ = stdout_reader.join();
+        let stderr = stderr_reader.join().unwrap_or_default();
+        panic!(
+            "guest never produced the stdout relay readiness marker{}; stderr={}",
+            ready
+                .err()
+                .as_deref()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default(),
+            String::from_utf8_lossy(&stderr),
+        );
+    }
+
+    let outcome = wait_interactive_relay_child(&mut child, &mut watchdog);
+    let _ = stdout_reader.join();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let status = outcome.unwrap_or_else(|error| {
+        panic!(
+            "interactive stdout-failure child watchdog failed: {error}; stderr={}",
+            String::from_utf8_lossy(&stderr),
+        )
+    });
+    assert!(
+        status.success(),
+        "interactive stdout-failure relay child failed with {status}; stderr={}",
+        String::from_utf8_lossy(&stderr),
+    );
+}
+
 /// Whether a timing-sensitive boot-race VM test ran in an environment
 /// too loaded for its wall-anchored expectation to hold — so the test
 /// SKIPs (environmental non-verdict) instead of false-failing. Two
@@ -55,119 +706,605 @@ fn routing_failure_summary_none_when_zero_else_counts() {
     );
 }
 
-/// build_overcommit_run_locks uses the resolved allowed cpuset as the default
-/// mask (no locks, no pinning plan). The mask is the run-time budget source:
-/// run() stamps result.cpu_budget = default_cpu_mask.len().max(1), so the
-/// sidecar reflects the overcommit mask, not the build-time vCPU count. vcpus
-/// equals the mask size here so the overcommit_warning side-channel (which fires
-/// only when the mask is narrower than vcpus) stays out of this mask-focused
-/// test.
+struct DefaultAdmissionTestGuard {
+    _dir: tempfile::TempDir,
+}
+
+impl DefaultAdmissionTestGuard {
+    fn new(cpus: Vec<usize>) -> Self {
+        let dir = tempfile::TempDir::new().expect("default admission tempdir");
+        host_topology::ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(cpus));
+        host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = Some(format!("{}/llc-", dir.path().display()));
+        });
+        host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = Some(format!("{}/cpu-", dir.path().display()));
+        });
+        Self { _dir: dir }
+    }
+}
+
+impl Drop for DefaultAdmissionTestGuard {
+    fn drop(&mut self) {
+        host_topology::ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// The default fallback constructor preserves the exact shared mask admitted
+/// alongside its run-scoped locks.
 #[test]
-fn build_overcommit_run_locks_uses_allowed_as_mask() {
-    let rl = KtstrVm::build_overcommit_run_locks(vec![0, 1, 2, 3], 4);
-    assert_eq!(rl.default_cpu_mask, Some(vec![0, 1, 2, 3]));
+fn build_default_shared_run_locks_uses_admitted_mask() {
+    let rl = KtstrVm::build_default_shared_run_locks(
+        vec![0, 1, 2, 3],
+        4,
+        host_topology::protocol::Acquired::untracked(Vec::new()),
+    );
+    assert_eq!(rl.shared_cpu_mask, Some(vec![0, 1, 2, 3]));
     assert!(rl.locks.is_empty());
     assert!(rl.pinning_plan.is_none());
-    // The overcommit path is not the no-perf replan path — it must not
-    // populate `no_perf_cpus` (only `acquire_run_locks`' no-perf arm
-    // does, from its fresh LLC plan).
-    assert!(rl.no_perf_cpus.is_none());
+    assert!(rl.default_shared_fallback);
 }
 
-/// acquire_default_run_locks overcommits (default_cpu_mask = the allowed cpuset)
-/// when there is no cached host topology — nothing to plan a 1:1 pin against.
+/// Without cached LLC topology, default still takes a target-sized CPU-SH
+/// reservation rather than degrading to an unreserved run.
 #[test]
-fn acquire_default_run_locks_overcommits_with_no_host_topo() {
-    // Reset BEFORE the asserts so an assert-fail cannot leak the thread-local
-    // into a sibling; the call itself has no panic path. (host_topology's RAII
-    // AllowedCpusGuard is module-private; the override is thread-local +
-    // per-test isolated, so a leak could not cross tests regardless.)
-    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(vec![0, 1]));
-    let rl = KtstrVm::acquire_default_run_locks(None, &Topology::new(1, 1, 1, 1), false);
-    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
+fn acquire_default_run_locks_uses_shared_bridge_with_no_host_topo() {
+    let _guard = DefaultAdmissionTestGuard::new(vec![0, 1]);
+    let rl = KtstrVm::acquire_default_preferred_run_locks(
+        None,
+        &Topology::new(1, 1, 1, 1),
+        false,
+        None,
+        None,
+        256,
+    );
     let rl = rl.expect("no-host overcommit is Ok, not an error");
+    let mut shared_cpu_mask = rl
+        .shared_cpu_mask
+        .clone()
+        .expect("default bridge retains its admitted CPU set");
+    shared_cpu_mask.sort_unstable();
     assert_eq!(
-        rl.default_cpu_mask,
-        Some(vec![0, 1]),
-        "overcommit uses the allowed cpuset as the mask",
+        shared_cpu_mask,
+        vec![0, 1],
+        "vcpus + 1 uses the complete two-CPU allowed set",
     );
     assert!(rl.pinning_plan.is_none());
-    assert!(rl.no_perf_cpus.is_none());
+    assert!(rl.default_shared_fallback);
 }
 
-/// acquire_default_run_locks overcommits when the host is too small for a 1:1
-/// pin (compute_pinning fails for every offset, produced_candidate stays false)
-/// — the make-it-work-overcommit-if-topologically-impossible host-gate policy.
-/// Host has 1 LLC; the topology requests 2, so no offset can map it.
+/// A host too small for exact 1:1 topology still admits the clamped shared
+/// pool. Host has 1 LLC; the topology requests 2, so no exact plan can map.
 #[test]
-fn acquire_default_run_locks_overcommits_when_host_too_small() {
+fn acquire_default_run_locks_uses_shared_pool_when_host_too_small() {
     let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
     let topo = Topology::new(1, 2, 1, 1);
-    // Reset BEFORE the asserts so an assert-fail cannot leak the thread-local
-    // into a sibling; the call itself has no panic path. (host_topology's RAII
-    // AllowedCpusGuard is module-private; the override is thread-local +
-    // per-test isolated, so a leak could not cross tests regardless.)
-    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = Some(vec![0, 1]));
-    let rl = KtstrVm::acquire_default_run_locks(Some(&host), &topo, false);
-    host_topology::ALLOWED_CPUS_OVERRIDE.with(|p| *p.borrow_mut() = None);
+    let _guard = DefaultAdmissionTestGuard::new(vec![0, 1]);
+    let rl =
+        KtstrVm::acquire_default_preferred_run_locks(Some(&host), &topo, false, None, None, 256);
     let rl = rl.expect("a too-small host overcommits, it does not error or skip");
+    let mut shared_cpu_mask = rl
+        .shared_cpu_mask
+        .clone()
+        .expect("default fallback retains its admitted CPU set");
+    shared_cpu_mask.sort_unstable();
     assert_eq!(
-        rl.default_cpu_mask,
-        Some(vec![0, 1]),
-        "host too small for a 1:1 pin overcommits to the allowed cpuset",
+        shared_cpu_mask,
+        vec![0, 1],
+        "host too small for a 1:1 pin uses the exact shared pool",
     );
     assert!(rl.pinning_plan.is_none());
-    assert!(rl.no_perf_cpus.is_none());
+    assert!(rl.default_shared_fallback);
 }
 
-/// degrade_contention_to_overcommit converts a transient ResourceContention
-/// into a lock-free best-effort RunLocks: the one-shot shell deliberately
-/// does not park on a peer's LOCK_EX (no wait deadline, no nextest retry),
-/// so it boots overcommitted rather than aborting. No locks, no mask, no
-/// pinning plan.
+/// Default's preferred CPU-EX probe is best-effort even after the caller has
+/// entered the queue. A shared holder must route the coordinator directly to
+/// the CPU-SH fallback rather than becoming an invalid durable EX marker on
+/// the ticket's deliberately shared watch.
 #[test]
-fn degrade_contention_to_overcommit_maps_contention_to_lockfree() {
-    let contended = Err(anyhow::Error::new(host_topology::ResourceContention {
-        reason: "all 3 LLC slots busy (LOCK_SH)".into(),
+fn acquire_default_waiting_run_discards_best_effort_ex_contention() {
+    let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0)]);
+    let topo = Topology::new(1, 1, 1, 1);
+    let _guard = DefaultAdmissionTestGuard::new(vec![0, 1]);
+    let _peer0 = crate::flock::try_flock(
+        host_topology::cpu_lock_path(0),
+        crate::flock::FlockMode::Shared,
+    )
+    .expect("open CPU 0 peer lock")
+    .expect("take CPU 0 shared peer lock");
+    let _peer1 = crate::flock::try_flock(
+        host_topology::cpu_lock_path(1),
+        crate::flock::FlockMode::Shared,
+    )
+    .expect("open CPU 1 peer lock")
+    .expect("take CPU 1 shared peer lock");
+
+    let admitted =
+        KtstrVm::acquire_default_preferred_run_locks(Some(&host), &topo, true, None, None, 256)
+            .expect("shared peers must route queued default admission to its shared fallback");
+
+    assert!(admitted.pinning_plan.is_none());
+    assert!(admitted.default_shared_fallback);
+    let mut mask = admitted
+        .shared_cpu_mask
+        .clone()
+        .expect("shared fallback retains its admitted CPU mask");
+    mask.sort_unstable();
+    assert_eq!(mask, vec![0, 1]);
+}
+
+#[test]
+fn default_early_intent_preserves_exact_preference_inside_shared_fallback() {
+    let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let topology = Topology::new(1, 1, 1, 1);
+    let candidates = default_intent_candidates(Some(&host), &topology, &[0, 1, 2, 3], 2)
+        .expect("build default early-intent candidates");
+    assert!(!candidates.is_empty());
+    assert!(candidates.iter().all(|candidate| {
+        !candidate.preferred_ex_cpus.is_empty()
+            && candidate
+                .preferred_ex_cpus
+                .iter()
+                .all(|cpu| candidate.cpus.contains(cpu))
+            && candidate.cpu_mode == crate::flock::FlockMode::Shared
+            && candidate.llc_mode == host_topology::LlcLockMode::Shared
     }));
-    let rl = KtstrVm::degrade_contention_to_overcommit(contended)
-        .expect("contention degrades to Ok, not an error");
-    assert!(
-        rl.locks.is_empty(),
-        "best-effort boot holds no resource locks"
-    );
-    assert!(rl.default_cpu_mask.is_none());
-    assert!(rl.pinning_plan.is_none());
-}
 
-/// degrade_contention_to_overcommit passes a successful acquire through
-/// unchanged — the degrade only fires on ResourceContention.
-#[test]
-fn degrade_contention_to_overcommit_passes_success_through() {
-    let ok = Ok(RunLocks {
-        locks: Vec::new(),
-        default_cpu_mask: Some(vec![0, 1]),
-        pinning_plan: None,
-        no_perf_cpus: None,
-    });
-    let rl = KtstrVm::degrade_contention_to_overcommit(ok).expect("Ok passes through");
-    assert_eq!(rl.default_cpu_mask, Some(vec![0, 1]));
-}
-
-/// degrade_contention_to_overcommit propagates a non-contention error rather
-/// than masking a genuine failure as an overcommit boot.
-#[test]
-fn degrade_contention_to_overcommit_propagates_other_errors() {
-    let boom = Err::<RunLocks, _>(anyhow::anyhow!("disk gone"));
-    let err = match KtstrVm::degrade_contention_to_overcommit(boom) {
-        Ok(_) => panic!("non-contention error must propagate, not degrade"),
-        Err(e) => e,
+    let plan = AdmissionIntentPlan {
+        candidates,
+        permit_pool: host_topology::VmPermitPool::new_with_preparation(2, 256, None)
+            .expect("construct test permit pool"),
     };
-    assert!(err.to_string().contains("disk gone"));
-    assert!(
-        err.downcast_ref::<host_topology::ResourceContention>()
-            .is_none()
+    let watch = plan.watch();
+    assert_eq!(
+        watch.cpu_mode,
+        host_topology::protocol::ClaimMode::Shared,
+        "best-effort exact preference must not promote the published SH watch to EX",
     );
+}
+
+#[test]
+fn early_intent_selects_weighted_permits_once_for_all_topology_candidates() {
+    let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1], 0), (vec![2, 3], 0)]);
+    let topology = Topology::new(1, 1, 1, 1);
+    let candidates = default_intent_candidates(Some(&host), &topology, &[0, 1, 2, 3], 2)
+        .expect("build default early-intent candidates");
+    assert!(candidates.len() > 1);
+    let count_permit_probes = |candidates| {
+        let plan = AdmissionIntentPlan {
+            candidates,
+            permit_pool: host_topology::VmPermitPool::new_with_preparation(2, 256, None)
+                .expect("construct test permit pool"),
+        };
+        let permit_only_probes = std::cell::Cell::new(0usize);
+        let selected = plan
+            .select(
+                |claim| {
+                    if claim.cpus.is_empty() && claim.llcs.is_empty() {
+                        permit_only_probes.set(permit_only_probes.get() + 1);
+                    }
+                    Ok(true)
+                },
+                |_| Ok((0, 0)),
+            )
+            .expect("select early-intent placement");
+        assert!(selected.is_some());
+        permit_only_probes.get()
+    };
+    let one_candidate_probes = count_permit_probes(vec![candidates[0].clone()]);
+    let all_candidate_probes = count_permit_probes(candidates);
+    assert!(one_candidate_probes > 0);
+    assert_eq!(
+        all_candidate_probes, one_candidate_probes,
+        "weighted permit selection must not restart for every topology candidate",
+    );
+}
+
+fn pending_exec_descriptor_for_validation(
+    memory_min_mib: u32,
+    wprof: bool,
+) -> crate::test_support::AdmissionCellDescriptor {
+    crate::test_support::AdmissionCellDescriptor {
+        exact_name: "ktstr/metadata_v3_contract".into(),
+        kind: crate::test_support::AdmissionCellKind::Ktstr,
+        entry_name: Some("metadata_v3_contract".into()),
+        preset_name: Some("1cpu-1llc-nosmt".into()),
+        scheduler_name: None,
+        kernel: Some("test-kernel".into()),
+        topology: crate::test_support::AdmissionTopologyDescriptor {
+            numa_nodes: 1,
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            node_llcs: None,
+            llc_cores: None,
+        },
+        cpu_budget: None,
+        memory_min_mib,
+        wprof,
+        mode: crate::test_support::AdmissionMode::Default,
+        host_only: false,
+        performance_mode: false,
+        no_perf_mode: false,
+        expect_auto_repro: false,
+    }
+}
+
+#[test]
+fn pending_exec_descriptor_rejects_built_memory_floor_mismatch() {
+    let descriptor = pending_exec_descriptor_for_validation(2_048, false);
+    let error = validate_pending_exec_descriptor(&descriptor, 1_024, 2_048, false)
+        .expect_err("the test binary cannot change its stamped memory floor after pre-admission");
+    assert!(
+        error.to_string().contains("test built 1024MiB"),
+        "unexpected memory-floor mismatch diagnostic: {error:#}",
+    );
+}
+
+#[test]
+fn pending_exec_descriptor_rejects_prepared_memory_below_floor() {
+    let descriptor = pending_exec_descriptor_for_validation(2_048, false);
+    let error = validate_pending_exec_descriptor(&descriptor, 2_048, 2_047, false)
+        .expect_err("immutable preparation cannot lower the stamped memory floor");
+    assert!(
+        error.to_string().contains("prepared VM memory is 2047MiB"),
+        "unexpected prepared-memory mismatch diagnostic: {error:#}",
+    );
+}
+
+#[test]
+fn pending_exec_descriptor_rejects_wprof_mismatch() {
+    let descriptor = pending_exec_descriptor_for_validation(2_048, true);
+    let error = validate_pending_exec_descriptor(&descriptor, 2_048, 2_048, false)
+        .expect_err("the exec target cannot drop the wrapper's stamped wprof requirement");
+    assert!(
+        error
+            .to_string()
+            .contains("carries wprof=true, but the test built wprof=false"),
+        "unexpected wprof mismatch diagnostic: {error:#}",
+    );
+}
+
+#[test]
+fn pending_exec_descriptor_accepts_matching_memory_and_wprof_contract() {
+    let descriptor = pending_exec_descriptor_for_validation(2_048, true);
+    validate_pending_exec_descriptor(&descriptor, 2_048, 3_072, true)
+        .expect("prepared memory may exceed an otherwise identical metadata-v3 contract");
+}
+
+/// Performance admission must publish every eligible exact whole-LLC
+/// placement, not freeze an all-busy storm onto the builder's first slot.
+/// The physical build/default reserve is deliberately ineligible. Candidate
+/// order is process-rotated, so compare the set.
+#[test]
+fn performance_run_candidates_cover_every_equivalent_exclusive_slot() {
+    let host = host_topology::HostTopology::new_for_tests(&[
+        (vec![0, 1], 0),
+        (vec![2, 3], 0),
+        (vec![4, 5], 0),
+    ]);
+    let candidates =
+        KtstrVm::performance_run_candidates(&host, &Topology::new(1, 1, 1, 1), &[0, 1, 2, 3, 4, 5])
+            .expect("enumerate exact perf placements");
+    let mut llcs: Vec<_> = candidates
+        .iter()
+        .map(|candidate| candidate.plan.llc_indices.clone())
+        .collect();
+    llcs.sort();
+    assert_eq!(llcs, vec![vec![1], vec![2]]);
+    let reserved = host.performance_reserved_cpus(&[0, 1, 2, 3, 4, 5]);
+    assert_eq!(reserved, [0, 1].into_iter().collect());
+    assert!(candidates.iter().all(|candidate| {
+        candidate
+            .plan
+            .llc_indices
+            .iter()
+            .flat_map(|llc| host.llc_groups[*llc].cpus.iter())
+            .all(|cpu| !reserved.contains(cpu))
+    }));
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.plan.locks.is_empty()),
+        "candidate enumeration carries no pre-boot flock ownership",
+    );
+}
+
+/// Per-CPU-grain performance mode exposes a bounded set of exact CPU
+/// footprints inside a large LLC while preserving shared-LLC + CPU-EX grain.
+#[test]
+fn performance_run_candidates_cover_every_disjoint_cpu_grain() {
+    let host = host_topology::HostTopology::new_for_tests(&[((0..36).collect(), 0)]);
+    let allowed = (0..36).collect::<Vec<_>>();
+    let candidates =
+        KtstrVm::performance_run_candidates(&host, &Topology::new(1, 1, 1, 1), &allowed)
+            .expect("enumerate per-CPU perf grains");
+    let mut footprints: Vec<Vec<usize>> = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .plan
+                .assignments
+                .iter()
+                .map(|&(_, cpu)| cpu)
+                .chain(candidate.plan.service_cpu)
+                .collect()
+        })
+        .collect();
+    footprints.sort();
+    assert!(!footprints.is_empty());
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate.llc_mode == host_topology::LlcLockMode::Shared)
+    );
+    assert!(footprints.len() <= allowed.len());
+}
+
+#[test]
+fn effective_run_placement_uses_runtime_plan_for_every_service_consumer() {
+    let selected = host_topology::PinningPlan {
+        assignments: vec![(0, 8), (1, 9)],
+        service_cpu: Some(10),
+        llc_indices: vec![2],
+        locks: host_topology::protocol::Acquired::untracked(Vec::new()),
+    };
+    let shared = [12, 13];
+    let placement = EffectiveRunPlacement::new(Some(&selected), Some(&shared));
+    assert_eq!(placement.service_cpu, Some(10));
+    assert_eq!(placement.shared_cpus, Some(shared.as_slice()));
+}
+
+#[test]
+fn run_helper_cpu_mask_comes_from_the_admitted_run() {
+    let exact = host_topology::PinningPlan {
+        assignments: vec![(2, 9), (0, 3), (1, 7), (3, 7)],
+        service_cpu: Some(11),
+        llc_indices: vec![1],
+        locks: host_topology::protocol::Acquired::untracked(Vec::new()),
+    };
+    assert_eq!(
+        freeze_coord::run_owned_helper_cpus(Some(&exact), Some(&[20, 21]), &[30, 31]),
+        vec![3, 7, 9],
+        "an exact run uses its vCPU assignments, excluding its service CPU and \
+         ignoring an inapplicable shared/fallback mask",
+    );
+    assert_eq!(
+        freeze_coord::run_owned_helper_cpus(None, Some(&[21, 20, 21]), &[30, 31]),
+        vec![20, 21],
+        "a shared run uses the CPU pool admission actually granted it",
+    );
+    assert_eq!(
+        freeze_coord::run_owned_helper_cpus(None, None, &[31, 30, 31]),
+        vec![30, 31],
+        "an untracked run falls back to the caller's pre-BSP affinity",
+    );
+}
+
+#[test]
+fn exact_plan_expands_to_dense_default_interactive_pins() {
+    let selected = host_topology::PinningPlan {
+        assignments: vec![(0, 20), (1, 21), (2, 22), (3, 23)],
+        service_cpu: None,
+        llc_indices: vec![4, 5],
+        locks: host_topology::protocol::Acquired::untracked(Vec::new()),
+    };
+    assert_eq!(
+        pin_targets_from_plan(Some(&selected), 4),
+        vec![Some(20), Some(21), Some(22), Some(23)],
+        "the interactive default path must consume every vCPU assignment from \
+         the exact candidate it reserved",
+    );
+    assert_eq!(
+        pin_targets_from_plan(None, 4),
+        vec![None; 4],
+        "an unreserved interactive run must remain unpinned",
+    );
+}
+
+#[test]
+fn interactive_affinity_guard_restores_the_calling_thread() {
+    let pid = nix::unistd::Pid::from_raw(0);
+    let original =
+        nix::sched::sched_getaffinity(pid).expect("read the test thread's original affinity");
+    let allowed = (0..libc::CPU_SETSIZE as usize)
+        .filter(|cpu| original.is_set(*cpu).unwrap_or(false))
+        .collect::<Vec<_>>();
+    if allowed.len() < 2 {
+        // A single-CPU test environment cannot distinguish restoration from
+        // leaving the temporary pin in place.
+        return;
+    }
+
+    let guard = freeze_coord::BspAffinityGuard::capture();
+    let mut narrowed = nix::sched::CpuSet::new();
+    narrowed
+        .set(allowed[0])
+        .expect("construct a one-CPU interactive BSP mask");
+    nix::sched::sched_setaffinity(pid, &narrowed).expect("apply the temporary interactive pin");
+    assert_eq!(
+        nix::sched::sched_getaffinity(pid).expect("read the temporary affinity"),
+        narrowed,
+        "the test must observe the same narrowing performed by the interactive BSP path",
+    );
+
+    drop(guard);
+    assert_eq!(
+        nix::sched::sched_getaffinity(pid).expect("read the restored affinity"),
+        original,
+        "interactive teardown must restore the caller before its reservation is released",
+    );
+}
+
+#[test]
+fn run_helpers_broaden_bsp_inheritance_without_escaping_the_cell() {
+    fn current_affinity_cpus() -> Vec<usize> {
+        let mask = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0))
+            .expect("read helper affinity");
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|cpu| mask.is_set(*cpu).unwrap_or(false))
+            .collect()
+    }
+
+    let pid = nix::unistd::Pid::from_raw(0);
+    let original =
+        nix::sched::sched_getaffinity(pid).expect("read the test thread's original affinity");
+    let allowed = (0..libc::CPU_SETSIZE as usize)
+        .filter(|cpu| original.is_set(*cpu).unwrap_or(false))
+        .collect::<Vec<_>>();
+    if allowed.len() < 3 {
+        // We need two admitted vCPU CPUs plus a distinct service CPU to prove
+        // both placement shapes and exclusion of every unrelated CPU.
+        return;
+    }
+
+    let guard = freeze_coord::BspAffinityGuard::capture();
+    let mut narrowed = nix::sched::CpuSet::new();
+    narrowed
+        .set(allowed[0])
+        .expect("construct a one-CPU BSP mask");
+    nix::sched::sched_setaffinity(pid, &narrowed).expect("apply the temporary BSP pin");
+
+    let admitted = vec![allowed[0], allowed[1]];
+    let admitted_for_thread = admitted.clone();
+    let default_mask = std::thread::spawn(move || {
+        freeze_coord::place_run_helper_thread(
+            None,
+            &admitted_for_thread,
+            "helper-affinity-default-test",
+        );
+        let own_mask = current_affinity_cpus();
+        let nested_mask = std::thread::spawn(current_affinity_cpus)
+            .join()
+            .expect("join nested accessor-shaped helper");
+        (own_mask, nested_mask)
+    })
+    .join()
+    .expect("join default helper");
+    let (default_mask, nested_mask) = default_mask;
+    assert_eq!(
+        default_mask, admitted,
+        "a default/no-perf helper must broaden past the inherited BSP singleton \
+         to exactly the run-owned admitted mask",
+    );
+    assert_eq!(
+        nested_mask, admitted,
+        "an accessor worker spawned by the freeze coordinator must inherit the \
+         coordinator's broadened cell mask rather than the BSP singleton",
+    );
+    assert!(
+        !default_mask.contains(&allowed[2]),
+        "the broadened helper must not escape onto an unadmitted CPU",
+    );
+
+    let service_cpu = allowed[2];
+    let admitted_for_thread = admitted.clone();
+    let service_mask = std::thread::spawn(move || {
+        freeze_coord::place_run_helper_thread(
+            Some(service_cpu),
+            &admitted_for_thread,
+            "helper-affinity-service-test",
+        );
+        current_affinity_cpus()
+    })
+    .join()
+    .expect("join service helper");
+    assert_eq!(
+        service_mask,
+        vec![service_cpu],
+        "a performance service helper must use its separately reserved CPU",
+    );
+
+    drop(guard);
+    assert_eq!(
+        nix::sched::sched_getaffinity(pid).expect("read the restored affinity"),
+        original,
+        "the parent BSP affinity must still restore after spawning helpers",
+    );
+}
+
+#[test]
+fn interactive_unreserved_placement_never_resurrects_build_shape() {
+    let run_locks = RunLocks::unreserved();
+    let (plan, placement) = KtstrVm::interactive_run_placement(&run_locks);
+    assert!(plan.is_none());
+    assert!(placement.service_cpu.is_none());
+    assert!(
+        placement.shared_cpus.is_none(),
+        "unreserved placement must not resurrect any stale build-time mask",
+    );
+}
+
+#[test]
+fn predecessor_ex_claim_fences_exact_and_shared_default_admission() {
+    struct ResetOverrides;
+    impl Drop for ResetOverrides {
+        fn drop(&mut self) {
+            host_topology::ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+            host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+            host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    let temp = tempfile::TempDir::new().expect("default-scan tempdir");
+    host_topology::ALLOWED_CPUS_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(vec![0, 1, 2, 3]));
+    host_topology::LLC_LOCK_PREFIX_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = Some(format!("{}/llc-", temp.path().display()));
+    });
+    host_topology::CPU_LOCK_PREFIX_OVERRIDE.with(|slot| {
+        *slot.borrow_mut() = Some(format!("{}/cpu-", temp.path().display()));
+    });
+    let _reset = ResetOverrides;
+
+    let claim = host_topology::protocol::ClaimSet::new(
+        std::iter::empty(),
+        0usize..4,
+        crate::flock::FlockMode::Exclusive,
+    );
+    let coordinator = match host_topology::protocol::register_ticket_or_acquire(
+        claim.clone(),
+        claim,
+        None,
+        |_| Ok::<Option<()>, anyhow::Error>(None),
+    )
+    .expect("register union CPU claim")
+    {
+        host_topology::protocol::TicketWork::Coordinator(coordinator) => coordinator,
+        host_topology::protocol::TicketWork::Acquired(_) => {
+            panic!("fresh registry must elect a coordinator")
+        }
+    };
+    let host = host_topology::HostTopology::new_for_tests(&[(vec![0, 1, 2, 3], 0)]);
+    let topo = Topology::new(1, 1, 1, 1);
+    let error = match KtstrVm::acquire_default_preferred_run_locks(
+        Some(&host),
+        &topo,
+        false,
+        None,
+        None,
+        256,
+    ) {
+        Ok(_) => panic!("the union EX claim must fence exact and shared default placement"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .downcast_ref::<host_topology::ResourceContention>()
+            .is_some(),
+        "predecessor EX pressure must report contention: {error:#}",
+    );
+
+    drop(coordinator);
+    let acquired =
+        KtstrVm::acquire_default_preferred_run_locks(Some(&host), &topo, false, None, None, 256)
+            .expect("an unfenced default candidate must acquire");
+    assert!(
+        acquired.pinning_plan.is_some(),
+        "free host prefers exact 1:1"
+    );
+    drop(acquired);
 }
 
 #[test]
@@ -302,6 +1439,22 @@ fn boot_kernel_produces_output() {
         result.stderr.contains("Linux") || result.stderr.contains("Booting"),
         "kernel console should contain boot messages"
     );
+}
+
+/// Inject a fallible helper-setup edge immediately after the interactive path
+/// has spawned its AP. Returning the injected error must run
+/// `InteractiveRunGuard::drop`, drain the live real-KVM AP through the shared
+/// bounded helper, and reach the caller instead of detaching or hanging.
+#[test]
+fn boot_kernel_interactive_post_ap_setup_failure_drains_threads() {
+    if !crate::test_support::cargo_ktstr_orchestrated() {
+        skip!(
+            "real-KVM interactive teardown regression requires cargo-ktstr orchestration; \
+             set {}=1 for an intentional local run",
+            crate::KTSTR_ORCHESTRATED_ENV,
+        );
+    }
+    assert_interactive_relay_child(INTERACTIVE_RELAY_SETUP_FAILURE_MODE);
 }
 
 /// Boot with SMP topology and verify kernel detects multiple CPUs.
@@ -449,8 +1602,17 @@ fn bench_boot_time() {
 /// helper both detects the marker in a genuine `crash_message` and stops
 /// once a clean boot arrives.
 ///
-/// Named `boot_kernel_*` so the nextest slow-timeout override
-/// (`test(boot_kernel) | test(bench_boot)`) covers its two cold boots.
+/// Named `boot_kernel_*` so the lock-taking-VM-cell override's
+/// `vmm::tests::boot_kernel_.*` arm covers its two cold boots. That block
+/// heads the override list of both `profile.ci` and `profile.default` in
+/// `.config/nextest.toml`, and overrides are first-match per setting, so it
+/// sets this test's slow-timeout (180s x 12) under the profiles CI and local
+/// runs select. Precedence is per profile, not per file position: nextest
+/// consults the selected profile's own overrides before falling back to
+/// `profile.default`. The `test(boot_kernel) | test(bench_boot)` filter is a
+/// `[[profile.quick.overrides]]` entry, so it is inert under ci/default and
+/// is what deliberately short-circuits this test to 60s with no retry under
+/// `--profile quick`.
 /// Follows the sibling boot tests' `skip_on_contention!` convention for
 /// the /dev/kvm + host-resource gate.
 #[test]
@@ -852,14 +2014,14 @@ fn sys_rdy_releases_monitor_before_5s_timeout() {
 /// pre-sample boot wait MUST observe the kill eventfd and
 /// fall through — not block until the 5 s sys_rdy ceiling.
 ///
-/// Wallclock budget: 12 s. The path to a kill_evt-driven
-/// monitor wakeup is "kernel panic → reboot exit → BSP loop
+/// The path to a kill_evt-driven monitor wakeup is "kernel panic
+/// → reboot exit → BSP loop
 /// sets kill → freeze coordinator writes kill_evt → monitor
 /// boot wait wakes". A regression that left the monitor
 /// blocked on sys_rdy alone (no kill_evt registration) would
-/// hold the VM open for the full 5 s ceiling — still under
-/// the 12 s budget, but a kill_evt regression that blocks
-/// indefinitely on a different fd would still surface here.
+/// hold the VM open for the full 5 s ceiling, while a kill_evt
+/// regression that blocks indefinitely on a different fd would
+/// still surface through the VM timeout.
 ///
 /// `init=/nonexistent` is supplied via the builder cmdline
 /// (this test sets no `init_binary`, so no `rdinit=/init`
@@ -894,44 +2056,11 @@ fn monitor_exits_cleanly_when_guest_panics_before_sys_rdy() {
          is not holding. Stderr tail: {:?}",
         result.stderr.lines().rev().take(5).collect::<Vec<_>>(),
     );
-    // Wallclock budget: 12 s. The monitor's 5 s sys_rdy ceiling
-    // plus VM setup + guest panic + reboot + teardown nominally
-    // finishes in 3-5 s on an idle host. The 12 s budget absorbs
-    // host contention (observed runs at 8-9 s under load) while
-    // still catching a regression that blocks the boot wait
-    // indefinitely (e.g. kill_evt unregistered, sys_rdy not
-    // promoted to the eventfd) — that path would either hit the
-    // builder's 15 s timeout (caught above) or sit on the 5 s
-    // ceiling under heavy overhead (well past 12 s).
-    // The 12 s budget is an IDLE-host expectation: setup + panic +
-    // reboot + teardown nominally finishes in 3-5 s. Under host dilation
-    // the wall inflates without the monitor misbehaving, so the budget is
-    // enforced only on a quiet host (D <= 1.1). The test's real invariant
-    // — the monitor woke on kill_evt rather than hanging on the sys_rdy
-    // ceiling — is already proven by the guest-rebooted check above (a
-    // hung monitor would have hit the builder's 15 s timeout, failing
-    // that assert). Under dilation the budget is downgraded to a note.
-    let d = result.host_vcpu_schedstat.and_then(|s| s.dilation());
-    if d.is_none_or(|d| d <= 1.1) {
-        assert!(
-            result.duration < Duration::from_secs(12),
-            "VM ran for {:?} on a quiet host (D={}) — past the 12 s budget. \
-             The monitor's boot wait did not wake on kill_evt; the loop sat on \
-             the sys_rdy ceiling instead. timed_out={}, exit_code={}",
-            result.duration,
-            d.map_or_else(|| "n/a".to_string(), |d| format!("{d:.2}x")),
-            result.timed_out,
-            result.exit_code,
-        );
-    } else if result.duration >= Duration::from_secs(12) {
-        eprintln!(
-            "ktstr: monitor_exits_cleanly ran {:?} (> 12 s budget) under host \
-             dilation D={:.2}x — budget not enforced (the no-hang invariant is \
-             covered by the guest-rebooted check); wall is a host artifact",
-            result.duration,
-            d.unwrap_or(0.0),
-        );
-    }
+    // `VmResult::duration` intentionally includes admission queue time. A
+    // wall-clock bound here would therefore fail when this test spends longer
+    // than the guest timeout waiting to be admitted, even though the monitor
+    // exits promptly once the VM starts. The `timed_out` assertion above is
+    // the run-phase no-hang invariant and is evaluated by the VM watchdog.
 }
 
 /// Asserts at least one of the first 5 monitor samples (no
@@ -1512,6 +2641,122 @@ fn builder_performance_mode_mbind_nodes_populated() {
         assert!(
             !vm.mbind_node_map.is_empty(),
             "mbind_node_map should be populated for performance_mode",
+        );
+    }
+}
+
+/// Exact per-cell admission-timing line shapes for the granted and
+/// never-granted (pending-killed) outcomes. Pure formatting, so the field
+/// set, ordering, and derived `wait_ns`/`held_ns` are asserted deterministically.
+#[test]
+fn admission_timing_line_shapes() {
+    let granted = format_admission_timing_line(
+        "ktstr::foo",
+        8,
+        4,
+        Duration::from_nanos(1000),
+        Some(Duration::from_nanos(5000)),
+        Duration::from_nanos(9000),
+    );
+    assert_eq!(
+        granted,
+        "admission-timing: test=ktstr::foo vcpus=8 permits=4 \
+         registered=1000 granted=5000 released=9000 \
+         wait_ns=4000 held_ns=4000 outcome=granted"
+    );
+
+    let killed = format_admission_timing_line(
+        "ktstr::bar",
+        2,
+        0,
+        Duration::from_nanos(1000),
+        None,
+        Duration::from_nanos(7000),
+    );
+    assert_eq!(
+        killed,
+        "admission-timing: test=ktstr::bar vcpus=2 permits=0 \
+         registered=1000 granted= released=7000 \
+         wait_ns=6000 held_ns=0 outcome=pending-killed"
+    );
+}
+
+/// When `KTSTR_BUILD_DIAGNOSTICS_DIR` is set, a granted cell and a
+/// never-granted cell each emit exactly one line on drop, both appended to the
+/// single shared `admission-timing.log`.
+#[test]
+fn admission_timing_emits_on_drop_when_dir_set() {
+    let _lock = crate::test_support::test_helpers::lock_env();
+    let dir = tempfile::TempDir::new().expect("admission-timing tempdir");
+    let _guard =
+        crate::test_support::test_helpers::EnvVarGuard::set(ADMISSION_TIMING_DIR_ENV, dir.path());
+
+    {
+        let mut granted =
+            AdmissionTiming::new("ktstr::granted".into(), 4, 2, false).expect("dir set -> Some");
+        granted.mark_granted();
+    }
+    AdmissionTiming::new("ktstr::killed".into(), 1, 0, false).expect("dir set -> Some");
+
+    let log = std::fs::read_to_string(dir.path().join(ADMISSION_TIMING_FILE))
+        .expect("admission-timing.log written");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "one line per cell: {log:?}");
+    let granted_line = lines
+        .iter()
+        .find(|line| line.contains("test=ktstr::granted"))
+        .expect("granted line present");
+    assert!(granted_line.contains("outcome=granted"), "{granted_line}");
+    assert!(!granted_line.contains("granted= "), "{granted_line}");
+    let killed_line = lines
+        .iter()
+        .find(|line| line.contains("test=ktstr::killed"))
+        .expect("killed line present");
+    assert!(
+        killed_line.contains("outcome=pending-killed"),
+        "{killed_line}"
+    );
+    assert!(killed_line.contains("granted= "), "{killed_line}");
+    assert!(killed_line.contains("held_ns=0"), "{killed_line}");
+}
+
+/// The whole path is inert with the env var absent: `new` yields `None`, so no
+/// clock is read, nothing is stored, and dropping writes nothing.
+#[test]
+fn admission_timing_silent_without_dir() {
+    let _lock = crate::test_support::test_helpers::lock_env();
+    let _guard = crate::test_support::test_helpers::EnvVarGuard::remove(ADMISSION_TIMING_DIR_ENV);
+    assert!(
+        AdmissionTiming::new("ktstr::none".into(), 4, 2, false).is_none(),
+        "no diagnostics dir -> no telemetry"
+    );
+}
+
+/// The pre-exec admission stamp survives its own encoding, and every way it
+/// can be wrong fails closed to `None` — the caller then falls back to this
+/// process's own clock instead of back-dating on a bogus value.
+#[test]
+fn pre_exec_admission_stamp_round_trips_and_fails_closed() {
+    let encoded = format_pre_exec_admission_stamp(
+        4242,
+        Duration::from_nanos(9_000),
+        Duration::from_nanos(1_500),
+    );
+    assert_eq!(encoded, "4242:9000:1500");
+    assert_eq!(
+        parse_pre_exec_admission_stamp(&encoded, 4242),
+        Some((Duration::from_nanos(9_000), Duration::from_nanos(1_500))),
+    );
+
+    // A grandchild inheriting the variable sees a different PID.
+    assert_eq!(parse_pre_exec_admission_stamp(&encoded, 4243), None);
+    // Registration cannot postdate the exec that carried it.
+    assert_eq!(parse_pre_exec_admission_stamp("7:1500:9000", 7), None);
+    for malformed in ["", "7", "7:9000", "7:9000:1500:0", "7:x:1", "x:9000:1500"] {
+        assert_eq!(
+            parse_pre_exec_admission_stamp(malformed, 7),
+            None,
+            "{malformed:?} must fail closed",
         );
     }
 }

@@ -21,8 +21,8 @@ fn compare_rows_dual_gate_both_must_trigger() {
     // 10 -> 12: abs delta 2.0 < 5.0 (abs gate fails); rel 0.20 < 0.25
     // (rel gate also fails). Result: 0 regressions, 0 improvements,
     // unchanged for worst_spread.
-    let rows_a = vec![cmp_row("test_a", "tiny-1llc", true, 10.0, 0)];
-    let rows_b = vec![cmp_row("test_a", "tiny-1llc", true, 12.0, 0)];
+    let rows_a = vec![cmp_row("test_a", "4cpu-1llc-nosmt", true, 10.0, 0)];
+    let rows_b = vec![cmp_row("test_a", "4cpu-1llc-nosmt", true, 12.0, 0)];
     let res = compare_rows_by(
         &rows_a,
         &rows_b,
@@ -40,7 +40,7 @@ fn compare_rows_dual_gate_both_must_trigger() {
 
     // Confirm the rel gate alone is not enough: spread 10 -> 14 has
     // rel 0.40 (>= 0.25) but abs delta 4.0 (< 5.0), still unchanged.
-    let rows_b2 = vec![cmp_row("test_a", "tiny-1llc", true, 14.0, 0)];
+    let rows_b2 = vec![cmp_row("test_a", "4cpu-1llc-nosmt", true, 14.0, 0)];
     let res2 = compare_rows_by(
         &rows_a,
         &rows_b2,
@@ -68,8 +68,8 @@ fn compare_rows_zero_baseline_jump_above_abs_gate_is_a_regression() {
     // worst_spread: LowerBetter (higher_is_worse), default_abs = 5.0.
     // 0.0 -> 10.0: delta 10.0 >= 5.0 clears the absolute gate; the
     // ~zero baseline must NOT let the relative gate veto it.
-    let rows_a = vec![cmp_row("zbase", "tiny-1llc", true, 0.0, 0)];
-    let rows_b = vec![cmp_row("zbase", "tiny-1llc", true, 10.0, 0)];
+    let rows_a = vec![cmp_row("zbase", "4cpu-1llc-nosmt", true, 0.0, 0)];
+    let rows_b = vec![cmp_row("zbase", "4cpu-1llc-nosmt", true, 10.0, 0)];
     let res = compare_rows_by(
         &rows_a,
         &rows_b,
@@ -106,8 +106,8 @@ fn compare_rows_zero_baseline_jump_above_abs_gate_is_a_regression() {
 #[test]
 fn compare_rows_zero_baseline_jump_below_abs_gate_is_unchanged() {
     // worst_spread default_abs = 5.0; 0.0 -> 3.0 is below it.
-    let rows_a = vec![cmp_row("zbase_small", "tiny-1llc", true, 0.0, 0)];
-    let rows_b = vec![cmp_row("zbase_small", "tiny-1llc", true, 3.0, 0)];
+    let rows_a = vec![cmp_row("zbase_small", "4cpu-1llc-nosmt", true, 0.0, 0)];
+    let rows_b = vec![cmp_row("zbase_small", "4cpu-1llc-nosmt", true, 3.0, 0)];
     let res = compare_rows_by(
         &rows_a,
         &rows_b,
@@ -142,8 +142,8 @@ fn compare_rows_zero_baseline_jump_above_abs_gate_is_an_improvement() {
     // total_iterations: HigherBetter, Counter, default_abs = 2.0 (the only
     // metric reading r.total_iterations). 0 -> 1000: delta +1000 >= 2
     // clears the absolute gate; HigherBetter + delta > 0 => improvement.
-    let rows_a = vec![cmp_row("zbase_imp", "tiny-1llc", true, 0.0, 0)];
-    let rows_b = vec![cmp_row("zbase_imp", "tiny-1llc", true, 0.0, 1000)];
+    let rows_a = vec![cmp_row("zbase_imp", "4cpu-1llc-nosmt", true, 0.0, 0)];
+    let rows_b = vec![cmp_row("zbase_imp", "4cpu-1llc-nosmt", true, 0.0, 1000)];
     let res = compare_rows_by(
         &rows_a,
         &rows_b,
@@ -174,9 +174,9 @@ fn compare_rows_zero_baseline_jump_above_abs_gate_is_an_improvement() {
 /// f64 `stuck_count` carries the exact mean so compare reads 0.2.
 #[test]
 fn compare_rows_subinteger_stuck_count_difference_is_unchanged() {
-    let mut a = make_row("test_a", "tiny-1llc", true, 10.0);
+    let mut a = make_row("test_a", "4cpu-1llc-nosmt", true, 10.0);
     a.stuck_count = 1.4;
-    let mut b = make_row("test_a", "tiny-1llc", true, 10.0);
+    let mut b = make_row("test_a", "4cpu-1llc-nosmt", true, 10.0);
     b.stuck_count = 1.6;
     let res = compare_rows_by(
         &[a],
@@ -207,9 +207,9 @@ fn compare_rows_subinteger_stuck_count_difference_is_unchanged() {
 /// it only stops fabricating regressions from sub-integer noise.
 #[test]
 fn compare_rows_genuine_stuck_count_regression_is_flagged() {
-    let mut a = make_row("test_a", "tiny-1llc", true, 10.0);
+    let mut a = make_row("test_a", "4cpu-1llc-nosmt", true, 10.0);
     a.stuck_count = 1.0;
-    let mut b = make_row("test_a", "tiny-1llc", true, 10.0);
+    let mut b = make_row("test_a", "4cpu-1llc-nosmt", true, 10.0);
     b.stuck_count = 2.5;
     let res = compare_rows_by(
         &[a],
@@ -236,8 +236,8 @@ fn compare_rows_synthetic_regression_and_improvement() {
     // regression (higher_is_worse).
     // Raw total_iterations also changes, but duration-sensitive raw totals are
     // informational now; only their normalized rates are directional.
-    let rows_a = vec![cmp_row("test1", "tiny-1llc", true, 10.0, 1000)];
-    let rows_b = vec![cmp_row("test1", "tiny-1llc", true, 30.0, 500)];
+    let rows_a = vec![cmp_row("test1", "4cpu-1llc-nosmt", true, 10.0, 1000)];
+    let rows_b = vec![cmp_row("test1", "4cpu-1llc-nosmt", true, 30.0, 500)];
     let res = compare_rows_by(
         &rows_a,
         &rows_b,
@@ -280,11 +280,11 @@ fn compare_rows_synthetic_regression_and_improvement() {
 /// the components stay in `ext_metrics` for the cross-run re-pool.
 #[test]
 fn compare_rows_suppresses_rate_components_not_the_rate() {
-    let mut a = cmp_row("t", "tiny-1llc", true, 0.0, 1000);
+    let mut a = cmp_row("t", "4cpu-1llc-nosmt", true, 0.0, 1000);
     a.ext_metrics
         .insert("total_iterations_pooled".to_string(), 1000.0);
     a.ext_metrics.insert("iteration_rate".to_string(), 500.0);
-    let mut b = cmp_row("t", "tiny-1llc", true, 0.0, 1000);
+    let mut b = cmp_row("t", "4cpu-1llc-nosmt", true, 0.0, 1000);
     b.ext_metrics
         .insert("total_iterations_pooled".to_string(), 2000.0);
     b.ext_metrics.insert("iteration_rate".to_string(), 1000.0);
@@ -310,8 +310,8 @@ fn compare_rows_suppresses_rate_components_not_the_rate() {
 fn compare_rows_higher_is_worse_inversion() {
     // total_iterations is higher_is_worse=false. A drop of 1000 ->
     // 500 must be reported as a regression, not an improvement.
-    let rows_a = vec![cmp_row("t", "tiny-1llc", true, 0.0, 1000)];
-    let rows_b = vec![cmp_row("t", "tiny-1llc", true, 0.0, 500)];
+    let rows_a = vec![cmp_row("t", "4cpu-1llc-nosmt", true, 0.0, 1000)];
+    let rows_b = vec![cmp_row("t", "4cpu-1llc-nosmt", true, 0.0, 500)];
     let res = compare_rows_by(
         &rows_a,
         &rows_b,
@@ -334,8 +334,8 @@ fn compare_rows_higher_is_worse_inversion() {
 
     // worst_spread is higher_is_worse=true. An increase must be a
     // regression; a decrease must be an improvement.
-    let rows_a2 = vec![cmp_row("t", "tiny-1llc", true, 10.0, 0)];
-    let rows_b2 = vec![cmp_row("t", "tiny-1llc", true, 30.0, 0)];
+    let rows_a2 = vec![cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 0)];
+    let rows_b2 = vec![cmp_row("t", "4cpu-1llc-nosmt", true, 30.0, 0)];
     let res_up = compare_rows_by(
         &rows_a2,
         &rows_b2,
@@ -380,8 +380,8 @@ fn compare_rows_skipped_side_drops_pair_into_excluded_pairs() {
     // carries no executed metrics, so the pair must short-circuit
     // via the is_skip() gate before regression math touches the
     // default-zero metric values.
-    let mut row_a = cmp_row("t", "tiny-1llc", true, 10.0, 100);
-    let mut row_b = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+    let mut row_a = cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100);
+    let mut row_b = cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100);
     row_a.skipped = true; // A side was skipped
     let res = compare_rows_by(
         &[row_a.clone()],
@@ -422,14 +422,14 @@ fn compare_rows_skips_failed_scenarios() {
     // test_ok (passed on both sides) should be eligible for the
     // regression math; the other two are counted as excluded_pairs.
     let rows_a = vec![
-        cmp_row("test_ok", "tiny-1llc", true, 10.0, 1000),
-        cmp_row("test_failed_b", "tiny-1llc", true, 10.0, 1000),
-        cmp_row("test_failed_a", "tiny-1llc", false, 10.0, 1000),
+        cmp_row("test_ok", "4cpu-1llc-nosmt", true, 10.0, 1000),
+        cmp_row("test_failed_b", "4cpu-1llc-nosmt", true, 10.0, 1000),
+        cmp_row("test_failed_a", "4cpu-1llc-nosmt", false, 10.0, 1000),
     ];
     let rows_b = vec![
-        cmp_row("test_ok", "tiny-1llc", true, 30.0, 500),
-        cmp_row("test_failed_b", "tiny-1llc", false, 30.0, 500),
-        cmp_row("test_failed_a", "tiny-1llc", true, 30.0, 500),
+        cmp_row("test_ok", "4cpu-1llc-nosmt", true, 30.0, 500),
+        cmp_row("test_failed_b", "4cpu-1llc-nosmt", false, 30.0, 500),
+        cmp_row("test_failed_a", "4cpu-1llc-nosmt", true, 30.0, 500),
     ];
     let res = compare_rows_by(
         &rows_a,
@@ -456,12 +456,12 @@ fn compare_rows_filter_substring() {
     // alpha row (substring of the joined "scenario topology
     // scheduler work_type" string) and exclude the beta row.
     let rows_a = vec![
-        cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
-        cmp_row("beta", "tiny-1llc", true, 10.0, 0),
+        cmp_row("alpha", "4cpu-1llc-nosmt", true, 10.0, 0),
+        cmp_row("beta", "4cpu-1llc-nosmt", true, 10.0, 0),
     ];
     let rows_b = vec![
-        cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
-        cmp_row("beta", "tiny-1llc", true, 30.0, 0),
+        cmp_row("alpha", "4cpu-1llc-nosmt", true, 30.0, 0),
+        cmp_row("beta", "4cpu-1llc-nosmt", true, 30.0, 0),
     ];
     let res = compare_rows_by(
         &rows_a,
@@ -479,17 +479,20 @@ fn compare_rows_filter_substring() {
     assert_eq!(res.findings[0].work_type, "SpinWait");
 
     // Filter on topology substring is also honored. Both rows
-    // share the "tiny-1llc" topology and only worst_spread crosses
+    // share the "4cpu-1llc-nosmt" topology and only worst_spread crosses
     // both gates (10 -> 30 with default_abs=5.0, default_rel=0.25),
     // so each row contributes exactly one finding.
     let res_topo = compare_rows_by(
         &rows_a,
         &rows_b,
         LEGACY_PAIRING_DIMS,
-        Some("tiny"),
+        Some("4cpu"),
         &ComparisonPolicy::default(),
     );
-    assert_eq!(res_topo.regressions, 2, "both rows match 'tiny' topology");
+    assert_eq!(
+        res_topo.regressions, 2,
+        "both rows match the '4cpu' topology prefix"
+    );
     assert_eq!(res_topo.findings.len(), 2);
 
     // Non-matching filter yields no comparisons at all.
@@ -511,8 +514,8 @@ fn compare_rows_threshold_override() {
     // worst_spread default_rel=0.25, default_abs=5.0. Move 100 ->
     // 106: abs delta 6.0 >= 5.0 (abs gate passes); rel 0.06 < 0.25
     // (default rel fails) → unchanged with default thresholds.
-    let rows_a = vec![cmp_row("t", "tiny-1llc", true, 100.0, 0)];
-    let rows_b = vec![cmp_row("t", "tiny-1llc", true, 106.0, 0)];
+    let rows_a = vec![cmp_row("t", "4cpu-1llc-nosmt", true, 100.0, 0)];
+    let rows_b = vec![cmp_row("t", "4cpu-1llc-nosmt", true, 106.0, 0)];
     let res_default = compare_rows_by(
         &rows_a,
         &rows_b,
@@ -549,8 +552,8 @@ fn compare_rows_threshold_override() {
     // The override does NOT loosen the abs gate. Move 1.0 -> 1.5:
     // abs delta 0.5 < 5.0; even threshold=1% (rel_thresh 0.01)
     // can't promote it to significant.
-    let rows_a_small = vec![cmp_row("t", "tiny-1llc", true, 1.0, 0)];
-    let rows_b_small = vec![cmp_row("t", "tiny-1llc", true, 1.5, 0)];
+    let rows_a_small = vec![cmp_row("t", "4cpu-1llc-nosmt", true, 1.0, 0)];
+    let rows_b_small = vec![cmp_row("t", "4cpu-1llc-nosmt", true, 1.5, 0)];
     let res_small = compare_rows_by(
         &rows_a_small,
         &rows_b_small,
@@ -638,8 +641,8 @@ fn wake_latency_tail_ratio_compares_via_ext_metrics() {
     // Absent ext key (the producer's sub-threshold / no-tail output): both
     // sides read None, so the `(None, None)` arm skips the pair (no finding,
     // no coverage diff).
-    let low_a = make_row("tail_low", "tiny-1llc", true, 0.0);
-    let low_b = make_row("tail_low", "tiny-1llc", true, 0.0);
+    let low_a = make_row("tail_low", "4cpu-1llc-nosmt", true, 0.0);
+    let low_b = make_row("tail_low", "4cpu-1llc-nosmt", true, 0.0);
     assert!(
         metric.read(&low_a).is_none(),
         "absent ext key must read as None (accessor is |_| None, no ext entry)",
@@ -663,8 +666,8 @@ fn wake_latency_tail_ratio_compares_via_ext_metrics() {
     // Present ext key with a 10x delta (the only difference between two
     // otherwise-identical rows): read() returns the ext value and the delta
     // surfaces as a regression.
-    let mut hi_a = make_row("tail_hi", "tiny-1llc", true, 0.0);
-    let mut hi_b = make_row("tail_hi", "tiny-1llc", true, 0.0);
+    let mut hi_a = make_row("tail_hi", "4cpu-1llc-nosmt", true, 0.0);
+    let mut hi_b = make_row("tail_hi", "4cpu-1llc-nosmt", true, 0.0);
     hi_a.ext_metrics.insert(key.to_string(), 2.0);
     hi_b.ext_metrics.insert(key.to_string(), 20.0);
     assert_eq!(
@@ -713,8 +716,8 @@ fn compare_rows_both_absent_ext_key_reads_none_and_is_skipped() {
     // Neither row carries the tail-ratio ext key, so read() is None on both
     // sides (accessor |_| None + absent ext entry). make_row no longer
     // paints this key — the producer alone decides its presence.
-    let row_a = make_row("none_branch", "tiny-1llc", true, 0.0);
-    let row_b = make_row("none_branch", "tiny-1llc", true, 0.0);
+    let row_a = make_row("none_branch", "4cpu-1llc-nosmt", true, 0.0);
+    let row_b = make_row("none_branch", "4cpu-1llc-nosmt", true, 0.0);
 
     assert!(
         metric.read(&row_a).is_none(),
@@ -1049,11 +1052,11 @@ fn compare_rows_per_metric_policy_resolves_each_metric_independently() {
     // Construct rows with both metrics non-default so we can
     // trigger per-metric and default_percent branches in one
     // row pair.
-    let mut row_a = cmp_row("t", "tiny-1llc", true, 100.0, 0);
+    let mut row_a = cmp_row("t", "4cpu-1llc-nosmt", true, 100.0, 0);
     row_a
         .ext_metrics
         .insert("worst_median_wake_latency_us".to_string(), 100.0);
-    let mut row_b = cmp_row("t", "tiny-1llc", true, 106.0, 0);
+    let mut row_b = cmp_row("t", "4cpu-1llc-nosmt", true, 106.0, 0);
     row_b
         .ext_metrics
         .insert("worst_median_wake_latency_us".to_string(), 110.0);
@@ -1123,10 +1126,10 @@ fn compare_rows_duplicate_key_first_match_wins() {
     // against B's 30). Second has spread=29 (would be unchanged).
     // The result must reflect the first entry only.
     let rows_a = vec![
-        cmp_row("t", "tiny-1llc", true, 10.0, 0),
-        cmp_row("t", "tiny-1llc", true, 29.0, 0),
+        cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 0),
+        cmp_row("t", "4cpu-1llc-nosmt", true, 29.0, 0),
     ];
-    let rows_b = vec![cmp_row("t", "tiny-1llc", true, 30.0, 0)];
+    let rows_b = vec![cmp_row("t", "4cpu-1llc-nosmt", true, 30.0, 0)];
     let res = compare_rows_by(
         &rows_a,
         &rows_b,
@@ -1154,12 +1157,12 @@ fn compare_rows_duplicate_key_first_match_wins() {
 #[test]
 fn compare_rows_filter_excludes_failed_from_skip_count() {
     let rows_a = vec![
-        cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
-        cmp_row("beta", "tiny-1llc", false, 10.0, 0),
+        cmp_row("alpha", "4cpu-1llc-nosmt", true, 10.0, 0),
+        cmp_row("beta", "4cpu-1llc-nosmt", false, 10.0, 0),
     ];
     let rows_b = vec![
-        cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
-        cmp_row("beta", "tiny-1llc", true, 30.0, 0),
+        cmp_row("alpha", "4cpu-1llc-nosmt", true, 30.0, 0),
+        cmp_row("beta", "4cpu-1llc-nosmt", true, 30.0, 0),
     ];
     // Without a filter, beta's failed row contributes
     // excluded_pairs=1.
@@ -1196,13 +1199,13 @@ fn compare_rows_filter_excludes_failed_from_skip_count() {
 /// require a less-precise substring (e.g. a scenario name).
 #[test]
 fn compare_rows_filter_substring_matches_scheduler() {
-    let mut a1 = cmp_row("test1", "tiny-1llc", true, 10.0, 0);
+    let mut a1 = cmp_row("test1", "4cpu-1llc-nosmt", true, 10.0, 0);
     a1.scheduler = "scx_alpha".into();
-    let mut a2 = cmp_row("test2", "tiny-1llc", true, 10.0, 0);
+    let mut a2 = cmp_row("test2", "4cpu-1llc-nosmt", true, 10.0, 0);
     a2.scheduler = "scx_beta".into();
-    let mut b1 = cmp_row("test1", "tiny-1llc", true, 30.0, 0);
+    let mut b1 = cmp_row("test1", "4cpu-1llc-nosmt", true, 30.0, 0);
     b1.scheduler = "scx_alpha".into();
-    let mut b2 = cmp_row("test2", "tiny-1llc", true, 30.0, 0);
+    let mut b2 = cmp_row("test2", "4cpu-1llc-nosmt", true, 30.0, 0);
     b2.scheduler = "scx_beta".into();
 
     let res = compare_rows_by(
@@ -1231,12 +1234,12 @@ fn compare_rows_tracks_new_and_removed_rows() {
     // beta exists only in B -> new_in_b=1.
     // gamma exists only in A -> removed_from_a=1.
     let rows_a = vec![
-        cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
-        cmp_row("gamma", "tiny-1llc", true, 10.0, 0),
+        cmp_row("alpha", "4cpu-1llc-nosmt", true, 10.0, 0),
+        cmp_row("gamma", "4cpu-1llc-nosmt", true, 10.0, 0),
     ];
     let rows_b = vec![
-        cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
-        cmp_row("beta", "tiny-1llc", true, 30.0, 0),
+        cmp_row("alpha", "4cpu-1llc-nosmt", true, 30.0, 0),
+        cmp_row("beta", "4cpu-1llc-nosmt", true, 30.0, 0),
     ];
     let res = compare_rows_by(
         &rows_a,
@@ -1257,12 +1260,12 @@ fn compare_rows_tracks_new_and_removed_rows() {
 #[test]
 fn compare_rows_filter_applies_to_new_and_removed_counters() {
     let rows_a = vec![
-        cmp_row("alpha", "tiny-1llc", true, 10.0, 0),
-        cmp_row("gamma", "tiny-1llc", true, 10.0, 0),
+        cmp_row("alpha", "4cpu-1llc-nosmt", true, 10.0, 0),
+        cmp_row("gamma", "4cpu-1llc-nosmt", true, 10.0, 0),
     ];
     let rows_b = vec![
-        cmp_row("alpha", "tiny-1llc", true, 30.0, 0),
-        cmp_row("beta", "tiny-1llc", true, 30.0, 0),
+        cmp_row("alpha", "4cpu-1llc-nosmt", true, 30.0, 0),
+        cmp_row("beta", "4cpu-1llc-nosmt", true, 30.0, 0),
     ];
 
     // Filter to "alpha" -- beta and gamma are excluded by the
@@ -2027,9 +2030,9 @@ fn render_overcommit_warning_mixed_no_overcommit_uses_else_banner() {
 /// (clean), isolating the cross-side direction classification.
 fn noise_side(scenario: &str, spread: f64, iters: u64) -> Vec<GauntletRow> {
     vec![
-        cmp_row(scenario, "tiny-1llc", true, spread, iters),
-        cmp_row(scenario, "tiny-1llc", true, spread, iters),
-        cmp_row(scenario, "tiny-1llc", true, spread, iters),
+        cmp_row(scenario, "4cpu-1llc-nosmt", true, spread, iters),
+        cmp_row(scenario, "4cpu-1llc-nosmt", true, spread, iters),
+        cmp_row(scenario, "4cpu-1llc-nosmt", true, spread, iters),
     ]
 }
 
@@ -2043,7 +2046,7 @@ fn noise_side(scenario: &str, spread: f64, iters: u64) -> Vec<GauntletRow> {
 #[test]
 fn noise_findings_rate_centroid_is_pooled_not_mean_of_ratios() {
     let mk = |run_delay: f64, vcpu_sec: f64| {
-        let mut r = cmp_row("rate", "tiny-1llc", true, 10.0, 0);
+        let mut r = cmp_row("rate", "4cpu-1llc-nosmt", true, 10.0, 0);
         r.ext_metrics
             .insert("total_run_delay".to_string(), run_delay);
         r.ext_metrics
@@ -2086,7 +2089,7 @@ fn noise_findings_rate_centroid_is_pooled_not_mean_of_ratios() {
 #[test]
 fn noise_findings_derives_schedstat_rate_from_per_run_components() {
     let mk = |run_delay: f64| {
-        let mut r = cmp_row("sched", "tiny-1llc", true, 10.0, 0);
+        let mut r = cmp_row("sched", "4cpu-1llc-nosmt", true, 10.0, 0);
         r.ext_metrics
             .insert("total_run_delay".to_string(), run_delay);
         r.ext_metrics.insert("total_pcount".to_string(), 1000.0);
@@ -2128,9 +2131,9 @@ fn noise_findings_derives_schedstat_rate_from_per_run_components() {
 fn noise_findings_excludes_failed_run_from_the_spread_pool() {
     let a = noise_side("fx", 10.0, 2000);
     let b = vec![
-        cmp_row("fx", "tiny-1llc", true, 10.0, 2000),
-        cmp_row("fx", "tiny-1llc", true, 10.0, 2000),
-        cmp_row("fx", "tiny-1llc", false, 10.0, 990), // failed run, outlier iters
+        cmp_row("fx", "4cpu-1llc-nosmt", true, 10.0, 2000),
+        cmp_row("fx", "4cpu-1llc-nosmt", true, 10.0, 2000),
+        cmp_row("fx", "4cpu-1llc-nosmt", false, 10.0, 990), // failed run, outlier iters
     ];
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
     assert_eq!(rep.paired_scenarios, 1);
@@ -2152,7 +2155,7 @@ fn noise_findings_excludes_failed_run_from_the_spread_pool() {
 /// guard in `noise_verdict` flows through `noise_findings` end-to-end.
 #[test]
 fn noise_findings_degenerate_single_sample_side_is_noisy_not_confident() {
-    let a_one = vec![cmp_row("degen", "tiny-1llc", true, 10.0, 2000)];
+    let a_one = vec![cmp_row("degen", "4cpu-1llc-nosmt", true, 10.0, 2000)];
     let b_three = noise_side("degen", 10.0, 1000); // 3 clean runs, iters dropped 2000->1000
     let rep = noise_findings(&a_one, &b_three, LEGACY_PAIRING_DIMS, 1.0, false);
     assert_eq!(rep.paired_scenarios, 1);
@@ -2181,7 +2184,7 @@ fn phased_rows(
 ) -> Vec<GauntletRow> {
     (0..n)
         .map(|_| {
-            let mut r = cmp_row(scenario, "tiny-1llc", true, 10.0, 0);
+            let mut r = cmp_row(scenario, "4cpu-1llc-nosmt", true, 10.0, 0);
             r.phases = buckets.to_vec();
             r
         })
@@ -2272,12 +2275,12 @@ fn noise_phase_rate_pooled_centroid_within_phase() {
     let side = |scn: &str| {
         vec![
             {
-                let mut r = cmp_row(scn, "tiny-1llc", true, 10.0, 0);
+                let mut r = cmp_row(scn, "4cpu-1llc-nosmt", true, 10.0, 0);
                 r.phases = vec![bucket(100.0, 1.0)];
                 r
             },
             {
-                let mut r = cmp_row(scn, "tiny-1llc", true, 10.0, 0);
+                let mut r = cmp_row(scn, "4cpu-1llc-nosmt", true, 10.0, 0);
                 r.phases = vec![bucket(100.0, 10.0)];
                 r
             },
@@ -2311,7 +2314,7 @@ fn noise_phase_excludes_non_pass_run() {
         2,
         &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
     );
-    let mut failed = cmp_row("scn", "tiny-1llc", false, 10.0, 0); // is_fail
+    let mut failed = cmp_row("scn", "4cpu-1llc-nosmt", false, 10.0, 0); // is_fail
     failed.phases = vec![make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 40.0)])];
     b.push(failed);
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
@@ -2444,7 +2447,7 @@ fn noise_phase_empty_phases_skip() {
         &[make_phase_bucket(1, "Step[0]", &[("max_dsq_depth", 8.0)])],
     );
     let b: Vec<GauntletRow> = (0..3)
-        .map(|_| cmp_row("scn", "tiny-1llc", true, 10.0, 0))
+        .map(|_| cmp_row("scn", "4cpu-1llc-nosmt", true, 10.0, 0))
         .collect();
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 1.0, false);
     assert!(
@@ -2982,10 +2985,10 @@ fn noise_phase_findings_disambiguate_by_pairing_key_across_topologies() {
             })
             .collect::<Vec<_>>()
     };
-    let mut a = phased("tiny-1llc", 8.0);
-    a.extend(phased("large-4llc", 8.0));
-    let mut b = phased("tiny-1llc", 20.0);
-    b.extend(phased("large-4llc", 20.0));
+    let mut a = phased("4cpu-1llc-nosmt", 8.0);
+    a.extend(phased("128cpu-4llc-smt", 8.0));
+    let mut b = phased("4cpu-1llc-nosmt", 20.0);
+    b.extend(phased("128cpu-4llc-smt", 20.0));
     let rep = noise_findings(&a, &b, LEGACY_PAIRING_DIMS, 5.0, false);
     let labels: Vec<&str> = rep
         .phase_findings
@@ -2999,8 +3002,8 @@ fn noise_phase_findings_disambiguate_by_pairing_key_across_topologies() {
         "one per-phase finding per topology group, distinct labels: {labels:?}",
     );
     assert!(
-        labels.iter().any(|l| l.contains("tiny-1llc"))
-            && labels.iter().any(|l| l.contains("large-4llc")),
+        labels.iter().any(|l| l.contains("4cpu-1llc-nosmt"))
+            && labels.iter().any(|l| l.contains("128cpu-4llc-smt")),
         "pairing labels must include the topology to disambiguate: {labels:?}",
     );
     assert_ne!(
@@ -3014,10 +3017,10 @@ fn summarize_side_runs_categorizes_by_exclusion() {
     // A skipped run (is_skip); a failed run (passed=false, not skipped/inc =>
     // is_fail); a comparable run (passed=true). `comparable` must equal the
     // count noise_findings keeps, so a zero explains an empty comparison.
-    let mut skip = cmp_row("s", "tiny-1llc", false, 0.0, 0);
+    let mut skip = cmp_row("s", "4cpu-1llc-nosmt", false, 0.0, 0);
     skip.skipped = true;
-    let fail = cmp_row("s", "tiny-1llc", false, 0.0, 0);
-    let pass = cmp_row("s", "tiny-1llc", true, 0.0, 0);
+    let fail = cmp_row("s", "4cpu-1llc-nosmt", false, 0.0, 0);
+    let pass = cmp_row("s", "4cpu-1llc-nosmt", true, 0.0, 0);
 
     // All skipped -> 0 comparable; the breakdown names the skips (the perf-delta
     // "no comparable runs to pair" diagnostic reads this).
@@ -3095,9 +3098,9 @@ fn noise_findings_high_spread_annotates_but_does_not_suppress_regression() {
     // [30,30]) so the move is separated, and the delta is material (15 >= abs 5,
     // 100% >= 25% rel).
     let a = vec![
-        cmp_row("noisy", "tiny-1llc", true, 10.0, 2000),
-        cmp_row("noisy", "tiny-1llc", true, 20.0, 2000),
-        cmp_row("noisy", "tiny-1llc", true, 15.0, 2000),
+        cmp_row("noisy", "4cpu-1llc-nosmt", true, 10.0, 2000),
+        cmp_row("noisy", "4cpu-1llc-nosmt", true, 20.0, 2000),
+        cmp_row("noisy", "4cpu-1llc-nosmt", true, 15.0, 2000),
     ];
     let rep = noise_findings(
         &a,
@@ -3277,7 +3280,7 @@ fn format_noise_findings_table_renders_rows_and_verdicts() {
     // The TEST column carries the full pairing-key label (scenario + pairing
     // dims: topology/work_type), not scenario alone — matching the scalar path.
     assert!(
-        out.contains("mix/tiny-1llc/SpinWait / worst_spread") && out.contains("REGRESSION"),
+        out.contains("mix/4cpu-1llc-nosmt/SpinWait / worst_spread") && out.contains("REGRESSION"),
         "worsened metric row + verdict: {out}"
     );
     assert!(
@@ -3292,7 +3295,7 @@ fn format_noise_findings_table_renders_noisy_improvement_and_advisory_spread() {
     // otherwise slip past the REGRESSION/stable-only table test).
 
     // Noisy: a side with <2 usable runs (insufficient_samples) -> NOISY row.
-    let a = vec![cmp_row("nz", "tiny-1llc", true, 10.0, 2000)];
+    let a = vec![cmp_row("nz", "4cpu-1llc-nosmt", true, 10.0, 2000)];
     let rep = noise_findings(
         &a,
         &noise_side("nz", 30.0, 2000),
@@ -3325,9 +3328,9 @@ fn format_noise_findings_table_renders_noisy_improvement_and_advisory_spread() {
     // as "REGRESSION (noisy spread)" — the advisory flag annotates but does NOT
     // suppress (the signal-inversion fix).
     let a = vec![
-        cmp_row("adv", "tiny-1llc", true, 10.0, 2000),
-        cmp_row("adv", "tiny-1llc", true, 20.0, 2000),
-        cmp_row("adv", "tiny-1llc", true, 15.0, 2000),
+        cmp_row("adv", "4cpu-1llc-nosmt", true, 10.0, 2000),
+        cmp_row("adv", "4cpu-1llc-nosmt", true, 20.0, 2000),
+        cmp_row("adv", "4cpu-1llc-nosmt", true, 15.0, 2000),
     ];
     let rep = noise_findings(
         &a,
@@ -3381,7 +3384,7 @@ fn format_noise_findings_table_default_hides_stable_and_noisy_rows() {
     // A report whose findings are ALL Stable/Noisy collapses to the one-line
     // summary (never an empty table) under show_all=false. Side A has one run
     // (insufficient) -> every metric classifies Noisy.
-    let a = vec![cmp_row("nz", "tiny-1llc", true, 10.0, 2000)];
+    let a = vec![cmp_row("nz", "4cpu-1llc-nosmt", true, 10.0, 2000)];
     let rep = noise_findings(
         &a,
         &noise_side("nz", 30.0, 2000),
@@ -3782,13 +3785,13 @@ fn noise_findings_declared_whole_run_gate_gates_the_exit() {
 fn scalar_declared_gate_warning_flags_present_gates() {
     // The scalar compare does not evaluate declared gates; it must WARN (not
     // silently ignore) when compared tests carry them.
-    let plain = vec![cmp_row("s", "tiny-1llc", true, 10.0, 0)];
+    let plain = vec![cmp_row("s", "4cpu-1llc-nosmt", true, 10.0, 0)];
     assert!(
         scalar_declared_gate_warning(&plain).is_none(),
         "no declared gates -> no warning",
     );
     let gated = with_gate(
-        vec![cmp_row("s", "tiny-1llc", true, 10.0, 0)],
+        vec![cmp_row("s", "4cpu-1llc-nosmt", true, 10.0, 0)],
         perf_gate("worst_spread", Some(5.0), None, None, None),
     );
     let w = scalar_declared_gate_warning(&gated).expect("declared gate -> warning");
@@ -3883,7 +3886,7 @@ fn compare_rows_informational_metric_shows_but_never_gates() {
     let mk = |ttwu: f64| {
         // spread (10.0) and total_iterations (100) identical both sides => no
         // directional finding; only the informational ext counter moves.
-        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        let mut r = cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100);
         r.ext_metrics.insert("total_ttwu_count".into(), ttwu);
         r
     };
@@ -3921,11 +3924,11 @@ fn compare_rows_informational_metric_shows_but_never_gates() {
 fn compare_rows_one_sided_absent_is_coverage_diff_not_verdict() {
     // avg_nr_running is LowerBetter + ext-only; present on exactly one side.
     let present = {
-        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        let mut r = cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100);
         r.ext_metrics.insert("avg_nr_running".into(), 5.0);
         r
     };
-    let absent = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+    let absent = cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100);
 
     // A present (5.0), B absent: pre-fix a phantom LowerBetter improvement
     // (5 -> 0); post-fix a coverage diff on side A.
@@ -3974,8 +3977,8 @@ fn compare_rows_one_sided_absent_is_coverage_diff_not_verdict() {
 #[test]
 fn compare_rows_both_absent_skipped_present_zero_still_compared() {
     let res_absent = compare_rows_by(
-        &[cmp_row("t", "tiny-1llc", true, 10.0, 100)],
-        &[cmp_row("t", "tiny-1llc", true, 10.0, 100)],
+        &[cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100)],
+        &[cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100)],
         LEGACY_PAIRING_DIMS,
         None,
         &ComparisonPolicy::default(),
@@ -3996,12 +3999,12 @@ fn compare_rows_both_absent_skipped_present_zero_still_compared() {
     // Some(5.0)), a real comparison, not a coverage diff. 0 -> 5 on a
     // LowerBetter metric is a regression.
     let zero_a = {
-        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        let mut r = cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100);
         r.ext_metrics.insert("avg_nr_running".into(), 0.0);
         r
     };
     let nonzero_b = {
-        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        let mut r = cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100);
         r.ext_metrics.insert("avg_nr_running".into(), 5.0);
         r
     };
@@ -4029,11 +4032,11 @@ fn compare_rows_both_absent_skipped_present_zero_still_compared() {
 #[test]
 fn coverage_diff_lines_map_present_absent_labels_by_side() {
     let present = {
-        let mut r = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+        let mut r = cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100);
         r.ext_metrics.insert("avg_nr_running".into(), 5.0);
         r
     };
-    let absent = cmp_row("t", "tiny-1llc", true, 10.0, 100);
+    let absent = cmp_row("t", "4cpu-1llc-nosmt", true, 10.0, 100);
 
     // A present, B absent -> present_side A -> "in runA, absent in runB".
     let report = compare_rows_by(
@@ -4088,8 +4091,8 @@ fn compare_rows_scale_varying_low_throughput_regression_is_material() {
     // total_iterations: HigherBetter, default_abs 2.0 (was 100), default_rel 0.10
     // (2.0 not 1.0: rounded-mean u64 field -- a floor of 1.0 would let a <=1.0
     // rounding delta fabricate a regression; see group.rs rounded-mean invariant).
-    let rows_a = vec![cmp_row("lowtput", "tiny-1llc", true, 10.0, 200)];
-    let rows_b = vec![cmp_row("lowtput", "tiny-1llc", true, 10.0, 120)];
+    let rows_a = vec![cmp_row("lowtput", "4cpu-1llc-nosmt", true, 10.0, 200)];
+    let rows_b = vec![cmp_row("lowtput", "4cpu-1llc-nosmt", true, 10.0, 120)];
     let res = compare_rows_by(
         &rows_a,
         &rows_b,
@@ -4117,8 +4120,8 @@ fn compare_rows_scale_varying_low_throughput_regression_is_material() {
 fn compare_rows_scale_varying_high_throughput_noise_is_unchanged() {
     // 100000 -> 101000 total_iterations: |delta| 1000 >= near-idle floor 2.0, but
     // rel 0.01 < default_rel 0.10 -> the relative gate vetoes -> unchanged.
-    let rows_a = vec![cmp_row("hitput", "tiny-1llc", true, 10.0, 100_000)];
-    let rows_b = vec![cmp_row("hitput", "tiny-1llc", true, 10.0, 101_000)];
+    let rows_a = vec![cmp_row("hitput", "4cpu-1llc-nosmt", true, 10.0, 100_000)];
+    let rows_b = vec![cmp_row("hitput", "4cpu-1llc-nosmt", true, 10.0, 101_000)];
     let res = compare_rows_by(
         &rows_a,
         &rows_b,

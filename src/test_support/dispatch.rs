@@ -7,7 +7,9 @@
 //!   ktstr-linked binary. Routes the process to guest init, host-side
 //!   VM launch, guest-side test execution, or nextest protocol handling.
 //! - [`ktstr_main`]: the nextest protocol handler — `--list` returns
-//!   `ktstr/` and `gauntlet/` test names, `--exact` runs a single test.
+//!   `ktstr/`, `gauntlet/`, and `host/` test names, `--exact` runs a single
+//!   test. The prefix is also a resource-admission identity: `ktstr/` and
+//!   `gauntlet/` boot VMs, while `host/` entries are ordinary host work.
 //! - [`run_ktstr_test`]: programmatic entry point used by library
 //!   consumers and the macro-generated `#[test]` wrappers.
 //! - [`analyze_sidecars`]: collects sidecar JSON from a run directory
@@ -29,10 +31,11 @@ use crate::assert::AssertResult;
 use super::extract_export_output_arg;
 use super::{
     HostClass, KTSTR_TESTS, KtstrTestEntry, TopoOverride, classify_host_error, collect_sidecars,
-    extract_export_test_arg, extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg,
-    find_test, format_callback_profile, format_kvm_stats, format_verifier_stats,
-    maybe_dispatch_vm_test, parse_topo_string, propagate_rust_env_from_cmdline,
-    record_skip_sidecar, resolve_test_kernel, run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
+    extract_export_check_test_arg, extract_export_test_arg, extract_shell_test_arg,
+    extract_test_fn_arg, extract_topo_arg, find_test, format_callback_profile, format_kvm_stats,
+    format_verifier_stats, maybe_dispatch_vm_test, parse_topo_string,
+    propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
+    run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
 };
 
 /// Check if an error is a host topology mismatch (e.g. test requests
@@ -162,8 +165,9 @@ pub fn is_topology_unrepresentable(e: &anyhow::Error) -> bool {
 /// host-insufficiency): `err_to_exit_code` and the `#[ktstr_test]` macro
 /// body both SKIP it by default, promoted to a FAIL under
 /// `KTSTR_NO_SKIP_MODE`. Under nextest the plain `#[test]` wrapper is
-/// suppressed, so an entry dispatches as `ktstr/{name}` via `run_named_test`
-/// → `err_to_exit_code` — meaning a developer running `cargo nextest run`,
+/// suppressed, so a VM entry dispatches as `ktstr/{name}` (and a host-only
+/// entry as `host/{name}`) via `run_named_test` → `err_to_exit_code` —
+/// meaning a developer running `cargo nextest run`,
 /// or `cargo ktstr test` without `--kernel`, on a kernel-less host gets a
 /// clean skip rather than a hard fail on every entry. This cannot mask a CI
 /// kernel-build failure: a requested `--kernel` that fails to build bails in
@@ -299,8 +303,9 @@ impl SanitizedKernelLabel {
 /// semantic, operator-readable label per kernel:
 /// - Version / Range expansion: the version string verbatim
 ///   (`6.14.2`, `6.15-rc3`).
-/// - CacheKey: the version prefix (everything before the
-///   `-tarball-` / `-git-` source tag).
+/// - CacheKey: the version prefix for tarballs, a compact
+///   `git_{kind}_{refhash6}` label for content-addressed git entries,
+///   or the legacy ref prefix for older `-git-` keys.
 /// - Git: `git_{owner}_{repo}_{kind}_{ref}` extracted from the URL
 ///   (kind = tag/branch/sha).
 /// - Path: `path_{basename}_{hash6}` — basename + 6-char crc32 of
@@ -494,7 +499,7 @@ pub fn ktstr_test_early_dispatch() {
     // those test names are silently dropped from the listing.
     //
     // For `--exact`, ktstr_main runs only when the test name starts
-    // with `ktstr/` or `gauntlet/` — names ktstr owns. Other names
+    // with `ktstr/`, `gauntlet/`, or `host/` — names ktstr owns. Other names
     // (libtest #[test] items, including the per-entry wrappers
     // emitted by `#[ktstr_test]` itself) fall through to libtest's
     // dispatch. Without this guard, run_named_test would fail
@@ -532,18 +537,21 @@ pub fn ktstr_test_early_dispatch() {
                 std::process::exit(code);
             } else if let Some(pos) = args.iter().position(|a| a == "--exact")
                 && let Some(name) = args.get(pos + 1)
-                && (name.starts_with("ktstr/") || name.starts_with("gauntlet/"))
+                && (name.starts_with("ktstr/")
+                    || name.starts_with("gauntlet/")
+                    || name.starts_with("host/"))
             {
                 let bare = name
                     .strip_prefix("ktstr/")
                     .or_else(|| name.strip_prefix("gauntlet/"))
+                    .or_else(|| name.strip_prefix("host/"))
                     .unwrap_or(name)
                     .split('/')
                     .next()
                     .unwrap_or(name);
 
                 // Reject malformed names like `gauntlet/` (trailing
-                // slash, no test name) and `ktstr/` up front, so the
+                // slash, no test name), `ktstr/`, and `host/` up front, so the
                 // operator sees a clear error instead of an opaque
                 // "unknown test" from the empty bare name.
                 if bare.is_empty() {
@@ -678,18 +686,18 @@ fn is_test_sentinel(name: &str) -> bool {
     name.starts_with("__unit_test_") && name.ends_with("__")
 }
 
-/// Export-self dispatch: if `--ktstr-export-test=NAME` is present in
-/// argv, look up `NAME` in the binary's own `KTSTR_TESTS` registry,
-/// build a self-extracting `.run` file embedding `current_exe()`
-/// (this binary), and exit. Returns `Some(exit_code)` when dispatched,
-/// `None` when the flag is absent.
+/// Export-self dispatch. `--ktstr-export-check-test=NAME` performs only the
+/// cheap registry ownership and static eligibility check;
+/// `--ktstr-export-test=NAME` builds the self-extracting `.run` file embedding
+/// `current_exe()` (this binary). Returns `Some(exit_code)` when either private
+/// discriminator is present and `None` otherwise.
 ///
 /// `cargo ktstr export <NAME>` (the cargo-ktstr binary) is a router
-/// that compiles the workspace's tests, locates the test binary that
-/// owns `NAME`, and exec's it with this arg. The test binary embeds
-/// ITSELF — without that indirection, cargo-ktstr would package its
-/// own binary, which has no `#[ktstr_test]` registrations from the
-/// user's crate and can't reproduce the test on bare metal.
+/// that compiles the workspace's tests, locates an eligible owner with the
+/// check-only arg, then exec's that selected binary once with the real export
+/// arg. The test binary embeds ITSELF — without that indirection, cargo-ktstr
+/// would package its own binary, which has no `#[ktstr_test]` registrations
+/// from the user's crate and can't reproduce the test on bare metal.
 ///
 /// `--ktstr-export-output=PATH` overrides the default output path
 /// (`<NAME>.run` in the cwd). Both flags are leniently parsed by the
@@ -699,7 +707,7 @@ fn is_test_sentinel(name: &str) -> bool {
 ///
 /// # Exit-code contract
 ///
-/// The router (`cargo-ktstr.rs::run_export`) discriminates between
+/// During the check-only phase the router discriminates between
 /// "this binary doesn't know the test" (exit 1) and "this binary
 /// has the test but rejects it" (exit 2). When ANY candidate exits
 /// 2, the router surfaces THAT candidate's stderr (the rejection
@@ -708,10 +716,10 @@ fn is_test_sentinel(name: &str) -> bool {
 /// Without the differentiation, an operator who exports a
 /// host_only test would see the misleading "not found" diagnostic
 /// even though the test exists.
-/// Stub for the `export`-feature-disabled build. The router
-/// (`cargo-ktstr.rs::run_export`) execs every candidate test binary
-/// with `--ktstr-export-test=NAME`; without this stub a binary
-/// compiled without `export` would fall through to the nextest
+///
+/// Stub for the `export`-feature-disabled build. The router probes candidate
+/// test binaries with `--ktstr-export-check-test=NAME`; without this stub a
+/// binary compiled without `export` would fall through to the nextest
 /// harness, which would surface an opaque "unrecognised argument"
 /// error against an arg the operator never typed. The stub turns
 /// that into an actionable diagnostic by detecting the arg and
@@ -724,7 +732,7 @@ fn is_test_sentinel(name: &str) -> bool {
 #[cfg(not(feature = "export"))]
 fn maybe_dispatch_export() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
-    let _ = extract_export_test_arg(&args)?;
+    let _ = extract_export_check_test_arg(&args).or_else(|| extract_export_test_arg(&args))?;
     eprintln!(
         "ktstr export: this test binary was built without the `export` cargo \
          feature, so `cargo ktstr export <name>` cannot reach the export pipeline \
@@ -737,13 +745,18 @@ fn maybe_dispatch_export() -> Option<i32> {
 #[cfg(feature = "export")]
 fn maybe_dispatch_export() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
-    let name = extract_export_test_arg(&args)?;
+    let check_name = extract_export_check_test_arg(&args);
+    let execute_name = extract_export_test_arg(&args);
+    let (name, check_only) = if let Some(name) = check_name {
+        (name, true)
+    } else {
+        (execute_name?, false)
+    };
     let output = extract_export_output_arg(&args).map(std::path::PathBuf::from);
 
-    // Empty name: surface as a hard error rather than silently
-    // succeeding. The router's "first binary that exits 0 wins"
-    // protocol relies on the absent-test path returning a non-zero
-    // exit so the next candidate is tried.
+    // Empty name: surface as a hard error rather than silently succeeding. The
+    // bounded selection protocol relies on the absent-test path returning a
+    // non-zero exit so the next candidate is tried.
     if name.is_empty() {
         eprintln!("ktstr export: --ktstr-export-test= requires a non-empty test name");
         return Some(1);
@@ -754,9 +767,19 @@ fn maybe_dispatch_export() -> Option<i32> {
     // "registered but rejected" (exit 2, router surfaces this
     // stderr). `export_test` itself returns anyhow::Error for both
     // cases, which would conflate them at the exit-code level.
-    if find_test(name).is_none() {
+    let Some(entry) = find_test(name) else {
         eprintln!("ktstr export: no registered test named '{name}'");
         return Some(1);
+    };
+
+    if check_only {
+        return match crate::export::validate_export_entry(entry) {
+            Ok(()) => Some(0),
+            Err(error) => {
+                eprintln!("ktstr export: {error:#}");
+                Some(2)
+            }
+        };
     }
 
     match crate::export::export_test(name, output) {
@@ -1137,6 +1160,13 @@ fn ok_to_exit_code(r: AssertResult, expect_err: bool, allow_inconclusive: bool) 
 /// order + per-class skip/fail policy live in `classify_host_error`, not
 /// here, so this site and the macro cannot drift apart.
 fn err_to_exit_code(e: anyhow::Error, expect_err: bool, no_skip: bool) -> i32 {
+    if crate::test_support::is_framework_infrastructure_failure(&e) {
+        // Framework faults are never resource insufficiency and never an
+        // expected guest failure. Check the marker before host classification
+        // so a nested errno or contextual message cannot turn it into a skip.
+        eprintln!("{e:#}");
+        return EXIT_FAIL;
+    }
     // Host-insufficiency classification (kernel-unavailable, perf-mode,
     // cpu-budget, topology-unrepresentable, resource-contention,
     // topology-insufficient) is shared with the `#[ktstr_test]` macro body via
@@ -1367,6 +1397,9 @@ pub(crate) fn final_outcome(
             Verdict::Pass
         }
         Err(e) => {
+            if crate::test_support::is_framework_infrastructure_failure(e) {
+                return Verdict::Fail;
+            }
             match classify_host_error(e, no_skip) {
                 HostClass::Skip { .. } => return Verdict::Skip,
                 HostClass::Fail { .. } => return Verdict::Fail,
@@ -1558,14 +1591,14 @@ fn for_each_gauntlet_variant<F>(
 {
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
     for preset in presets {
-        // Non-uniform presets (per-LLC core counts, e.g. uneven-11llc)
+        // Non-uniform presets (per-LLC core counts, e.g. 192cpu-11llc-smt)
         // are VERIFIER-ONLY: the gauntlet execution path reconstructs the
         // topology from a `TopoOverride` (numa/llcs/cores/threads only),
         // which cannot carry `llc_cores`, so a gauntlet variant would boot
         // a WRONG uniform shape. The verifier path passes the full
         // Topology (with llc_cores) directly, so it is the only path that
         // renders these shapes faithfully. Skip them here regardless of
-        // constraints — this is why uneven-11llc's forced overcommit is
+        // constraints — this is why 192cpu-11llc-smt's forced overcommit is
         // realized only in the verifier battery.
         if preset.topology.llc_cores.is_some() {
             continue;
@@ -1605,7 +1638,8 @@ fn for_each_gauntlet_variant<F>(
 ///
 /// `KTSTR_CARGO_TEST_MODE=1` skips gauntlet variant emission and
 /// the multi-kernel suffix path: each test gets exactly one
-/// `ktstr/{name}: test` line. Bare `cargo test` doesn't have
+/// `ktstr/{name}: test` line for VM tests or `host/{name}: test` for
+/// host-only tests. Bare `cargo test` doesn't have
 /// access to the cargo-ktstr resolver that produces
 /// `KTSTR_KERNEL_LIST`, so the multi-kernel branch can't apply
 /// even if it were enabled — pin both behaviors explicitly so
@@ -1643,7 +1677,7 @@ fn list_tests_all(ignored_only: bool) {
 
         if !ignored_only || is_ignored(entry) {
             if entry.host_only {
-                println!("ktstr/{}: test", entry.name);
+                println!("host/{}: test", entry.name);
             } else {
                 for suffix in &kernel_suffixes {
                     if suffix.is_empty() {
@@ -1715,40 +1749,25 @@ fn list_tests_all(ignored_only: bool) {
 ///   produce identical sanitized labels.
 ///
 /// [`KernelId`]: crate::kernel_path::KernelId
+#[cfg(test)]
 fn sched_kernel_filter_accepts(declared: &[&'static str], entry: &KernelEntry) -> bool {
-    if declared.is_empty() {
-        return true;
-    }
-    declared.iter().any(|spec| entry_matches_spec(entry, spec))
+    super::entry::verifier_kernel_specs_accept(
+        declared.iter().copied(),
+        &entry.label,
+        entry.sanitized.as_str(),
+    )
 }
 
 /// Single-spec match helper for [`sched_kernel_filter_accepts`].
 /// Parses `spec` via [`crate::kernel_path::KernelId::parse`] and
 /// dispatches on the variant. Pure logic — no network, no FS.
+#[cfg(test)]
 fn entry_matches_spec(entry: &KernelEntry, spec: &str) -> bool {
-    use crate::kernel_path::{KernelId, decompose_version_for_compare};
-    match KernelId::parse(spec) {
-        KernelId::Version(spec_ver) => {
-            entry.label == spec_ver || entry.sanitized.as_str() == sanitize_kernel_label(&spec_ver)
-        }
-        KernelId::Range { start, end, .. } => {
-            let Some(entry_t) = decompose_version_for_compare(&entry.label) else {
-                return false;
-            };
-            let Some(start_t) = decompose_version_for_compare(&start) else {
-                return false;
-            };
-            let Some(end_t) = decompose_version_for_compare(&end) else {
-                return false;
-            };
-            entry_t >= start_t && entry_t <= end_t
-        }
-        KernelId::CacheKey(_)
-        | KernelId::Path(_)
-        | KernelId::Git { .. }
-        | KernelId::Package { .. }
-        | KernelId::Distro { .. } => entry.sanitized.as_str() == sanitize_kernel_label(spec),
-    }
+    super::entry::verifier_kernel_specs_accept(
+        std::iter::once(spec),
+        &entry.label,
+        entry.sanitized.as_str(),
+    )
 }
 
 /// Format the `KTSTR_KERNEL_LIST is empty` diagnostic emitted by
@@ -1827,7 +1846,7 @@ fn workspace_member_packages(manifest_dir: &str) -> &'static std::collections::H
 /// in that workspace is then gated out rather than emitted for a package
 /// the runtime resolver could not build.
 fn query_workspace_member_packages(manifest_dir: &str) -> std::collections::HashSet<String> {
-    let manifest_path = std::path::Path::new(manifest_dir).join("Cargo.toml");
+    let manifest_path = crate::writable_source_path(manifest_dir).join("Cargo.toml");
     let output = std::process::Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .arg("--manifest-path")
@@ -1871,6 +1890,13 @@ fn query_workspace_member_packages(manifest_dir: &str) -> std::collections::Hash
         .filter_map(|pkg| pkg.get("name").and_then(|n| n.as_str()))
         .map(|s| s.to_string())
         .collect()
+}
+
+fn claim_verifier_scheduler_name<'a>(
+    emitted: &mut std::collections::HashSet<&'a str>,
+    name: &'a str,
+) -> bool {
+    emitted.insert(name)
 }
 
 /// Emit `verifier/<sched>/<kernel>/<preset>: test` lines — one per
@@ -1925,11 +1951,19 @@ fn query_workspace_member_packages(manifest_dir: &str) -> std::collections::Hash
 /// (direct binary invocation outside the dispatcher), no cells emit.
 fn list_verifier_cells_all() {
     use super::SchedulerSpec;
+    let cell_ownership = match crate::verifier::verifier_cell_ownership_from_env() {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            eprintln!("ktstr verifier: cannot establish cell ownership while listing: {error:#}");
+            std::process::exit(1);
+        }
+    };
     let kernel_list = read_kernel_list();
     if kernel_list.is_empty() {
         return;
     }
     let presets = crate::gauntlet::gauntlet_presets();
+    let mut emitted_scheduler_names = std::collections::HashSet::new();
     // No host_capacity() read here: verifier preset selection has no
     // host-size bound (see accepts_verifier) — a battery shape lists on
     // any host regardless of CPU count.
@@ -1986,8 +2020,39 @@ fn list_verifier_cells_all() {
             }
             _ => {}
         }
+        let scheduler_json = super::SchedulerJson::from_scheduler(sched);
+        if !scheduler_json.has_accepted_verifier_cell(
+            kernel_list
+                .iter()
+                .map(|entry| (entry.label.as_str(), entry.sanitized.as_str())),
+            &presets,
+        ) {
+            continue;
+        }
+        if let Some(ownership) = &cell_ownership {
+            match ownership.owns_scheduler(&scheduler_json) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "ktstr verifier: cannot establish cell ownership for scheduler {:?}: \
+                         {error:#}",
+                        sched.name,
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        // The parent collapses exact declarations across binaries. Mirror
+        // that identity rule inside the elected binary too: repeated links of
+        // the same scheduler static/name still advertise one nextest cell set.
+        if !claim_verifier_scheduler_name(&mut emitted_scheduler_names, sched.name) {
+            continue;
+        }
         for kernel_entry in &kernel_list {
-            if !sched_kernel_filter_accepts(sched.kernels, kernel_entry) {
+            if !scheduler_json
+                .accepts_verifier_kernel(&kernel_entry.label, kernel_entry.sanitized.as_str())
+            {
                 continue;
             }
             // One cell per (scheduler, kernel, topology preset). The
@@ -2013,7 +2078,7 @@ fn list_verifier_cells_all() {
                     );
                     continue;
                 }
-                if !scheduler_accepts_verifier_preset(sched, preset) {
+                if !scheduler_json.accepts_verifier_preset(preset) {
                     continue;
                 }
                 println!(
@@ -2028,12 +2093,12 @@ fn list_verifier_cells_all() {
 /// Apply the verifier-only topology policy for one scheduler/preset
 /// pair. Kept separate from emission so named exclusions are directly
 /// unit-testable without capturing a process-wide nextest listing.
+#[cfg(test)]
 fn scheduler_accepts_verifier_preset(
     sched: &super::Scheduler,
     preset: &crate::gauntlet::TopoPreset,
 ) -> bool {
-    sched.constraints.accepts_verifier(&preset.topology)
-        && !sched.verifier_exclude_topologies.contains(&preset.name)
+    super::SchedulerJson::from_scheduler(sched).accepts_verifier_preset(preset)
 }
 
 /// Whether a verifier-cell error is a typed guest-kernel/topology
@@ -2081,6 +2146,7 @@ fn is_verifier_topology_unsupported(e: &anyhow::Error) -> bool {
 /// that case they emit a `SKIP` banner + exit 0.
 fn run_verifier_cell_inner(
     full_name: &str,
+    sched: &super::Scheduler,
     out_stats: &mut Vec<crate::verifier::ProgStats>,
     out_skipped: &mut bool,
 ) -> i32 {
@@ -2117,13 +2183,13 @@ fn run_verifier_cell_inner(
         return 1;
     }
 
-    let Some(sched) = super::KTSTR_SCHEDULERS
-        .iter()
-        .find(|s| s.name == sched_name)
-    else {
-        eprintln!("ktstr verifier: no declared scheduler {sched_name:?} (cell {full_name:?})",);
+    if sched.name != sched_name {
+        eprintln!(
+            "ktstr verifier: selected scheduler {:?} does not match cell {full_name:?}",
+            sched.name,
+        );
         return 1;
-    };
+    }
 
     // Resolve the cell's topology preset by its <preset> name segment.
     let preset_list = crate::gauntlet::gauntlet_presets();
@@ -2161,48 +2227,69 @@ fn run_verifier_cell_inner(
         return 1;
     };
 
-    let sched_bin: std::path::PathBuf = match sched.binary {
-        // Build the scheduler in the DECLARING crate's workspace with
-        // `cargo build -p <pkg>` run from `sched.manifest_dir` — the same
-        // workspace whose membership the emission-time gate in
-        // `list_verifier_cells_all` checked, so an emitted cell always
-        // names a buildable package. Cargo owns freshness (rebuild when
-        // sources changed, no-op when up to date, fail when unbuildable).
-        SchedulerSpec::Discover(pkg) => {
-            match crate::build_and_find_binary(pkg, sched.manifest_dir) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
-                    return 1;
-                }
-            }
-        }
-        SchedulerSpec::Path(p) => {
-            let path = std::path::PathBuf::from(p);
-            if !path.exists() {
-                eprintln!("ktstr verifier: scheduler binary not found: {p}");
+    let prebuilt = if sched.binary.has_bpf_scheduler() {
+        match crate::scheduler_artifact::scheduler_artifact_from_env(
+            Some(sched.name),
+            &sched.binary,
+            sched.manifest_dir,
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "ktstr verifier: resolve parent-owned scheduler artifact for \
+                     {sched_name:?}: {e:#}"
+                );
                 return 1;
             }
-            path
         }
-        // Eevdf + KernelBuiltin are filtered at list time in
-        // list_verifier_cells_all, so nextest dispatch never reaches
-        // these arms. The SKIP arms remain as defense-in-depth for
-        // direct `--exact verifier/<eevdf>/...` invocation outside
-        // nextest.
-        SchedulerSpec::Eevdf => {
-            *out_skipped = true;
-            println!(
-                "ktstr verifier: SKIP cell {full_name} (Eevdf has no userspace binary to verify)",
-            );
-            return 0;
-        }
-        SchedulerSpec::KernelBuiltin { .. } => {
-            *out_skipped = true;
-            println!(
-                "ktstr verifier: SKIP cell {full_name} (KernelBuiltin has no userspace binary to verify)",
-            );
-            return 0;
+    } else {
+        None
+    };
+    let sched_bin: std::path::PathBuf = if let Some(path) = prebuilt {
+        path
+    } else {
+        match sched.binary {
+            // A cargo-ktstr parent prebuilds every selected Discover package once
+            // and exports the same immutable exact-identity manifest used by
+            // ordinary and coverage tests. A direct/manual cell invocation has no
+            // manifest and retains on-demand resolution. Once a manifest is
+            // present, lookup failure is fatal and MUST NOT silently rebuild.
+            SchedulerSpec::Discover(pkg) => {
+                match crate::build_and_find_binary(pkg, sched.manifest_dir) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
+                        return 1;
+                    }
+                }
+            }
+            SchedulerSpec::Path(p) => {
+                let path = std::path::PathBuf::from(p);
+                if !path.exists() {
+                    eprintln!("ktstr verifier: scheduler binary not found: {p}");
+                    return 1;
+                }
+                path
+            }
+            // Eevdf + KernelBuiltin are filtered at list time in
+            // list_verifier_cells_all, so nextest dispatch never reaches
+            // these arms. The SKIP arms remain as defense-in-depth for
+            // direct `--exact verifier/<eevdf>/...` invocation outside
+            // nextest.
+            SchedulerSpec::Eevdf => {
+                *out_skipped = true;
+                println!(
+                    "ktstr verifier: SKIP cell {full_name} (Eevdf has no userspace binary to verify)",
+                );
+                return 0;
+            }
+            SchedulerSpec::KernelBuiltin { .. } => {
+                *out_skipped = true;
+                println!(
+                    "ktstr verifier: SKIP cell {full_name} (KernelBuiltin has no userspace binary to verify)",
+                );
+                return 0;
+            }
         }
     };
 
@@ -2240,11 +2327,13 @@ fn run_verifier_cell_inner(
             }
         }
     };
-    // Pass the preset's Topology directly (uneven-11llc's per-LLC core
+    // Pass the preset's Topology directly (192cpu-11llc-smt's per-LLC core
     // counts must survive into the guest CPUID; the TopologyJson wire
     // shape would drop them).
     let topology = preset.topology;
-    let sched_args: Vec<String> = sched.sched_args.iter().map(|s| s.to_string()).collect();
+    let memory_min_mib =
+        super::runtime::verifier_preset_memory_min_mib(topology.total_cpus(), preset.memory_mib);
+    let launch = crate::verifier::VerifierSchedulerLaunchPlan::from_scheduler(sched);
 
     // Raw mode is opt-in via the dispatcher's --raw flag, plumbed
     // through KTSTR_VERIFIER_RAW_ENV. Presence (any value, including
@@ -2253,12 +2342,13 @@ fn run_verifier_cell_inner(
     // `cmd.env(KTSTR_VERIFIER_RAW_ENV, "1")` setter.
     let raw = std::env::var_os(crate::KTSTR_VERIFIER_RAW_ENV).is_some();
 
-    match crate::verifier::collect_verifier_output(
+    match crate::verifier::collect_verifier_output_with_memory_min(
         &sched_bin,
         &ktstr_bin,
         &kernel_path,
-        &sched_args,
+        &launch,
         topology,
+        memory_min_mib,
         preset.forced_cpu_budget,
     ) {
         Ok(result) => {
@@ -2304,6 +2394,70 @@ fn run_verifier_cell_inner(
     }
 }
 
+/// Check parent-elected ownership before an exact verifier cell can launch or
+/// write its deterministic record.
+///
+/// The environment-absent path preserves direct/manual invocation. Once a
+/// manifest is present, malformed names and missing local declarations cannot
+/// establish ownership and fail closed. A non-owner returns `Ok(None)` so the
+/// wrapper can reject it without entering either the VM path or record writer.
+fn select_verifier_scheduler_from<'a>(
+    schedulers: impl IntoIterator<Item = &'a super::Scheduler>,
+    scheduler_name: &str,
+    expected: Option<&super::SchedulerJson>,
+) -> anyhow::Result<&'a super::Scheduler> {
+    let mut candidates = schedulers
+        .into_iter()
+        .filter(|scheduler| scheduler.name == scheduler_name);
+    let Some(expected) = expected else {
+        return candidates.next().ok_or_else(|| {
+            anyhow::anyhow!("no declared scheduler {scheduler_name:?} exists in this test binary")
+        });
+    };
+    candidates
+        .find(|scheduler| super::SchedulerJson::from_scheduler(scheduler).eq(expected))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this test binary has no declaration matching the parent-selected full \
+                 identity for scheduler {scheduler_name:?}: {expected:?}"
+            )
+        })
+}
+
+fn select_local_verifier_scheduler(
+    scheduler_name: &str,
+    expected: Option<&super::SchedulerJson>,
+) -> anyhow::Result<&'static super::Scheduler> {
+    select_verifier_scheduler_from(
+        super::KTSTR_SCHEDULERS.iter().copied(),
+        scheduler_name,
+        expected,
+    )
+}
+
+fn current_binary_verifier_scheduler(
+    full_name: &str,
+) -> anyhow::Result<Option<&'static super::Scheduler>> {
+    let rest = full_name
+        .strip_prefix("verifier/")
+        .ok_or_else(|| anyhow::anyhow!("missing 'verifier/' prefix in cell name {full_name:?}"))?;
+    let parts = rest.splitn(3, '/').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        anyhow::bail!(
+            "malformed cell name {full_name:?}; expected \
+             verifier/<sched>/<kernel>/<preset>"
+        );
+    }
+    let scheduler_name = parts[0];
+    let Some(ownership) = crate::verifier::verifier_cell_ownership_from_env()? else {
+        return select_local_verifier_scheduler(scheduler_name, None).map(Some);
+    };
+    let Some(expected) = ownership.owned_scheduler(scheduler_name)? else {
+        return Ok(None);
+    };
+    select_local_verifier_scheduler(scheduler_name, Some(expected)).map(Some)
+}
+
 /// Run a verifier cell and, when the `cargo ktstr verifier` dispatcher
 /// set [`crate::KTSTR_VERIFIER_RESULT_DIR_ENV`], record its
 /// PASS/FAIL/SKIP outcome there so the dispatcher can render the
@@ -2313,10 +2467,33 @@ fn run_verifier_cell_inner(
 /// the cell's exit code. A nextest RETRY re-runs this wrapper and
 /// overwrites the cell's own record (deterministic filename), so the
 /// final attempt's outcome is the one that lands in the table.
-fn run_verifier_cell(full_name: &str) -> i32 {
+fn run_verifier_cell_after_ownership(
+    full_name: &str,
+    scheduler: anyhow::Result<Option<&super::Scheduler>>,
+    execute: impl FnOnce(
+        &str,
+        &super::Scheduler,
+        &mut Vec<crate::verifier::ProgStats>,
+        &mut bool,
+    ) -> i32,
+) -> i32 {
+    let scheduler = match scheduler {
+        Ok(Some(scheduler)) => scheduler,
+        Ok(None) => {
+            eprintln!("ktstr verifier: refusing non-owner exact-cell dispatch for {full_name:?}");
+            return 1;
+        }
+        Err(error) => {
+            eprintln!(
+                "ktstr verifier: cannot establish exact-cell ownership for {full_name:?}: \
+                 {error:#}"
+            );
+            return 1;
+        }
+    };
     let mut stats = Vec::new();
     let mut skipped = false;
-    let code = run_verifier_cell_inner(full_name, &mut stats, &mut skipped);
+    let code = execute(full_name, scheduler, &mut stats, &mut skipped);
     if let Some(dir) = std::env::var_os(crate::KTSTR_VERIFIER_RESULT_DIR_ENV) {
         crate::verifier::write_cell_record(
             std::path::Path::new(&dir),
@@ -2327,6 +2504,14 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         );
     }
     code
+}
+
+fn run_verifier_cell(full_name: &str) -> i32 {
+    run_verifier_cell_after_ownership(
+        full_name,
+        current_binary_verifier_scheduler(full_name),
+        run_verifier_cell_inner,
+    )
 }
 
 /// List tests with budget-based coverage maximization.
@@ -2342,6 +2527,45 @@ fn run_verifier_cell(full_name: &str) -> i32 {
 /// fan-out). The greedy selector still applies — a low budget
 /// can still trim the base list — but the candidate set is the
 /// same set that the dispatch path would actually run.
+fn push_budget_base_candidates(
+    candidates: &mut Vec<crate::budget::TestCandidate>,
+    entry: &KtstrTestEntry,
+    ignored_only: bool,
+    base_ignored: bool,
+    base_topo: &crate::vmm::topology::Topology,
+    kernel_suffixes: &[&str],
+) {
+    use crate::budget::{TestCandidate, estimate_duration, extract_features};
+
+    if ignored_only && !base_ignored {
+        return;
+    }
+
+    // Host-only tests never boot a VM, so the kernel never affects what
+    // runs. Emit one candidate without a kernel suffix even in multi-kernel
+    // mode; VM tests retain one candidate per selected kernel.
+    if entry.host_only {
+        candidates.push(TestCandidate {
+            name: format!("host/{}: test", entry.name),
+            features: extract_features(entry, base_topo, false, entry.name),
+            estimated_secs: estimate_duration(entry, base_topo),
+        });
+    } else {
+        for suffix in kernel_suffixes {
+            let name = if suffix.is_empty() {
+                format!("ktstr/{}: test", entry.name)
+            } else {
+                format!("ktstr/{}/{suffix}: test", entry.name)
+            };
+            candidates.push(TestCandidate {
+                name,
+                features: extract_features(entry, base_topo, false, entry.name),
+                estimated_secs: estimate_duration(entry, base_topo),
+            });
+        }
+    }
+}
+
 fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     use crate::budget::{TestCandidate, estimate_duration, extract_features, select};
 
@@ -2370,34 +2594,14 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
         let base_ignored = is_ignored(entry);
         let base_topo = entry.topology;
 
-        // Base test
-        if !ignored_only || base_ignored {
-            // host_only tests never boot a VM, so the kernel never
-            // affects what runs — push one candidate without a
-            // kernel suffix even in multi-kernel mode. Otherwise the
-            // budget selector would consider N identical copies of
-            // the same host-side function.
-            if entry.host_only {
-                candidates.push(TestCandidate {
-                    name: format!("ktstr/{}: test", entry.name),
-                    features: extract_features(entry, &base_topo, false, entry.name),
-                    estimated_secs: estimate_duration(entry, &base_topo),
-                });
-            } else {
-                for suffix in &kernel_suffixes {
-                    let name = if suffix.is_empty() {
-                        format!("ktstr/{}: test", entry.name)
-                    } else {
-                        format!("ktstr/{}/{suffix}: test", entry.name)
-                    };
-                    candidates.push(TestCandidate {
-                        name,
-                        features: extract_features(entry, &base_topo, false, entry.name),
-                        estimated_secs: estimate_duration(entry, &base_topo),
-                    });
-                }
-            }
-        }
+        push_budget_base_candidates(
+            &mut candidates,
+            entry,
+            ignored_only,
+            base_ignored,
+            &base_topo,
+            &kernel_suffixes,
+        );
 
         if entry.host_only {
             continue;
@@ -2522,8 +2726,9 @@ fn export_kernel_for_variant(entry: &KernelEntry) {
 
 /// Parse a nextest-style test name and run it.
 ///
-/// Handles base tests (`ktstr/{name}`), gauntlet variants
-/// (`gauntlet/{name}/{preset}`), and bare names (backward compat).
+/// Handles VM base tests (`ktstr/{name}`), host-only tests (`host/{name}`),
+/// gauntlet variants (`gauntlet/{name}/{preset}`), and bare names (backward
+/// compatibility).
 /// When `KTSTR_KERNEL_LIST` carries 2+ kernels,
 /// VM-bound test names additionally end with
 /// `/{sanitized_kernel_label}` — that suffix is peeled here and
@@ -2531,7 +2736,7 @@ fn export_kernel_for_variant(entry: &KernelEntry) {
 /// [`crate::KTSTR_KERNEL_ENV`] before the dispatch continues. `host_only`
 /// tests are short-circuited BEFORE the suffix peel: they never
 /// boot a VM, so the kernel-suffix listing path emits one
-/// `ktstr/{name}: test` entry without a kernel suffix regardless
+/// `host/{name}: test` entry without a kernel suffix regardless
 /// of the kernel-list cardinality (see `list_tests_all` /
 /// `list_tests_budget`), and routing them through
 /// `strip_kernel_suffix` would surface as a "no recognised kernel
@@ -2542,7 +2747,7 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     // host_only short-circuit: in multi-kernel mode, host_only tests
     // are listed without a `/{sanitized_kernel_label}` suffix (see
     // `list_tests_all` / `list_tests_budget`, which emit a single
-    // `ktstr/{name}: test` line for host_only entries regardless of
+    // `host/{name}: test` line for host_only entries regardless of
     // the kernel-list cardinality — a host_only test never boots a
     // VM, so the kernel never affects what runs). Calling
     // `strip_kernel_suffix` on such a name in multi-kernel mode
@@ -2554,7 +2759,10 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     // VM-bound tests. Single-kernel mode is unaffected — the
     // pass-through arm in `strip_kernel_suffix` returns the input
     // verbatim either way.
-    let bare_for_lookup = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
+    let bare_for_lookup = test_name
+        .strip_prefix("host/")
+        .or_else(|| test_name.strip_prefix("ktstr/"))
+        .unwrap_or(test_name);
 
     if let Some(entry) = find_test(bare_for_lookup)
         && entry.host_only
@@ -2577,7 +2785,10 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
         return run_gauntlet_test(rest);
     }
 
-    let bare_name = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
+    let bare_name = test_name
+        .strip_prefix("host/")
+        .or_else(|| test_name.strip_prefix("ktstr/"))
+        .unwrap_or(test_name);
     let entry = match find_test(bare_name) {
         Some(e) => e,
         None => {
@@ -2999,11 +3210,12 @@ fn ktstr_list_only() {
 /// under nextest with `--exact <ktstr_or_gauntlet_name>`.
 /// Not intended for direct use.
 ///
-/// - `--list --format terse`: output `ktstr/{name}: test\n` for base
-///   tests and `gauntlet/{name}/{preset}: test\n` for gauntlet
-///   variants. (Discovery uses `ktstr_list_only` instead to allow
-///   libtest to print its own list afterward; this branch is
-///   preserved for direct callers of `ktstr_main`.)
+/// - `--list --format terse`: output `ktstr/{name}: test\n` for VM base
+///   tests, `host/{name}: test\n` for host-only tests, and
+///   `gauntlet/{name}/{preset}: test\n` for gauntlet variants. (Discovery
+///   uses `ktstr_list_only` instead to allow libtest to print its own list
+///   afterward; this branch is preserved for direct callers of
+///   `ktstr_main`.)
 /// - `--exact NAME --nocapture`: run the named test, exit 0/1.
 pub fn ktstr_main() -> ! {
     let args: Vec<String> = std::env::args().collect();

@@ -4,7 +4,8 @@
 //! Reads a sidecar root (defaults to `target/ktstr/`), selects every
 //! sidecar whose run failed and was not a skip, dedupes the
 //! resulting test names, and emits a `cargo nextest run`-compatible
-//! filter expression that targets exactly that subset. With
+//! filter expression that targets every listed variant of exactly that
+//! subset. With
 //! `--exec`, also invokes nextest and waits for it; default is
 //! dry-run so an operator can paste the filter expression into CI
 //! or refine it by hand before committing to a re-run.
@@ -52,26 +53,40 @@
 //!
 //! Multiple sidecars per test_name (one per topology variant, one
 //! per scheduler) fold into a single nextest filter entry via
-//! [`std::collections::BTreeSet`]. The output filter uses
-//! nextest's `test(/regex/)` form anchored at end-of-identifier:
-//! `test(/^(.*::)?NAME$/) | test(/^(.*::)?NAME2$/)`.
+//! [`std::collections::BTreeSet`]. A sidecar stores the registered bare
+//! `KtstrTestEntry::name`, while nextest can list that entry under four
+//! concrete shapes:
+//!
+//! - the ordinary libtest path ending in `::NAME`;
+//! - `host/NAME`;
+//! - `ktstr/NAME` with an optional kernel suffix; or
+//! - `gauntlet/NAME/PRESET` with an optional kernel suffix.
+//!
+//! The output filter therefore uses one fully anchored `test(/regex/)`
+//! union per bare name. It deliberately includes every shape instead of
+//! guessing whether an archived sidecar came from a host-only, base-VM, or
+//! gauntlet invocation; names absent from the current binary simply match
+//! nothing.
 //!
 //! Why the regex form rather than the simpler `test(=NAME)` or
 //! `test(NAME)`:
-//! - `test(=NAME)` matches the FULL nextest identifier
-//!   (`<binary_id>::<path>::<test_name>`). SidecarResult.test_name
-//!   stores only the bare function name (per sidecar/mod.rs:107),
-//!   so the equality match never fires against production tests.
+//! - `test(=NAME)` matches one exact nextest test name.
+//!   `SidecarResult.test_name` stores only the registered bare entry name
+//!   (per sidecar/mod.rs:107), so equality cannot cover its module path or
+//!   generated `host/`, `ktstr/`, and `gauntlet/` variants.
 //! - `test(NAME)` is a substring match — would shadow if one
 //!   test name is a substring of another (e.g.
 //!   `phase_pipeline_two_step_e2e` vs
 //!   `phase_pipeline_no_periodic_samples_yields_empty_phases`
 //!   share the `phase_pipeline_` prefix).
-//! - `test(/^(.*::)?NAME$/)` matches the bare name as the
-//!   terminal component of any nextest path, with the `$` anchor
-//!   preventing substring shadowing. The optional `(.*::)?`
-//!   prefix tolerates both `binary::name` and
-//!   `binary::module::name` shapes nextest emits.
+//! - The generated union matches the bare name only as a complete path
+//!   component and anchors the whole nextest test name with `^...$`, so
+//!   substring-related tests cannot shadow one another.
+//!
+//! Verifier cells are not included in this reconstruction. Their names are
+//! `verifier/SCHEDULER/KERNEL/PRESET` and do not contain the registered test
+//! entry name stored in a sidecar, so selecting one from `test_name` alone
+//! would be guesswork.
 //!
 //! Empty selection (no failures in the pool) prints a
 //! pipeline-safe no-op expression (`test(/^__ktstr_no_failures_to_replay__$/)`)
@@ -122,6 +137,25 @@ use ktstr::host_context::{HostContext, collect_host_context};
 /// with any real test name astronomically unlikely.
 const EMPTY_POOL_FILTER: &str = "test(/^__ktstr_no_failures_to_replay__$/)";
 
+/// Route replay's `--exec` Cargo arguments through the same preflight as every
+/// other cargo-ktstr nextest frontend.
+///
+/// Keeping the preparer injectable gives the routing contract a metadata-free
+/// unit test. Production always supplies [`crate::run_cargo::prepare_nextest_args`],
+/// which owns target-aware feature inference, selected-graph version checks,
+/// and the established best-effort behavior when metadata itself is
+/// unavailable.
+fn prepare_exec_args_with(
+    args: &[String],
+    prepare: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>> {
+    prepare(args.to_vec()).map_err(anyhow::Error::msg)
+}
+
+fn prepare_exec_args(args: &[String]) -> Result<Vec<String>> {
+    prepare_exec_args_with(args, crate::run_cargo::prepare_nextest_args)
+}
+
 /// Entry point for the `cargo ktstr replay` subcommand.
 ///
 /// `dir` overrides the sidecar root (default:
@@ -166,7 +200,7 @@ pub(crate) fn run_replay(
     let failed_names = select_failed_names(&pool, filter);
 
     if failed_names.is_empty() {
-        eprintln!(
+        ktstr::ktstr_status!(
             "ktstr replay: no failed sidecars in pool at {} \
              (filter: {:?}) — nothing to re-run",
             root.display(),
@@ -201,7 +235,7 @@ pub(crate) fn run_replay(
         // tool tradition of "show me what you'd do before doing
         // it" (cf. `rm -i`, `git push --dry-run`).
         println!("{filter_expr}");
-        eprintln!(
+        ktstr::ktstr_status!(
             "ktstr replay: {} failed test name(s) selected. \
              Pipe the printed filter into `cargo nextest run -E` \
              or re-run with --exec to invoke nextest directly.",
@@ -218,9 +252,22 @@ pub(crate) fn run_replay(
     // post-exec re-scan that builds a fresh pool Vec.
     let queued: BTreeSet<String> = failed_names.iter().map(|s| s.to_string()).collect();
 
-    let exit = invoke_nextest(&filter_expr, profile, nextest_profile, args).with_context(|| {
-        format!("ktstr replay: cargo nextest run -E {filter_expr:?} failed to spawn")
-    })?;
+    // Only the --exec path builds test binaries. Use the exact shared nextest
+    // preflight: target-aware narrow feature inference, selected resolved-graph
+    // version compatibility, and best-effort forwarding on metadata failures.
+    // Dry-run and empty selections above do no metadata work.
+    let args = prepare_exec_args(args)?;
+    // Discovery above is preflight and retains ordinary signal termination.
+    // Cross into cleanup ownership only when --exec is about to create the
+    // nextest process tree, so the shared anchored runner can forward the
+    // exact signal and reap same-group descendants before the top level
+    // restores and re-raises it.
+    crate::interrupt::enter_cleanup_phase()
+        .context("ktstr replay: enter interrupt cleanup phase")?;
+    let exit =
+        invoke_nextest(&filter_expr, profile, nextest_profile, &args).with_context(|| {
+            format!("ktstr replay: cargo nextest run -E {filter_expr:?} failed to spawn")
+        })?;
 
     // Post-exec outcome diff. Re-scan the sidecar pool so the
     // newly-written sidecars from the replay run reach the
@@ -405,7 +452,7 @@ fn render_outcome_diff(outcomes: &BTreeMap<&str, ReplayOutcome>) {
         }
     }
     eprintln!();
-    eprintln!(
+    ktstr::ktstr_status!(
         "ktstr replay: {fixed} FIXED, {persistent} PERSISTENT, \
          {inconclusive} INCONCLUSIVE, {mixed} MIXED, {dropped} DROPPED",
     );
@@ -627,13 +674,13 @@ fn without_heap_state(host: &HostContext) -> HostContext {
 fn render_host_diff_section(section: &HostDiffSection) {
     match section {
         HostDiffSection::NoCapture => {
-            eprintln!("ktstr replay: (no host context captured)");
+            ktstr::ktstr_status!("ktstr replay: (no host context captured)");
         }
         HostDiffSection::Unchanged => {
-            eprintln!("ktstr replay: (host context unchanged since capture)");
+            ktstr::ktstr_status!("ktstr replay: (host context unchanged since capture)");
         }
         HostDiffSection::Changed(body) => {
-            eprintln!("ktstr replay: host context drift since capture:");
+            ktstr::ktstr_status!("ktstr replay: host context drift since capture:");
             // `HostContext::diff` already terminates each line with
             // a newline AND uses two-space indentation, so a single
             // `eprint!` (NOT `eprintln!`) emits the body verbatim
@@ -675,18 +722,26 @@ pub(crate) fn select_failed_names<'a>(
         .collect()
 }
 
-/// Format a `BTreeSet<&str>` of test names as a nextest filter
-/// expression using the regex `test(/^(.*::)?NAME$/)` form.
-/// See the module-level "Filter expression shape" section for
-/// the rationale behind the regex form (over `test(=NAME)` or
-/// bare `test(NAME)`). Empty set is rejected by the caller
-/// before reaching this fn — callers emit
-/// `EMPTY_POOL_FILTER` instead so the downstream nextest
+/// Format a `BTreeSet<&str>` of registered bare test names as a nextest
+/// filter expression covering every concrete name shape the dispatcher can
+/// list for each entry.
+///
+/// See the module-level "Filter expression shape" section for the rationale
+/// behind the exact regex union (over `test(=NAME)` or bare
+/// `test(NAME)`). Empty set is rejected by the caller before reaching this
+/// fn — callers emit `EMPTY_POOL_FILTER` instead so the downstream nextest
 /// invocation has a parseable input.
 pub(crate) fn build_nextest_filter(names: &BTreeSet<&str>) -> String {
     let parts: Vec<String> = names
         .iter()
-        .map(|n| format!("test(/^(.*::)?{}$/)", regex_escape(n)))
+        .map(|name| {
+            let name = regex_escape(name);
+            format!(
+                "test(/^(?:(?:.*::)?{name}|host\\/{name}|\
+                 ktstr\\/{name}(?:\\/[^\\/]+)?|\
+                 gauntlet\\/{name}\\/[^\\/]+(?:\\/[^\\/]+)?)$/)"
+            )
+        })
         .collect();
     parts.join(" | ")
 }
@@ -702,7 +757,8 @@ fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
-            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\'
+            | '/' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -715,8 +771,8 @@ fn regex_escape(s: &str) -> String {
 /// Invoke `cargo nextest run -E '<filter>'` and forward its exit
 /// code. Inherits stdout/stderr so the operator sees nextest's
 /// live progress. Returns the nextest exit code; an `Err` here
-/// is only for spawn failure (nextest binary missing,
-/// `Command::status()` failed at the syscall level).
+/// is only for a shared-runner spawn/wait failure (for example,
+/// the nextest binary is missing).
 ///
 /// `nextest_profile` becomes nextest's own `--profile <NAME>` (the test
 /// profile), placed before the user's trailing `args` so a passthrough
@@ -730,30 +786,155 @@ fn invoke_nextest(
     args: &[String],
 ) -> Result<i32> {
     use std::process::Command;
+    let nextest_args = build_injected_nextest_run_args_with(
+        filter_expr,
+        nextest_profile,
+        args,
+        crate::nextest_config::inject,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("prepare ktstr nextest tool config")?;
     let mut cmd = Command::new("cargo");
-    cmd.args(["nextest", "run", "-E", filter_expr]);
-    // `--nextest-profile <NAME>` selects the NEXTEST test profile;
-    // nextest's own flag is `--profile`.
-    if let Some(np) = nextest_profile {
-        cmd.args(["--profile", np]);
-    }
-    // Forward the operator's cargo/nextest flags (features,
-    // `--cargo-profile`, …) verbatim so the replay re-run builds
-    // identically to the original suite. No `--` separator is required.
-    cmd.args(args);
+    cmd.args(&nextest_args);
     // `--profile <NAME>` sets the scheduler-under-test's cargo BUILD
     // profile via `KTSTR_SCHEDULER_PROFILE`.
     if let Some(p) = profile {
         cmd.env(ktstr::KTSTR_SCHEDULER_PROFILE_ENV, p);
     }
-    let status = cmd.status().context("spawn `cargo nextest run`")?;
+    let status = crate::nextest_process::run_status(cmd).context("spawn `cargo nextest run`")?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Build replay's complete nextest argv before the process is spawned.
+///
+/// Injection happens after the filter/profile/user argv are assembled so an
+/// inner `--` is handled uniformly, and so a user-supplied ktstr tool config
+/// can suppress the built-in one. The shared command normalizer then removes
+/// valid user run-slot limits and installs ktstr's effectively-unbounded
+/// admission count, keeping replay on the same single-scheduler path as every
+/// other nextest frontend. Keeping this helper injectable gives the replay
+/// route a command-shape regression test without touching the cache.
+fn build_injected_nextest_run_args_with(
+    filter_expr: &str,
+    nextest_profile: Option<&str>,
+    args: &[String],
+    inject: impl FnOnce(Vec<String>) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    let mut nextest_args = vec![
+        "nextest".to_string(),
+        "run".to_string(),
+        "-E".to_string(),
+        filter_expr.to_string(),
+    ];
+    // `--nextest-profile <NAME>` selects the NEXTEST test profile;
+    // nextest's own flag is `--profile`.
+    if let Some(np) = nextest_profile {
+        nextest_args.extend(["--profile".to_string(), np.to_string()]);
+    }
+    // Forward the operator's cargo/nextest flags (features,
+    // `--cargo-profile`, …) verbatim so the replay re-run builds
+    // identically to the original suite. No `--` separator is required.
+    nextest_args.extend_from_slice(args);
+    inject(nextest_args).map(crate::run_cargo::normalize_nextest_command_admission)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ktstr::test_support::SidecarResult;
+
+    #[test]
+    fn exec_routes_complete_cargo_selection_through_shared_nextest_preflight() {
+        let original = vec![
+            "--workspace".to_string(),
+            "--exclude".to_string(),
+            "old-tests".to_string(),
+            "--no-default-features".to_string(),
+            "--features".to_string(),
+            "explicit".to_string(),
+        ];
+        let prepared = prepare_exec_args_with(&original, |received| {
+            assert_eq!(
+                received, original,
+                "replay must not pre-parse or narrow Cargo selectors before shared preflight",
+            );
+            let mut received = received;
+            received.extend([
+                "--features".to_string(),
+                "scheduler/ktstr-tests".to_string(),
+            ]);
+            Ok(received)
+        })
+        .expect("injected shared preflight succeeds");
+        assert_eq!(
+            prepared,
+            [
+                "--workspace",
+                "--exclude",
+                "old-tests",
+                "--no-default-features",
+                "--features",
+                "explicit",
+                "--features",
+                "scheduler/ktstr-tests",
+            ]
+            .map(ToString::to_string),
+            "replay forwards the shared preparer's exact augmented argv",
+        );
+    }
+
+    #[test]
+    fn exec_surfaces_shared_version_guard_rejection() {
+        let error = prepare_exec_args_with(&["-p".to_string(), "future-tests".to_string()], |_| {
+            Err("package future-tests uses newer ktstr".to_string())
+        })
+        .expect_err("a version incompatibility remains fatal");
+        assert!(
+            error
+                .to_string()
+                .contains("package future-tests uses newer ktstr"),
+            "{error:#}",
+        );
+    }
+
+    #[test]
+    fn replay_exec_injects_tool_config_and_normalizes_admission_before_test_binary_args() {
+        let failed_names = BTreeSet::from(["failing"]);
+        let filter_expr = build_nextest_filter(&failed_names);
+        let got = build_injected_nextest_run_args_with(
+            &filter_expr,
+            Some("ci"),
+            &[
+                "-j".to_string(),
+                "77".to_string(),
+                "--".to_string(),
+                "--nocapture".to_string(),
+            ],
+            |args| {
+                crate::nextest_config::inject_with_path(
+                    args,
+                    std::path::Path::new("/tmp/ktstr-nextest.toml"),
+                )
+            },
+        )
+        .expect("replay tool-config injection succeeds");
+        assert_eq!(
+            got,
+            [
+                "nextest",
+                "run",
+                "-E",
+                filter_expr.as_str(),
+                "--profile",
+                "ci",
+                "--tool-config-file=ktstr:/tmp/ktstr-nextest.toml",
+                "--test-threads=1000000",
+                "--",
+                "--nocapture",
+            ]
+            .map(ToString::to_string),
+        );
+    }
 
     /// Build a minimal SidecarResult fixture for the scan-path
     /// tests. The selector consults `passed`/`skipped`/`inconclusive`
@@ -842,9 +1023,68 @@ mod tests {
         names.insert("scheduler_smoke_test");
         let expr = build_nextest_filter(&names);
         assert_eq!(
-            expr, "test(/^(.*::)?scheduler_smoke_test$/)",
-            "single-name filter wraps in regex with optional path prefix + end anchor"
+            expr,
+            "test(/^(?:(?:.*::)?scheduler_smoke_test|host\\/scheduler_smoke_test|\
+             ktstr\\/scheduler_smoke_test(?:\\/[^\\/]+)?|\
+             gauntlet\\/scheduler_smoke_test\\/[^\\/]+(?:\\/[^\\/]+)?)$/)",
+            "single-name filter covers every concrete dispatcher name shape"
         );
+    }
+
+    /// Compile a one-name nextest regex arm with Rust's regex engine.
+    ///
+    /// nextest's `/.../` filter literal requires `/` to be escaped even
+    /// though `/` has no special meaning to the regex engine itself.
+    fn compile_single_name_filter(expr: &str) -> regex::Regex {
+        let body = expr
+            .strip_prefix("test(/")
+            .and_then(|body| body.strip_suffix("/)"))
+            .expect("one-name filter has nextest's test(/.../) envelope")
+            .replace("\\/", "/");
+        regex::Regex::new(&body).expect("generated nextest filter contains a valid regex")
+    }
+
+    /// A sidecar records only the registered bare entry name. Replay must
+    /// therefore select every exact name shape that `dispatch` can list for
+    /// that entry, without also admitting malformed or unrelated variants.
+    #[test]
+    fn build_nextest_filter_matches_every_dispatch_name_shape_exactly() {
+        let names = BTreeSet::from(["scheduler_smoke_test"]);
+        let expr = build_nextest_filter(&names);
+        let regex = compile_single_name_filter(&expr);
+
+        for listed_name in [
+            "scheduler_smoke_test",
+            "module::scheduler_smoke_test",
+            "binary::module::scheduler_smoke_test",
+            "host/scheduler_smoke_test",
+            "ktstr/scheduler_smoke_test",
+            "ktstr/scheduler_smoke_test/kernel_6_14",
+            "gauntlet/scheduler_smoke_test/8cpu-2llc-smt",
+            "gauntlet/scheduler_smoke_test/8cpu-2llc-smt/kernel_6_14",
+        ] {
+            assert!(
+                regex.is_match(listed_name),
+                "replay filter must select dispatcher name {listed_name:?}: {expr}"
+            );
+        }
+
+        for unrelated_name in [
+            "scheduler_smoke_test_extra",
+            "prefix_scheduler_smoke_test",
+            "host/scheduler_smoke_test/kernel_6_14",
+            "ktstr/scheduler_smoke_test/preset/kernel_6_14",
+            "gauntlet/scheduler_smoke_test",
+            "gauntlet/scheduler_smoke_test/preset/kernel/extra",
+            // A verifier cell contains no registered entry name. The sidecar
+            // identity cannot reconstruct it, so replay must not guess.
+            "verifier/scx_rustland/kernel_6_14/8cpu-2llc-smt",
+        ] {
+            assert!(
+                !regex.is_match(unrelated_name),
+                "replay filter must reject non-dispatch shape {unrelated_name:?}: {expr}"
+            );
+        }
     }
 
     /// Multiple names produce a `|`-joined expression in
@@ -860,7 +1100,9 @@ mod tests {
         let expr = build_nextest_filter(&names);
         assert_eq!(
             expr,
-            "test(/^(.*::)?a_test$/) | test(/^(.*::)?m_test$/) | test(/^(.*::)?z_test$/)"
+            "test(/^(?:(?:.*::)?a_test|host\\/a_test|ktstr\\/a_test(?:\\/[^\\/]+)?|gauntlet\\/a_test\\/[^\\/]+(?:\\/[^\\/]+)?)$/) | \
+             test(/^(?:(?:.*::)?m_test|host\\/m_test|ktstr\\/m_test(?:\\/[^\\/]+)?|gauntlet\\/m_test\\/[^\\/]+(?:\\/[^\\/]+)?)$/) | \
+             test(/^(?:(?:.*::)?z_test|host\\/z_test|ktstr\\/z_test(?:\\/[^\\/]+)?|gauntlet\\/z_test\\/[^\\/]+(?:\\/[^\\/]+)?)$/)"
         );
     }
 
@@ -876,12 +1118,12 @@ mod tests {
         names.insert("phase_pipeline_no_periodic_samples_yields_empty_phases");
         let expr = build_nextest_filter(&names);
         assert!(
-            expr.contains("phase_pipeline_two_step_e2e$"),
-            "two_step_e2e present with end anchor"
+            expr.contains("host\\/phase_pipeline_two_step_e2e"),
+            "two_step_e2e exact host variant is present"
         );
         assert!(
-            expr.contains("phase_pipeline_no_periodic_samples_yields_empty_phases$"),
-            "no_periodic_samples present with end anchor"
+            expr.contains("host\\/phase_pipeline_no_periodic_samples_yields_empty_phases"),
+            "no_periodic_samples exact host variant is present"
         );
         assert_eq!(
             expr.matches(" | ").count(),
@@ -906,6 +1148,7 @@ mod tests {
         assert_eq!(regex_escape("(group)"), "\\(group\\)");
         assert_eq!(regex_escape("a|b"), "a\\|b");
         assert_eq!(regex_escape("end$"), "end\\$");
+        assert_eq!(regex_escape("path/name"), "path\\/name");
     }
 
     // -- select_failed_names (scan-path selector) --

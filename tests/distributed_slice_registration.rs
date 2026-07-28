@@ -41,8 +41,7 @@ fn external_context_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
 /// `ktstr::distributed_slice_registration ktstr/external_context_marker`,
 /// the manual-registration surface regressed — the macro expansion
 /// still works but programmatic test generation has silently broken.
-#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
-#[linkme(crate = ktstr::linkme)]
+#[ktstr::ktstr_test_entry]
 static EXTERNAL_CONTEXT_MARKER: KtstrTestEntry = KtstrTestEntry {
     name: "external_context_marker",
     func: external_context_test_fn,

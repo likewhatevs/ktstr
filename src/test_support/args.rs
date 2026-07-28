@@ -143,6 +143,21 @@ pub(crate) fn extract_export_test_arg(args: &[String]) -> Option<&str> {
     None
 }
 
+/// Extract the private cheap export-acceptance discriminator used by
+/// `cargo ktstr export` before it asks one selected test binary to perform the
+/// potentially long build and packaging phase.
+///
+/// Empty values remain `Some("")` so the dispatch ctor returns the same
+/// actionable miss as the execution discriminator.
+pub(crate) fn extract_export_check_test_arg(args: &[String]) -> Option<&str> {
+    for a in args {
+        if let Some(val) = a.strip_prefix("--ktstr-export-check-test=") {
+            return Some(val);
+        }
+    }
+    None
+}
+
 /// Extract `--ktstr-shell-test=NAME` from the argument list. Used by
 /// `crate::test_support::dispatch::maybe_dispatch_shell_test` (the
 /// test binary's main-path dispatch) to detect a `cargo ktstr shell
@@ -608,6 +623,32 @@ mod tests {
     fn extract_export_test_arg_empty_value() {
         let args = vec!["test_bin".into(), "--ktstr-export-test=".into()];
         assert_eq!(extract_export_test_arg(&args), Some(""));
+    }
+
+    // -- extract_export_check_test_arg --
+
+    #[test]
+    fn extract_export_check_test_arg_equals() {
+        let args = vec![
+            "test_bin".into(),
+            "--ktstr-export-check-test=preempt_regression".into(),
+        ];
+        assert_eq!(
+            extract_export_check_test_arg(&args),
+            Some("preempt_regression"),
+        );
+    }
+
+    #[test]
+    fn extract_export_check_test_arg_missing() {
+        let args = vec!["test_bin".into(), "--list".into()];
+        assert!(extract_export_check_test_arg(&args).is_none());
+    }
+
+    #[test]
+    fn extract_export_check_test_arg_empty_value() {
+        let args = vec!["test_bin".into(), "--ktstr-export-check-test=".into()];
+        assert_eq!(extract_export_check_test_arg(&args), Some(""));
     }
 
     // -- extract_export_output_arg --

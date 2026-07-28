@@ -739,6 +739,7 @@ fn arena_stx_pending_then_duplicate_is_idempotent() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],
@@ -1008,6 +1009,7 @@ fn stx_nested_struct_arena_finding_keys_on_inner() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],
@@ -1207,6 +1209,7 @@ fn cross_function_u64_param_inherits_caller_pointer_type() {
         }],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 4,
         }],
@@ -1477,6 +1480,7 @@ fn helper_map_update_then_lookup_propagates_arena_through_map_value() {
         &[],
         &datasec_pointers,
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],
@@ -1639,6 +1643,7 @@ fn cross_function_fixpoint_callee_before_caller() {
         ],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 3,
         }], // allocator at PC 3
@@ -1799,6 +1804,7 @@ fn finalize_arena_stx_emits_deferred_resolve_when_shape_inference_ambiguous() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 4,
         }],
@@ -1944,6 +1950,7 @@ fn stx_flow_stx_before_deref_resolves_target_via_shape_inference() {
         &[],
         &[],
         &[SubprogReturn {
+            return_struct_id: None,
             alloc_size: None,
             insn_offset: 0,
         }],

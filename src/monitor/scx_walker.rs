@@ -489,8 +489,8 @@ pub const SCX_SCHED_STATE_SOURCE_LIVE: &str = "live";
 /// reconstructed from the probe BPF program's `.bss` snapshot
 /// (`ktstr_exit_*` vars). The scheduler had already torn down by
 /// freeze time (`*scx_root == 0`), so the live walker returned None
-/// and the host fell back to the snapshot the BPF tp_btf handler
-/// captured at err-exit time.
+/// and the host fell back to the snapshot the selected BPF
+/// scheduler-exit handler captured at error-exit time.
 pub const SCX_SCHED_STATE_SOURCE_BSS: &str = "bss_snapshot";
 
 /// `SCX_TASK_CURSOR` flag value (`1 << 31`) on `sched_ext_entity.flags`.

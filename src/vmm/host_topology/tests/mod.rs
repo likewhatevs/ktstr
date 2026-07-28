@@ -1,5 +1,31 @@
 use super::*;
 
+#[test]
+fn reservation_wait_progress_hook_is_synchronous_and_scoped() {
+    let ticks = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let callback_ticks = std::rc::Rc::clone(&ticks);
+    assert!(reservation_wait_progress_poll().is_none());
+
+    let value = with_reservation_wait_progress(
+        move || callback_ticks.set(callback_ticks.get() + 1),
+        || {
+            assert_eq!(
+                reservation_wait_progress_poll(),
+                Some(RESERVATION_WAIT_PROGRESS_POLL),
+            );
+            tick_reservation_wait_progress();
+            17
+        },
+    );
+
+    assert_eq!(value, 17);
+    assert_eq!(ticks.get(), 1);
+    assert!(
+        reservation_wait_progress_poll().is_none(),
+        "the callback cannot leak into a later acquisition",
+    );
+}
+
 // ─── SYNTHETIC-TOPOLOGY OFFSET CONVENTION ────────────────────
 //
 // Flock-path tests in this module install a per-test lockfile
@@ -14,32 +40,25 @@ use super::*;
 // `/tmp/ktstr-llc-*.lock` is therefore impossible regardless of
 // the index a test picks.
 //
-// The 9xxxx LLC/CPU indices that remain in some tests
-// (locking.rs 90xxx; planning.rs retry seam 93500/93501/93600,
-// cargo-test-mode bypass 95100/95200) are a legacy/organizational
+// The 9xxxx LLC/CPU indices that remain in some planning tests
+// (retry seam 93500/93501/93600 and cargo-test-mode bypass
+// 95100/95200) are a legacy/organizational
 // convention and double as synthetic CPU IDs / LLC indices —
 // they are NOT a collision-avoidance requirement, since the
 // prefix guards already isolate the lockfile pool. Newer
 // acquire_llc_plan tests use small indices (0, 1, 2, …) under a
 // prefix guard instead.
 //
+// A test that enters the queue registry MUST use CPU identities below the
+// host's `/sys/devices/system/cpu/possible` width. The registry stores weighted
+// permits in the remaining CPU bitmap range, so a legacy 9xxxx CPU identity is
+// decoded as a permit after publication. Sparse LLC identities remain valid.
+//
 // When adding a new test that flocks, install a prefix guard
 // (default to [`LockPrefixesGuard`] when in doubt) so the
 // lockfiles land in a per-test tempdir; the specific index no
 // longer needs to dodge a high range.
 // ─────────────────────────────────────────────────────────────
-
-/// Collect the distinct host NUMA node IDs the given CPUs belong
-/// to. Tests that assert "these N CPUs all live on one NUMA node"
-/// (or span two) route through this helper so the CPU → node
-/// lookup and the single-CPU default stay in one place rather
-/// than duplicating the same closure across every assertion
-/// site.
-fn numa_nodes_for_cpus(topo: &HostTopology, cpus: &[usize]) -> std::collections::BTreeSet<usize> {
-    cpus.iter()
-        .map(|c| topo.cpu_to_node.get(c).copied().unwrap_or(0))
-        .collect()
-}
 
 // -- synthetic topology mapping tests --
 
@@ -76,9 +95,10 @@ fn synthetic_topo_numa(groups: Vec<(usize, Vec<usize>)>) -> HostTopology {
     HostTopology::new_for_tests(&tagged)
 }
 
-/// RAII guard for a per-test LLC lockfile path prefix. Installs
-/// a `{tempdir}/llc-` prefix into [`LLC_LOCK_PREFIX_OVERRIDE`]
-/// on construction and unsets it on Drop. Two parallel tests
+/// RAII guard for a per-test LLC-plan lockfile pool. Installs
+/// `{tempdir}/llc-` and `{tempdir}/cpu-` prefixes on construction
+/// and unsets both on Drop because an [`LlcPlan`] reserves shared CPU
+/// locks as well as shared LLC locks. Two parallel tests
 /// using this guard each get their own tempdir, so their
 /// `acquire_llc_plan` lockfiles can't collide. Eliminates the
 /// 90K+ empty `LlcGroup` padding that earlier tests used to
@@ -94,8 +114,10 @@ struct LlcLockPrefixGuard {
 impl LlcLockPrefixGuard {
     fn new() -> Self {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let prefix = format!("{}/llc-", dir.path().display());
-        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(prefix));
+        let llc_prefix = format!("{}/llc-", dir.path().display());
+        let cpu_prefix = format!("{}/cpu-", dir.path().display());
+        LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(llc_prefix));
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = Some(cpu_prefix));
         LlcLockPrefixGuard { _dir: dir }
     }
 }
@@ -103,12 +125,13 @@ impl LlcLockPrefixGuard {
 impl Drop for LlcLockPrefixGuard {
     fn drop(&mut self) {
         LLC_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
+        CPU_LOCK_PREFIX_OVERRIDE.with(|p| *p.borrow_mut() = None);
     }
 }
 
 /// RAII guard for a per-test CPU lockfile path prefix. Mirrors
 /// [`LlcLockPrefixGuard`] for the CPU-lock side of the
-/// `acquire_resource_locks` path. See that struct's doc for the
+/// explicit two-resource-class admission path. See that struct's doc for the
 /// per-test-tempdir + panic-safe-cleanup rationale.
 struct CpuLockPrefixGuard {
     _dir: tempfile::TempDir,
@@ -132,7 +155,7 @@ impl Drop for CpuLockPrefixGuard {
 /// RAII bundle that installs BOTH [`LlcLockPrefixGuard`]
 /// AND [`CpuLockPrefixGuard`] in one call. Used by any
 /// test that hits both LLC and CPU lockfile families —
-/// `acquire_resource_locks` (LLC + per-CPU), or any
+/// topology admission (LLC + per-CPU), or any
 /// future helper that composes the two. Each test gets
 /// its own per-tempdir prefix for both lockfile families,
 /// so cross-run / cross-process collisions on
@@ -144,13 +167,41 @@ impl Drop for CpuLockPrefixGuard {
 struct LockPrefixesGuard {
     _cpu: CpuLockPrefixGuard,
     _llc: LlcLockPrefixGuard,
+    retry_wake_marker: Option<std::path::PathBuf>,
 }
 
 impl LockPrefixesGuard {
     fn new() -> Self {
-        LockPrefixesGuard {
-            _cpu: CpuLockPrefixGuard::new(),
-            _llc: LlcLockPrefixGuard::new(),
+        Self::new_with_retry_wake(true)
+    }
+
+    /// Keep the production real-inotify transport for end-to-end wake
+    /// contract tests while retaining isolated lock paths.
+    fn new_real_wake() -> Self {
+        Self::new_with_retry_wake(false)
+    }
+
+    fn new_with_retry_wake(test_retry: bool) -> Self {
+        let cpu = CpuLockPrefixGuard::new();
+        let llc = LlcLockPrefixGuard::new();
+        let retry_wake_marker = test_retry.then(|| {
+            let marker = super::protocol::test_retry_wake_marker_path_for_tests();
+            std::fs::write(&marker, b"test-retry")
+                .expect("create test retry wake marker beside registry");
+            marker
+        });
+        Self {
+            _cpu: cpu,
+            _llc: llc,
+            retry_wake_marker,
+        }
+    }
+}
+
+impl Drop for LockPrefixesGuard {
+    fn drop(&mut self) {
+        if let Some(marker) = self.retry_wake_marker.take() {
+            let _ = std::fs::remove_file(marker);
         }
     }
 }
@@ -188,7 +239,13 @@ impl Drop for AllowedCpusGuard {
 ///
 /// See [`expect_unavailable`] for tests that expect the
 /// `Unavailable` branch instead.
-fn unwrap_acquired(outcome: LockOutcome, ctx: Option<&str>) -> (usize, Vec<std::os::fd::OwnedFd>) {
+fn unwrap_acquired(
+    outcome: LockOutcome,
+    ctx: Option<&str>,
+) -> (
+    usize,
+    super::protocol::Acquired<Vec<super::protocol::AdmissionFlock>>,
+) {
     match outcome {
         LockOutcome::Acquired { llc_offset, locks } => (llc_offset, locks),
         LockOutcome::Unavailable(reason) => {
@@ -295,19 +352,128 @@ impl Drop for EnvGuard {
 }
 
 // ---------------------------------------------------------------
-// NUMA primitives — host_llcs_by_numa_node / with_capacity /
-// sorted_by_distance
+// NUMA primitives — host_llcs_by_numa_node / sorted_by_distance
 // ---------------------------------------------------------------
 
-/// Backwards-compat helper: forwards to
-/// [`HostTopology::new_for_tests`]. Kept so existing tests that
-/// reference `synth_host_topo` don't need to be renamed in lock-
-/// step with the consolidation — the single authoritative
-/// constructor is `new_for_tests`, this and
+/// Shared test adapter over [`HostTopology::new_for_tests`]. The single
+/// authoritative constructor is `new_for_tests`; this and
 /// [`synthetic_topo`] / [`synthetic_topo_numa`] are thin adapters
 /// over it.
 fn synth_host_topo(groups: &[(Vec<usize>, usize)]) -> HostTopology {
     HostTopology::new_for_tests(groups)
+}
+
+// ─── PRODUCTION-ADMISSION MISCLASSIFICATION GUARD ────────────
+//
+// `production_lock_dir` aborts when a test that resolves the run's
+// shared lock dir (VM boot, resource locks, build reservations) was
+// spawned by nextest into the CPU-bounded `host-tests` group instead
+// of `@global`; see that function's doc for the second-scheduler
+// rationale and the sealed-reference discriminator. Every case drives
+// NEXTEST_TEST_GROUP, KTSTR_LOCK_DIR, and the sealed reference
+// KTSTR_PRODUCTION_LOCK_DIR explicitly — never touching the real
+// default dir — so the outcome is independent of the ambient CI env
+// (which always sets all three).
+
+/// A `host-tests`-classified test that resolves the sealed reference
+/// dir (no lock-prefix override) must abort, naming itself, the group,
+/// and the resource selector.
+#[test]
+#[cfg(panic = "unwind")]
+fn production_admission_guard_aborts_host_tests_group_resource_user() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let _lock = lock_env();
+    let _group = EnvVarGuard::set(NEXTEST_TEST_GROUP_ENV, crate::NEXTEST_HOST_TESTS_GROUP);
+    let _name = EnvVarGuard::set(NEXTEST_TEST_NAME_ENV, "vmm::some_future_resource_user");
+    let _dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, tmp.path());
+    let _reference = EnvVarGuard::set(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV, tmp.path());
+    let panic = std::panic::catch_unwind(llc_lock_prefix)
+        .expect_err("a host-tests-classified resource user must abort");
+    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        message.contains("vmm::some_future_resource_user")
+            && message.contains("host-tests")
+            && message.contains("@global")
+            && message.contains(".config/nextest.toml"),
+        "guard must name the test, the misclassifying group, the required \
+         @global group, and the resource selector; got: {message:?}",
+    );
+}
+
+/// Isolation, not misclassification: a `host-tests` test that redirects
+/// `KTSTR_LOCK_DIR` to a private namespace resolves a dir that differs
+/// from the sealed reference, so the guard must proceed. This is the
+/// re-exec'd build-reservation tests' CI shape.
+#[test]
+fn production_admission_guard_permits_isolated_namespace_mismatch() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let isolated = tempfile::TempDir::new().expect("isolated tempdir");
+    let reference = tempfile::TempDir::new().expect("reference tempdir");
+    let _lock = lock_env();
+    let _group = EnvVarGuard::set(NEXTEST_TEST_GROUP_ENV, crate::NEXTEST_HOST_TESTS_GROUP);
+    let _name = EnvVarGuard::set(NEXTEST_TEST_NAME_ENV, "vmm::isolated_reservation");
+    let _dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, isolated.path());
+    let _reference = EnvVarGuard::set(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV, reference.path());
+    let prefix = llc_lock_prefix();
+    assert!(
+        prefix.starts_with(&isolated.path().display().to_string())
+            && prefix.ends_with("/ktstr-llc-"),
+        "an isolated namespace must resolve its own dir without aborting; got: {prefix}",
+    );
+}
+
+/// No reference (an ad-hoc `cargo nextest run` not launched by
+/// cargo-ktstr) disarms the guard even in `host-tests`.
+#[test]
+fn production_admission_guard_permits_absent_reference() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let _lock = lock_env();
+    let _group = EnvVarGuard::set(NEXTEST_TEST_GROUP_ENV, crate::NEXTEST_HOST_TESTS_GROUP);
+    let _name = EnvVarGuard::set(NEXTEST_TEST_NAME_ENV, "vmm::ad_hoc_run");
+    let _dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, tmp.path());
+    let _reference = EnvVarGuard::remove(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV);
+    assert!(llc_lock_prefix().ends_with("/ktstr-llc-"));
+}
+
+/// A temp-path registry installs the lock-prefix override, so the
+/// acquire path never resolves the production lock dir — the guard is
+/// bypassed entirely, even with the group and a matching reference set.
+/// This is what the protocol/locking unit tests rely on.
+#[test]
+fn production_admission_guard_ignores_temp_path_registry() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let _lock = lock_env();
+    let _group = EnvVarGuard::set(NEXTEST_TEST_GROUP_ENV, crate::NEXTEST_HOST_TESTS_GROUP);
+    let _name = EnvVarGuard::set(NEXTEST_TEST_NAME_ENV, "vmm::protocol_temp_registry");
+    let _prefix = LlcLockPrefixGuard::new();
+    let llc = llc_lock_path(0);
+    assert!(
+        llc.ends_with("/llc-0.lock") && !llc.contains("ktstr-llc-"),
+        "override must route to the per-test tempdir, bypassing the guard; got: {llc}",
+    );
+}
+
+/// The ungrouped `@global` value, and an absent group, both proceed
+/// normally — only the literal `host-tests` arms the guard.
+#[test]
+fn production_admission_guard_permits_global_and_ungoverned() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let _lock = lock_env();
+    let _dir = EnvVarGuard::set(crate::KTSTR_LOCK_DIR_ENV, tmp.path());
+    let _reference = EnvVarGuard::set(crate::KTSTR_PRODUCTION_LOCK_DIR_ENV, tmp.path());
+    {
+        let _group = EnvVarGuard::set(NEXTEST_TEST_GROUP_ENV, "@global");
+        let _name = EnvVarGuard::set(NEXTEST_TEST_NAME_ENV, "vmm::tests::boot_kernel");
+        assert!(llc_lock_prefix().ends_with("/ktstr-llc-"));
+    }
+    {
+        let _group = EnvVarGuard::remove(NEXTEST_TEST_GROUP_ENV);
+        let _name = EnvVarGuard::remove(NEXTEST_TEST_NAME_ENV);
+        assert!(llc_lock_prefix().ends_with("/ktstr-llc-"));
+    }
 }
 
 // Test groups extracted from the original flat tests.rs; the helper fns

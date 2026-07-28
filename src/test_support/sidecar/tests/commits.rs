@@ -1480,6 +1480,43 @@ fn repo_is_dirty_dirty_worktree_returns_some_true() {
     );
 }
 
+/// The metadata-only dirty probe must never inherit gix's default
+/// host-sized worker count. Nextest supplies the useful process-level
+/// parallelism; multiplying it by every logical CPU is the 64 x 192 thread
+/// explosion this option exists to prevent.
+#[test]
+fn repo_is_dirty_status_options_are_single_threaded() {
+    let mut options = gix::status::index_worktree::Options::default();
+    super::super::configure_dirty_status_options(&mut options);
+    assert_eq!(
+        options.thread_limit,
+        Some(1),
+        "the per-process status walk must use one worker",
+    );
+    assert!(
+        options.dirwalk_options.is_none(),
+        "untracked-file directory walking is outside the dirty probe contract",
+    );
+}
+
+/// Even a one-worker gix status iterator has an outer producer thread.
+/// Consuming the stream fully (instead of returning on its first item) makes
+/// gix join that producer before startup performs any environment mutation.
+#[test]
+fn repo_is_dirty_status_consumer_exhausts_the_producer() {
+    let yielded = std::cell::Cell::new(0);
+    let iter = (0..4).inspect(|_| {
+        yielded.set(yielded.get() + 1);
+    });
+    assert!(crate::git_status::consume_has_any(iter));
+    assert_eq!(
+        yielded.get(),
+        4,
+        "status consumption must reach EOF rather than short-circuit",
+    );
+    assert!(!crate::git_status::consume_has_any(std::iter::empty::<()>()));
+}
+
 /// Non-git directory: `detect_commit_at` calls
 /// `gix::discover` which walks up from the input path
 /// looking for a `.git` boundary. When the host's `/tmp`
@@ -2237,6 +2274,81 @@ fn create_fake_image_in(dir: &std::path::Path) -> std::path::PathBuf {
     let image = dir.join("bzImage");
     std::fs::write(&image, b"fake kernel image").expect("write fake image");
     image
+}
+
+#[test]
+fn resolved_kernel_commit_uses_cache_metadata_without_source_walk() {
+    let cache_entry = tempfile::TempDir::new().expect("cache entry tempdir");
+    let metadata = crate::cache::KernelMetadata::new(
+        crate::cache::KernelSource::Local {
+            source_tree_path: Some(cache_entry.path().join("missing-source")),
+            git_hash: Some("a1b2c3d".to_string()),
+        },
+        std::env::consts::ARCH,
+        "bzImage",
+        "2026-07-22T00:00:00Z",
+    );
+    std::fs::write(
+        cache_entry.path().join("metadata.json"),
+        serde_json::to_vec(&metadata).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+
+    assert_eq!(
+        super::super::kernel_commit_for_resolved(
+            cache_entry.path().to_str().expect("utf-8 cache path"),
+        )
+        .as_deref(),
+        Some("a1b2c3d"),
+        "resolved cache metadata is authoritative even when its historical source path is absent",
+    );
+}
+
+#[test]
+fn resolved_kernel_commit_legacy_local_metadata_walks_recorded_source() {
+    let cache_entry = tempfile::TempDir::new().expect("cache entry tempdir");
+    let source = tempfile::TempDir::new().expect("source tempdir");
+    let head = init_clean_repo_with_file(source.path());
+    let metadata = crate::cache::KernelMetadata::new(
+        crate::cache::KernelSource::Local {
+            source_tree_path: Some(source.path().to_path_buf()),
+            git_hash: None,
+        },
+        std::env::consts::ARCH,
+        "bzImage",
+        "2026-07-22T00:00:00Z",
+    );
+    std::fs::write(
+        cache_entry.path().join("metadata.json"),
+        serde_json::to_vec(&metadata).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+    let expected = head.to_hex_with_len(7).to_string();
+
+    assert_eq!(
+        super::super::kernel_commit_for_resolved(
+            cache_entry.path().to_str().expect("utf-8 cache path"),
+        )
+        .as_deref(),
+        Some(expected.as_str()),
+        "legacy Local metadata without git_hash must retain the recorded-source fallback",
+    );
+}
+
+#[test]
+fn resolved_kernel_commit_raw_source_path_walks_repo() {
+    let source = tempfile::TempDir::new().expect("source tempdir");
+    let head = init_clean_repo_with_file(source.path());
+    let expected = head.to_hex_with_len(7).to_string();
+
+    assert_eq!(
+        super::super::kernel_commit_for_resolved(
+            source.path().to_str().expect("utf-8 source path"),
+        )
+        .as_deref(),
+        Some(expected.as_str()),
+        "raw source paths without cache metadata must retain commit detection",
+    );
 }
 
 /// Tarball-shaped lookup hit yields the entry's source_tree_path

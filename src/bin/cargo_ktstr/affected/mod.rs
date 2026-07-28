@@ -52,6 +52,7 @@ mod dep_info;
 mod diff;
 
 /// A declared scheduler discovered from the target repo's test binaries.
+#[derive(Debug)]
 struct SchedulerInfo {
     /// The scheduler's declared name -- the key `--relevant` maps a test's
     /// `scheduler` field onto, to find its package.
@@ -59,8 +60,14 @@ struct SchedulerInfo {
     /// The cargo package to build; `Some` only for `Discover` schedulers
     /// (`Path`/`Eevdf`/`KernelBuiltin` have no target-repo package).
     package: Option<String>,
-    /// Count of `#[ktstr_test]`s declared against this scheduler.
+    /// Count of primary and staged uses across `#[ktstr_test]`s.
     test_count: usize,
+}
+
+#[derive(Debug)]
+struct SchedulerInventory {
+    schedulers: Vec<SchedulerInfo>,
+    tests: Vec<ktstr::test_support::SchedulerTestJson>,
 }
 
 /// Outcome of the affected computation.
@@ -82,8 +89,9 @@ enum AffectedOutcome {
 /// package to key a matrix job on, so they are NOT in this array and cannot be
 /// change-scoped -- CI must run their tests in a SEPARATE UNCONDITIONAL leg.
 pub(crate) fn run(base: Option<&str>, base_ref: Option<&str>, default_branch: &str) -> Result<()> {
-    let schedulers = enumerate_schedulers().context("enumerate declared schedulers")?;
-    let (outcome, testable) = compute_outcome(base, base_ref, default_branch, false, &schedulers)?;
+    let inventory = enumerate_scheduler_inventory().context("enumerate scheduler registry")?;
+    let (outcome, testable) =
+        compute_outcome(base, base_ref, default_branch, false, &inventory.schedulers)?;
     let names = match outcome {
         AffectedOutcome::RunAll => testable,
         AffectedOutcome::Empty => Vec::new(),
@@ -110,71 +118,101 @@ fn package_schedulers(schedulers: &[SchedulerInfo]) -> Vec<String> {
     v
 }
 
-/// Enumerate declared schedulers by probing the target's built test binaries
-/// with `--ktstr-list-schedulers`. Deduplicates by scheduler name, summing
-/// `test_count` across binaries (a scheduler may be registered in more than
-/// one test binary).
-fn enumerate_schedulers() -> Result<Vec<SchedulerInfo>> {
-    let per_binary: Vec<Vec<ktstr::test_support::SchedulerListEntry>> = crate::misc::probe_collect(
-        None,
-        false,
-        |bin| {
-            let mut c = Command::new(bin);
-            c.arg("--ktstr-list-schedulers");
-            c
-        },
-        |_bin, out| {
-            serde_json::from_slice::<Vec<ktstr::test_support::SchedulerListEntry>>(&out.stdout)
-                .map_err(|e| format!("parse --ktstr-list-schedulers output: {e}"))
-        },
-    )
-    .map_err(|e| anyhow!("probe test binaries for declared schedulers: {e:?}"))?;
-
-    let mut by_name: BTreeMap<String, SchedulerInfo> = BTreeMap::new();
-    for entry in per_binary.into_iter().flatten() {
-        let name = entry.scheduler.name.clone();
-        let package = match entry.scheduler.binary_kind {
-            ktstr::test_support::BinaryKindJson::Discover(pkg) => Some(pkg),
-            _ => None,
-        };
-        by_name
-            .entry(name.clone())
-            .and_modify(|si| si.test_count += entry.test_count)
-            .or_insert(SchedulerInfo {
-                name,
-                package,
-                test_count: entry.test_count,
-            });
-    }
-    Ok(by_name.into_values().collect())
+/// Build the target's complete test-registry set, then execute the combined
+/// scheduler-manifest ctor exactly once in each distinct binary. Both the
+/// matrix scheduler universe and test-to-scheduler mapping are derived from
+/// those same process outputs.
+fn enumerate_scheduler_inventory() -> Result<SchedulerInventory> {
+    let bins = crate::misc::build_test_binaries(None, false)
+        .map_err(anyhow::Error::msg)
+        .context("build workspace test registries")?;
+    enumerate_scheduler_inventory_from_bins(&bins)
 }
 
-/// Enumerate declared tests with their scheduler by probing the target's built
-/// test binaries with `--ktstr-list-scheduler-tests`. Used by
-/// [`relevant_test_filter`] to map each test onto its scheduler's package.
-/// Deduplicates by test name (a test is registered in exactly one binary; the
-/// probe visits each binary, so re-seen entries are idempotent).
-fn enumerate_scheduler_tests() -> Result<Vec<ktstr::test_support::SchedulerTestJson>> {
-    let per_binary: Vec<Vec<ktstr::test_support::SchedulerTestJson>> = crate::misc::probe_collect(
-        None,
-        false,
-        |bin| {
-            let mut c = Command::new(bin);
-            c.arg("--ktstr-list-scheduler-tests");
-            c
-        },
-        |_bin, out| {
-            serde_json::from_slice::<Vec<ktstr::test_support::SchedulerTestJson>>(&out.stdout)
-                .map_err(|e| format!("parse --ktstr-list-scheduler-tests output: {e}"))
-        },
-    )
-    .map_err(|e| anyhow!("probe test binaries for declared tests: {e:?}"))?;
-
-    let mut by_name: BTreeMap<String, ktstr::test_support::SchedulerTestJson> = BTreeMap::new();
-    for entry in per_binary.into_iter().flatten() {
-        by_name.entry(entry.test.clone()).or_insert(entry);
+fn scheduler_inventory_from_manifests(
+    per_binary: impl IntoIterator<Item = ktstr::test_support::SchedulerManifestProbe>,
+) -> Result<SchedulerInventory> {
+    let mut by_name: BTreeMap<String, (ktstr::test_support::SchedulerJson, SchedulerInfo)> =
+        BTreeMap::new();
+    let mut tests_by_identity: BTreeMap<(String, String), ktstr::test_support::SchedulerTestJson> =
+        BTreeMap::new();
+    for manifest in per_binary {
+        for entry in manifest.declarations {
+            let identity = entry.scheduler;
+            let name = identity.name.clone();
+            let package = match &identity.binary_kind {
+                ktstr::test_support::BinaryKindJson::Discover(pkg) => Some(pkg.clone()),
+                _ => None,
+            };
+            match by_name.entry(name.clone()) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert((
+                        identity,
+                        SchedulerInfo {
+                            name,
+                            package,
+                            test_count: entry.test_count,
+                        },
+                    ));
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let (first_identity, scheduler) = slot.get_mut();
+                    if *first_identity != identity {
+                        let first = serde_json::to_string(first_identity)
+                            .expect("SchedulerJson serialization is infallible");
+                        let later = serde_json::to_string(&identity)
+                            .expect("SchedulerJson serialization is infallible");
+                        return Err(anyhow!(
+                            "conflicting scheduler declarations for name {name:?}: \
+                             first={first}; later={later}"
+                        ));
+                    }
+                    scheduler.test_count = scheduler
+                        .test_count
+                        .checked_add(entry.test_count)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "scheduler {name:?} test-count overflow while merging \
+                                 identical declarations"
+                            )
+                        })?;
+                }
+            }
+        }
+        for test in manifest.tests {
+            let identity = (test.test.clone(), test.scheduler.clone());
+            tests_by_identity.entry(identity).or_insert(test);
+        }
     }
-    Ok(by_name.into_values().collect())
+    Ok(SchedulerInventory {
+        schedulers: by_name
+            .into_values()
+            .map(|(_identity, scheduler)| scheduler)
+            .collect(),
+        tests: tests_by_identity.into_values().collect(),
+    })
+}
+
+fn enumerate_scheduler_inventory_from_bins(bins: &[PathBuf]) -> Result<SchedulerInventory> {
+    if bins.is_empty() {
+        return Err(anyhow!(
+            "cargo test registry build produced no executable artifacts; \
+             ensure the selection contains at least one test target"
+        ));
+    }
+    let per_binary = crate::misc::probe_scheduler_manifests_from_bins(
+        bins,
+        None,
+        "test binaries for affected scheduler manifests",
+    )
+    .map_err(|error| anyhow!("probe test binaries for combined scheduler manifests: {error}"))?;
+    if per_binary.is_empty() {
+        return Err(anyhow!(
+            "none of {} selected test binaries linked the combined scheduler-manifest probe",
+            bins.len(),
+        ));
+    }
+    scheduler_inventory_from_manifests(per_binary.into_iter().map(|binary| binary.manifest))
 }
 
 /// The core fallback + attribution engine. Resolves the changed-path set
@@ -229,7 +267,7 @@ fn compute_outcome(
         if ws.is_member(pkg) {
             testable_pkgs.push(pkg.to_string());
         } else {
-            eprintln!(
+            ktstr::ktstr_status!(
                 "ktstr affected: declared scheduler package `{pkg}` (with tests) \
                  is not a workspace member; excluded from the matrix"
             );
@@ -344,22 +382,36 @@ pub(crate) fn relevant_test_filter(
     base: Option<&str>,
     base_ref: Option<&str>,
     default_branch: &str,
+    registry_args: &[String],
+    release: bool,
 ) -> Result<Option<String>> {
-    let schedulers = enumerate_schedulers().context("enumerate declared schedulers")?;
-    let (outcome, _testable) = compute_outcome(base, base_ref, default_branch, true, &schedulers)?;
+    // Build once from the caller's already-prepared nextest selection, then
+    // execute one combined manifest probe per exact executable. Scheduler
+    // declarations and per-test mappings must come from the same process
+    // outputs so no second probe can observe a different registry generation.
+    // Rebuilding through the workspace-wide probe here would silently discard
+    // `-p`/`--exclude`, target, harness profile, and feature modes and can
+    // discover a different registry than the final test/coverage run.
+    let bins = crate::misc::build_contextual_test_binaries(registry_args, release)
+        .map_err(anyhow::Error::msg)
+        .context("build selected test registries")?;
+    let inventory = enumerate_scheduler_inventory_from_bins(&bins)
+        .context("enumerate selected scheduler registry")?;
+    let (outcome, _testable) =
+        compute_outcome(base, base_ref, default_branch, true, &inventory.schedulers)?;
 
-    // RunAll / Empty resolve without the per-test scheduler map, so skip the
-    // (build+run) test-list probe on those paths; only Subset needs it.
+    // RunAll / Empty resolve without consulting the already-collected
+    // per-test scheduler map; only Subset needs to construct package lookups.
     if !matches!(outcome, AffectedOutcome::Subset(_)) {
         return Ok(select_relevant_tests(&outcome, &BTreeMap::new(), &[]));
     }
     // scheduler name -> its package (None = package-less: outside the matrix).
-    let pkg_of: BTreeMap<&str, Option<&str>> = schedulers
+    let pkg_of: BTreeMap<&str, Option<&str>> = inventory
+        .schedulers
         .iter()
         .map(|s| (s.name.as_str(), s.package.as_deref()))
         .collect();
-    let tests = enumerate_scheduler_tests().context("enumerate declared tests")?;
-    Ok(select_relevant_tests(&outcome, &pkg_of, &tests))
+    Ok(select_relevant_tests(&outcome, &pkg_of, &inventory.tests))
 }
 
 /// Pure mapping of an [`AffectedOutcome`] onto a nextest filter over test NAMES,
@@ -583,7 +635,7 @@ fn map_artifacts_to_bins<R: std::io::BufRead>(
         {
             let path = PathBuf::from(exe.as_str());
             if let Some(prev) = map.insert(name.clone(), path) {
-                eprintln!(
+                ktstr::ktstr_status!(
                     "ktstr affected: scheduler package `{name}` emitted multiple \
                      [[bin]] artifacts; using the last, ignoring {} (its `.d` \
                      inputs are not considered)",
@@ -1095,6 +1147,114 @@ mod tests {
         }
     }
 
+    #[test]
+    fn one_combined_payload_populates_scheduler_universe_and_test_mapping() {
+        let scheduler =
+            ktstr::test_support::Scheduler::named("scx_a_sched").binary_discover("scx_a");
+        let declaration = |test_count| ktstr::test_support::SchedulerListEntry {
+            scheduler: ktstr::test_support::SchedulerJson::from_scheduler(&scheduler),
+            test_count,
+        };
+        let inventory = scheduler_inventory_from_manifests([
+            ktstr::test_support::SchedulerManifestProbe {
+                declarations: vec![declaration(1)],
+                artifact_requirements: Vec::new(),
+                tests: vec![sched_test("t_a", "scx_a_sched")],
+            },
+            ktstr::test_support::SchedulerManifestProbe {
+                declarations: vec![declaration(2)],
+                artifact_requirements: Vec::new(),
+                tests: vec![
+                    sched_test("t_a", "scx_a_sched"),
+                    sched_test("t_b", "scx_a_sched"),
+                ],
+            },
+        ])
+        .expect("identical scheduler declarations merge");
+
+        assert_eq!(inventory.schedulers.len(), 1);
+        assert_eq!(inventory.schedulers[0].name, "scx_a_sched");
+        assert_eq!(inventory.schedulers[0].package.as_deref(), Some("scx_a"));
+        assert_eq!(inventory.schedulers[0].test_count, 3);
+        assert_eq!(
+            inventory
+                .tests
+                .iter()
+                .map(|test| test.test.as_str())
+                .collect::<Vec<_>>(),
+            ["t_a", "t_b"],
+            "the same combined process payload supplies the --relevant mapping",
+        );
+    }
+
+    #[test]
+    fn combined_payload_preserves_each_test_scheduler_association() {
+        let scheduler_a = ktstr::test_support::Scheduler::named("sched_a").binary_discover("scx_a");
+        let scheduler_b = ktstr::test_support::Scheduler::named("sched_b").binary_discover("scx_b");
+        let declaration =
+            |scheduler: &ktstr::test_support::Scheduler| ktstr::test_support::SchedulerListEntry {
+                scheduler: ktstr::test_support::SchedulerJson::from_scheduler(scheduler),
+                test_count: 1,
+            };
+        let inventory = scheduler_inventory_from_manifests([
+            ktstr::test_support::SchedulerManifestProbe {
+                declarations: vec![declaration(&scheduler_a)],
+                artifact_requirements: Vec::new(),
+                tests: vec![sched_test("scheduler_swap", "sched_a")],
+            },
+            ktstr::test_support::SchedulerManifestProbe {
+                declarations: vec![declaration(&scheduler_b)],
+                artifact_requirements: Vec::new(),
+                tests: vec![
+                    sched_test("scheduler_swap", "sched_a"),
+                    sched_test("scheduler_swap", "sched_b"),
+                ],
+            },
+        ])
+        .expect("distinct scheduler declarations merge");
+
+        assert_eq!(
+            inventory
+                .tests
+                .iter()
+                .map(|test| (test.test.as_str(), test.scheduler.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("scheduler_swap", "sched_a"), ("scheduler_swap", "sched_b"),],
+            "only an exact duplicate pair is removed; staged associations survive",
+        );
+    }
+
+    #[test]
+    fn conflicting_same_name_scheduler_declarations_fail_deterministically() {
+        let first = ktstr::test_support::Scheduler::named("collision").binary_discover("scx_first");
+        let later = ktstr::test_support::Scheduler::named("collision").binary_discover("scx_later");
+        let first_identity = ktstr::test_support::SchedulerJson::from_scheduler(&first);
+        let later_identity = ktstr::test_support::SchedulerJson::from_scheduler(&later);
+        let declaration = |scheduler| ktstr::test_support::SchedulerListEntry {
+            scheduler,
+            test_count: 1,
+        };
+        let error = scheduler_inventory_from_manifests([
+            ktstr::test_support::SchedulerManifestProbe {
+                declarations: vec![declaration(first_identity.clone())],
+                artifact_requirements: Vec::new(),
+                tests: Vec::new(),
+            },
+            ktstr::test_support::SchedulerManifestProbe {
+                declarations: vec![declaration(later_identity.clone())],
+                artifact_requirements: Vec::new(),
+                tests: Vec::new(),
+            },
+        ])
+        .expect_err("one name cannot denote two execution identities");
+        let expected = format!(
+            "conflicting scheduler declarations for name \"collision\": first={}; later={}",
+            serde_json::to_string(&first_identity).expect("serialize first scheduler identity"),
+            serde_json::to_string(&later_identity).expect("serialize later scheduler identity"),
+        );
+        assert_eq!(error.to_string(), expected);
+    }
+
     /// RunAll -> None (run everything, the fail-safe); no test map is consulted.
     #[test]
     fn select_relevant_runall_is_none() {
@@ -1132,24 +1292,30 @@ mod tests {
         ];
         let outcome = AffectedOutcome::Subset(vec!["scx_a".to_string()]);
         let expr = select_relevant_tests(&outcome, &pkg_of, &tests).expect("Subset selects tests");
-        // Match on the `NAME$` boundary `build_nextest_filter` emits, so a
-        // dropped name is not falsely "found" as a prefix of a kept one
-        // (e.g. `t_b` is a prefix of `t_builtin`).
-        assert!(
-            expr.contains("t_a$"),
-            "affected Discover pkg test kept: {expr}"
+        let expected = BTreeSet::from(["t_a", "t_builtin", "t_unknown"]);
+        assert_eq!(
+            expr,
+            crate::replay::build_nextest_filter(&expected),
+            "relevant selection keeps the affected, package-less, and \
+             unenumerable tests while dropping the unaffected test even when \
+             its name is a prefix of a kept one",
         );
-        assert!(
-            expr.contains("t_builtin$"),
-            "package-less test kept: {expr}"
-        );
-        assert!(
-            expr.contains("t_unknown$"),
-            "unenumerable-scheduler test kept: {expr}"
-        );
-        assert!(
-            !expr.contains("t_b$"),
-            "unaffected Discover pkg test dropped: {expr}"
+    }
+
+    #[test]
+    fn select_relevant_keeps_test_when_any_of_its_schedulers_is_affected() {
+        let pkg_of = BTreeMap::from([("sched_a", Some("scx_a")), ("sched_b", Some("scx_b"))]);
+        let tests = vec![
+            sched_test("scheduler_swap", "sched_a"),
+            sched_test("scheduler_swap", "sched_b"),
+        ];
+        let outcome = AffectedOutcome::Subset(vec!["scx_b".to_string()]);
+        let expression = select_relevant_tests(&outcome, &pkg_of, &tests)
+            .expect("the staged affected scheduler selects the shared test");
+        assert_eq!(
+            expression,
+            crate::replay::build_nextest_filter(&BTreeSet::from(["scheduler_swap",])),
+            "an unaffected primary association cannot hide an affected staged one",
         );
     }
 

@@ -244,10 +244,13 @@ fn parse_trace_cpu(line: &str) -> Option<&str> {
 }
 
 /// Strip ANSI CSI escape sequences (`\x1b[...<letter>`) from a
-/// string. Used by [`extract_bug_summary`] so a colorized
-/// scheduler-log line does not break the substring scan. Bytes
-/// outside CSI sequences pass through unchanged.
-fn strip_ansi_csi(s: &str) -> String {
+/// string.
+///
+/// Used by [`extract_bug_summary`] and command-output assertions so
+/// colorized output does not break semantic scans. Bytes outside CSI
+/// sequences pass through unchanged.
+#[doc(hidden)]
+pub fn strip_ansi_csi(s: &str) -> String {
     // Common case: no ESC byte at all — return without allocating
     // a separate Vec + roundtripping through from_utf8. Called up
     // to twice per test failure via `extract_bug_summary` — once

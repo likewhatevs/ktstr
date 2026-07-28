@@ -1124,7 +1124,7 @@ fn decompose_roundtrip_representative_topologies() {
     }
 }
 
-/// Guest-observation proof for NON-UNIFORM LLC sizing (uneven-11llc).
+/// Guest-observation proof for NON-UNIFORM LLC sizing (192cpu-11llc-smt).
 ///
 /// The guest kernel groups CPUs into L3 (LLC) domains by
 /// `cache_id = apicid >> order(num_threads_sharing + 1)`. ktstr encodes

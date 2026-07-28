@@ -40,7 +40,7 @@ use super::{find_struct, member_byte_offset};
 /// bytes is `producer_pos - consumer_pos` (both monotonically advancing
 /// 64-bit counters; the kernel uses unsigned wraparound subtraction
 /// to compute occupancy in the dispatch path).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct BpfRingbufOffsets {
     /// Offset of `rb` (`struct bpf_ringbuf *`) within
@@ -101,7 +101,7 @@ pub(crate) fn resolve_ringbuf_offsets(btf: &Btf) -> Result<BpfRingbufOffsets> {
 /// `data[]` flex array holds `nr` u64 program counters (or
 /// `bpf_stack_build_id` records when `BPF_F_STACK_BUILD_ID` is set on
 /// the map; the dump path treats both as opaque trace bytes).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct BpfStackmapOffsets {
     /// Offset of `n_buckets` (u32) within `struct bpf_stack_map`.

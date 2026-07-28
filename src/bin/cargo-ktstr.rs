@@ -11,6 +11,9 @@
 //!   `KtstrCommand` / `StatsCommand`
 //!   types that drive argument parsing and shell
 //!   completion generation.
+//! - `feature_discovery` — Cargo-metadata inspection that finds narrow
+//!   optional-ktstr feature gates and package-qualifies them for every
+//!   supported nextest or workspace test-registry build/probe command.
 //! - `kernel` — `--kernel <SPEC>` resolution shared by the `shell`,
 //!   `verifier`, and gauntlet-expansion code paths, plus
 //!   the `kernel build` subcommand dispatcher. Pure
@@ -46,20 +49,32 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[path = "cargo_ktstr/admission_runner.rs"]
+mod admission_runner;
 #[path = "cargo_ktstr/affected/mod.rs"]
 mod affected;
 #[path = "cargo_ktstr/cli.rs"]
 mod cli;
+#[path = "cargo_ktstr/feature_discovery.rs"]
+mod feature_discovery;
 #[path = "cargo_ktstr/interrupt.rs"]
 mod interrupt;
 #[path = "cargo_ktstr/kernel/mod.rs"]
 mod kernel;
 #[path = "cargo_ktstr/misc/mod.rs"]
 mod misc;
+#[path = "cargo_ktstr/nextest_artifact_cache.rs"]
+mod nextest_artifact_cache;
+#[path = "cargo_ktstr/nextest_config.rs"]
+mod nextest_config;
+#[path = "cargo_ktstr/nextest_process.rs"]
+mod nextest_process;
 #[path = "cargo_ktstr/perf_delta.rs"]
 mod perf_delta;
 #[path = "cargo_ktstr/replay.rs"]
 mod replay;
+#[path = "cargo_ktstr/reserved_build_progress.rs"]
+mod reserved_build_progress;
 #[path = "cargo_ktstr/run_cargo.rs"]
 mod run_cargo;
 #[path = "cargo_ktstr/stats.rs"]
@@ -79,13 +94,77 @@ mod argsplit;
 #[cfg(test)]
 #[path = "cargo_ktstr/parse_tests.rs"]
 mod parse_tests;
+#[cfg(test)]
+#[path = "cargo_ktstr/test_env.rs"]
+mod test_env;
 
 use clap::{CommandFactory, Parser};
 use ktstr::cli::KernelCommand;
 
 use crate::cli::{Cargo, CargoSub, KtstrCommand};
 
+/// Decide whether startup must install a freshly detected project commit.
+///
+/// A non-empty inherited value is authoritative (notably perf-delta's
+/// baseline and HEAD labels) and suppresses detection. Missing or empty values
+/// trigger exactly one probe. Split from [`install_project_commit_env`] so the
+/// precedence and one-probe contract are testable without mutating the
+/// process-wide environment from a parallel unit test.
+fn project_commit_to_install_with(
+    existing: Option<std::ffi::OsString>,
+    detect: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if existing.as_ref().is_some_and(|value| !value.is_empty()) {
+        None
+    } else {
+        detect()
+    }
+}
+
+/// Resolve the invoking project's commit once and export it to every
+/// descendant of cargo-ktstr.
+///
+/// This is intentionally top-level rather than attached to individual
+/// subcommands: verifier, replay, shell, test, coverage, and raw
+/// `llvm-cov nextest` all spawn processes that may eventually write a
+/// sidecar. A single inherited value gives every path the same project
+/// snapshot and prevents process-per-test commit/status rediscovery.
+///
+/// SAFETY: `main` calls this before tracing initialization, signal-handler
+/// installation, or any other persistent thread spawn. `repo_is_dirty`
+/// bounds gix's tracked-file work to one worker and exhausts its status
+/// iterator, joining gix's temporary producer before detection returns.
+fn install_project_commit_env() {
+    let install = project_commit_to_install_with(
+        std::env::var_os(ktstr::KTSTR_PROJECT_COMMIT_ENV),
+        ktstr::test_support::detect_project_commit,
+    );
+    if let Some(commit) = install {
+        // SAFETY: see the function doc — startup is single-threaded, and the
+        // detector joins its temporary gix producer before returning.
+        unsafe {
+            std::env::set_var(ktstr::KTSTR_PROJECT_COMMIT_ENV, commit);
+        }
+    }
+}
+
 fn main() {
+    // Cargo/nextest re-enters this executable as a hidden target runner. That
+    // mode must remain a tiny admission+exec path: no startup supervisor,
+    // embedded-blob extraction, metadata probe, tracing, or clap dispatch.
+    admission_runner::dispatch_if_requested();
+
+    // Process-group anchors re-exec this binary with a private marker and
+    // control pipes. Handle that mode before blob extraction, Cargo metadata,
+    // tracing, argument parsing, or any other ordinary CLI initialization.
+    if interrupt::run_anchor_mode_if_requested() {
+        return;
+    }
+    if interrupt::run_command_pair_coordinator_if_requested() {
+        return;
+    }
+    interrupt::run_startup_supervision();
+
     ktstr::host_heap::mark_jemalloc_global_allocator();
     // Restore SIGPIPE so piping `cargo ktstr ... | head` doesn't
     // panic inside `print!`. See `ktstr::cli::restore_sigpipe_default`
@@ -103,8 +182,13 @@ fn main() {
     // error.
     if let Err(e) = blobs::install_env() {
         eprintln!("error: extract embedded blobs: {e}");
+        interrupt::commit_startup_worker_exit(1);
         std::process::exit(1);
     }
+    // Resolve project identity once for every descendant-producing command.
+    // This must stay before tracing/thread initialization; see the installer's
+    // environment-safety contract.
+    install_project_commit_env();
     // Pin KTSTR_RUNS_ROOT to the absolute cargo target dir's ktstr
     // subdir so this orchestrator's footer / stats / replay reads and
     // the child test processes' sidecar writes resolve the SAME dir
@@ -113,6 +197,15 @@ fn main() {
     // or anything that spawns a thread — for the same `set_var` safety
     // reason as `blobs::install_env` above; child processes inherit it.
     run_cargo::install_runs_root_env();
+    // Best-effort reclaim of PRIOR CI runs' sidecar output directories that
+    // accumulate on a persistent runner (one tree per run/attempt/lane under
+    // `KTSTR_SIDECAR_DIR`'s parent). Each run uploaded its own forensics as
+    // artifacts, so a finished run's directory is pure disk noise; nothing
+    // else deletes them, and unbounded growth here is what fills a shared
+    // runner. Concurrent same-run lanes and newer/overlapping runs are never
+    // touched (see `prune_prior_ci_sidecar_dirs`). CI-scoped and side-effect
+    // free off GitHub Actions, so it is safe on this startup path.
+    run_cargo::prune_prior_ci_sidecar_dirs();
     // Mirror `ktstr`'s tracing init (src/bin/ktstr.rs main()) so
     // `tracing::warn!` calls inside `cli::` / `test_support::` surface
     // on stderr instead of being silently dropped. Default to `warn`
@@ -136,15 +229,53 @@ fn main() {
         command: CargoSub::Ktstr(ktstr),
     } = match Cargo::try_parse_from(&rewritten) {
         Ok(c) => c,
-        Err(e) => e.exit(),
+        Err(e) => {
+            let code = u8::try_from(e.exit_code()).unwrap_or(1);
+            let _ = e.print();
+            interrupt::commit_startup_worker_exit(code);
+            std::process::exit(i32::from(code));
+        }
     };
 
-    let result = dispatch_command(ktstr.command);
-
-    if let Err(e) = result {
-        eprintln!("error: {e:#}");
+    // Install the nextest target runner only for commands that can execute
+    // test cells. All environment mutation remains in single-threaded startup:
+    // tracing's synchronous formatter owns no worker and every earlier helper
+    // has joined its temporary child/work before returning.
+    if let Err(e) = admission_runner::install_for_command(&ktstr.command) {
+        eprintln!("error: configure nextest pre-admission runner: {e}");
+        interrupt::commit_startup_worker_exit(1);
         std::process::exit(1);
     }
+
+    // One handler installation spans the dispatched CLI lifetime. It starts
+    // in EARLY mode, where SIGINT/SIGTERM retain terminate-immediately
+    // semantics through command-specific metadata, network, and kernel
+    // preflight. Run-producing dispatchers cross into cleanup ownership
+    // immediately before their first reservation/result-dir/checkout, then
+    // this top-level owner restores and re-raises only after every
+    // dispatcher-local RAII cleanup has completed. Installing after parsing
+    // also leaves Clap's direct error exit under the ordinary dispositions.
+    let interrupt_guard = interrupt::InterruptGuard::install();
+    let result = dispatch_command(ktstr.command);
+
+    let caught = interrupt::restore_and_caught(interrupt_guard);
+    if let Some(signal) = caught {
+        // A signal exit is intentionally not a clean-release commit. The
+        // startup subreaper drains anything that survived worker cleanup
+        // before relaying the exact signal status.
+        interrupt::reraise(signal);
+    }
+    if let Some(code) = interrupt::take_deferred_exit_code() {
+        let code = code as u8;
+        interrupt::commit_startup_worker_exit(code);
+        std::process::exit(i32::from(code));
+    }
+    if let Err(e) = result {
+        eprintln!("error: {e:#}");
+        interrupt::commit_startup_worker_exit(1);
+        std::process::exit(1);
+    }
+    interrupt::commit_startup_worker_exit(0);
 }
 
 /// Fan out a parsed [`KtstrCommand`] to its subcommand handler.
@@ -249,7 +380,10 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             &args,
         ) {
             Ok(0) => Ok(()),
-            Ok(code) => std::process::exit(code),
+            Ok(code) => {
+                interrupt::defer_exit_code(code);
+                Ok(())
+            }
             Err(e) => Err(format!("{e:#}")),
         },
         KtstrCommand::PerfDelta {
@@ -302,7 +436,10 @@ fn dispatch_run_command(command: KtstrCommand) -> Result<(), String> {
             };
             match perf_delta::run(&args) {
                 Ok(0) => Ok(()),
-                Ok(code) => std::process::exit(code),
+                Ok(code) => {
+                    interrupt::defer_exit_code(code);
+                    Ok(())
+                }
                 Err(e) => Err(format!("{e:#}")),
             }
         }
@@ -435,10 +572,14 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
         ) {
             // Shell mode exits with the guest payload's own exit code
             // (recovered from the ExecExit bulk frame); interactive mode
-            // (None) exits 0. Diverge here so it does not fall through to
-            // the uniform exit-0 path below; Err routes to the shared
-            // error handler.
-            Ok(opt) => std::process::exit(opt.unwrap_or(0)),
+            // (None) exits 0. Defer a non-zero code until the top-level
+            // signal owner has restored dispositions; Err routes to the
+            // shared error handler.
+            Ok(Some(code)) if code != 0 => {
+                interrupt::defer_exit_code(code);
+                Ok(())
+            }
+            Ok(_) => Ok(()),
             Err(e) => Err(e),
         },
         // Reached only for variants `dispatch_run_command` handles;
@@ -453,5 +594,50 @@ fn dispatch_admin_command(command: KtstrCommand) -> Result<(), String> {
         | KtstrCommand::PerfDelta { .. } => unreachable!(
             "run-group variants are handled by dispatch_run_command and never forwarded here"
         ),
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn project_commit_install_preserves_nonempty_override_without_probing() {
+        let calls = std::cell::Cell::new(0);
+        let install =
+            project_commit_to_install_with(Some(std::ffi::OsString::from("baseline1")), || {
+                calls.set(calls.get() + 1);
+                Some("wrong".to_string())
+            });
+        assert_eq!(install, None);
+        assert_eq!(
+            calls.get(),
+            0,
+            "an inherited perf-delta label must remain authoritative",
+        );
+    }
+
+    #[test]
+    fn project_commit_install_probes_once_for_missing_or_empty_value() {
+        for existing in [None, Some(std::ffi::OsString::new())] {
+            let calls = std::cell::Cell::new(0);
+            let install = project_commit_to_install_with(existing, || {
+                calls.set(calls.get() + 1);
+                Some("deadbee-dirty".to_string())
+            });
+            assert_eq!(install.as_deref(), Some("deadbee-dirty"));
+            assert_eq!(calls.get(), 1, "startup must resolve exactly once");
+        }
+    }
+
+    #[test]
+    fn project_commit_install_leaves_env_unset_when_detection_fails() {
+        let calls = std::cell::Cell::new(0);
+        let install = project_commit_to_install_with(None, || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(install, None);
+        assert_eq!(calls.get(), 1);
     }
 }

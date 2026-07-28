@@ -1,9 +1,11 @@
-//! Crash investigation via BPF kprobes, fentry/fexit, and tracepoints.
+//! Crash investigation via BPF kprobes, fentry, and fexit.
 //!
 //! Attaches kprobes and fentry probes to kernel and BPF functions from
-//! a crash stack trace, triggers on `sched_ext_exit` via tp_btf,
-//! captures argument state, and formats annotated output with source
-//! locations.
+//! a crash stack trace, selects the kernel's scheduler-exit hook
+//! (`tp_btf/sched_ext_exit` on the newest kernels,
+//! a raw `scx_vexit` entry/return pair on the preceding generation, or filtered
+//! `fentry/scx_dump_state` on global-era kernels), captures argument state,
+//! and formats annotated output with source locations.
 //!
 //! See the [Investigate a Crash](https://ktstr.dev/guide/recipes/investigate-crash.html)
 //! recipe.

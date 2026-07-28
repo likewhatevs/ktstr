@@ -412,7 +412,8 @@ fn ktstr_env_constants_are_their_literals() {
         KTSTR_KERNEL_PARALLELISM_ENV, KTSTR_LOCK_DIR_ENV, KTSTR_LOG_PASSES_ENV,
         KTSTR_NO_PERF_MODE_ENV, KTSTR_NO_SKIP_MODE_ENV, KTSTR_ORCHESTRATED_ENV,
         KTSTR_SCHEDULER_ENV, KTSTR_SIDECAR_DIR_ENV, KTSTR_TEST_KERNEL_ENV, KTSTR_VERBOSE_ENV,
-        KTSTR_VERIFIER_RAW_ENV, KTSTR_VERIFIER_SCHEDULER_ENV,
+        KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST_ENV, KTSTR_VERIFIER_RAW_ENV,
+        KTSTR_VERIFIER_SCHEDULER_ENV,
     };
     assert_eq!(KTSTR_KERNEL_ENV, "KTSTR_KERNEL");
     assert_eq!(KTSTR_KERNEL_LIST_ENV, "KTSTR_KERNEL_LIST");
@@ -421,6 +422,10 @@ fn ktstr_env_constants_are_their_literals() {
     assert_eq!(KTSTR_CGROUP_WALK_ROOT_ENV, "KTSTR_CGROUP_WALK_ROOT");
     assert_eq!(KTSTR_KERNEL_PARALLELISM_ENV, "KTSTR_KERNEL_PARALLELISM");
     assert_eq!(KTSTR_VERIFIER_RAW_ENV, "KTSTR_VERIFIER_RAW");
+    assert_eq!(
+        KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST_ENV,
+        "KTSTR_VERIFIER_CELL_OWNERSHIP_MANIFEST"
+    );
     assert_eq!(KTSTR_VERIFIER_SCHEDULER_ENV, "KTSTR_VERIFIER_SCHEDULER");
     assert_eq!(KTSTR_NO_PERF_MODE_ENV, "KTSTR_NO_PERF_MODE");
     assert_eq!(KTSTR_GHA_CACHE_ENV, "KTSTR_GHA_CACHE");
@@ -451,6 +456,26 @@ fn ktstr_env_constants_are_their_literals() {
     #[cfg(feature = "wprof")]
     assert_eq!(super::KTSTR_WPROF_PATH_ENV, "KTSTR_WPROF_PATH");
     assert_eq!(KTSTR_LOG_PASSES_ENV, "KTSTR_LOG_PASSES");
+}
+
+/// The production-admission guard matches nextest's group by the
+/// [`crate::NEXTEST_HOST_TESTS_GROUP`] literal instead of parsing
+/// config; this pins that literal to the group name the checked-in
+/// `.config/nextest.toml` assigns ordinary host tests, so renaming the
+/// group in config without updating the constant fails here rather than
+/// silently disarming the guard. The bin-side `nextest_config` code
+/// cannot host the constant — test binaries do not link it — so the
+/// two are kept in sync from the library crate the tests do link.
+#[test]
+fn nextest_host_tests_group_matches_config() {
+    const CONFIG: &str = include_str!("../.config/nextest.toml");
+    let assignment = format!("test-group = \"{}\"", super::NEXTEST_HOST_TESTS_GROUP);
+    assert!(
+        CONFIG.contains(&assignment),
+        "`.config/nextest.toml` must assign ordinary host tests to the `{}` \
+         group the admission guard keys on",
+        super::NEXTEST_HOST_TESTS_GROUP,
+    );
 }
 
 // -- extra_kconfig_hash + cache_key_suffix_with_extra --

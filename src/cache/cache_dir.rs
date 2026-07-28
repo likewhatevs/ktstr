@@ -689,6 +689,18 @@ impl CacheDir {
             .join(format!("{cache_key}.lock"))
     }
 
+    /// Lockfile used to elect the sole fetch+build producer for one
+    /// content-addressed git kernel. This namespace is deliberately
+    /// distinct from the cache-entry reader/writer lock: the elected
+    /// builder holds this guard across acquisition, compilation, and
+    /// `store()`, whose implementation must remain free to acquire the
+    /// ordinary entry lock itself.
+    pub(crate) fn git_builder_lock_path(&self, cache_key: &str) -> PathBuf {
+        self.root
+            .join(LOCK_DIR_NAME)
+            .join(format!("git-builder-{cache_key}.lock"))
+    }
+
     /// Create the `{cache_root}/.locks/` subdirectory if absent.
     pub(crate) fn ensure_lock_dir(&self) -> anyhow::Result<()> {
         let dir = self.root.join(LOCK_DIR_NAME);
@@ -759,6 +771,21 @@ impl CacheDir {
             }
         }
     }
+
+    /// Non-blocking election attempt for the producer of one exact git
+    /// cache key. `Ok(None)` means a peer process is already acquiring
+    /// or building that content; unrelated keys use unrelated files and
+    /// never serialize behind this guard.
+    pub(crate) fn try_acquire_git_builder_lock(
+        &self,
+        cache_key: &str,
+    ) -> anyhow::Result<Option<GitBuilderLockGuard>> {
+        validate_cache_key(cache_key)?;
+        self.ensure_lock_dir()?;
+        let path = self.git_builder_lock_path(cache_key);
+        crate::flock::try_flock(&path, crate::flock::FlockMode::Exclusive)
+            .map(|fd| fd.map(|fd| GitBuilderLockGuard { fd }))
+    }
 }
 
 /// RAII guard for a `LOCK_SH` hold on a cache-entry lockfile.
@@ -771,6 +798,13 @@ pub struct SharedLockGuard {
 /// RAII guard for a `LOCK_EX` hold on a cache-entry lockfile.
 #[derive(Debug)]
 pub struct ExclusiveLockGuard {
+    #[allow(dead_code)]
+    fd: std::os::fd::OwnedFd,
+}
+
+/// Sole-producer election guard for one content-addressed git kernel.
+#[derive(Debug)]
+pub(crate) struct GitBuilderLockGuard {
     #[allow(dead_code)]
     fd: std::os::fd::OwnedFd,
 }

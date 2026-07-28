@@ -1,5 +1,11 @@
 [workspace]
 members = [".", "ktstr-macros", "scx-ktstr"]
+resolver = "3"
+# The verifier recursive-discovery e2e fixture's stand-in scheduler package.
+# Excluded so `cargo check/clippy --workspace` never builds it (it needs clang
+# + sched_ext BTF, present only where the KVM e2e itself runs); the fixture
+# copies it into a generated workspace where it builds as a normal member.
+exclude = ["tests/fixtures/scx_standin"]
 
 [workspace.package]
 edition = "2024"
@@ -9,7 +15,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.42.0"
+version = "0.44.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -42,6 +48,15 @@ anyhow = "1"
 # consumer drops it. Re-exports `semver`, so the guard uses
 # `cargo_metadata::semver::Version` (one semver source, no version skew).
 cargo_metadata = { version = "0.19", optional = true }
+# Resolve Cargo's effective target runner with the same hierarchical config,
+# environment, cfg-table, and relative-path semantics Cargo applies. Used only
+# by cargo-ktstr's nextest pre-admission wrapper; downstream library consumers
+# that disable `cli-bins` do not pull it in.
+cargo-config2 = { version = "0.1", optional = true }
+# Cargo's own target-table evaluator. cargo-ktstr uses the effective rustc
+# target + `rustc --print cfg` output to decide whether a target-specific
+# optional ktstr edge can participate in the test build.
+cargo-platform = { version = "0.1", optional = true }
 clap = { version = "4", features = ["derive"] }
 # Shell-completions generator for the `ktstr completions` /
 # `cargo ktstr completions` subcommands. Only referenced from the
@@ -65,7 +80,7 @@ crc32fast = "1.5"
 # requirements, no format-pinning headaches.
 postcard = { version = "1", features = ["use-std"] }
 itoa = "1"
-gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision", "progress-tree", "tree-editor"] }
+gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-curl-rustls", "worktree-mutation", "status", "revision", "progress-tree", "tree-editor", "parallel"] }
 reqwest = { version = "0.13", features = ["blocking"] }
 # Streaming XML pull-parser for distro repo metadata (repomd.xml and
 # the multi-MB primary.xml the Fedora / Amazon Linux resolvers walk in
@@ -129,6 +144,7 @@ rmesg = { version = "1", default-features = false, features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
+toml = { version = "1.1", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 btf-rs = "2.0"
@@ -154,7 +170,7 @@ virtio-queue = "0.17"
 vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.42.0", path = "ktstr-macros" }
+ktstr-macros = { version = "0.44.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 # Memory-map /proc/self/exe in the coverage-instrumentation detection
 # probe (`is_coverage_instrumented_binary` / `find_symbol_vaddrs` in
@@ -364,8 +380,26 @@ panic = "abort"
 # interactive debug session. The nextest sched_stats timeout
 # override stays as defense-in-depth — this addresses the
 # binary-size root cause; the timeout is the symptom budget.
+#
+# opt-level 1 for the same reason, one layer down. `cargo test` builds
+# the whole graph under this profile — raising `[profile.dev]` alongside
+# it was measured and moved the test binary by under 100 bytes — and that
+# binary is packed as the guest's `/init`, LZ4'd into the initrd CAS,
+# and unpacked into guest tmpfs on every cell. Measured on
+# ktstr_sched_tests: stripped 83.8 MB -> 41.1 MB, its LZ4 payload
+# 34.2 MB -> 19.7 MB, and the unit suite 219 s -> 36 s, for +28 s of
+# build wall. opt-level 2 buys 2.3 MB more stripped for another 11 s of
+# build, which does not pay for itself on a per-lane build.
+#
+# `debug-assertions` and `overflow-checks` are spelled out rather than
+# left to the dev defaults: they are the assertion coverage every test
+# and every guest runs with, and a raised opt-level must never be read
+# as license to drop them.
 [profile.test]
 debug = "line-tables-only"
+opt-level = 1
+debug-assertions = true
+overflow-checks = true
 
 [features]
 default = ["cli-bins", "vendored"]
@@ -416,9 +450,12 @@ integration = ["cli-bins"]
 cli-bins = [
     "dep:tikv-jemallocator",
     "dep:clap_complete",
+    "dep:cargo-config2",
+    "dep:cargo-platform",
     "dep:cargo_metadata",
     "dep:tree-sitter",
     "dep:tree-sitter-c",
+    "dep:toml",
     "export",
 ]
 # `cargo ktstr export` self-extracting `.run` file generator
@@ -428,10 +465,13 @@ cli-bins = [
 # `export` subcommand wired through the test-binary dispatch path.
 export = []
 # Embed the wprof BPF tracer for Perfetto-format profiling in VMs.
-# Default off: first build clones github.com/anakryiko/wprof and
-# compiles libbpf + blazesym (requires git, make, gcc, clang, mold,
-# elfutils-devel, zlib-devel on the host; takes several minutes).
-wprof = ["ktstr-macros/wprof"]
+# Default off: one elected build fetches github.com/anakryiko/wprof through
+# in-process gix and compiles libbpf + blazesym (requires make, gcc, clang,
+# mold, elfutils-devel, zlib-devel on the host; takes several minutes cold).
+wprof = [
+    "ktstr-macros/wprof",
+    "dep:gix",
+]
 # Pretty thread-name labels in `ctprof_compare` output. Enables
 # `grex` regex synthesis to render multi-member buckets as a
 # minimal regex (e.g. `tokio-runtime-worker-[0-3]`). With this
@@ -454,28 +494,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_
 
 [dev-dependencies]
 assert_cmd = "2"
+fs2 = "0.4"
+jobserver = "0.1"
 insta = "1"
 predicates = "3"
 proptest = "1"
-# Rust parser for the function-size guard test
-# (`tests/src_function_size_guard.rs`). `full` enables the
-# fn/impl/expr grammar; `visit` enables the `syn::visit::Visit`
-# traverser that walks every `ItemFn` / `ImplItemFn` /
-# `TraitItemFn` to measure body line spans. Pure-AST walk: no
-# proc-macro context required, so the test runs in the standard
-# integration-test harness without a build script.
-syn = { version = "2", features = ["full", "visit"] }
-# `quote::ToTokens` + `proc_macro2::Span` for the function-size
-# guard's impl-receiver / trait-path rendering. Already in the
-# transitive dep tree via `syn` and `ktstr-macros`; pinned as
-# explicit dev-deps so the test's `use quote::ToTokens` /
-# `proc_macro2::Span` imports resolve without leaning on syn's
-# re-export surface. `span-locations` feature on proc-macro2
-# enables `Span::start()` / `Span::end()` returning
-# `LineColumn`, which the guard uses to measure brace-token
-# body spans.
-proc-macro2 = { version = "1", features = ["span-locations"] }
-quote = "1"
 # Grok-style structured log matcher. Used by the watchdog timing
 # precision test to extract the sched_ext stall duration from the
 # kernel's SCX_EXIT_ERROR_STALL message ("…failed to run for
@@ -506,6 +529,17 @@ mockito = "1"
 virtio-queue = { version = "0.17", features = ["test-utils"] }
 
 [build-dependencies]
+# Fixed-seed, non-cryptographic content identity for both prebuilt blob
+# handoffs. Unconditional because busybox is prepared on the default build;
+# the wprof source-acquisition path reuses the same host-side crate.
+ahash = "0.8"
+# The build-script blob CAS is used by the default BusyBox build, so its
+# cross-process publication lock cannot be gated on the optional wprof path.
+fs2 = "0.4"
+# Optional with `wprof`: default builds do not compile a second host-side gix
+# graph merely for a build-script path that is disabled.
+gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-curl-rustls", "worktree-mutation", "progress-tree", "parallel"], optional = true }
+jobserver = { version = "0.1" }
 cc = "1"
 flate2 = "1"
 # BPF skeleton generator, invoked by build.rs. Optional + pulled in by

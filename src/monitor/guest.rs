@@ -25,6 +25,70 @@ use super::symbols::{
     start_kernel_map_for_tcr, text_kva_to_pa_with_base,
 };
 
+/// Append the aarch64 address-derivation snapshot to the build
+/// diagnostics dir once per process.
+///
+/// The freeze-coordinator guest reads (probe `.bss` counters,
+/// `*scx_root->exit_kind`) go through the aarch64 TTBR1 page-table
+/// walk, which fails on the arm64 + guest-kernel 7.1 lanes and leaves
+/// those captures at the `maps:[]` placeholder. The static VA-layout
+/// formulas are identical between the working (6.14) and broken (7.1)
+/// kernels, so the discriminator is the live `TCR_EL1` — see
+/// `symbols::arm64_derivation_diag`.
+///
+/// An earlier revision emitted this at `tracing::warn`, but the failing
+/// lanes' captured output carried zero `arm64-derivation` lines — the
+/// warn never reached any captured sink. This uses the file-based
+/// build-diagnostics idiom the sibling channels already rely on
+/// (`exit_timing`, admission-timing, coordinator-wakes): append one
+/// line to `${KTSTR_BUILD_DIAGNOSTICS_DIR}/arm64-derivation-<pid>.log`.
+/// Entirely inert unless the env var is set (CI only); best-effort,
+/// `O_APPEND`, and gated once per process so a lane emits exactly one
+/// line. No-op on x86_64 (the walk uses CR3, not this derivation).
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+fn emit_arm64_derivation_diag_once(
+    tcr_el1: u64,
+    cr3_pa: u64,
+    start_kernel_map: u64,
+    page_offset: u64,
+    phys_base: u64,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::io::Write as _;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let Some(dir) = std::env::var_os("KTSTR_BUILD_DIAGNOSTICS_DIR")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+            else {
+                return;
+            };
+            if std::fs::create_dir_all(&dir).is_err() {
+                return;
+            }
+            let pid = std::process::id();
+            let line = format!(
+                "{}\n",
+                super::symbols::arm64_derivation_diag(
+                    tcr_el1,
+                    cr3_pa,
+                    start_kernel_map,
+                    page_offset,
+                    phys_base,
+                )
+            );
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("arm64-derivation-{pid}.log")))
+            {
+                let _ = file.write_all(line.as_bytes());
+            }
+        });
+    }
+}
+
 /// Host-side accessor for kernel memory in a running guest VM.
 ///
 /// Resolves ELF symbols and paging configuration once at construction.
@@ -201,33 +265,18 @@ impl GuestKernel {
         Self::from_elf_with_hint(mem, elf, tcr_el1, cr3_pa, 0)
     }
 
-    /// Like [`Self::from_elf_with_hint`] but accepts a pre-built
-    /// `symbols: Arc<HashMap<String, u64>>` map, storing it directly
-    /// instead of parsing the ELF symtab (which
-    /// [`Self::from_elf`]/[`Self::from_elf_with_hint`] do). Also takes
-    /// the `phys_base_hint`: when non-zero, skips the page-table walk
-    /// for `phys_base` and uses the hint directly. The guest-reported
-    /// `phys_base` (from `/proc/iomem`) includes `kaslr_offset`, which
-    /// is what `text_kva_to_pa_with_base` needs for link-time KVAs.
-    pub fn from_elf_with_symbols(
-        mem: Arc<GuestMem>,
-        symbols: Arc<HashMap<String, u64>>,
-        elf: &goblin::elf::Elf<'_>,
-        tcr_el1: u64,
-        cr3_pa: u64,
-        phys_base_hint: u64,
-    ) -> Result<Self> {
-        let kern_syms = super::symbols::KernelSymbols::from_elf(elf)?;
-        Self::from_precomputed(mem, symbols, &kern_syms, tcr_el1, cr3_pa, phys_base_hint)
-    }
-
     /// Construct from the two symbol products already derived by `run_vm`:
     /// the complete name→KVA table and the compact bootstrap subset.
     ///
-    /// This is semantically identical to [`Self::from_elf_with_symbols`] but
-    /// performs no ELF traversal. It exists for live-VM helper threads whose
-    /// lifetime must contain only finite guest-memory reads, not host file
+    /// Like [`Self::from_elf_with_hint`] but performs no ELF traversal: the
+    /// caller supplies both the name→KVA map and the bootstrap symbol subset
+    /// directly. It exists for live-VM helper threads whose lifetime must
+    /// contain only finite guest-memory reads, not host file
     /// parsing/allocation that teardown would otherwise have to join.
+    ///
+    /// `phys_base_hint` behaves as in [`Self::from_elf_with_hint`]: when
+    /// non-zero it skips the page-table walk for `phys_base` and uses the
+    /// hint directly.
     pub(crate) fn from_precomputed(
         mem: Arc<GuestMem>,
         symbols: Arc<HashMap<String, u64>>,
@@ -281,6 +330,13 @@ impl GuestKernel {
         };
         let page_offset =
             resolve_page_offset_with_tcr(&mem, kern_syms, start_kernel_map, tcr_el1, phys_base);
+        emit_arm64_derivation_diag_once(
+            tcr_el1,
+            walk_cr3,
+            start_kernel_map,
+            page_offset,
+            phys_base,
+        );
         let aarch64_params = decode_aarch64_params(tcr_el1);
         Ok(Self {
             mem,
@@ -417,6 +473,13 @@ impl GuestKernel {
 
         let page_offset =
             resolve_page_offset_with_tcr(&mem, &kern_syms, start_kernel_map, tcr_el1, phys_base);
+        emit_arm64_derivation_diag_once(
+            tcr_el1,
+            walk_cr3,
+            start_kernel_map,
+            page_offset,
+            phys_base,
+        );
 
         // Cache the decoded aarch64 walk parameters once. On x86_64
         // the helper's `from_tcr_el1` returns None; the cache stays
@@ -499,19 +562,6 @@ impl GuestKernel {
         &self.mem
     }
 
-    /// Clone the owning Arc handle to guest memory. Lets a caller
-    /// build a sibling [`GuestKernel`] (or any other consumer that
-    /// expects an `Arc<GuestMem>`) that shares the same backing
-    /// mapping without re-resolving the host pointer through
-    /// [`super::reader::GuestMem::from_layout`].
-    pub fn mem_arc(&self) -> Arc<GuestMem> {
-        self.mem.clone()
-    }
-
-    pub fn symbols_arc(&self) -> Arc<HashMap<String, u64>> {
-        self.symbols.clone()
-    }
-
     /// Runtime PAGE_OFFSET (resolved from guest memory).
     pub fn page_offset(&self) -> u64 {
         self.page_offset
@@ -532,16 +582,6 @@ impl GuestKernel {
     /// granule-agnostic aarch64 page-table walker.
     pub fn tcr_el1(&self) -> u64 {
         self.tcr_el1
-    }
-
-    /// Cached aarch64 page-table walk parameters decoded from
-    /// [`Self::tcr_el1`]. `None` on x86_64 and on aarch64 when the
-    /// TCR decode fails (uninitialised register, reserved
-    /// encoding). Hot-path consumers feed it into
-    /// [`super::reader::GuestMem::translate_kva_with_aarch64_params`]
-    /// to skip the per-call decode.
-    pub fn aarch64_walk_params(&self) -> Option<&Aarch64WalkParams> {
-        self.aarch64_params.as_ref()
     }
 
     /// Bundle of the four paging fields ([`super::reader::WalkContext`])

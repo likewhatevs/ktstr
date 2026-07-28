@@ -128,29 +128,69 @@ pub fn acquire_build_reservation(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<BuildReservation> {
-    acquire_build_reservation_impl(cli_label, cpu_cap, false)
+    acquire_build_reservation_impl(cli_label, cpu_cap, false, None)
 }
 
 /// Acquire a build reservation, joining the progress-aware host queue when
 /// perf-mode work temporarily owns too much LLC capacity.
 ///
 /// Harness prebuilds use this variant because many independent CI invocations
-/// compile concurrently and have no source-tree lock to serialize them. A
-/// transient `LOCK_EX` holder must delay compilation, not abort the entire
-/// test job after four nonblocking probes. Kernel builds retain
-/// [`acquire_build_reservation`]'s interactive nonblocking behavior.
+/// compile concurrently and have no source-tree lock to serialize them. The
+/// resolved CPU budget is a ceiling: this path immediately takes the largest
+/// non-empty placement that does not overlap an exact VM reservation, and
+/// derives Cargo/make parallelism from that actual placement. It joins the
+/// queue only while every compatible CPU is occupied, then repeats that
+/// largest-fit plan on each wake. Direct kernel builds
+/// ([`acquire_build_reservation`]) instead hold a fixed exact width, but they
+/// too wait work-conservingly on that width through the same host queue rather
+/// than giving up the lane under transient contention.
 pub fn acquire_build_reservation_waiting(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
 ) -> Result<BuildReservation> {
-    acquire_build_reservation_impl(cli_label, cpu_cap, true)
+    acquire_build_reservation_impl(cli_label, cpu_cap, true, None)
+}
+
+/// Cancellation-aware harness-build reservation.
+///
+/// A signal-published `cancelled` flag interrupts either the ticket's futex
+/// wait or the coordinator's inotify wait, releasing the current elastic
+/// registry claim, partial LLC holds, and any completed plan before returning
+/// [`std::io::ErrorKind::Interrupted`]. Sizing otherwise matches
+/// [`acquire_build_reservation_waiting`].
+pub fn acquire_build_reservation_waiting_interruptible(
+    cli_label: &str,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<BuildReservation> {
+    acquire_build_reservation_impl(cli_label, cpu_cap, true, Some(cancelled))
+}
+
+/// Cancellation-aware harness-build reservation with synchronous wait ticks.
+///
+/// `progress` runs on the acquiring thread while an ordinary admission ticket is
+/// parked or its elected coordinator is blocked in inotify. The protocol only
+/// slices those blocking syscalls; reservation ordering, retry deadlines, and
+/// liveness deadlines are unchanged. Sizing otherwise matches
+/// [`acquire_build_reservation_waiting`].
+pub fn acquire_build_reservation_waiting_interruptible_with_progress(
+    cli_label: &str,
+    cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
+    cancelled: &std::sync::atomic::AtomicBool,
+    progress: impl FnMut() + 'static,
+) -> Result<BuildReservation> {
+    crate::vmm::host_topology::with_reservation_wait_progress(progress, || {
+        acquire_build_reservation_impl(cli_label, cpu_cap, true, Some(cancelled))
+    })
 }
 
 fn acquire_build_reservation_impl(
     cli_label: &str,
     cpu_cap: Option<crate::vmm::host_topology::CpuCap>,
-    wait: bool,
+    elastic: bool,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<BuildReservation> {
+    check_reservation_cancelled(cancelled)?;
     let bypass = crate::bypass_llc_locks_active();
     // INVARIANT: `_sandbox` is declared first and drops first per
     // Rust's declaration-order field-drop rule; this ensures the
@@ -171,17 +211,35 @@ fn acquire_build_reservation_impl(
         None
     } else if let Ok(host_topo) = crate::vmm::host_topology::HostTopology::from_sysfs() {
         let test_topo = crate::topology::TestTopology::from_system()?;
-        // Builds keep Consolidate placement: packing onto already-held
-        // LLCs leaves whole LLCs free for exclusive perf-mode
-        // reservations, and a build is throughput-elastic where a VM's
-        // vCPU threads are not (VMs use Spread — see `PlacementPolicy`).
-        let acquired_plan = crate::vmm::host_topology::acquire_llc_plan(
-            &host_topo,
-            &test_topo,
-            cpu_cap,
-            crate::vmm::host_topology::PlacementPolicy::Consolidate,
-            wait,
-        )?;
+        // Concurrent harness/scheduler prebuilds decouple cache footprint from
+        // CPU choice. They consolidate among LLCs carrying the effective
+        // free-first CPU set so whole cache domains remain available for
+        // hard-exclusive performance runs, then select least-held CPUs inside
+        // that footprint instead of converging on one busy CPU prefix. Their
+        // elastic width consumes currently unshared capacity first and retains
+        // cooperative SH overlap as the fully-occupied fallback.
+        //
+        // A direct kernel build keeps its fixed Consolidate contract. It is
+        // non-elastic and deliberately packs one bounded compile at its exact
+        // width rather than participating in the independently fanned-out
+        // harness-build storm. It waits work-conservingly for that width: the
+        // reservation is taken here BEFORE the source-tree flock below, so the
+        // wait holds no other lock, and it routes through the same event-driven
+        // registry admission that run claims use (`register_ticket_or_acquire`
+        // via the wait phase). Under contention it joins the host queue and
+        // re-plans on each coordinator wake instead of giving up the lane after
+        // a few TOCTOU retries — dead holders are pruned by the registry's
+        // liveness, and it never abandons a plan while live holders progress.
+        let acquired_plan = if elastic {
+            crate::vmm::host_topology::acquire_elastic_build_llc_plan(
+                &host_topo, &test_topo, cpu_cap, cancelled,
+            )?
+        } else {
+            crate::vmm::host_topology::acquire_build_llc_plan(
+                &host_topo, &test_topo, cpu_cap, true, cancelled,
+            )?
+        };
+        check_reservation_cancelled(cancelled)?;
         crate::vmm::host_topology::warn_if_cross_node_spill(&acquired_plan, &host_topo);
         Some(acquired_plan)
     } else {
@@ -216,6 +274,7 @@ fn acquire_build_reservation_impl(
         )?),
         None => None,
     };
+    check_reservation_cancelled(cancelled)?;
 
     // `make -jN` parallelism hint. `N` = `plan.cpus.len()` via
     // `make_jobs_for_plan` — the reserved CPU count, whether that
@@ -230,6 +289,18 @@ fn acquire_build_reservation_impl(
         _sandbox: sandbox,
         make_jobs,
     })
+}
+
+fn check_reservation_cancelled(cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "ktstr build-reservation acquisition interrupted",
+        )
+        .into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Acquire an exclusive flock on a per-source-canonical-path lockfile
@@ -260,12 +331,14 @@ fn acquire_build_reservation_impl(
 /// those sweeps.
 ///
 /// Try-then-wait: attempts a non-blocking acquire first. If
-/// contended, logs the holder (pid + cmdline from /proc/locks)
-/// and falls through to a blocking acquire that parks until the
-/// peer releases. When the blocking acquire returns, the peer's
-/// build is done and the cache likely contains the artifact —
-/// the caller checks the cache after we return and skips the
-/// build if the slot is populated.
+/// contended, reports the wait and falls through to a blocking
+/// acquire that parks until the peer releases. The wait path does
+/// not scan host-global `/proc/locks`: on a storm host that scan can
+/// itself take seconds, delaying the actual flock wait without
+/// affecting correctness. When the blocking acquire returns, the
+/// peer's build is done and the cache likely contains the artifact —
+/// the caller checks the cache after we return and skips the build
+/// if the slot is populated.
 ///
 /// Distinct from the cache-entry flock acquired inside
 /// [`crate::cache::CacheDir::store`]: that lock serializes the
@@ -275,6 +348,14 @@ fn acquire_build_reservation_impl(
 pub(crate) fn acquire_source_tree_lock(
     canonical: &Path,
     cli_label: &str,
+) -> Result<std::os::fd::OwnedFd> {
+    acquire_source_tree_lock_with_wait_hook(canonical, cli_label, || {})
+}
+
+fn acquire_source_tree_lock_with_wait_hook(
+    canonical: &Path,
+    cli_label: &str,
+    on_wait: impl FnOnce(),
 ) -> Result<std::os::fd::OwnedFd> {
     use anyhow::Context;
 
@@ -295,21 +376,14 @@ pub(crate) fn acquire_source_tree_lock(
         Some(fd) => Ok(fd),
         None => {
             // Non-blocking acquire failed (EWOULDBLOCK) — a live
-            // peer holds the lock. Surface the holder, then block
-            // until they release. When the blocking acquire
-            // returns, the peer's build is done and the cache
-            // likely contains the artifact we need — the caller
-            // checks the cache after we return, so it will skip
-            // the build if the peer populated the slot.
-            let holders = crate::flock::read_holders(&lock_path).unwrap_or_default();
-            let holder_text = if holders.is_empty() {
-                String::from("(holder not identified via /proc/locks)")
-            } else {
-                crate::flock::format_holder_list(&holders)
-            };
-            eprintln!(
+            // peer holds the lock. Publish the transition before
+            // entering the blocking syscall; production uses a no-op
+            // hook while the test seam observes it without polling
+            // host-global `/proc/locks`.
+            on_wait();
+            crate::ktstr_status!(
                 "{cli_label}: source tree {} is locked by a concurrent ktstr \
-                 build — waiting for it to finish.\n{holder_text}",
+                 build — waiting for it to finish.",
                 canonical.display(),
             );
             crate::flock::block_flock(&lock_path, crate::flock::FlockMode::Exclusive).with_context(
@@ -359,7 +433,7 @@ enum MidWaitState {
 
 impl MidWaitState {
     /// Operator-facing diagnostic body (without the `{cli_label}: `
-    /// prefix — caller composes via `eprintln!("{cli_label}: {body}")`).
+    /// prefix — caller composes via `crate::ktstr_status!("{cli_label}: {body}")`).
     ///
     /// Returns `None` for [`Self::Clean`] (the cache-skip gate emits
     /// its own message) and [`Self::PreAcquireDirty`] (the wait was
@@ -387,7 +461,7 @@ impl MidWaitState {
 
 /// Operator-facing diagnostic body emitted when the post-mid-wait
 /// `cache_lookup` short-circuit fires (without the `{cli_label}: `
-/// prefix — caller composes via `eprintln!("{cli_label}: {body}")`,
+/// prefix — caller composes via `crate::ktstr_status!("{cli_label}: {body}")`,
 /// matching the [`MidWaitState::diagnostic`] convention).
 ///
 /// Separate from [`MidWaitState::diagnostic`] because the cache-hit
@@ -545,15 +619,14 @@ pub fn kernel_build_pipeline(
     // env var already declares "I accept noise from concurrent runs."
     //
     // `acquire_source_tree_lock` does a non-blocking `try_flock`
-    // first; on EWOULDBLOCK it surfaces the holder via
-    // `/proc/locks` (so the operator's terminal shows which peer is
-    // holding the lock) and then parks in a blocking `flock(LOCK_EX)`
-    // until the holder releases. The wait is intentional: when the
-    // peer's build finishes, the cache slot is likely populated and
-    // the post-acquire cache check below short-circuits the
-    // redundant rebuild. The pre-wait `eprintln!` inside
-    // `acquire_source_tree_lock` ensures the operator sees what
-    // they're waiting on rather than a silent stall.
+    // first; on EWOULDBLOCK it reports the source path and then parks
+    // in a blocking `flock(LOCK_EX)` until the holder releases. It
+    // deliberately avoids a host-global `/proc/locks` attribution
+    // scan before parking. The wait is intentional: when the peer's
+    // build finishes, the cache slot is likely populated and the
+    // post-acquire cache check below short-circuits the redundant
+    // rebuild. The pre-wait `eprintln!` ensures the operator sees
+    // what they're waiting on rather than a silent stall.
     let _source_lock = if is_local_source && !crate::bypass_llc_locks_active() {
         Some(acquire_source_tree_lock(source_dir, cli_label)?)
     } else {
@@ -572,7 +645,7 @@ pub fn kernel_build_pipeline(
     let mid_wait_clean = mid_wait_state == MidWaitState::Clean;
 
     if let Some(body) = mid_wait_state.diagnostic() {
-        eprintln!("{cli_label}: {body}");
+        crate::ktstr_status!("{cli_label}: {body}");
     }
 
     if !force
@@ -581,7 +654,7 @@ pub fn kernel_build_pipeline(
             crate::cli::resolve::cache_lookup(cache, &acquired.cache_key, cli_label)
         && entry.image_path().exists()
     {
-        eprintln!("{cli_label}: {}", cache_hit_diagnostic(&acquired.cache_key));
+        crate::ktstr_status!("{cli_label}: {}", cache_hit_diagnostic(&acquired.cache_key));
         let image_path = entry.image_path();
         return Ok(KernelBuildResult {
             entry: Some(entry),
@@ -592,11 +665,11 @@ pub fn kernel_build_pipeline(
 
     if clean {
         if !is_local_source {
-            eprintln!(
+            crate::ktstr_status!(
                 "{cli_label}: --clean is only meaningful with a --kernel <path> source (downloaded/cloned sources start clean)"
             );
         } else {
-            eprintln!("{cli_label}: make mrproper");
+            crate::ktstr_status!("{cli_label}: make mrproper");
             run_make(source_dir, &["mrproper"])?;
         }
     }
@@ -631,14 +704,14 @@ pub fn kernel_build_pipeline(
 
     // Cache (skip for dirty local trees).
     if acquired.is_dirty {
-        eprintln!("{cli_label}: kernel built at {}", image_path.display());
+        crate::ktstr_status!("{cli_label}: kernel built at {}", image_path.display());
         // Branch the hint wording: commit/stash is only an actionable
         // remediation for an actual git repo. A non-git source tree
         // is force-marked dirty (see `acquire_local_source` in
         // `fetch.rs`) because dirty detection is impossible, and
         // telling the operator to "commit or stash" leads nowhere.
         let hint = dirty_cache_skip_hint(acquired.is_git);
-        eprintln!("{cli_label}: {hint}");
+        crate::ktstr_status!("{cli_label}: {hint}");
         return Ok(KernelBuildResult {
             entry: None,
             image_path,
@@ -877,10 +950,10 @@ fn find_built_image(
         let orig_mib = std::fs::metadata(&vmlinux_path)
             .map(|m| m.len() as f64 / (1024.0 * 1024.0))
             .unwrap_or(0.0);
-        eprintln!("{cli_label}: caching vmlinux ({orig_mib:.0} MiB, will be stripped)");
+        crate::ktstr_status!("{cli_label}: caching vmlinux ({orig_mib:.0} MiB, will be stripped)");
         Some(vmlinux_path)
     } else {
-        eprintln!("{cli_label}: warning: vmlinux not found, BTF will not be cached");
+        crate::ktstr_status!("{cli_label}: warning: vmlinux not found, BTF will not be cached");
         None
     };
     Ok((image_path, vmlinux_opt))
@@ -920,13 +993,14 @@ fn post_build_dirty_skip(
                 let (skip, hash_changed) =
                     post_build_cache_store_skip(&post, acquired.kernel_source.as_local_git_hash());
                 if skip {
-                    eprintln!(
+                    crate::ktstr_status!(
                         "{cli_label}: source tree changed during build \
                          (acquire-time dirty={}, post-build dirty={}; \
                          hash_changed={hash_changed}); skipping cache store \
                          to avoid recording a stale identity. Re-run after \
                          the working tree settles to populate the cache.",
-                        acquired.is_dirty, post.is_dirty,
+                        acquired.is_dirty,
+                        post.is_dirty,
                     );
                     return Some(KernelBuildResult {
                         entry: None,
@@ -1024,7 +1098,7 @@ fn build_metadata_and_store(
     let entry = match cache.store(&acquired.cache_key, &artifacts, &metadata) {
         Ok(entry) => {
             success(&format!("\u{2713} Kernel cached: {}", acquired.cache_key));
-            eprintln!("{cli_label}: image: {}", entry.image_path().display());
+            crate::ktstr_status!("{cli_label}: image: {}", entry.image_path().display());
             if crate::remote_cache::is_enabled() {
                 crate::remote_cache::remote_store(&entry, cli_label);
             }
@@ -2055,37 +2129,21 @@ mod tests {
     /// holder releases, then succeeds. Pins the try-then-wait
     /// contract: a regression that re-introduced the bail-on-EWOULDBLOCK
     /// behavior, or any other path that returns without ever calling
-    /// `flock(LOCK_EX)` blocking, would surface here as either the
-    /// `/proc/locks` waiter scan timing out (no `-> FLOCK` line ever
-    /// appears against the lockfile inode) or the worker's elapsed
-    /// time being below the holder-retention window.
+    /// `flock(LOCK_EX)` blocking, would either bypass the wait hook,
+    /// complete while the original holder remains live, or fail to
+    /// acquire after that holder releases.
     ///
     /// We simulate "concurrent peer" by holding the first FD on the
-    /// main thread, spawn a worker that issues a second acquire (which
-    /// blocks in `block_flock`), poll `/proc/locks` until the kernel
-    /// records the worker as a waiter against the lockfile inode
-    /// (kernel emits blocked flock waiters as lines containing both
-    /// `->` and the `{major:02x}:{minor:02x}:{inode}` triple — see
-    /// `fs/locks.c::lock_get_status`), retain the holder for a fixed
-    /// window after the waiter appears so the worker's blocking call
-    /// can be measured, drop the holder, then collect the worker's
-    /// `Result` via `recv_timeout` so a real regression that caused
-    /// the worker to hang forever surfaces as a bounded test failure
-    /// rather than an indefinite test-runner stall.
-    ///
-    /// Two assertions guard the blocking semantic together:
-    ///   1. The `/proc/locks` waiter scan: proves the worker entered
-    ///      the kernel's blocked-flock state. A non-blocking
-    ///      regression never enters that state.
-    ///   2. The worker's measured elapsed time `>= HOLD_WINDOW`:
-    ///      proves the worker stayed parked until the holder
-    ///      released. A non-blocking regression that eagerly
-    ///      returned `Err` would record a near-zero elapsed time
-    ///      even if the waiter scan happened to be flaky.
+    /// main thread, spawn a worker that issues a second acquire, wait
+    /// for the contended-path hook immediately before `block_flock`,
+    /// assert that the worker has not completed, release the holder,
+    /// and collect the successful acquisition. The hook makes this
+    /// fully event-driven and avoids a host-global `/proc/locks` scan,
+    /// whose cost scales with every runner on a storm host.
     #[test]
     fn acquire_source_tree_lock_blocks_on_contention_then_succeeds() {
         use crate::test_support::test_helpers::{isolated_cache_dir, lock_env};
-        // `_env_lock` and `cache` MUST outlive the spawned worker
+        // `_env_lock` and `_cache` MUST outlive the spawned worker
         // thread. The worker reads `KTSTR_CACHE_DIR` inside
         // `acquire_source_tree_lock`'s `CacheDir::new()`; if
         // `IsolatedCacheDir`'s drop ran while the worker was still
@@ -2095,153 +2153,41 @@ mod tests {
         // below are declared here and dropped at end-of-scope, AFTER
         // the explicit `worker_result` collection point below.
         let _env_lock = lock_env();
-        let cache = isolated_cache_dir();
+        let _cache = isolated_cache_dir();
         let canonical = std::path::PathBuf::from("/tmp/fake-source-contention");
         let holder = acquire_source_tree_lock(&canonical, "test")
             .expect("first acquire must succeed under isolated cache");
 
-        // Re-derive the lockfile path so we can needle `/proc/locks`
-        // for waiter lines below. The production code constructs the
-        // same path via `CacheDir::lock_path(format!("source-{hash}"))`
-        // — see [`acquire_source_tree_lock`] above. The lockfile was
-        // materialized by the holder's successful `try_flock` open
-        // (O_CREAT), so by this point the inode exists on disk and
-        // `needle_from_path` can stat it.
-        let path_hash = crate::fetch::canonical_path_hash(&canonical);
-        let lock_path = cache
-            .path()
-            .join(crate::flock::LOCK_DIR_NAME)
-            .join(format!("source-{path_hash}.lock"));
-        let needle = crate::flock::mountinfo::needle_from_path(&lock_path)
-            .expect("needle_from_path must resolve the lockfile inode");
-
-        // Spawn a worker that issues the second acquire. The worker's
-        // non-blocking `try_flock` will see the held lock and fall
-        // through to `block_flock`, which parks the worker thread in
-        // `flock(2)` until the holder's FD closes. `OwnedFd` and
-        // `anyhow::Error` are both `Send`, so the `Result<OwnedFd>`
-        // returns through the channel below. The worker also
-        // captures its own elapsed time around the
-        // `acquire_source_tree_lock` call so the assertion below can
-        // verify the blocking path actually executed for the holder
-        // retention window — a regression that returned non-blockingly
-        // without parking in the kernel would surface as a near-zero
-        // elapsed value even if the `/proc/locks` waiter scan happened
-        // to be flaky.
-        //
-        // `sync_channel(1)`: a single-slot buffered channel lets the
-        // worker `send` and exit even if the main thread already
-        // panicked from an earlier assertion failure (rendezvous
-        // bound-0 would leave the worker parked in `send` forever,
-        // a thread leak on top of an already-failed test). A worker
-        // that hangs forever before reaching `send` leaves the
-        // channel empty and the `recv_timeout` below bails the test
-        // within 5s rather than hanging the test runner indefinitely.
         let worker_canonical = canonical.clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(
-            std::result::Result<std::os::fd::OwnedFd, anyhow::Error>,
-            std::time::Duration,
-        )>(1);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         let _worker = std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            let result = acquire_source_tree_lock(&worker_canonical, "test");
-            let elapsed = started.elapsed();
-            // Send result + elapsed through the rendezvous channel.
-            // If the main thread already abandoned the test (panic)
-            // before the worker reached this point the send fails;
-            // discarding the failure is correct because the test is
-            // already failing for a different reason.
-            let _ = tx.send((result, elapsed));
+            let result = acquire_source_tree_lock_with_wait_hook(&worker_canonical, "test", || {
+                let _ = waiting_tx.send(());
+            });
+            let _ = result_tx.send(result);
         });
 
-        // Poll `/proc/locks` for a waiter line against the lockfile
-        // inode. The kernel emits one `-> FLOCK ... {dev}:{ino}` line
-        // per blocked waiter (`fs/locks.c::lock_get_status` — the
-        // leading `-> ` distinguishes a waiter from a holder); seeing
-        // such a line proves the worker is parked in `flock(2)`.
-        // `parse_flock_pids_for_needle` (the production scanner) does
-        // NOT match `-> FLOCK` lines because it filters on `FLOCK` in
-        // field-2, so the test scans the raw text directly with the
-        // `->` + needle byte-pattern documented in the user-facing
-        // task description.
-        //
-        // 10ms poll interval × 500 iterations = 5s deadline. A
-        // healthy host enters the waiter state within a single
-        // 10ms tick; the 5s ceiling exists only to bail a
-        // pathologically-slow CI runner before the test runner's
-        // own hang detector fires.
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-        const POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
-        let poll_start = std::time::Instant::now();
-        let mut waiter_observed = false;
-        while poll_start.elapsed() < POLL_DEADLINE {
-            let contents = std::fs::read_to_string("/proc/locks")
-                .expect("/proc/locks must be readable on a Linux host");
-            if contents
-                .lines()
-                .any(|line| line.contains("->") && line.contains(&needle))
-            {
-                waiter_observed = true;
-                break;
-            }
-            std::thread::sleep(POLL_INTERVAL);
-        }
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("contended acquire must publish the blocking transition");
         assert!(
-            waiter_observed,
-            "no `-> FLOCK ... {needle}` waiter line appeared in \
-             /proc/locks within {POLL_DEADLINE:?} — worker did not \
-             enter the kernel's blocked-flock state, which means \
-             `acquire_source_tree_lock` regressed off the blocking path",
+            matches!(
+                result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "the contended acquisition must not complete while the holder is live",
         );
 
-        // Hold the lock for `HOLD_WINDOW` AFTER the waiter is
-        // observed so the worker's measured elapsed time provably
-        // exceeds the window. A regression that returned
-        // non-blockingly would still record a sub-window elapsed
-        // time even if a waiter line happened to flicker through
-        // /proc/locks for unrelated reasons; the elapsed-window
-        // assertion catches that. The window is wall-clock from
-        // observation, not from worker entry, so the worker's
-        // measured elapsed includes its own pre-park work plus the
-        // window — `worker_elapsed >= HOLD_WINDOW` is sufficient.
-        const HOLD_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
-        std::thread::sleep(HOLD_WINDOW);
-
-        // Drop the holder. The worker's blocking flock(2) returns,
-        // it acquires the lock, and the worker thread sends its
-        // result through the channel.
         drop(holder);
-
-        // `recv_timeout` bounds the test's worst-case wall time.
-        // Healthy worker delivers within microseconds of the
-        // holder drop; the 5s ceiling fires only on a true
-        // regression (worker stuck, fd not released, etc.).
-        let (worker_result, worker_elapsed) =
-            rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
-                "worker must deliver its acquire result within 5s of \
-                 holder release — a regression that caused the worker \
-                 to hang forever lands here",
-            );
+        let worker_result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("worker must deliver after the holder releases");
         let acquired = worker_result.expect("worker acquire must succeed once the holder releases");
-
-        // Elapsed-window assertion: the worker's measured time around
-        // `acquire_source_tree_lock` must be at least the holder
-        // retention window, because the worker was parked in
-        // `flock(2)` for at least that long after `/proc/locks`
-        // observed the waiter line. A revert to non-blocking
-        // EWOULDBLOCK behavior would record a sub-window elapsed
-        // value here and fail this assertion even if the
-        // `/proc/locks` waiter scan happened to flake-pass.
-        assert!(
-            worker_elapsed >= HOLD_WINDOW,
-            "worker's acquire returned in {worker_elapsed:?}, less than \
-             the {HOLD_WINDOW:?} holder-retention window — worker did \
-             not actually block on the held flock",
-        );
 
         // Drop the worker's FD explicitly so the lockfile flock
         // releases before the isolated cache dir is torn down.
-        // `_env_lock` and `cache` are bound at function-scope above
+        // `_env_lock` and `_cache` are bound at function-scope above
         // and drop at end-of-scope, AFTER this point.
         drop(acquired);
     }

@@ -18,13 +18,12 @@ use anyhow::Result;
 
 /// Minimum guest memory (MiB) for test entries that enable wprof.
 ///
-/// Derivation: `WprofConfig::default_args` requests
-/// `--ringbuf-size=256000 --ringbuf-cnt=8`. wprof rounds the
-/// 256000 KB request up to the next power of two (262144 KB =
-/// 256 MiB) per ringbuf, times 8 ringbufs = 2048 MiB BPF arena.
-/// On guests below this, wprof OOM-kills mid-run before it can
-/// emit the Perfetto `.pb` trace, producing a truncated artifact
-/// and a confused test author.
+/// Derivation: `WprofConfig::default_args` requests a single 16 MiB
+/// BPF ring buffer (`--ringbuf-size=16384 --ringbuf-cnt=1`). wprof
+/// faults the whole arena in on capture, so guest RAM must cover it.
+/// The floor is computed from the default ringbuf constants at
+/// `crate::test_support::runtime::WPROF_MIN_MEMORY_MIB` (16 MiB), so
+/// editing `--ringbuf-size`/`--ringbuf-cnt` moves the floor with them.
 ///
 /// Applied as a floor by
 /// `crate::test_support::runtime::derive_test_memory_mib` —
@@ -38,19 +37,21 @@ use anyhow::Result;
 /// the two VMs is also required for stall reproducibility.
 ///
 /// The floor applies when the derived memory
-/// `max(cpus*64, 256, entry.memory_mib)` falls below 2048 MiB
-/// AND `entry.wprof` is true. An operator-supplied
-/// `crate::test_support::topo::TopoOverride` with explicit
-/// `memory_mib` is honored verbatim per the override-is-verbatim
-/// contract — a warn-level log fires when the override conflicts
-/// with the floor, but the operator's choice wins. Shell-mode VMs
+/// `max(cpus*64, 256, entry.memory_mib)` falls below it AND
+/// `entry.wprof` is true. At the minimal default the 16 MiB arena
+/// sits below the universal 256 MiB memory floor, so this floor is
+/// subsumed and never bumps a real VM — the point is that the
+/// default no longer oversizes; it re-engages only if the default
+/// ringbuf sizing grows the arena past the universal floor. A test
+/// that overrides to a larger arena via
+/// `#[ktstr_test(wprof_args = "...")]` must raise its own
+/// `memory_mib` if that arena exceeds the guest's normal memory. An
+/// operator-supplied `crate::test_support::topo::TopoOverride` with
+/// explicit `memory_mib` is honored verbatim per the
+/// override-is-verbatim contract. Shell-mode VMs
 /// (`cargo ktstr shell --kernel ...`) bypass this floor entirely;
 /// the operator sets memory size via shell-mode CLI args.
-///
-/// Tracks `WprofConfig::default_args`: a future change to
-/// `--ringbuf-size` or `--ringbuf-cnt` invalidates the 2048
-/// derivation and this const should move with the args.
-pub const WPROF_MIN_MEMORY_MIB: u32 = 2048;
+pub const WPROF_MIN_MEMORY_MIB: u32 = crate::test_support::runtime::WPROF_MIN_MEMORY_MIB;
 
 /// Apply the wprof memory floor to a raw memory size.
 ///
@@ -70,11 +71,7 @@ pub const WPROF_MIN_MEMORY_MIB: u32 = 2048;
 /// conditional are a regression per the
 /// derive_test_memory_mib/attach_wprof_if_requested precedent.
 pub fn apply_wprof_memory_floor(raw_mib: u32, wprof: bool) -> u32 {
-    if wprof && raw_mib < WPROF_MIN_MEMORY_MIB {
-        WPROF_MIN_MEMORY_MIB
-    } else {
-        raw_mib
-    }
+    crate::test_support::runtime::apply_wprof_memory_floor(raw_mib, wprof)
 }
 
 /// wprof invocation args + binary path. Passed to
@@ -119,24 +116,31 @@ impl WprofConfig {
     }
 
     /// Default wprof args used by the auto-repro pipeline:
-    /// `-d 500 -e sched --ringbuf-size=256000 --ringbuf-cnt=8`.
+    /// `-d 500 -e sched --ringbuf-size=16384 --ringbuf-cnt=1`.
     ///
-    /// Capture window: 500 ms of sched-event tracing. Ringbuf
-    /// sizing tuned for the scheduler-event volume expected from
-    /// ktstr's typical workload shapes. Override per-test by
-    /// constructing a [`WprofConfig`] with a custom `args` vec.
+    /// Capture window: 500 ms of sched-event tracing into a single
+    /// 16 MiB BPF ring buffer — wprof's own per-buffer default
+    /// (`DEFAULT_RINGBUF_SZ`), the minimal arena that still captures
+    /// ktstr's short sched traces without dropping. The ringbuf
+    /// sizing comes from
+    /// [`crate::test_support::runtime::WPROF_DEFAULT_RINGBUF_SIZE_KB`]
+    /// and [`crate::test_support::runtime::WPROF_DEFAULT_RINGBUF_CNT`]
+    /// so the flags and the derived [`WPROF_MIN_MEMORY_MIB`] floor
+    /// stay in lockstep. Override per-test by constructing a
+    /// [`WprofConfig`] with a custom `args` vec (or, from a test,
+    /// `#[ktstr_test(wprof_args = "...")]`).
     pub fn default_args() -> Vec<String> {
-        [
-            "-d",
-            "500",
-            "-e",
-            "sched",
-            "--ringbuf-size=256000",
-            "--ringbuf-cnt=8",
+        use crate::test_support::runtime::{
+            WPROF_DEFAULT_RINGBUF_CNT, WPROF_DEFAULT_RINGBUF_SIZE_KB,
+        };
+        vec![
+            "-d".to_string(),
+            "500".to_string(),
+            "-e".to_string(),
+            "sched".to_string(),
+            format!("--ringbuf-size={WPROF_DEFAULT_RINGBUF_SIZE_KB}"),
+            format!("--ringbuf-cnt={WPROF_DEFAULT_RINGBUF_CNT}"),
         ]
-        .into_iter()
-        .map(String::from)
-        .collect()
     }
 
     /// Render the args as a delimited string suitable for passing on

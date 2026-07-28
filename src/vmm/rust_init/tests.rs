@@ -591,8 +591,7 @@ fn poll_startup_reports_alive_after_timeout() {
 /// touching the kernel. POSIX kill(2) reserves 0 (caller's pgrp)
 /// and negative values (signal pgrp), neither of which the
 /// scheduler-lifecycle call site ever wants. The check is a
-/// programming-error guard for callers that fail to validate
-/// SCHED_PID readouts.
+/// programming-error guard for callers that fail to validate a pid.
 #[test]
 fn kill_scheduler_process_invalid_pid_returns_err() {
     assert_eq!(
@@ -737,56 +736,6 @@ fn kill_scheduler_process_ignoring_sigterm_child_escalates_to_sigkill() {
     assert_eq!(outcome, Ok(KillSchedulerOutcome::EscalatedToSigkill));
 }
 
-/// kill_scheduler_process MUST NOT mutate SCHED_PID — the design
-/// contract on `kill_scheduler_process` (see its `# Pid lifecycle
-/// semantic` doc in process.rs) explicitly keeps the helper
-/// generic-pid (no implicit singleton-pid assumption) and defers
-/// SCHED_PID ownership to the dispatcher (the future
-/// Op::DetachScheduler arm). This test pins that contract against
-/// a future "improvement" that adds an implicit SCHED_PID reset
-/// for symmetry with the dispatcher path — silent decoupling
-/// breakage that would couple kill-pid choice to the singleton
-/// scheduler pid in unintended ways.
-///
-/// Seeds SCHED_PID with a sentinel distinct from any spawnable
-/// pid (99_999_999 > Linux's default kernel.pid_max), exercises
-/// kill_scheduler_process against an unrelated /bin/sleep pid,
-/// and asserts the sentinel survives. Restores SCHED_PID to 0
-/// at end so subsequent tests see a clean baseline.
-#[test]
-fn kill_scheduler_process_does_not_mutate_sched_pid() {
-    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
-    let _restore = SigchldGuard::install(libc::SIG_IGN);
-
-    let original = SCHED_PID.load(Ordering::Acquire);
-    let sentinel: i32 = 99_999_999;
-    SCHED_PID.store(sentinel, Ordering::Release);
-
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("60")
-        .spawn()
-        .expect("spawn /bin/sleep");
-    let pid = child.id() as libc::pid_t;
-    let _ = kill_scheduler_process(pid, std::time::Duration::from_millis(500));
-    let _ = child.wait();
-
-    let observed = SCHED_PID.load(Ordering::Acquire);
-    // Restore BEFORE the assert so a failure does not leak
-    // sentinel state to subsequent tests.
-    SCHED_PID.store(original, Ordering::Release);
-
-    assert_eq!(
-        observed, sentinel,
-        "kill_scheduler_process(pid={pid}) mutated SCHED_PID \
-         (sentinel={sentinel}, observed={observed}); the helper \
-         must NOT touch SCHED_PID — that side channel is the \
-         dispatcher's responsibility per the helper's design \
-         decoupling. A future commit that adds an implicit reset \
-         couples the helper to singleton-pid semantics that the \
-         design explicitly avoids."
-    );
-}
-
 /// SIGCHLD signal disposition is process-wide, so the
 /// `with_sigchld_default_*`, `poll_startup_*_under_sigchld_ignore`,
 /// `kill_scheduler_process_*`, and `sched_pid_*` regression tests
@@ -856,11 +805,14 @@ fn verifier_cleanup_rejects_pidfd_ready_zombie() {
         "SIGCHLD=SIG_DFL keeps the exited child as a proc-visible zombie",
     );
     assert!(
-        sched_exit_observed(libc::POLLIN, true),
+        sched_exit_observed(libc::POLLIN).expect("valid pidfd event"),
         "pidfd POLLIN must outrank a still-present zombie proc entry",
     );
-    assert!(!sched_exit_observed(0, true));
-    assert!(sched_exit_observed(0, false));
+    assert!(
+        !sched_exit_observed(0).expect("empty pidfd event"),
+        "numeric pid/proc disappearance is not scheduler identity evidence",
+    );
+    assert!(sched_exit_observed(libc::POLLNVAL).is_err());
 
     // Linux accepts a signal directed at a zombie. That syscall success must
     // not be mistaken for proof that cleanup killed a live scheduler.
@@ -874,6 +826,166 @@ fn verifier_cleanup_rejects_pidfd_ready_zombie() {
     assert!(
         !verifier_cleanup_kill_confirmed(kill_sent, Some(&status)),
         "natural exit status must fail even when kill(2) returned success",
+    );
+}
+
+fn open_pidfd_for_sched_exit_test(pid: u32) -> OwnedFd {
+    // SAFETY: pidfd_open on a child owned by this test with flags zero. A
+    // non-negative return is a new descriptor transferred into OwnedFd.
+    let raw =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) as libc::c_int };
+    assert!(
+        raw >= 0,
+        "pidfd_open({pid}) failed: {}",
+        std::io::Error::last_os_error(),
+    );
+    unsafe { OwnedFd::from_raw_fd(raw) }
+}
+
+static OWNER_TEST_SPEC_A: crate::test_support::SchedulerSpec =
+    crate::test_support::SchedulerSpec::Discover("owner-test-a");
+static OWNER_TEST_SPEC_B: crate::test_support::SchedulerSpec =
+    crate::test_support::SchedulerSpec::Discover("owner-test-b");
+
+#[test]
+fn restart_identity_comes_from_declared_boot_spec() {
+    install_boot_scheduler(Some(&OWNER_TEST_SPEC_A));
+    let restart = boot_scheduler().expect("declared boot scheduler");
+    assert!(std::ptr::eq(restart, &OWNER_TEST_SPEC_A));
+    assert!(
+        !std::ptr::eq(restart, &OWNER_TEST_SPEC_B),
+        "Restart must not inherit the staged current scheduler identity"
+    );
+}
+
+fn scheduler_owner_test_process(
+    generation: u64,
+    log_path: &str,
+    scheduler: &'static crate::test_support::SchedulerSpec,
+) -> CurrentSchedulerProcess {
+    let child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn scheduler owner stand-in");
+    let pidfd = open_pidfd_for_sched_exit_test(child.id());
+    let monitor_pidfd = pidfd.try_clone().expect("clone exact monitor pidfd");
+    let monitor = start_sched_exit_monitor(
+        child.id(),
+        monitor_pidfd,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .expect("start scheduler owner monitor");
+    CurrentSchedulerProcess {
+        generation,
+        child,
+        pidfd,
+        log_path: log_path.to_string(),
+        scheduler: Some(scheduler),
+        monitor: Some(monitor),
+        drop_reap_exhausted: false,
+    }
+}
+
+#[test]
+fn scheduler_owner_install_take_keeps_one_coherent_record() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+    let slot = std::sync::Mutex::new(None);
+    let mut owner = scheduler_process_owner_for_test(&slot);
+    let process = scheduler_owner_test_process(41, "/tmp/owner-a.log", &OWNER_TEST_SPEC_A);
+    let pid = process.pid();
+
+    assert!(owner.install(process).is_ok(), "install empty local owner");
+    let current = owner.current().expect("owner published");
+    assert_eq!(current.pid(), pid);
+    assert_eq!(current.generation, 41);
+    assert_eq!(current.log_path, "/tmp/owner-a.log");
+    assert!(std::ptr::eq(
+        current.scheduler.expect("scheduler spec"),
+        &OWNER_TEST_SPEC_A
+    ));
+    assert!(current.monitor.is_some());
+
+    let mut taken = owner.take().expect("take coherent owner");
+    assert!(owner.current().is_none());
+    assert_eq!(taken.pid(), pid);
+    assert_eq!(taken.generation, 41);
+    assert_eq!(taken.log_path, "/tmp/owner-a.log");
+    let _ = taken.stop_monitor();
+    taken.terminate_exact().expect("exact cleanup");
+}
+
+#[test]
+fn exact_owner_cleanup_leaves_unrelated_process_alive() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+    let mut unrelated = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn unrelated process");
+    let mut owned = scheduler_owner_test_process(42, "/tmp/owner-b.log", &OWNER_TEST_SPEC_B);
+    let _ = owned.stop_monitor();
+    owned.terminate_exact().expect("exact owner cleanup");
+    assert!(
+        matches!(unrelated.try_wait(), Ok(None)),
+        "pidfd cleanup of owner A must not touch unrelated process B"
+    );
+    unrelated.kill().expect("kill unrelated process");
+    unrelated.wait().expect("reap unrelated process");
+}
+
+#[test]
+fn pidfd_liveness_does_not_consume_child_wait_status() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+    let mut owned = scheduler_owner_test_process(43, "/tmp/owner-c.log", &OWNER_TEST_SPEC_A);
+    let _ = owned.stop_monitor();
+    assert_eq!(
+        owned.send_signal(libc::SIGKILL),
+        Ok(PidfdSignalOutcome::Delivered)
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while owned.is_alive().expect("pidfd liveness") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pidfd did not report scheduler exit"
+        );
+        std::thread::yield_now();
+    }
+    let status = owned
+        .child
+        .wait()
+        .expect("pidfd liveness must leave Child status unconsumed");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert_eq!(
+        owned.send_signal(libc::SIGKILL),
+        Ok(PidfdSignalOutcome::AlreadyExited),
+        "an already-readable/reaped pidfd must not claim signal delivery"
+    );
+}
+
+#[test]
+fn sigchld_ignored_terminal_reap_is_not_reported_as_timeout() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_IGN);
+    let mut owned = scheduler_owner_test_process(44, "/tmp/owner-sigign.log", &OWNER_TEST_SPEC_A);
+    let _ = owned.stop_monitor();
+    assert_eq!(
+        owned.send_signal(libc::SIGKILL),
+        Ok(PidfdSignalOutcome::Delivered)
+    );
+
+    let outcome = owned.reap_bounded_status(std::time::Duration::from_secs(5));
+    assert!(
+        matches!(outcome, SchedulerReapOutcome::TerminalWithoutStatus),
+        "pidfd terminal readiness under SIGCHLD=SIG_IGN must be distinguished \
+         from a live-process timeout (got {outcome:?})"
+    );
+    assert!(
+        !owned.drop_reap_exhausted,
+        "an auto-reaped terminal process must not consume Drop's reap budget"
     );
 }
 
@@ -896,13 +1008,20 @@ fn sched_exit_monitor_reports_an_unreaped_zombie() {
         "the child must remain an unreaped proc-visible zombie",
     );
 
-    let stop = start_sched_exit_monitor(
-        Some(pid as u32),
+    let pidfd = open_pidfd_for_sched_exit_test(pid as u32);
+    let stop = start_pending_sched_exit_monitor(
+        pid as u32,
+        pidfd,
         None,
         Arc::new(AtomicBool::new(false)),
         None,
     )
-    .expect("start monitor on zombie");
+    .expect("start pending monitor on zombie");
+    assert_eq!(
+        stop.commit(),
+        Err(SchedExitTerminal::Exited),
+        "an unreaped zombie cannot be committed as the current scheduler"
+    );
     assert!(
         stop.stop_and_join(),
         "pidfd readiness must propagate through the actual monitor join result",
@@ -910,6 +1029,65 @@ fn sched_exit_monitor_reports_an_unreaped_zombie() {
 
     let status = child.wait().expect("reap scheduler stand-in");
     assert_eq!(status.code(), Some(9));
+}
+
+#[test]
+fn sched_exit_monitor_accepts_an_already_readable_handed_off_pidfd() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn scheduler stand-in");
+    let pid = child.id();
+    let pidfd = open_pidfd_for_sched_exit_test(pid);
+    child.kill().expect("kill scheduler stand-in");
+    child.wait().expect("reap scheduler stand-in");
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "the numeric pid must be gone before monitor installation",
+    );
+
+    let stop =
+        start_pending_sched_exit_monitor(pid, pidfd, None, Arc::new(AtomicBool::new(false)), None)
+            .expect("install pending monitor from the handed-off readable pidfd");
+    assert_eq!(
+        stop.commit(),
+        Err(SchedExitTerminal::Exited),
+        "an already-readable pidfd must reject owner publication"
+    );
+    assert!(
+        stop.stop_and_join(),
+        "an already-readable pidfd must be observed without reopening the numeric pid",
+    );
+}
+
+#[test]
+fn sched_exit_monitor_thread_spawn_failure_is_synchronous() {
+    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
+    let _restore = SigchldGuard::install(libc::SIG_DFL);
+
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn scheduler stand-in");
+    let pid = child.id();
+    let pidfd = open_pidfd_for_sched_exit_test(pid);
+    let error = match start_sched_exit_monitor_with_spawn_failure_for_test(pid, pidfd) {
+        Ok(_) => panic!("injected thread spawn failure unexpectedly installed a monitor"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(
+        error
+            .to_string()
+            .contains("injected sched-exit monitor thread spawn failure"),
+        "unexpected spawn error: {error}",
+    );
+
+    child.kill().expect("kill scheduler stand-in");
+    child.wait().expect("reap scheduler stand-in");
 }
 
 #[test]
@@ -929,7 +1107,8 @@ fn sched_exit_monitor_without_wake_writer_stops_on_finite_poll() {
         .arg("30")
         .spawn()
         .expect("spawn live child");
-    let stop = start_sched_exit_monitor_without_wake_writer_for_test(child.id())
+    let pidfd = open_pidfd_for_sched_exit_test(child.id());
+    let stop = start_sched_exit_monitor_without_wake_writer_for_test(child.id(), pidfd)
         .expect("start scheduler-exit monitor");
     let started = std::time::Instant::now();
     assert!(
@@ -960,6 +1139,22 @@ fn verifier_cleanup_requires_enabled_state() {
             "cleanup must fail closed for {state:?}",
         );
     }
+}
+
+/// Verifier probes do not run the scenario driver which normally publishes
+/// ScenarioEnd. Their init-owned completion boundary must therefore close
+/// Body before Phase 6, while ordinary tests retain the pause used to exclude
+/// cleanup from scenario timing.
+#[test]
+fn verifier_completion_closes_body_before_cleanup() {
+    assert_eq!(
+        post_workload_boundary(true),
+        PostWorkloadBoundary::ScenarioEndThenPause
+    );
+    assert_eq!(
+        post_workload_boundary(false),
+        PostWorkloadBoundary::ScenarioPause
+    );
 }
 
 #[test]
@@ -1106,73 +1301,6 @@ fn poll_startup_reports_alive_under_sigchld_ignore() {
         matches!(status, StartupStatus::Alive),
         "under SIG_IGN, a running child must be observed as Alive (was {status:?})",
     );
-}
-
-/// Regression: the [`SCHED_PID`] side channel must
-/// publish the writer's value and `sched_pid()` must return
-/// `Some(pid)` when set, `None` when the sentinel `0` is in
-/// place. Since `SCHED_PID` is a process-wide static, the test
-/// snapshots the current value, exercises both store paths,
-/// and restores the snapshot — so concurrent tests (and the
-/// real producer in `start_scheduler` if some other test ever
-/// drives it) do not see ambient corruption.
-#[test]
-fn sched_pid_side_channel_roundtrips() {
-    // Snapshot and restore with `Acquire`/`Release` to mirror
-    // the production load/store ordering. The test must hold
-    // exclusive access to the static for its lifetime; serial
-    // execution under the same process means concurrent
-    // `sched_pid()` readers in other tests would race, so this
-    // test is annotated to acquire `SIGCHLD_TEST_LOCK` even
-    // though it has no signal interaction — the existing lock
-    // is already the chokepoint for "tests that touch
-    // process-wide state" and serializing through it is
-    // cheaper than introducing a second mutex for one test.
-    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
-
-    let snapshot = SCHED_PID.load(Ordering::Acquire);
-
-    // Sentinel 0 must read as None.
-    SCHED_PID.store(0, Ordering::Release);
-    assert_eq!(sched_pid(), None, "0 must read as None (sentinel)");
-
-    // Non-zero writer publishes, reader observes.
-    SCHED_PID.store(12345, Ordering::Release);
-    assert_eq!(
-        sched_pid(),
-        Some(12345),
-        "writer must publish via the atomic side channel",
-    );
-
-    // Restore so the test does not leak state into peers.
-    SCHED_PID.store(snapshot, Ordering::Release);
-}
-
-/// Regression (no env-var write): the new fix must NOT
-/// touch `std::env::set_var("SCHED_PID", ...)` because
-/// mutating glibc's `__environ` while the probe thread is live
-/// is documented UB. Asserting that the env var is absent
-/// after a fresh atomic store is a proxy for "no rogue
-/// env-mutation snuck back in." If a future refactor brings
-/// `set_var` back, this test fails immediately.
-#[test]
-fn sched_pid_does_not_publish_via_env_var() {
-    let _guard = SIGCHLD_TEST_LOCK.lock_unpoisoned();
-
-    // Clear any ambient env var — some test harnesses inherit
-    // `SCHED_PID` from a parent shell. SAFETY: holding the
-    // mutex guarantees no concurrent env reader/writer in this
-    // test binary.
-    unsafe { std::env::remove_var("SCHED_PID") };
-
-    let snapshot = SCHED_PID.load(Ordering::Acquire);
-    SCHED_PID.store(99999, Ordering::Release);
-    assert_eq!(sched_pid(), Some(99999));
-    assert!(
-        std::env::var("SCHED_PID").is_err(),
-        "atomic side channel must not publish via env var",
-    );
-    SCHED_PID.store(snapshot, Ordering::Release);
 }
 
 /// T2 regression: the trace_pipe→COM1 reader's dump-marker scanner

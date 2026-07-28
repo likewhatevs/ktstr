@@ -8,7 +8,7 @@
 //!
 //! Probe attachment runs in two phases:
 //! - **Phase A** ([`start_probe_phase_a`]) attaches kprobes, fexits,
-//!   and the tracepoint trigger to kernel functions before the scheduler
+//!   and the selected scheduler-exit trigger before the scheduler
 //!   starts. Needed because kprobes must be in place before the
 //!   first call to each traced function.
 //! - **Phase B** ([`maybe_dispatch_vm_test_with_phase_a`]) discovers
@@ -42,6 +42,30 @@ use crate::verifier::{
 /// `discover_bpf_symbols()` can dynamically find the scheduler's BPF
 /// programs. `filter_traceable` drops it (not in kallsyms).
 const DISCOVER_SENTINEL: &str = "__discover__";
+
+/// Minimal primary diagnostic target used by the probe-counter readiness test.
+///
+/// `enqueue_task_scx` is the stable sched_ext enqueue bridge already used by
+/// auto-repro's BPF-to-kernel expansion. It fires after scheduler launch and
+/// increments `KTSTR_PCPU_PROBE_COUNT`, proving the decoded per-CPU slab is
+/// live rather than merely addressable.
+const PRIMARY_PROBE_DUMP_STACK: &str = "enqueue_task_scx";
+
+/// Add the minimal probe request needed by a primary VM whose scheduler
+/// launch is gated on full probe-counter dump readiness.
+///
+/// Phase A loads the base probe skeleton before scheduler launch, which
+/// materializes `probe_bp.bss` and its `ktstr_pcpu_counters` array for the host
+/// dump decoder, and attaches one sched_ext bridge kprobe so the eventual dump
+/// also proves live counter activity. Phase B may discover scheduler BPF
+/// programs after launch as usual. Keep this primary-only: stall auto-repro
+/// deliberately skips probe attachment and therefore cannot satisfy the
+/// readiness gate.
+pub(crate) fn append_primary_probe_dump_arg(entry: &KtstrTestEntry, guest_args: &mut Vec<String>) {
+    if entry.probe_dump_ready_gate && extract_probe_stack_arg(guest_args).is_none() {
+        guest_args.push(format!("--ktstr-probe-stack={PRIMARY_PROBE_DUMP_STACK}"));
+    }
+}
 
 /// Propagate `RUST_BACKTRACE` and `RUST_LOG` from the guest kernel
 /// cmdline into the process environment.
@@ -254,25 +278,51 @@ fn classify_dmesg_corruption(text: &str) -> Option<&'static str> {
     }
 }
 
-/// Read the repro VM's failure-dump JSON, parse it via
-/// [`crate::monitor::dump::FailureDumpReportAny`], and emit the
-/// Display rendering as a `--- repro VM failure dump ---` tail.
-/// Returns `None` when the file is missing (no freeze fired during
-/// repro), unreadable, or fails to parse — the JSON file itself
-/// stays on disk for any downstream consumer that needs the
-/// structured form. Schema-dispatch logic (single vs dual vs
-/// degraded discriminant; absent or unknown schema rejection) lives
-/// in `FailureDumpReportAny::from_json`; this helper is just the
-/// file-IO + tail-header wrapper.
+/// Render a bounded pointer to the repro VM's failure-dump artifact.
+///
+/// Failure dumps can contain thousands of rendered map entries and
+/// megabytes of arena page bytes. Formatting the parsed report here
+/// duplicates that forensic artifact into nextest's stderr, where one
+/// failure can overwhelm the useful diagnostics from every other test.
+/// The complete JSON is already durable at `path`; keep the inline
+/// surface to its exact path and byte size.
+///
+/// Returns `None` when the file is missing, unreadable, or not a regular
+/// file. The output is two lines and independent of the dump payload
+/// size. Linux limits a successfully-resolved pathname to well below
+/// [`MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES`]; the overflow branch is a
+/// defensive guard for a future non-Linux caller or an unusual virtual
+/// filesystem.
+const MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES: usize = 16 * 1024;
+const MAX_INLINE_FAILURE_DUMP_SUMMARY_LINES: usize = 2;
+
 fn render_failure_dump_file(path: &std::path::Path) -> Option<String> {
-    use crate::monitor::dump::FailureDumpReportAny;
-    use std::fmt::Write;
-    let json = std::fs::read_to_string(path).ok()?;
-    let any = FailureDumpReportAny::from_json(&json)?;
-    let mut buf = String::with_capacity(json.len());
-    buf.push_str("--- repro VM failure dump ---\n");
-    let _ = write!(buf, "{any}");
-    Some(buf)
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let summary = format!(
+        "--- repro VM failure dump ---\n\
+         full dump preserved at {} ({} bytes)",
+        path.display(),
+        metadata.len(),
+    );
+    if summary.len() > MAX_INLINE_FAILURE_DUMP_SUMMARY_BYTES
+        || summary.lines().count() > MAX_INLINE_FAILURE_DUMP_SUMMARY_LINES
+    {
+        tracing::warn!(
+            path_bytes = path.as_os_str().as_encoded_bytes().len(),
+            bytes = metadata.len(),
+            "auto-repro failure-dump path exceeded the inline diagnostic limit"
+        );
+        return Some(format!(
+            "--- repro VM failure dump ---\n\
+             full dump preserved in KTSTR_SIDECAR_DIR \
+             (path omitted from stderr; {} bytes)",
+            metadata.len(),
+        ));
+    }
+    Some(summary)
 }
 
 /// Prepend "PRIMARY DID NOT REACH WORKLOAD" to a repro VM verdict
@@ -555,53 +605,26 @@ fn build_repro_vm_builder(
     entry: &KtstrTestEntry,
     kernel: &Path,
     scheduler: Option<&Path>,
+    resolved_staged: &[(String, std::path::PathBuf, Vec<String>)],
     ktstr_bin: &Path,
     topo: Option<&TopoOverride>,
     guest_args: &[String],
 ) -> Option<(crate::vmm::KtstrVmBuilder, std::path::PathBuf)> {
-    let cmdline_extra = super::runtime::build_cmdline_extra(entry);
+    let cmdline_extra = super::runtime::build_auto_repro_cmdline_extra(entry);
 
     let (vm_topology, memory_mib) = super::runtime::resolve_vm_topology(entry, topo);
 
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
-    // Resolve staged schedulers for the auto-repro VM so any
-    // scheduler-lifecycle ops in the replayed scenario can find
-    // their staged binaries at the same /staging/schedulers/<name>/
-    // paths the primary VM used. See crate::test_support::eval for the
-    // resolve-loop rationale + KernelBuiltin/Eevdf skip semantics.
-    //
-    // Resolution errors here log + skip rather than propagate: the
-    // auto-repro function returns Option<String> (best-effort), so
-    // a staging-resolve failure for one staged scheduler should not
-    // tear down the whole auto-repro path. The operator still gets
-    // the warn in tracing; the primary VM's failure already landed
-    // its own dump.
-    let mut resolved_staged: Vec<(String, std::path::PathBuf, Vec<String>)> = Vec::new();
-    for staged in entry.staged_schedulers {
-        match super::eval::resolve_scheduler(&staged.binary, staged.manifest_dir) {
-            Ok((Some(host_path), _src)) => {
-                resolved_staged.push((
-                    staged.name.to_string(),
-                    host_path,
-                    staged.sched_args.iter().map(|s| s.to_string()).collect(),
-                ));
-            }
-            Ok((None, _)) => {} // KernelBuiltin / Eevdf — no binary
-            Err(e) => {
-                tracing::warn!(
-                    staged_name = %staged.name,
-                    error = %e,
-                    "auto-repro: failed to resolve staged scheduler binary; skipping (Op::AttachScheduler / Op::ReplaceScheduler against this staged entry will fail at dispatch time in the repro VM)"
-                );
-            }
-        }
-    }
+    // Reuse the exact primary-run resolution. In orchestrated runs these are
+    // immutable parent snapshots from the authoritative manifest; resolving
+    // again could demote a handoff error into the auto-repro path's historical
+    // best-effort skip and could observe a replaced Path source.
     let mut builder = super::runtime::build_vm_builder_base(
         entry,
         kernel,
         ktstr_bin,
         scheduler,
-        &resolved_staged,
+        resolved_staged,
         vm_topology,
         memory_mib,
         &cmdline_extra,
@@ -757,6 +780,7 @@ pub(crate) fn attempt_auto_repro(
     entry: &KtstrTestEntry,
     kernel: &Path,
     scheduler: Option<&Path>,
+    resolved_staged: &[(String, std::path::PathBuf, Vec<String>)],
     ktstr_bin: &Path,
     first_vm_output: &str,
     console_output: &str,
@@ -868,8 +892,15 @@ pub(crate) fn attempt_auto_repro(
         eprintln!("ktstr_test: auto-repro: stall exit — skipping probe attachment");
     }
 
-    let (builder, repro_dump_path) =
-        build_repro_vm_builder(entry, kernel, scheduler, ktstr_bin, topo, &guest_args)?;
+    let (builder, repro_dump_path) = build_repro_vm_builder(
+        entry,
+        kernel,
+        scheduler,
+        resolved_staged,
+        ktstr_bin,
+        topo,
+        &guest_args,
+    )?;
 
     // VM build phase: KVM create, vCPU pinning, virtio device setup,
     // freeze-coord arming, ELF/BTF parses for monitor accessors. Any
@@ -1052,18 +1083,13 @@ fn format_repro_output(
     // with the other tail builders that legitimately return `None`.
     let dmesg_tail = Some(render_dmesg_tail(&repro_result.stderr, REPRO_TAIL_LINES));
 
-    // Inline-render the freeze coordinator's failure-dump JSON when
-    // present. The freeze-coord writes a `FailureDumpReport` /
-    // `DualFailureDumpReport` to `repro_dump_path` if any error-class
-    // SCX exit (or the dual-snapshot half-way trigger) fired during
-    // the repro VM run. Surfacing the Display rendering inline means a
-    // CLI user sees the BPF map state, vCPU regs, and (for dual)
-    // early/late jiffies metadata in the same tail block as the
-    // sched_ext_dump and dmesg — no need to chase the separate
-    // `.repro.failure-dump.json` sibling for the at-a-glance view.
-    let failure_dump_tail = render_failure_dump_file(repro_dump_path);
+    // Point at the freeze coordinator's complete failure-dump JSON
+    // when present. Do not render the parsed report here: map entries
+    // and arena pages are intentionally forensic-sized and belong in
+    // the sidecar artifact, not nextest's stderr.
+    let failure_dump_summary = render_failure_dump_file(repro_dump_path);
 
-    let tails: Vec<String> = [sched_log_tail, dump_tail, failure_dump_tail, dmesg_tail]
+    let tails: Vec<String> = [sched_log_tail, dump_tail, failure_dump_summary, dmesg_tail]
         .into_iter()
         .flatten()
         .collect();
@@ -1222,7 +1248,7 @@ fn probe_health_issue(output: &str) -> Option<String> {
 /// Condense a (possibly multi-line, libbpf-log-bearing)
 /// `trigger_attach_error` into a single short footer clause. Prefers the
 /// TAIL of the forwarded libbpf log — the BTF / verifier rejection reason
-/// (e.g. "failed to find kernel BTF type ID of 'sched_ext_exit'") lands
+/// (e.g. "failed to find kernel BTF type ID of 'scx_vexit'") lands
 /// at the end, whereas the leading text is the bare errno — then collapses
 /// whitespace and truncates.
 fn condense_probe_reason(err: &str) -> String {
@@ -1427,11 +1453,11 @@ fn find_balanced_object_end(s: &str) -> Option<usize> {
 /// speculative.
 ///
 /// Branch order matches the failure-mode taxonomy:
-///   1. `bpf_trigger_fires == 0` — the `tp_btf/sched_ext_exit`
-///      handler never executed. Either the scheduler clean-exited
-///      (kind < SCX_EXIT_ERROR, handler early-returns at line 565
-///      of probe.bpf.c) or the scheduler crashed before reaching
-///      the tracepoint at all.
+///   1. `bpf_trigger_fires == 0` — the selected exit
+///      handler never accepted an error-class exit. Either the
+///      scheduler clean-exited (kind < SCX_EXIT_ERROR, handler
+///      early-returns in probe.bpf.c) or the scheduler crashed
+///      before reaching the return probe at all.
 ///   2. `bpf_trigger_fires > 0 && exit_kind_snap == ERROR_STALL` —
 ///      the handler fired but skipped the ringbuf submit (probe.bpf.c
 ///      line 699 explicit early-return for STALL). target_tptr is
@@ -1738,13 +1764,13 @@ fn build_dispatch_ctx_parts(
     // controllers (a test that requires the absence of a controller
     // would fail) or under-enable them (the test's set_cpuset/set_memory
     // call would fail with bare ENOENT/EACCES at the knob-write site).
-    // Read the scheduler PID from the atomic side channel published by
-    // `vmm::rust_init::start_scheduler`. The previous consumer parsed
+    // Read the scheduler PID from the coherent process owner published by
+    // `vmm::rust_init`. The previous consumer parsed
     // `std::env::var("SCHED_PID")`, which is unsound under the live
     // probe thread spawned by `start_probe_phase_a` — glibc mutates
     // `__environ` without locks, so a concurrent reader vs. writer
-    // races. `sched_pid()` returns `None` on the `0` sentinel, matching
-    // the `.filter(|&pid| pid != 0)` clause it replaces.
+    // races. `sched_pid()` returns `None` when no userspace scheduler
+    // process is currently owned.
     let sched_pid = crate::vmm::rust_init::sched_pid();
     // Three-layer merge: default_checks → scheduler.assert → entry.assert.
     let merged_assert = crate::assert::Assert::default_checks()
@@ -1955,6 +1981,7 @@ fn setup_probe_handle(stack_input: &str, pipeline: &ProbePipeline) -> Option<Pro
             &thread_pipeline.stop,
             &bpf_fds,
             &thread_pipeline.probes_ready,
+            &thread_pipeline.phase_a_status,
             None,
         );
         let emit_fn_names = if accumulated_fn_names.is_empty() {
@@ -1981,6 +2008,15 @@ fn setup_probe_handle(stack_input: &str, pipeline: &ProbePipeline) -> Option<Pro
     // Without this, the test may crash the scheduler before probes
     // are active, resulting in 0 captured events.
     pipeline.probes_ready.wait();
+    if let Err(error) = take_phase_a_status(pipeline) {
+        // This single-phase path runs after scheduler launch. Preserve its
+        // established non-fatal disposition, but do not mistake the terminal
+        // latch for success. The worker carries the same reason in
+        // ProbeDiagnostics, so the immediate guest log and rendered pipeline
+        // agree.
+        tracing::warn!(%error, "probe Phase A failed in single-phase mode");
+        eprintln!("ktstr_test: probe Phase A failed: {error}");
+    }
 
     Some(ProbeHandle {
         thread: handle,
@@ -2019,13 +2055,14 @@ struct ProbeHandle {
 
 /// Cross-thread probe pipeline signals.
 ///
-/// Groups the three signals the probe setup path has to hand to its
+/// Groups the four signals the probe setup path has to hand to its
 /// worker thread: `stop` (main thread asks the probe thread to shut
 /// down), `output_done` (probe thread tells the main thread it has
-/// already emitted `PROBE_OUTPUT_START`/`PROBE_OUTPUT_END`), and `probes_ready` (probe
-/// thread signals the main thread that kprobes/kfentries have
-/// attached). `stop` is an `AtomicBool` because the probe thread's
-/// ring-buffer poll loop checks it via `load(Acquire)` between
+/// already emitted `PROBE_OUTPUT_START`/`PROBE_OUTPUT_END`),
+/// `probes_ready` (probe thread signals that Phase A reached a terminal
+/// state), and `phase_a_status` (the corresponding success/failure result,
+/// published before the latch). `stop` is an `AtomicBool` because the probe
+/// thread's ring-buffer poll loop checks it via `load(Acquire)` between
 /// events — a blocking wait would stall diagnostics collection.
 /// `output_done` and `probes_ready` use [`crate::sync::Latch`] so
 /// the dispatch path and the early-bail drain path block on a
@@ -2037,12 +2074,28 @@ pub(crate) struct ProbePipeline {
     pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub output_done: std::sync::Arc<crate::sync::Latch>,
     pub probes_ready: std::sync::Arc<crate::sync::Latch>,
+    pub phase_a_status: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
 }
 
 impl ProbePipeline {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// Consume the terminal status published immediately before `probes_ready`.
+///
+/// A missing value is a protocol violation: the latch denotes a terminal
+/// Phase-A state, not success by itself.
+fn take_phase_a_status(pipeline: &ProbePipeline) -> Result<(), String> {
+    pipeline
+        .phase_a_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_else(|| {
+            Err("probe Phase A signaled readiness without publishing status".to_string())
+        })
 }
 
 /// Pre-skeleton pipeline diagnostics captured during guest probe setup.
@@ -2083,12 +2136,19 @@ pub(crate) struct ProbePhaseAState {
 ///
 /// Parses `--ktstr-probe-stack` from args, loads kernel functions,
 /// attaches kprobes + trigger + kernel fexit, and spawns the probe
-/// thread with a Phase B channel. Returns `None` if no probe stack
-/// arg is present or no traceable functions remain.
-pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
+/// thread with a Phase B channel. Returns `Ok(None)` if no probe stack
+/// arg is present or no traceable functions remain. The caller supplies one
+/// absolute deadline so probe attachment cannot become an unbounded guest
+/// prerequisite or multiply a surrounding readiness budget.
+pub(crate) fn start_probe_phase_a(
+    args: &[String],
+    deadline: Instant,
+) -> Result<Option<ProbePhaseAState>, String> {
     use crate::probe::stack::{filter_traceable, load_probe_stack};
 
-    let stack_input = extract_probe_stack_arg(args)?;
+    let Some(stack_input) = extract_probe_stack_arg(args) else {
+        return Ok(None);
+    };
 
     let phase_a_start = Instant::now();
     eprintln!("ktstr_test: probe phase_a: loading kernel functions");
@@ -2146,6 +2206,7 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
             &thread_pipeline.stop,
             &bpf_fds,
             &thread_pipeline.probes_ready,
+            &thread_pipeline.phase_a_status,
             Some(phase_b_rx),
         );
         let emit_fn_names = if accumulated_fn_names.is_empty() {
@@ -2166,7 +2227,18 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
     });
 
     // Wait for Phase A probes (kprobes + trigger + kernel fexit) to attach.
-    pipeline.probes_ready.wait();
+    if !pipeline.probes_ready.wait_until(deadline) {
+        pipeline
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        return Err("probe Phase A did not attach before its finite deadline".to_string());
+    }
+    if let Err(error) = take_phase_a_status(&pipeline) {
+        pipeline
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        return Err(error);
+    }
 
     tracing::info!(
         elapsed_ms = phase_a_start.elapsed().as_millis() as u64,
@@ -2181,7 +2253,7 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
 
     let kernel_func_count = kernel_functions.len() as u32;
 
-    Some(ProbePhaseAState {
+    Ok(Some(ProbePhaseAState {
         handle,
         phase_b_tx,
         pipeline,
@@ -2190,7 +2262,7 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
         pipe_diag,
         param_names,
         render_hints,
-    })
+    }))
 }
 
 /// Complete the probe pipeline with Phase B (after scheduler starts).
@@ -2282,20 +2354,22 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     let stack_display_names: Vec<&str> = Vec::new(); // Discovery uses empty hint list
     let bpf_syms = discover_bpf_symbols(&stack_display_names);
     if bpf_syms.is_empty() {
-        let sched_alive = crate::vmm::rust_init::sched_pid()
-            .is_some_and(|pid| unsafe { libc::kill(pid, 0) == 0 });
-        if sched_alive {
-            tracing::warn!(
+        match crate::vmm::rust_init::current_scheduler_liveness() {
+            Ok(Some(true)) => tracing::warn!(
                 "phase_b: bpf_discover returned 0 programs while scheduler is \
                  still alive — verify ProgInfoIter access permissions or BTF \
                  (this is the unexpected case; the auto-repro pipeline is now \
                  attached to no BPF struct_ops callbacks)"
-            );
-        } else {
-            tracing::info!(
+            ),
+            Ok(Some(false) | None) => tracing::info!(
                 "phase_b: bpf_discover returned 0 programs — scheduler exited \
                  before the discovery window (expected for fast-crash paths)"
-            );
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                "phase_b: bpf_discover returned 0 programs and retained-pidfd \
+                 scheduler liveness could not be determined"
+            ),
         }
     }
     // Update Phase A's pipeline-diag counter with the Phase B
@@ -2570,8 +2644,8 @@ fn emit_probe_payload(
 /// after the guest's Phase 6 scheduler teardown. Holds the `stop`
 /// signal and probe handle that [`collect_and_print_probe_data`]
 /// consumes; deferring the consumption past `child.kill()` is what
-/// keeps the `tp_btf/sched_ext_exit` listener attached while the
-/// kernel's `scx_claim_exit` path fires the trigger.
+/// keeps the selected exit listener attached while the kernel's
+/// accepted error path crosses the trigger.
 ///
 /// Stored in [`DEFERRED_PROBE_COLLECT`]; [`take_deferred_probe`]
 /// drains it.
@@ -2621,11 +2695,11 @@ fn take_deferred_probe() -> Option<DeferredProbe> {
 /// without sched_ext or non-root probes can't read it).
 ///
 /// `disabled` is set by `scx_set_enable_state(SCX_DISABLED)` at the
-/// tail of `scx_root_disable`, which runs strictly after
-/// `scx_claim_exit` (called from `scx_vexit`/`scx_disable`) fired
-/// `trace_sched_ext_exit`. Polling for this transition is the most
-/// reliable signal that the trigger tracepoint has fired (or never
-/// will, in which case the timeout is the correct signal).
+/// tail of sched_ext disable, which runs strictly after the selected
+/// typed exit program has fired.
+/// Polling for this transition is the most reliable signal that the
+/// trigger has fired (or never will, in which case the timeout is
+/// the correct signal).
 ///
 /// Polls every 50 ms — short enough to bound the post-test
 /// finalisation latency, long enough that the per-iteration
@@ -2654,8 +2728,8 @@ fn wait_for_sched_disabled_at(path: &str, timeout: std::time::Duration) -> bool 
         } else {
             // File unreadable: kernel without sched_ext, or sysfs
             // restriction. The probe-attach path already ran a
-            // tp_btf/sched_ext_exit attach; if the file doesn't
-            // exist, the tracepoint can't fire either. Treat as
+            // typed sched_ext trigger attach; if the file doesn't exist,
+            // sched_ext cannot reach that trigger either. Treat as
             // "no-op wait" rather than spinning.
             return false;
         }
@@ -2672,7 +2746,7 @@ fn wait_for_sched_disabled_at(path: &str, timeout: std::time::Duration) -> bool 
 /// `child.wait()` / `/sched_disable`. By the time the kernel
 /// finishes `scx_disable_irq_workfn` (signalled by
 /// `/sys/kernel/sched_ext/state` transitioning to `disabled`),
-/// the probe's `tp_btf/sched_ext_exit` listener has had its one
+/// the probe's selected exit listener has had its one
 /// guaranteed fire — the trigger event lands in the ring buffer
 /// with a real `target_tptr`, the probe poll loop's BSS latch
 /// check observes `ktstr_err_exit_detected != 0`, and the
@@ -2692,7 +2766,7 @@ pub(crate) fn finalize_probe_after_unwind() {
     };
     // Skip the kernel-unwind wait when no probe handle is attached.
     // The wait exists exclusively to give the probe's
-    // tp_btf/sched_ext_exit listener time to observe the trigger;
+    // exit listener time to observe the trigger;
     // when there is no listener, the wait is wasted teardown
     // latency on every test (auto-repro is the only path that
     // installs a probe handle, and even then only when the primary
@@ -2709,8 +2783,8 @@ pub(crate) fn finalize_probe_after_unwind() {
         //
         // No grace sleep after `wait_for_sched_disabled` returns
         // true: the kernel's `scx_claim_exit` (called from
-        // `scx_vexit`/`scx_disable`) fires `trace_sched_ext_exit`
-        // BEFORE `scx_set_enable_state(SCX_DISABLED)` runs at the
+        // selected exit hook fires BEFORE the kernel publishes
+        // SCX_DISABLED at the
         // tail of `scx_root_disable`, so a `state == disabled`
         // observation establishes a happens-after relationship
         // with the BPF handler's CAS
@@ -2783,9 +2857,8 @@ fn enforce_survives_storm_liveness(result: &mut AssertResult, survives_storm: bo
 /// teardown lives) or collect-and-emit immediately (ctor path on
 /// the host, where there is no Phase 6).
 ///
-/// The deferred path is what keeps the `tp_btf/sched_ext_exit`
-/// listener attached while the kernel fires the trigger from
-/// `scx_claim_exit` during scheduler unwind — without it, the probe
+/// The deferred path is what keeps the selected exit listener
+/// attached while the accepted error path unwinds — without it, the probe
 /// is detached before `child.kill()` runs and the stall-class
 /// trigger fires into a void (146 captured kprobe events, 0
 /// trigger fires, 0 after stitch).

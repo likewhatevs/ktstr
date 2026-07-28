@@ -282,33 +282,56 @@ fn assert_synthetic_thread_state(t: &ThreadState) {
     );
 }
 
-/// Capture against an empty `proc_root` (no tgid subdirs at
-/// all) must complete without panic and produce an empty
-/// snapshot. Pins the rayon parallel-probe phase's empty-input
-/// handling: `iter_tgids_at` returns an empty Vec, `par_iter`
-/// over zero elements collects to an empty HashMap, and the
-/// sequential phase 2 loop runs zero iterations. `use_syscall_affinity=true`
-/// is required to enter the rayon block at all (the `false`
-/// branch skips probe-attach entirely and assigns an empty
-/// HashMap directly). Without this gate test, the rayon
-/// par_iter over empty input has zero coverage.
+/// Capture against an empty `proc_root` must stay entirely on the caller:
+/// there is no eligible probe work, so production mode must not even ask for a
+/// Rayon pool.
 #[test]
 fn capture_with_empty_proc_root_produces_empty_snapshot() {
     let proc_tmp = tempfile::TempDir::new().unwrap();
     let cgroup_tmp = tempfile::TempDir::new().unwrap();
     let sys_tmp = tempfile::TempDir::new().unwrap();
 
-    // Stage `/proc/loadavg` so the parallelism-clamp read at
-    // <proc_root>/loadavg succeeds rather than falling back to
-    // the 0.0 default. Empty `proc_root` otherwise — no tgid
-    // subdirs, so `iter_tgids_at` returns Vec::new().
-    std::fs::write(proc_tmp.path().join("loadavg"), "0.0 0.0 0.0 1/1 1\n").unwrap();
-
-    let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), true);
+    let snap = capture_with_pool_builder(
+        proc_tmp.path(),
+        cgroup_tmp.path(),
+        sys_tmp.path(),
+        true,
+        |_| panic!("empty capture must not build a Rayon pool"),
+    );
     assert!(
         snap.threads.is_empty(),
         "empty proc_root must produce empty snapshot; got {} threads",
         snap.threads.len(),
+    );
+}
+
+/// A single eligible TGID likewise runs directly without creating an idle
+/// host-sized pool. Phase 2 still observes the staged thread normally.
+#[test]
+fn capture_with_single_tgid_does_not_build_pool() {
+    let proc_tmp = tempfile::TempDir::new().unwrap();
+    let cgroup_tmp = tempfile::TempDir::new().unwrap();
+    let sys_tmp = tempfile::TempDir::new().unwrap();
+    let tgid = std::process::id() as i32 + 1_000;
+    stage_synthetic_proc(
+        proc_tmp.path(),
+        tgid,
+        tgid + 1,
+        "single-pcomm",
+        "single-comm",
+    );
+
+    let snap = capture_with_pool_builder(
+        proc_tmp.path(),
+        cgroup_tmp.path(),
+        sys_tmp.path(),
+        true,
+        |_| panic!("single-TGID capture must not build a Rayon pool"),
+    );
+    assert_eq!(snap.threads.len(), 1);
+    assert_eq!(
+        snap.threads[0].tgid,
+        u32::try_from(tgid).expect("synthetic tgid is positive"),
     );
 }
 

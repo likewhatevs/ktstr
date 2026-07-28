@@ -11,6 +11,30 @@ mod json;
 mod ktstr_test;
 mod payload;
 mod scheduler;
+mod test_entry;
+
+/// Register a manually constructed `KtstrTestEntry`.
+///
+/// This is the manual-entry counterpart to [`macro@ktstr_test`]: it registers the
+/// static in `KTSTR_TESTS` and emits the versioned ELF scheduler-manifest
+/// record consumed by `cargo ktstr`. Manual entries with staged schedulers
+/// should use `#[ktstr_test]`, whose attribute grammar can project every
+/// staged edge into the stamp.
+#[proc_macro_attribute]
+pub fn ktstr_test_entry(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "ktstr_test_entry does not accept arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let item = parse_macro_input!(item as syn::ItemStatic);
+    test_entry::expand(item)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
 
 /// Attribute macro that registers a function as a ktstr integration test.
 ///
@@ -47,11 +71,12 @@ mod scheduler;
 ///   - `threads = N` (default: inherited from scheduler, or 1)
 ///   - `numa_nodes = N` (default: inherited from scheduler, or 1)
 ///   - `memory_mib = N` — per-test minimum memory in MiB (default:
-///     2048). The framework picks `max(total_cpus * 64, 256,
-///     memory_mib)` MiB at VM-launch time, so for tests with more
-///     than 32 vCPUs the cpu-based floor dominates the macro
-///     default. Below ~4 vCPUs the absolute 256-MiB floor wins if
-///     `memory_mib` is also below it. Setting `memory_mib` above
+///     256). The declaration-derived floor is
+///     `max(total_cpus * 64, 256, memory_mib)` MiB; deferred sizing
+///     can raise the final allocation further to fit the prepared
+///     initramfs. For tests with more than 4 vCPUs the cpu-based
+///     floor dominates the macro default. At or below 4 vCPUs the
+///     absolute 256-MiB floor wins. Setting `memory_mib` above
 ///     the cpu-based floor is only meaningful when the test needs
 ///     more headroom than the per-cpu budget. The unit is binary
 ///     mebibytes; the conversion at VM-launch is `value << 20`
@@ -291,8 +316,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   `Scheduler`.
 /// - A hidden `static __KTSTR_SCHED_REG_MITOSIS: &'static Scheduler`
 ///   registered in `KTSTR_SCHEDULERS` (`ktstr::test_support::KTSTR_SCHEDULERS`)
-///   via linkme so the verifier can discover the declaration by
-///   spawning the test binary with `--ktstr-list-schedulers`.
+///   via linkme for in-process lookup.
+/// - A hidden, versioned scheduler-manifest record in a link-retained ELF
+///   section. `cargo ktstr` reads this record directly from warmed test
+///   binaries, so verifier discovery does not start each binary.
 ///
 /// # Visibility prefix
 ///
@@ -1285,13 +1312,13 @@ mod tests {
             TEST_SCHED, {
                 name = "test_sched",
                 binary = "scx_test",
-                verifier_exclude_topologies = ["tiny-1llc", "tiny-1llc"],
+                verifier_exclude_topologies = ["4cpu-1llc-nosmt", "4cpu-1llc-nosmt"],
             }
         })
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("duplicate `verifier_exclude_topologies` entry `tiny-1llc`"),
+                .contains("duplicate `verifier_exclude_topologies` entry `4cpu-1llc-nosmt`"),
             "unexpected diagnostic: {err}",
         );
     }
@@ -1302,7 +1329,7 @@ mod tests {
             TEST_SCHED, {
                 name = "test_sched",
                 binary = "scx_test",
-                verifier_exclude_topologies = ["tiny/1llc"],
+                verifier_exclude_topologies = ["4cpu/1llc-nosmt"],
             }
         })
         .unwrap_err();

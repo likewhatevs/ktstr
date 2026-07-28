@@ -77,9 +77,11 @@ pub(crate) fn decorate_path_label_for_dirty(base_label: &str, is_dirty: bool) ->
 /// Cache keys follow three shapes:
 /// - tarball: `{version}-tarball-{arch}-kc{hash}` — version is a
 ///   PROPER PREFIX, e.g. `6.14.2-tarball-x86_64-kcabc` → `6.14.2`.
-/// - git: `{ref}-git-{short_hash}-{arch}-kc{hash}` — ref is a
-///   PROPER PREFIX, e.g. `for-next-git-deadbee-x86_64-kcabc` →
-///   `for-next`.
+/// - git: `git-{kind}-{ref_hash}-{commit}-{arch}-kc{hash}` — the raw
+///   ref is represented by a stable fixed-seed hash, so the compact
+///   label is `git_{kind}_{ref_hash6}`. Legacy
+///   `{ref}-git-{short_hash}-{arch}-kc{hash}` keys retain their
+///   historical ref-prefix label.
 /// - local: `local-{discriminator}-{arch}-kc{hash}` — the `local-`
 ///   PREFIX is the source tag, with `{discriminator}` being the
 ///   git short_hash of the source tree (or the literal `unknown`
@@ -99,7 +101,7 @@ pub(crate) fn decorate_path_label_for_dirty(base_label: &str, is_dirty: bool) ->
 ///
 /// Returns `Cow<str>` because the local arm builds an owned label
 /// (`local_{hash6}` requires a fresh allocation), while the
-/// tarball/git arms return a borrow into the input.
+/// tarball/legacy-git arms return a borrow into the input.
 ///
 /// Falls back to the full key (borrowed) if no recognised tag is
 /// present — a future cache-key shape with an unknown tag still
@@ -142,6 +144,27 @@ pub(crate) fn cache_key_to_version_label(key: &str) -> std::borrow::Cow<'_, str>
             discriminator.chars().take(6).collect::<String>()
         };
         return Cow::Owned(format!("local_{suffix}"));
+    }
+    if let Some(rest) = key.strip_prefix("git-") {
+        let mut parts = rest.split('-');
+        let kind = parts.next().unwrap_or("");
+        let ref_hash = parts.next().unwrap_or("");
+        let commit = parts.next().unwrap_or("");
+        let arch = parts.next().unwrap_or("");
+        let kconfig = parts.next().unwrap_or("");
+        if matches!(kind, "tag" | "branch" | "sha" | "unknown")
+            && ref_hash.len() == 16
+            && ref_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && commit.len() == 40
+            && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && !arch.is_empty()
+            && kconfig.starts_with("kc")
+        {
+            return Cow::Owned(format!(
+                "git_{kind}_{}",
+                ref_hash.chars().take(6).collect::<String>()
+            ));
+        }
     }
     for tag in &["-tarball-", "-git-"] {
         if let Some(prefix_end) = key.find(tag) {
@@ -499,12 +522,34 @@ mod tests {
 
     #[test]
     fn cache_key_to_version_label_git() {
-        // Git keys carry the git ref as the prefix; the label
-        // captures the ref, not the post-`-git-` short hash.
+        // Content-addressed git keys retain kind plus a compact stable
+        // ref-hash discriminator without exposing the full commit/key.
+        assert_eq!(
+            cache_key_to_version_label(
+                "git-branch-0123456789abcdef-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef-x86_64-kcabc"
+            ),
+            "git_branch_012345",
+        );
+        assert_eq!(
+            cache_key_to_version_label(
+                "git-tag-fedcba9876543210-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef-aarch64-kcabc"
+            ),
+            "git_tag_fedcba",
+        );
+    }
+
+    #[test]
+    fn cache_key_to_version_label_legacy_git() {
         assert_eq!(
             cache_key_to_version_label("for-next-git-deadbee-x86_64-kcabc"),
             "for-next",
         );
+    }
+
+    #[test]
+    fn malformed_content_addressed_git_key_falls_through() {
+        let key = "git-branch-not-a-fixed-ref-hash-deadbee-x86_64-kcabc";
+        assert_eq!(cache_key_to_version_label(key), key);
     }
 
     #[test]
