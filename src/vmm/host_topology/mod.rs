@@ -3433,8 +3433,8 @@ fn memory_permit_base_for_possible_width(possible_width: usize) -> usize {
 
 /// Exclusive permit identities below this bound account cooperative VM CPU
 /// pressure. Later permit namespaces account memory, preparation tokens, and
-/// builds independently. The queue uses the same boundary to measure a full
-/// backfill wave in resource units rather than in an arbitrary callback count.
+/// builds independently. The queue publishes each record's cooperative watch
+/// cardinality against the same boundary.
 pub(super) fn cooperative_cpu_permit_end() -> usize {
     memory_permit_base_for_possible_width(possible_cpu_width())
 }

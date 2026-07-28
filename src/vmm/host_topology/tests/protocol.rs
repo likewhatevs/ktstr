@@ -4546,29 +4546,6 @@ fn exact_acquired_commits_do_not_force_full_grant_scans() {
 }
 
 #[test]
-fn backfill_is_weighted_by_cooperative_capacity_instead_of_callback_count() {
-    let _prefixes = LockPrefixesGuard::new();
-    let (wave_credit, light_cost, heavy_cost, non_cooperative_cost) =
-        protocol::exercise_resource_weighted_backfill_accounting_for_tests();
-    assert!(
-        wave_credit >= 4,
-        "one backfill wave must expose at least the four cooperative lanes of one possible CPU",
-    );
-    assert_eq!(
-        light_cost, 1,
-        "one cooperative CPU permit costs one wave unit"
-    );
-    assert_eq!(
-        heavy_cost, 4,
-        "one callback consuming four CPU permits must cost four units, not one callback",
-    );
-    assert_eq!(
-        non_cooperative_cost, 2,
-        "claims outside the cooperative permit namespace fall back to physical width",
-    );
-}
-
-#[test]
 fn preparation_pool_budget_grants_min_waiters_pool_in_ticket_order() {
     let _prefixes = LockPrefixesGuard::new();
     let outcome = protocol::exercise_preparation_pool_budget_for_tests()
@@ -4708,45 +4685,6 @@ fn activated_cell_awaiting_its_run_claim_holds_no_preparation_token() {
             .expect("probe token after activation")
             .is_some(),
         "activation must release the preparation token before acquiring the run claim",
-    );
-}
-
-#[test]
-fn unavailable_wide_head_refills_live_backfill_capacity_until_bounded_age_then_drains() {
-    let _prefixes = LockPrefixesGuard::new();
-    let outcome = protocol::exercise_work_conserving_backfill_for_tests()
-        .expect("exercise work-conserving bounded backfill");
-    assert_eq!(
-        outcome.conflicting_grants, 3,
-        "the blocked wide head must admit exactly its configured outstanding resource capacity",
-    );
-    assert_eq!(
-        outcome.conflicting_waiters, 2,
-        "new conflicting work must wait while the head's full live capacity is occupied",
-    );
-    assert_eq!(
-        outcome.disjoint_grants, 8,
-        "disjoint suffix work must remain unbounded by the fairness capacity",
-    );
-    assert!(
-        outcome.refilled_after_completion,
-        "completed bypass work must immediately open replacement capacity instead of creating a low-utilization drain",
-    );
-    assert!(
-        outcome.expired_head_stops_refill,
-        "an aged head must stop admitting replacement conflicts so exclusive work cannot starve",
-    );
-    assert!(
-        outcome.wide_wins,
-        "once the admitted burst releases, the now-viable wide head must receive the next exact grant",
-    );
-    assert!(
-        outcome.racer_revoked_without_placement_damage,
-        "the viability scan must revoke a stale conflicting callback while preserving disjoint grants",
-    );
-    assert!(
-        outcome.stale_callback_suppressed,
-        "a callback revoked by the wide-head scan must not execute planner or acquisition code",
     );
 }
 
