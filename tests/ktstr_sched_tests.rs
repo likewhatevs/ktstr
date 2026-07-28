@@ -444,7 +444,7 @@ fn check_watchdog_timing(result: &VmResult) -> Result<()> {
          jiffies to scx_sched.watchdog_timeout but guest memory reads back \
          {observed_jiffies} — the host-write missed the field (a kernel \
          refactor moved the offset, the deref resolved the wrong scx_sched, \
-         or scx-ktstr's .timeout_ms=20000 BPF default overwrote it)"
+         or scx-ktstr's .timeout_ms=4000 BPF default overwrote it)"
     );
 
     // Tier 2 — the watchdog actually fired a stall (the override was

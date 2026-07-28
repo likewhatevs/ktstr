@@ -2048,8 +2048,10 @@ pub(crate) struct RqRefresh {
 /// observes `None`. Refresh each iteration so the first sample
 /// after scheduler attach picks up real PAs.
 pub(crate) struct EventRefresh {
-    /// PA of the `scx_root` global pointer (text mapping).
-    pub scx_root_pa: u64,
+    /// Link-time KVA of the `scx_root` global pointer (kernel-image
+    /// mapping). Translated to a PA per iteration against the live
+    /// bases, never baked at construction — see [`RqRefresh`].
+    pub scx_root_kva: u64,
     /// BTF-resolved offsets within `scx_sched` and the per-CPU
     /// stats struct. See [`ScxEventOffsets`] for version-specific
     /// indirection.
@@ -2064,37 +2066,47 @@ pub(crate) struct EventRefresh {
 ///   `scx_sched` struct, then write at the BTF-resolved offset.
 ///   Re-derefs each iteration because `scx_sched` is reallocated on
 ///   scheduler (re)load.
-/// - pre-7.1 (`StaticGlobal`): write directly to the PA of the
+/// - pre-7.1 (`StaticGlobal`): write directly to the
 ///   `scx_watchdog_timeout` static global. No deref needed — the
-///   address is fixed for the kernel's lifetime.
+///   symbol is fixed for the kernel's lifetime.
+///
+/// Every address here is a LINK-TIME KVA, not a PA: the loop translates
+/// each one per iteration against the live kernel-image base and
+/// `phys_base` (see [`RqRefresh`]). A construction-time bake pinned
+/// these to whatever `phys_base` the monitor's bounded KERN_ADDRS wait
+/// had produced, and a guest that publishes after that wait times out
+/// left every one of them pointing at the wrong physical page for the
+/// whole run — the `scx_root` read then returned stable non-null
+/// garbage, so the null guard below did not fire and the override was
+/// written into (and read back from) an address outside guest DRAM.
 pub(crate) enum WatchdogOverride {
     /// 7.1+ path: deref `scx_root` -> `scx_sched` -> write at offset.
     ScxSched {
-        /// PA of the `scx_root` global pointer (text mapping).
-        scx_root_pa: u64,
+        /// Link-time KVA of the `scx_root` global pointer.
+        scx_root_kva: u64,
         /// Byte offset of `watchdog_timeout` within `struct scx_sched`.
         watchdog_offset: usize,
         /// Jiffies value to write.
         jiffies: u64,
-        /// PA of `scx_watchdog_interval` global.
-        interval_pa: Option<u64>,
-        /// PA of `scx_watchdog_timestamp` global.
-        timestamp_pa: Option<u64>,
-        /// PA of `jiffies_64` global (to read current time).
-        jiffies_64_pa: Option<u64>,
+        /// Link-time KVA of the `scx_watchdog_interval` global.
+        interval_kva: Option<u64>,
+        /// Link-time KVA of the `scx_watchdog_timestamp` global.
+        timestamp_kva: Option<u64>,
+        /// Link-time KVA of `jiffies_64` (to read current time).
+        jiffies_64_kva: Option<u64>,
     },
-    /// Pre-7.1 path: write directly to the static global's PA.
+    /// Pre-7.1 path: write directly to the static global.
     StaticGlobal {
-        /// PA of the `scx_watchdog_timeout` static global (text mapping).
-        watchdog_timeout_pa: u64,
+        /// Link-time KVA of the `scx_watchdog_timeout` static global.
+        watchdog_timeout_kva: u64,
         /// Jiffies value to write.
         jiffies: u64,
-        /// PA of `scx_watchdog_interval` global.
-        interval_pa: Option<u64>,
-        /// PA of `scx_watchdog_timestamp` global.
-        timestamp_pa: Option<u64>,
-        /// PA of `jiffies_64` global.
-        jiffies_64_pa: Option<u64>,
+        /// Link-time KVA of the `scx_watchdog_interval` global.
+        interval_kva: Option<u64>,
+        /// Link-time KVA of the `scx_watchdog_timestamp` global.
+        timestamp_kva: Option<u64>,
+        /// Link-time KVA of `jiffies_64`.
+        jiffies_64_kva: Option<u64>,
     },
 }
 
@@ -2421,7 +2433,7 @@ pub(crate) struct MonitorConfig<'a> {
     pub psi: Option<PsiCaptureCfg>,
     /// Optional scheduler-attach watchdog reset. When `Some`, the
     /// loop reads `*scx_root` each iteration via
-    /// [`WatchdogReset::scx_root_pa`] and, on the first 0 →
+    /// [`WatchdogReset::scx_root_kva`] and, on the first 0 →
     /// non-zero transition, stores `(now - run_start +
     /// workload_duration).as_nanos()` into the shared atomic so
     /// the host-side VM watchdog can recompute its hard deadline
@@ -2461,16 +2473,16 @@ pub(crate) struct MonitorConfig<'a> {
 /// All fields move together — none of them are useful alone — so
 /// they're bundled to keep [`MonitorConfig`] flat. Construction is
 /// owned by [`crate::vmm::freeze_coord`] inside `start_monitor`, where
-/// `scx_root_pa` is the text-mapped PA of the kernel's `scx_root`
+/// `scx_root_kva` is the link-time address of the kernel's `scx_root`
 /// global, `workload_duration` flows from
 /// [`crate::vmm::KtstrVm::workload_duration`] (which mirrors the
 /// test entry's `duration`), and `reset_ns` / `reset_tag` are shared
 /// with the watchdog thread.
 pub(crate) struct WatchdogReset<'a> {
-    /// PA of the `scx_root` global pointer (text mapping). The
-    /// loop reads `mem.read_u64(scx_root_pa, 0)` each iteration
-    /// and detects the 0 → non-zero edge.
-    pub scx_root_pa: u64,
+    /// Link-time KVA of the `scx_root` global pointer. The loop
+    /// translates it against the live bases and reads it each
+    /// iteration, detecting the 0 → non-zero edge.
+    pub scx_root_kva: u64,
     /// Workload time budget the watchdog should reset to. Encoded
     /// as nanoseconds since `run_start` (added to `Instant::now()
     /// - run_start` at attach time and stored into [`reset_ns`]).
@@ -3738,6 +3750,15 @@ pub(crate) fn monitor_loop(
                 page_offset = architectural_page_offset;
             }
         }
+        // Translate a kernel-image (text/data) link-time KVA against THIS
+        // iteration's live bases. Both inputs can resolve after the monitor
+        // thread was constructed — `phys_base` when the guest's KERN_ADDRS
+        // publish outlives the bounded pre-loop wait, `iter_start_kernel_map`
+        // when the aarch64 BSP programs TCR_EL1 late — so every consumer
+        // below re-derives rather than carrying a construction-time bake.
+        let text_pa = |kva: u64| {
+            super::symbols::text_kva_to_pa_with_base(kva, iter_start_kernel_map, phys_base)
+        };
         // Scheduler-attach watchdog reset. Read `*scx_root` and,
         // on the first 0 → non-zero transition, store the encoded
         // attach-moment deadline so the watchdog thread can
@@ -3745,14 +3766,14 @@ pub(crate) fn monitor_loop(
         // (instead of from VM boot, which wastes the budget on
         // boot + BPF verifier time). Runs each iteration until
         // the latch fires; the read itself is cheap (one bounded
-        // [`GuestMem::read_u64`]) and `scx_root_pa` is text-mapped
-        // so the read is valid throughout the run regardless of
-        // the per-iteration `data_valid` gate above. Fires
-        // independently of `watchdog_override`: a kernel without
-        // a resolvable `scx_sched.watchdog_timeout` BTF field
-        // still gets a correct outer kill timer.
+        // [`GuestMem::read_u64`]) and the kernel-image translation
+        // above is independent of the `data_valid` gate, so the read
+        // is valid throughout the run. Fires independently of
+        // `watchdog_override`: a kernel without a resolvable
+        // `scx_sched.watchdog_timeout` BTF field still gets a
+        // correct outer kill timer.
         if let Some(reset) = cfg.watchdog_reset.as_ref() {
-            let scx_sched_kva = mem.read_u64(reset.scx_root_pa, 0);
+            let scx_sched_kva = mem.read_u64(text_pa(reset.scx_root_kva), 0);
             if scx_sched_kva != 0 && !watchdog_reset_signaled {
                 let elapsed = run_start.elapsed();
                 let target_ns = elapsed
@@ -3799,12 +3820,12 @@ pub(crate) fn monitor_loop(
         if let Some(wd) = watchdog_override {
             let (write_pa, write_offset, wd_jiffies) = match wd {
                 WatchdogOverride::ScxSched {
-                    scx_root_pa,
+                    scx_root_kva,
                     watchdog_offset,
                     jiffies,
                     ..
                 } => {
-                    let sch_kva = mem.read_u64(*scx_root_pa, 0);
+                    let sch_kva = mem.read_u64(text_pa(*scx_root_kva), 0);
                     if sch_kva == 0 {
                         (None, 0, *jiffies)
                     } else {
@@ -3813,24 +3834,28 @@ pub(crate) fn monitor_loop(
                     }
                 }
                 WatchdogOverride::StaticGlobal {
-                    watchdog_timeout_pa,
+                    watchdog_timeout_kva,
                     jiffies,
                     ..
-                } => (Some(*watchdog_timeout_pa), 0, *jiffies),
+                } => (Some(text_pa(*watchdog_timeout_kva)), 0, *jiffies),
             };
             let (interval_pa, timestamp_pa, jiffies_64_pa) = match wd {
                 WatchdogOverride::ScxSched {
-                    interval_pa,
-                    timestamp_pa,
-                    jiffies_64_pa,
+                    interval_kva,
+                    timestamp_kva,
+                    jiffies_64_kva,
                     ..
                 }
                 | WatchdogOverride::StaticGlobal {
-                    interval_pa,
-                    timestamp_pa,
-                    jiffies_64_pa,
+                    interval_kva,
+                    timestamp_kva,
+                    jiffies_64_kva,
                     ..
-                } => (*interval_pa, *timestamp_pa, *jiffies_64_pa),
+                } => (
+                    interval_kva.map(&text_pa),
+                    timestamp_kva.map(&text_pa),
+                    jiffies_64_kva.map(&text_pa),
+                ),
             };
             if let Some(pa) = write_pa {
                 // Capture the guest's original `watchdog_timeout` ONCE,
@@ -4130,7 +4155,13 @@ pub(crate) fn monitor_loop(
             // is zero and `resolve_event_pcpu_pas` returns `None` —
             // event counters stay absent for that sample.
             event_pcpu_pas_buf = refresh.event.as_ref().and_then(|ev| {
-                resolve_event_pcpu_pas(mem, ev.scx_root_pa, &ev.event_offsets, &fresh, page_offset)
+                resolve_event_pcpu_pas(
+                    mem,
+                    text_pa(ev.scx_root_kva),
+                    &ev.event_offsets,
+                    &fresh,
+                    page_offset,
+                )
             });
             per_cpu_offsets_buf = fresh;
         }
@@ -4860,6 +4891,12 @@ mod tests {
     fn test_kill_evt() -> vmm_sys_util::eventfd::EventFd {
         vmm_sys_util::eventfd::EventFd::new(vmm_sys_util::eventfd::EFD_NONBLOCK)
             .expect("create kill EventFd")
+    }
+
+    /// Link-time KVA whose kernel-image translation under `test_config()`'s
+    /// bases (`START_KERNEL_MAP`, `phys_base = 0`) is the fixture PA `pa`.
+    fn test_text_kva(pa: u64) -> u64 {
+        pa.wrapping_add(super::super::symbols::START_KERNEL_MAP)
     }
 
     fn test_config() -> MonitorConfig<'static> {
@@ -5953,6 +5990,124 @@ mod tests {
         assert_eq!(latched.cpus[0].nr_running, 55);
     }
 
+    /// Sibling of the test above for the watchdog-override path: the
+    /// `scx_root` deref must translate its LINK-TIME KVA against the live
+    /// `phys_base` every tick, not against a construction-time bake.
+    ///
+    /// The bake was the whole failure. On a contended host the guest's
+    /// KERN_ADDRS publish routinely lands after the monitor's bounded
+    /// pre-loop wait, so the override was resolved against `phys_base = 0`
+    /// and every later write went to a fixed wrong page for the rest of the
+    /// run — `ktstr/watchdog_override_timing_precision` then read back 0
+    /// while the guest ran on the scheduler's own compiled-in timeout.
+    ///
+    /// Shape mirrors the pco test: `cfg.phys_base` carries the wrong
+    /// displacement, so the `scx_root` read lands outside the fixture
+    /// (bounds-zero → treated as "no scheduler attached", no observation).
+    /// Mid-run the authoritative base is published into the Arc; the next
+    /// tick must adopt it, reach the real `scx_root`, deref to the
+    /// `scx_sched` stub, and land the write. A regression to a once-baked
+    /// PA leaves `watchdog_observation` at `None`.
+    #[test]
+    fn monitor_loop_watchdog_override_adopts_late_phys_base_publish() {
+        let offsets = test_offsets();
+        const TABLE_PA: u64 = 24;
+        const KERNEL_HALF: u64 = 1u64 << 63;
+        const WATCHDOG_OFFSET: usize = 16;
+        const WD_JIFFIES: u64 = 2000;
+        let rq0_buf = make_rq_buffer(&offsets, 55, 1, 1, 6543, 0);
+        let rq0_pa = TABLE_PA + 8; // after the 1-slot (8-byte) table
+        let pco0 = KERNEL_HALF | rq0_pa;
+
+        let mut combined = vec![0u8; TABLE_PA as usize];
+        combined.extend_from_slice(&pco0.to_ne_bytes());
+        combined.extend_from_slice(&rq0_buf);
+        // `scx_root` pointer slot, then the `scx_sched` stub it points at.
+        let scx_root_pa = combined.len() as u64;
+        let sch_pa = scx_root_pa + 8;
+        combined.extend_from_slice(&(KERNEL_HALF | sch_pa).to_ne_bytes());
+        combined.extend_from_slice(&[0u8; 64]);
+
+        // SAFETY: combined is a live local buffer whose backing storage
+        // outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_mut_ptr(), combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        let s = super::super::symbols::START_KERNEL_MAP;
+        let good_p: u64 = 0x10_0000; // authoritative guest phys_base
+        let bad_p: u64 = 0x40_0000; // construction fallback's garbage
+        let per_cpu_offset_kva = TABLE_PA.wrapping_add(s).wrapping_sub(good_p);
+        // Resolves to `scx_root_pa` only under the authoritative base.
+        let scx_root_kva = scx_root_pa.wrapping_add(s).wrapping_sub(good_p);
+
+        let phys_base_arc = std::sync::Arc::new(AtomicU64::new(0));
+        let refresh = RqRefresh {
+            per_cpu_offset_kva,
+            tcr_el1: None,
+            runqueues_kva: 0,
+            num_cpus: 1,
+            page_offset_base_kva: None,
+            memstart_addr_kva: None,
+            kern_phys_base: Some(phys_base_arc.clone()),
+            phys_base_guest_published: false,
+            kern_addrs_frames: None,
+            kern_addrs_crc_bad: None,
+            event: None,
+            kaslr_offset: std::sync::Arc::new(AtomicU64::new(1)),
+        };
+        let wd = WatchdogOverride::ScxSched {
+            scx_root_kva,
+            watchdog_offset: WATCHDOG_OFFSET,
+            jiffies: WD_JIFFIES,
+            interval_kva: None,
+            timestamp_kva: None,
+            jiffies_64_kva: None,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            let arc = phys_base_arc.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(40));
+                arc.store(good_p.wrapping_add(1), Ordering::Release);
+                std::thread::sleep(Duration::from_millis(80));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            watchdog_override: Some(&wd),
+            page_offset: KERNEL_HALF,
+            start_kernel_map: s,
+            phys_base: bad_p, // the garbage the bounded wait latched
+            ..test_config()
+        };
+        let MonitorLoopResult {
+            watchdog_observation,
+            ..
+        } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        let observation = watchdog_observation.expect(
+            "no watchdog observation after the authoritative phys_base \
+             publish — the scx_root deref regressed to a construction-baked \
+             PA and never reached guest memory",
+        );
+        assert_eq!(observation.expected_jiffies, WD_JIFFIES);
+        assert_eq!(observation.observed_jiffies, WD_JIFFIES);
+    }
+
     /// Regression: the monitor must RE-READ the KASLR-slide Arc each
     /// iteration, not snapshot it at `RqRefresh` construction. On aarch64
     /// the slide has a single no-retry publisher, and the monitor's
@@ -6205,12 +6360,12 @@ mod tests {
         let kill_evt = test_kill_evt();
 
         let wd = WatchdogOverride::ScxSched {
-            scx_root_pa,
+            scx_root_kva: test_text_kva(scx_root_pa),
             watchdog_offset,
             jiffies: 99999,
-            interval_pa: None,
-            timestamp_pa: None,
-            jiffies_64_pa: None,
+            interval_kva: None,
+            timestamp_kva: None,
+            jiffies_64_kva: None,
         };
 
         let handle = kill_after(&kill, Duration::from_millis(30));
@@ -6264,12 +6419,12 @@ mod tests {
         let kill = std::sync::Arc::new(AtomicBool::new(false));
         let kill_evt = test_kill_evt();
         let wd = WatchdogOverride::ScxSched {
-            scx_root_pa,
+            scx_root_kva: test_text_kva(scx_root_pa),
             watchdog_offset: 16,
             jiffies: 0xDEADBEEF,
-            interval_pa: None,
-            timestamp_pa: None,
-            jiffies_64_pa: None,
+            interval_kva: None,
+            timestamp_kva: None,
+            jiffies_64_kva: None,
         };
 
         let handle = kill_after(&kill, Duration::from_millis(30));
@@ -6330,7 +6485,7 @@ mod tests {
         let reset_ns = AtomicU64::new(0);
         let reset_tag = std::sync::atomic::AtomicU8::new(0);
         let wr = WatchdogReset {
-            scx_root_pa,
+            scx_root_kva: test_text_kva(scx_root_pa),
             workload_duration: Duration::from_secs(60),
             reset_ns: &reset_ns,
             reset_tag: &reset_tag,
@@ -6395,7 +6550,7 @@ mod tests {
             crate::vmm::freeze_coord::WatchdogResetTag::GuestAttachConfirm as u8;
         let reset_tag = std::sync::atomic::AtomicU8::new(guest_confirm_tag);
         let wr = WatchdogReset {
-            scx_root_pa,
+            scx_root_kva: test_text_kva(scx_root_pa),
             workload_duration: Duration::from_secs(60),
             reset_ns: &reset_ns,
             reset_tag: &reset_tag,
@@ -6447,11 +6602,11 @@ mod tests {
         let kill_evt = test_kill_evt();
 
         let wd = WatchdogOverride::StaticGlobal {
-            watchdog_timeout_pa: watchdog_pa,
+            watchdog_timeout_kva: test_text_kva(watchdog_pa),
             jiffies: 77777,
-            interval_pa: None,
-            timestamp_pa: None,
-            jiffies_64_pa: None,
+            interval_kva: None,
+            timestamp_kva: None,
+            jiffies_64_kva: None,
         };
 
         let handle = kill_after(&kill, Duration::from_millis(30));
@@ -6639,11 +6794,11 @@ mod tests {
         let kill_evt = test_kill_evt();
 
         let wd = WatchdogOverride::StaticGlobal {
-            watchdog_timeout_pa: timeout_pa,
+            watchdog_timeout_kva: test_text_kva(timeout_pa),
             jiffies: 500, // override = 5 s @ HZ=100
-            interval_pa: Some(interval_pa),
-            timestamp_pa: Some(timestamp_pa),
-            jiffies_64_pa: Some(jiffies_64_pa),
+            interval_kva: Some(test_text_kva(interval_pa)),
+            timestamp_kva: Some(test_text_kva(timestamp_pa)),
+            jiffies_64_kva: Some(test_text_kva(jiffies_64_pa)),
         };
 
         let handle = kill_after(&kill, Duration::from_millis(30));

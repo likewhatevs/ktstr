@@ -17223,54 +17223,43 @@ impl KtstrVm {
                 // pin the read at the wrong PA for the whole run —
                 // see [`monitor::reader::RqRefresh`]).
 
+                // Carry the LINK-TIME KVAs, not PAs: the monitor loop
+                // translates each one per iteration against the live
+                // kernel-image base and `phys_base`, the same discipline
+                // `RqRefresh` uses. Baking them here pinned the whole
+                // override to whatever `phys_base` the bounded KERN_ADDRS
+                // wait above had produced, and a guest whose publish lands
+                // after that wait times out (a contended host boots slowly
+                // enough for this to be routine) left the `scx_root` read
+                // on a wrong physical page for the entire run — reading
+                // stable non-null garbage, so the loop's null guard passed
+                // and the override was written outside guest DRAM, where
+                // the write no-ops and the read-back returns zero.
                 let watchdog_override = watchdog_jiffies.and_then(|jiffies| {
+                    let interval_kva = symbols.scx_watchdog_interval;
+                    let timestamp_kva = symbols.scx_watchdog_timestamp;
+                    let jiffies_64_kva = symbols.jiffies_64;
                     // 7.1+ path: deref scx_root -> scx_sched.watchdog_timeout.
                     if let Some((scx_root_kva, wd_offs)) = symbols
                         .scx_root
                         .zip(offsets.watchdog_offsets.as_ref())
                     {
-                        let scx_root_pa = monitor::symbols::text_kva_to_pa_with_base(
-                            scx_root_kva,
-                            start_kernel_map_for_thread,
-                            phys_base,
-                        );
-                        let resolve_pa = |kva| {
-                            monitor::symbols::text_kva_to_pa_with_base(
-                                kva,
-                                start_kernel_map_for_thread,
-                                phys_base,
-                            )
-                        };
-                        let interval_pa = symbols.scx_watchdog_interval.map(&resolve_pa);
-                        let timestamp_pa = symbols.scx_watchdog_timestamp.map(&resolve_pa);
-                        let jiffies_64_pa = symbols.jiffies_64.map(&resolve_pa);
                         return Some(monitor::reader::WatchdogOverride::ScxSched {
-                            scx_root_pa,
+                            scx_root_kva,
                             watchdog_offset: wd_offs.scx_sched_watchdog_timeout_off,
                             jiffies,
-                            interval_pa,
-                            timestamp_pa,
-                            jiffies_64_pa,
+                            interval_kva,
+                            timestamp_kva,
+                            jiffies_64_kva,
                         });
                     }
-                    if let Some(wdt_kva) = symbols.scx_watchdog_timeout {
-                        let resolve_pa = |kva| {
-                            monitor::symbols::text_kva_to_pa_with_base(
-                                kva,
-                                start_kernel_map_for_thread,
-                                phys_base,
-                            )
-                        };
-                        let watchdog_timeout_pa = resolve_pa(wdt_kva);
-                        let interval_pa = symbols.scx_watchdog_interval.map(&resolve_pa);
-                        let timestamp_pa = symbols.scx_watchdog_timestamp.map(&resolve_pa);
-                        let jiffies_64_pa = symbols.jiffies_64.map(&resolve_pa);
+                    if let Some(watchdog_timeout_kva) = symbols.scx_watchdog_timeout {
                         return Some(monitor::reader::WatchdogOverride::StaticGlobal {
-                            watchdog_timeout_pa,
+                            watchdog_timeout_kva,
                             jiffies,
-                            interval_pa,
-                            timestamp_pa,
-                            jiffies_64_pa,
+                            interval_kva,
+                            timestamp_kva,
+                            jiffies_64_kva,
                         });
                     }
                     None
@@ -17310,43 +17299,31 @@ impl KtstrVm {
                 // lifetime: `*scx_root` is null until a scheduler
                 // attaches, and the percpu base table is BSS zero
                 // until `setup_per_cpu_areas` runs. Stash the
-                // text-mapped PA of `scx_root` plus the BTF offsets
-                // and let the monitor loop refresh per-iteration.
-                let event_refresh =
-                    symbols
-                        .scx_root
-                        .zip(offsets.event_offsets.as_ref())
-                        .map(|(scx_root_kva, ev)| {
-                            let scx_root_pa = monitor::symbols::text_kva_to_pa_with_base(
-                                scx_root_kva,
-                                start_kernel_map_for_thread,
-                                phys_base,
-                            );
-                            monitor::reader::EventRefresh {
-                                scx_root_pa,
-                                event_offsets: ev.clone(),
-                            }
-                        });
-                // Scheduler-attach watchdog-reset PA, derived
+                // link-time KVA of `scx_root` plus the BTF offsets
+                // and let the monitor loop refresh per-iteration —
+                // including the KVA-to-PA translation, for the
+                // late-`phys_base` reason on `watchdog_override`.
+                let event_refresh = symbols
+                    .scx_root
+                    .zip(offsets.event_offsets.as_ref())
+                    .map(|(scx_root_kva, ev)| monitor::reader::EventRefresh {
+                        scx_root_kva,
+                        event_offsets: ev.clone(),
+                    });
+                // Scheduler-attach watchdog-reset input, derived
                 // independently of `event_refresh` so the reset
                 // works on kernels without resolvable
                 // `event_offsets` (e.g. older kernels lacking the
                 // BTF struct, or stripped vmlinux). Always derives
                 // from `symbols.scx_root` directly — the same
-                // text-mapped global the kernel itself uses to
+                // kernel-image global the kernel itself uses to
                 // publish the active `scx_sched`. `None` when the
                 // symbol could not be resolved (no scx support in
                 // the kernel image, or `KernelSymbols::from_elf`
                 // failed to find it); the loop's
                 // `cfg.watchdog_reset` short-circuits in that
                 // case.
-                let scx_root_pa_for_reset = symbols.scx_root.map(|kva| {
-                    monitor::symbols::text_kva_to_pa_with_base(
-                        kva,
-                        start_kernel_map_for_thread,
-                        phys_base,
-                    )
-                });
+                let scx_root_kva_for_reset = symbols.scx_root;
                 // `page_offset_base` is x86_64-only (a KASLR direct-map
                 // base randomized by `CONFIG_RANDOMIZE_MEMORY`).
                 // `KernelSymbols::from_vmlinux` returns `None` on
@@ -17551,9 +17528,9 @@ impl KtstrVm {
                 // detection point — leave the field `None` so
                 // the monitor's per-iteration check
                 // short-circuits.
-                let watchdog_reset_cfg = workload_duration.zip(scx_root_pa_for_reset).map(
-                    |(workload_duration, scx_root_pa)| monitor::reader::WatchdogReset {
-                        scx_root_pa,
+                let watchdog_reset_cfg = workload_duration.zip(scx_root_kva_for_reset).map(
+                    |(workload_duration, scx_root_kva)| monitor::reader::WatchdogReset {
+                        scx_root_kva,
                         workload_duration,
                         reset_ns: watchdog_reset_ns.as_ref(),
                         reset_tag: watchdog_reset_tag.as_ref(),
