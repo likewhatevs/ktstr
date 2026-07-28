@@ -228,6 +228,12 @@ pub(crate) struct MonitorArtifacts {
 /// split base, and the probe's split-BTF `.bss` Datasec walk, which
 /// needs the vmlinux BTF as its split base — take the cost only when
 /// they actually run.
+///
+/// Those remaining consumers then split by how they use the type graph,
+/// which is what [`Self::btf`] and [`Self::mapped_btf`] separate: the
+/// probe and watch paths look up a handful of names and are served the
+/// mapped form, dump rendering peels an unbounded number of `Fwd`
+/// terminals by name and is served the owned parse.
 pub(crate) struct BtfProducts {
     /// Canonical vmlinux path, used to rehydrate on demand.
     canon: PathBuf,
@@ -235,6 +241,10 @@ pub(crate) struct BtfProducts {
     /// attempted and failed, so a broken `.btf` sidecar is not retried
     /// once per dump iteration.
     btf: OnceLock<Option<Arc<btf_rs::Btf>>>,
+    /// The mapped handle [`BtfProducts::mapped_btf`] serves, kept apart
+    /// from `btf` because the two backends trade construction cost
+    /// against name-resolution cost in opposite directions.
+    mapped_btf: OnceLock<Option<Arc<btf_rs::Btf>>>,
     dump_offsets: OnceLock<crate::monitor::btf_offsets::DumpOffsets>,
 }
 
@@ -249,6 +259,7 @@ impl BtfProducts {
         let products = Self {
             canon,
             btf: OnceLock::new(),
+            mapped_btf: OnceLock::new(),
             dump_offsets: OnceLock::new(),
         };
         let _ = products.btf.set(Some(Arc::new(btf)));
@@ -267,6 +278,7 @@ impl BtfProducts {
         let products = Self {
             canon,
             btf: OnceLock::new(),
+            mapped_btf: OnceLock::new(),
             dump_offsets: OnceLock::new(),
         };
         if let Some(offsets) = dump_offsets {
@@ -295,6 +307,34 @@ impl BtfProducts {
                     .map(Arc::new)
             })
             .as_ref()
+    }
+
+    /// The vmlinux `Btf` for the consumers that resolve at most a
+    /// handful of names: the probe's `.bss` Datasec walk, the
+    /// probe-counter decodability pre-check, and the `watch_bpf_maps`
+    /// split base. Those are the only demands an ordinary cell makes, so
+    /// this handle is built with btf-rs's `Backend::Mmap` — 1.3 ms and
+    /// 4.5 MB against 61 ms and 41 MB for [`Self::btf`] on a 7.1.5
+    /// sidecar — paying instead for linear-scan name resolution they
+    /// barely use (see
+    /// [`crate::monitor::btf_offsets::load_btf_from_sidecar_mapped`]).
+    ///
+    /// An already-materialized [`Self::btf`] is reused rather than held
+    /// alongside a second copy of the same type graph, and a sidecar the
+    /// mapped loader will not take (outside the cache, stale, or absent)
+    /// falls through to [`Self::btf`] and its ELF fallback. Both are
+    /// answers to the same question, so either handle is correct here;
+    /// only the cost profile differs.
+    pub(crate) fn mapped_btf(&self) -> Option<&Arc<btf_rs::Btf>> {
+        if let Some(Some(btf)) = self.btf.get() {
+            return Some(btf);
+        }
+        self.mapped_btf
+            .get_or_init(|| {
+                crate::monitor::btf_offsets::load_btf_from_sidecar_mapped(&self.canon).map(Arc::new)
+            })
+            .as_ref()
+            .or_else(|| self.btf())
     }
 
     /// Has [`Self::btf`] been materialized yet? The whole point of this

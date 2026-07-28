@@ -8833,7 +8833,7 @@ impl KtstrVm {
                             || {
                                 let (Some(owned), Some(btf)) = (
                                     owned_accessor.as_ref(),
-                                    dump_btf.as_ref().and_then(|products| products.btf()),
+                                    dump_btf.as_ref().and_then(|products| products.mapped_btf()),
                                 ) else {
                                     return false;
                                 };
@@ -9109,7 +9109,7 @@ impl KtstrVm {
                             if cached_bss_offset.is_none()
                                 && map.btf_kva != 0
                                 && let Some(base) =
-                                    dump_btf.as_ref().and_then(|products| products.btf())
+                                    dump_btf.as_ref().and_then(|products| products.mapped_btf())
                             {
                                 match load_probe_bss_offset(
                                     kernel,
@@ -17552,7 +17552,7 @@ impl KtstrVm {
                         watch_prog_offsets,
                         symbols.prog_idr,
                         watch_vmlinux_data,
-                        btf.btf().cloned(),
+                        btf.mapped_btf().cloned(),
                     ) {
                         (
                             Some(prog_offsets),

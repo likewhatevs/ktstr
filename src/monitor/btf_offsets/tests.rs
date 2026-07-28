@@ -1053,6 +1053,59 @@ fn load_btf_empty_ktstr_cache_dir_falls_through() {
     );
 }
 
+/// The mapped sidecar loader must describe the SAME type graph as the
+/// owned one. `BtfProducts` hands one form to the probe/watch paths and
+/// the other to dump rendering purely as a cost tradeoff, so a backend
+/// that disagreed about ids, names, or member offsets would silently
+/// give the two paths different kernel layouts — and only the run path
+/// would notice, by reading the wrong guest bytes.
+///
+/// Checked against a real vmlinux because the divergence risk lives in
+/// btf-rs's two section decoders, not in a synthetic blob small enough
+/// to hand-verify.
+#[test]
+fn mapped_sidecar_load_describes_the_same_types_as_the_owned_parse() {
+    let Some(path) = crate::monitor::find_test_vmlinux() else {
+        return;
+    };
+    if path.starts_with("/sys/") {
+        return;
+    }
+
+    let _env = crate::test_support::test_helpers::lock_env();
+    let staged = stage_in_cache(&path);
+    let vmlinux = staged.vmlinux.as_path();
+    // Writes the `.btf` sidecar both loaders read below.
+    let _ = load_btf_from_path(vmlinux).expect("load must succeed inside cache root");
+
+    let owned = load_btf_from_sidecar(vmlinux).expect("owned sidecar load");
+    let mapped = load_btf_from_sidecar_mapped(vmlinux).expect("mapped sidecar load");
+
+    let owned_ids = owned
+        .resolve_ids_by_name("task_struct")
+        .expect("task_struct resolves in the owned parse");
+    assert!(
+        !owned_ids.is_empty(),
+        "fixture invariant: the staged vmlinux must carry task_struct, \
+         otherwise the comparison below is vacuous",
+    );
+    assert_eq!(
+        mapped
+            .resolve_ids_by_name("task_struct")
+            .expect("task_struct resolves in the mapped parse"),
+        owned_ids,
+        "both backends must return the same ids for one name",
+    );
+
+    let (owned_struct, _) = find_struct(&owned, "task_struct").expect("owned task_struct");
+    let (mapped_struct, _) = find_struct(&mapped, "task_struct").expect("mapped task_struct");
+    assert_eq!(
+        member_byte_offset(&mapped, &mapped_struct, "pid").expect("mapped pid offset"),
+        member_byte_offset(&owned, &owned_struct, "pid").expect("owned pid offset"),
+        "a member offset resolved through the mapped backend must match the owned one",
+    );
+}
+
 /// Mid-process `KTSTR_CACHE_DIR` change: a load that wrote a
 /// sidecar under cache_a must produce no sidecar under cache_b
 /// for the same vmlinux on the next call after the env points

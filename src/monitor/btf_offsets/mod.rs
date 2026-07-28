@@ -467,19 +467,54 @@ fn write_btf_sidecar(sidecar: &Path, bytes: &[u8]) -> Result<()> {
 /// `.artifacts` sidecar's BTF-derived products are only trustworthy
 /// paired with a matching `.btf` sidecar.
 pub(crate) fn load_btf_from_sidecar(path: &Path) -> Option<Btf> {
-    let canon = std::fs::canonicalize(path).ok()?;
-    if !crate::cache::path_inside_cache_root(&canon) {
-        return None;
-    }
-    let sidecar = btf_sidecar_path(&canon);
-    if !sidecar_fresh(&sidecar, &canon) {
-        return None;
-    }
+    let sidecar = trusted_btf_sidecar(path)?;
     let cached = map_sidecar(&sidecar).ok()?;
     if !is_raw_btf(&cached) {
         return None;
     }
     Btf::from_bytes(&cached).ok()
+}
+
+/// The `.btf` sidecar path for `path`, or `None` when it fails the
+/// membership + freshness gate the sidecar loaders share.
+fn trusted_btf_sidecar(path: &Path) -> Option<std::path::PathBuf> {
+    let canon = std::fs::canonicalize(path).ok()?;
+    if !crate::cache::path_inside_cache_root(&canon) {
+        return None;
+    }
+    let sidecar = btf_sidecar_path(&canon);
+    sidecar_fresh(&sidecar, &canon).then_some(sidecar)
+}
+
+/// [`load_btf_from_sidecar`] with btf-rs's `Backend::Mmap`: the sidecar
+/// stays mapped and each type is decoded from those bytes on demand
+/// instead of being parsed up front into an owned type graph.
+///
+/// Measured against the cached 7.1.5 sidecar (5.7 MiB of raw BTF):
+/// 1.3 ms and 4.5 MB resident to construct, against 61 ms and 41 MB for
+/// [`load_btf_from_sidecar`]. `resolve_type_by_id` is no slower
+/// (0.07 us against 0.09 us — both decode a type and allocate it). The
+/// whole cost moves to `resolve_ids_by_name`, which becomes a linear
+/// walk of the type section: ~0.7 ms against ~0.5 us. The two forms
+/// break even at roughly 85 name resolutions per handle.
+///
+/// So this is deliberately not the default. Dump rendering resolves a
+/// name once per `Fwd` terminal it peels
+/// ([`crate::monitor::btf_render::peel_modifiers_resolving_fwd`]) — an
+/// unbounded count over a report — while the run-path consumers resolve
+/// a handful. `vmm::vmlinux`'s `BtfProducts` owns that split.
+///
+/// btf-rs offers `Backend::Mmap` only for a base BTF read from a file,
+/// so there is no byte-slice form and no ELF fallback here; callers fall
+/// back to [`load_btf_from_sidecar`]'s owned parse.
+pub(crate) fn load_btf_from_sidecar_mapped(path: &Path) -> Option<Btf> {
+    let sidecar = trusted_btf_sidecar(path)?;
+    // btf-rs would accept a big-endian blob through its own header
+    // parse; keep the little-endian-only gate `is_raw_btf` documents.
+    if !is_raw_btf(&map_sidecar(&sidecar).ok()?) {
+        return None;
+    }
+    Btf::from_file_with_backend(&sidecar, btf_rs::Backend::Mmap).ok()
 }
 
 /// True iff the `.btf` sidecar for `path` exists and is fresh relative
