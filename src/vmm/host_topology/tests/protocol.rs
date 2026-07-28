@@ -5362,6 +5362,26 @@ fn revoked_claim_stays_charged_until_ack() {
 /// GRANTED permit is visible to a senior's planning snapshot, and proves the
 /// senior that acts on it keeps the junior's grant alive instead of revoking
 /// it. The blind counterpart is [`revoked_claim_stays_charged_until_ack`].
+/// A scan-side availability rejection is unattributable while "never observed"
+/// and "observed held" share one counter: the first is a coordinator that has
+/// not looked yet, the second is a peer that has not released. The split has to
+/// separate them even though both fail the same predicate.
+#[test]
+fn scan_unavailable_separates_unobserved_from_held() {
+    let _prefixes = LockPrefixesGuard::new();
+    let (unobserved_split_out, held_not_reported_unobserved) =
+        protocol::exercise_scan_unavailable_split_for_tests()
+            .expect("classify both scan-side availability rejections");
+    assert!(
+        unobserved_split_out,
+        "a claim naming a never-observed resource must attribute to the unobserved cause",
+    );
+    assert!(
+        held_not_reported_unobserved,
+        "a claim whose named resource is observed held must not attribute to the unobserved cause",
+    );
+}
+
 #[test]
 fn permit_grant_charge_is_visible_and_avoidable() {
     let _prefixes = LockPrefixesGuard::new();

@@ -10998,6 +10998,51 @@ pub(crate) fn grant_charge_matches_derived_for_tests() -> Result<()> {
     grant_charge_derived_matches(&mut table)
 }
 
+/// Classify one never-observed claim and one observed-held claim through the
+/// exact predicate the scan's `scan_unavailable` split uses, returning
+/// `(unobserved_is_split_out, observed_held_is_not)`.
+///
+/// Both claims fail `claim_availability_compatible` identically, which is why
+/// the totals alone cannot say whether a stalled queue is waiting on the
+/// coordinator to observe something or on a peer to release it.
+#[cfg(test)]
+pub(crate) fn exercise_scan_unavailable_split_for_tests() -> Result<(bool, bool)> {
+    let never_observed_cpu = 2_800usize;
+    let observed_held_cpu = 2_801usize;
+    let anchor = ClaimSet::new(std::iter::empty(), [2_802usize], FlockMode::Exclusive);
+    let mut anchor = Ticket::register(anchor.clone(), anchor, None)?;
+    let split = {
+        let _lock = lock_registry_existing(FlockMode::Exclusive)?;
+        let mut table = Table::open_existing()?;
+        set_cpu_availability_for_tests(
+            &mut table,
+            observed_held_cpu,
+            ResourceAvailability::ExclusiveHeld,
+        )?;
+        let unobserved = ClaimSet::new(
+            std::iter::empty(),
+            [never_observed_cpu],
+            FlockMode::Exclusive,
+        );
+        let held = ClaimSet::new(
+            std::iter::empty(),
+            [observed_held_cpu],
+            FlockMode::Exclusive,
+        );
+        anyhow::ensure!(
+            !table.claim_availability_compatible(&unobserved)?
+                && !table.claim_availability_compatible(&held)?,
+            "the split fixture needs two claims the scan rejects for availability",
+        );
+        (
+            table.claim_names_unobserved(&unobserved)?,
+            !table.claim_names_unobserved(&held)?,
+        )
+    };
+    anchor.finish(None)?;
+    Ok(split)
+}
+
 #[cfg(test)]
 pub(crate) struct GrantedChargeLifecycleOutcome {
     pub(crate) scan_granted_charged: bool,
@@ -18887,6 +18932,11 @@ impl Table {
                     }
                 } else if !availability_compatible {
                     note_block(GrantBlock::ScanUnavailable);
+                    note_block(if self.claim_names_unobserved(&record.claim)? {
+                        GrantBlock::ScanUnavailableUnobserved
+                    } else {
+                        GrantBlock::ScanUnavailableBusy
+                    });
                 } else if !blocker_ready {
                     note_block(GrantBlock::ScanBlocker);
                 } else {
@@ -19664,6 +19714,31 @@ impl Table {
             serial,
         );
         Ok(serial)
+    }
+
+    /// Diagnostics-only split of [`Self::claim_availability_compatible`]:
+    /// whether the claim names a resource that has never been observed, as
+    /// opposed to one observed held. Both fail that check identically, but
+    /// they are opposite causes — an unobserved resource may be free, and only
+    /// an observation can tell — so a scan-side rejection is unattributable
+    /// while the two share one counter.
+    fn claim_names_unobserved(&self, claim: &impl ClaimView) -> Result<bool> {
+        for cpu in claim.cpus() {
+            if !self.bitmap_bit(B_CPU_KNOWN, cpu)? {
+                return Ok(true);
+            }
+        }
+        for permit in claim.permits() {
+            if !self.bitmap_bit(B_CPU_KNOWN, permit_resource_index(permit)?)? {
+                return Ok(true);
+            }
+        }
+        for llc in claim.llcs() {
+            if !self.bitmap_bit(B_LLC_KNOWN, llc)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn claim_availability_compatible(&self, claim: &impl ClaimView) -> Result<bool> {

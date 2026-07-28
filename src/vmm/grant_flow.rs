@@ -31,6 +31,38 @@
 //! to a parked PENDING preparation rather than to HELD, and the later one-shot
 //! activation that does publish HELD needs no fresh grant.
 //!
+//! # `grants_reached_held` is a denominator, not a throughput
+//!
+//! Read this before deriving anything from it. A lane admits a fixed set of
+//! cells — the suite decides how many, not the admission protocol — and each
+//! publishes its HELD run claim exactly once, so `grants_reached_held` is a
+//! constant of the workload. It has measured 368-374 on every lane of every
+//! configuration this protocol has been through — before and after the
+//! granted-entrant park, at 18% and at 29% of grants issued. Admission getting
+//! faster cannot raise it; it moves only when a cell fails to run at all.
+//!
+//! The consequence is that `grants_reached_held / grants_issued` is `1 /
+//! grants burned per admission`: a **waste ratio**, not a conversion rate and
+//! not throughput. Halving the waste does not run one extra cell. Steering a
+//! performance change on it reads a fixed numerator over a noisy denominator.
+//!
+//! `running_in_flight` is the throughput term. `held_in_flight` counts every
+//! in-flight GRANTED+HELD record and `granted_in_flight` the GRANTED subset;
+//! both fence later tickets identically, but only the difference is running a
+//! VM. That difference against the lane's fixed cell count and mean hold time
+//! is what predicts wall clock.
+//!
+//! # Scan-side counters need their denominator
+//!
+//! The `scan_*` group fires once per queued waiter per authoritative scan, so
+//! its totals scale with how deep the queue was — a lane whose queue is three
+//! times deeper reports three times the rejections at identical behavior.
+//! `grant_scans` and `records_scanned` ship on this line for exactly that
+//! reason: normalize by `records_scanned` before comparing any `scan_*` count
+//! across runs. The wake-side counters have a different denominator again
+//! (candidates walked, not records scanned), so the two groups are not
+//! comparable to each other even within one run.
+//!
 //! The per-cause loss/probe/replan/guard/watermark breakdown counters this
 //! module once carried answered their questions (the watermark-park and
 //! EX-pin-rotation churn producers are fixed) and were removed with them.
@@ -84,6 +116,8 @@ static GRANTED_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 static DISTINCT_HELD_CPUS_MAX: AtomicU64 = AtomicU64::new(0);
 static HELD_IN_FLIGHT_SUM: AtomicU64 = AtomicU64::new(0);
 static GRANTED_IN_FLIGHT_SUM: AtomicU64 = AtomicU64::new(0);
+static RUNNING_IN_FLIGHT_SUM: AtomicU64 = AtomicU64::new(0);
+static RUNNING_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 static IN_FLIGHT_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static IN_FLIGHT_FIRST_NS: AtomicU64 = AtomicU64::new(0);
 static IN_FLIGHT_LAST_NS: AtomicU64 = AtomicU64::new(0);
@@ -176,6 +210,15 @@ pub(crate) enum GrantBlock {
     /// Scan side: the waiter's claim is free of predecessors but a resource it
     /// names is observed held, or has never been observed at all.
     ScanUnavailable,
+    /// Sub-count of [`GrantBlock::ScanUnavailable`]: at least one named
+    /// resource has never been observed. This is the opposite cause to the
+    /// one below — an unobserved resource may well be free — and the two were
+    /// one number until this split, which is the same conflation the wake-side
+    /// [`GrantBlock::Unobserved`] / [`GrantBlock::Busy`] pair already avoids.
+    ScanUnavailableUnobserved,
+    /// Sub-count of [`GrantBlock::ScanUnavailable`]: every named resource has
+    /// been observed and at least one is genuinely held.
+    ScanUnavailableBusy,
     /// Scan side: the waiter is pinned to a blocker whose serial has not moved.
     ScanBlocker,
     /// Scan side: a preparation intent found no free slot in the preparation
@@ -225,7 +268,7 @@ pub(crate) enum GrantBlock {
 }
 
 impl GrantBlock {
-    const COUNT: usize = 25;
+    const COUNT: usize = 27;
 
     const ALL: [Self; Self::COUNT] = [
         Self::Unlicensed,
@@ -241,6 +284,8 @@ impl GrantBlock {
         Self::ScanConflictPermit,
         Self::ScanConflictLlc,
         Self::ScanUnavailable,
+        Self::ScanUnavailableUnobserved,
+        Self::ScanUnavailableBusy,
         Self::ScanBlocker,
         Self::ScanPreparationPool,
         Self::ScanRevoke,
@@ -274,6 +319,8 @@ impl GrantBlock {
             Self::ScanConflictPermit => "scan_conflict_permit",
             Self::ScanConflictLlc => "scan_conflict_llc",
             Self::ScanUnavailable => "scan_unavailable",
+            Self::ScanUnavailableUnobserved => "scan_unavailable_unobserved",
+            Self::ScanUnavailableBusy => "scan_unavailable_busy",
             Self::ScanBlocker => "scan_blocker",
             Self::ScanPreparationPool => "scan_preparation_pool",
             Self::ScanRevoke => "scan_revoke",
@@ -380,6 +427,16 @@ pub(crate) fn note_held_in_flight(
     // problem or a wake-path one.
     HELD_IN_FLIGHT_SUM.fetch_add(held_records, Ordering::Relaxed);
     GRANTED_IN_FLIGHT_SUM.fetch_add(granted_records, Ordering::Relaxed);
+    // The running population, differenced per sample rather than between the
+    // two means, so the max is a real simultaneous observation instead of the
+    // gap between two peaks that never coincided. `held_records` counts the
+    // GRANTED subset too, so this is the HELD-only remainder: the cells that
+    // are running a VM rather than fencing the host while they wait to be
+    // woken. Saturating because the two inputs are counted from one snapshot
+    // but nothing in the type system pins their order.
+    let running = held_records.saturating_sub(granted_records);
+    RUNNING_IN_FLIGHT_SUM.fetch_add(running, Ordering::Relaxed);
+    bump_max(&RUNNING_IN_FLIGHT_MAX, running);
     IN_FLIGHT_SAMPLES.fetch_add(1, Ordering::Relaxed);
     let _ = IN_FLIGHT_FIRST_NS.compare_exchange(0, now_ns, Ordering::Relaxed, Ordering::Relaxed);
     bump_max(&IN_FLIGHT_LAST_NS, now_ns);
@@ -467,6 +524,12 @@ fn format_line(pid: u32) -> String {
     };
     let held_in_flight_mean = in_flight_mean(&HELD_IN_FLIGHT_SUM);
     let granted_in_flight_mean = in_flight_mean(&GRANTED_IN_FLIGHT_SUM);
+    let running_in_flight_mean = in_flight_mean(&RUNNING_IN_FLIGHT_SUM);
+    // Read from the coordinator's own scan counters rather than accumulated
+    // here, so this line and `coordinator-wakes-<pid>.txt` cannot disagree
+    // about the denominator every `scan_*` count below has to be divided by.
+    let (grant_scans, records_scanned) =
+        crate::vmm::host_topology::protocol::coordinator_scan_stats();
     let in_flight_span_ns = IN_FLIGHT_LAST_NS
         .load(Ordering::Relaxed)
         .saturating_sub(IN_FLIGHT_FIRST_NS.load(Ordering::Relaxed));
@@ -500,7 +563,10 @@ fn format_line(pid: u32) -> String {
          callback_count={callback_count} callback_ns_mean={callback_ns_mean} \
          callback_ns_max={} discover_ns_sum={} changed_cpu_bits_sum={} \
          changed_permit_bits_sum={} changed_llc_bits_sum={} held_in_flight_sum={} \
-         granted_in_flight_sum={} callback_ns_sum={}{blocks}\n",
+         granted_in_flight_sum={} callback_ns_sum={} \
+         running_in_flight_mean={running_in_flight_mean} \
+         running_in_flight_sum={} running_in_flight_max={} \
+         grant_scans={grant_scans} records_scanned={records_scanned}{blocks}\n",
         GRANTS_ISSUED.load(Ordering::Relaxed),
         GRANTS_REACHED_HELD.load(Ordering::Relaxed),
         GRANTS_LOST.load(Ordering::Relaxed),
@@ -523,6 +589,8 @@ fn format_line(pid: u32) -> String {
         HELD_IN_FLIGHT_SUM.load(Ordering::Relaxed),
         GRANTED_IN_FLIGHT_SUM.load(Ordering::Relaxed),
         CALLBACK_NS_SUM.load(Ordering::Relaxed),
+        RUNNING_IN_FLIGHT_SUM.load(Ordering::Relaxed),
+        RUNNING_IN_FLIGHT_MAX.load(Ordering::Relaxed),
     )
 }
 
@@ -608,6 +676,8 @@ mod tests {
             "block_scan_conflict_permit=",
             "block_scan_conflict_llc=",
             "block_scan_unavailable=",
+            "block_scan_unavailable_unobserved=",
+            "block_scan_unavailable_busy=",
             "block_scan_blocker=",
             "block_scan_preparation_pool=",
             "block_scan_revoke=",
@@ -620,6 +690,11 @@ mod tests {
             "block_park_commit=",
             "block_park_saturated=",
             "block_prepared=",
+            "running_in_flight_mean=",
+            "running_in_flight_sum=",
+            "running_in_flight_max=",
+            "grant_scans=",
+            "records_scanned=",
         ] {
             assert!(line.contains(field), "missing {field} in {line}");
         }
@@ -649,6 +724,32 @@ mod tests {
         assert_eq!(
             BLOCKS[GrantBlock::Unobserved.index()].load(Ordering::Relaxed),
             before,
+        );
+    }
+
+    /// The running population is the HELD-only remainder, differenced per
+    /// sample. Differencing the two published means instead would report a max
+    /// that is the gap between two peaks which may never have coincided, and
+    /// would underflow rather than clamp if a snapshot ever counted the GRANTED
+    /// subset above its own total.
+    #[test]
+    fn running_in_flight_is_the_held_only_remainder_per_sample() {
+        let before_sum = RUNNING_IN_FLIGHT_SUM.load(Ordering::Relaxed);
+        let before_max = RUNNING_IN_FLIGHT_MAX.load(Ordering::Relaxed);
+        note_held_in_flight(11, 7, 0, 1);
+        note_held_in_flight(9, 6, 0, 2);
+        note_held_in_flight(5, 9, 0, 3);
+        assert_eq!(
+            RUNNING_IN_FLIGHT_SUM.load(Ordering::Relaxed) - before_sum,
+            7,
+            "each sample contributes held minus granted, clamped at zero",
+        );
+        assert_eq!(
+            RUNNING_IN_FLIGHT_MAX
+                .load(Ordering::Relaxed)
+                .max(before_max),
+            before_max.max(4),
+            "the max is a single sample's remainder, not the gap between peaks",
         );
     }
 

@@ -95,9 +95,9 @@ pub(crate) use registry::{
     exercise_same_wake_redesignation_fallback_for_tests,
     exercise_same_wake_redesignation_grant_for_tests,
     exercise_same_wake_redesignation_older_fence_for_tests,
-    exercise_scan_metadata_validation_for_tests, exercise_shared_commit_improvement_for_tests,
-    exercise_shared_watch_held_metadata_for_tests, exercise_stale_acquired_release_order_for_tests,
-    exercise_stale_contention_commit_for_tests,
+    exercise_scan_metadata_validation_for_tests, exercise_scan_unavailable_split_for_tests,
+    exercise_shared_commit_improvement_for_tests, exercise_shared_watch_held_metadata_for_tests,
+    exercise_stale_acquired_release_order_for_tests, exercise_stale_contention_commit_for_tests,
     exercise_stale_heartbeat_known_free_close_for_tests,
     exercise_stalled_takeover_notification_for_tests, exercise_superset_commit_rescan_for_tests,
     exercise_unchanged_completion_guard_for_tests,
@@ -429,6 +429,17 @@ static COORDINATOR_FALLBACK_WAKES: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) fn coordinator_event_wakes_for_tests() -> u64 {
     COORDINATOR_EVENT_WAKES.load(Ordering::Relaxed)
+}
+
+/// Authoritative grant scans this process's coordinator has run, and the
+/// records those scans walked.
+///
+/// Shared with the grant-flow line so a reader can normalize the `scan_*`
+/// causes — which fire once per queued waiter per scan — without joining
+/// against `coordinator-wakes-<pid>.txt`, and so the two files cannot report
+/// different denominators for the same process.
+pub(in crate::vmm) fn coordinator_scan_stats() -> (u64, u64) {
+    registry::coordinator_scan_stats()
 }
 
 fn persist_coordinator_wake_stats_if_enabled() {
