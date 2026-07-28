@@ -2283,6 +2283,7 @@ mod tests {
             progress_epoch: 0,
             monitor_heartbeat: 0,
             monitor_terminal: false,
+            monitor_absent: false,
             runnable_demand,
             cpu_currency,
             evidence_channels_live: channels_live,

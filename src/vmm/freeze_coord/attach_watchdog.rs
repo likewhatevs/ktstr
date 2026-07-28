@@ -1105,6 +1105,28 @@ mod tests {
     }
 
     #[test]
+    fn monitor_absent_never_fails_an_active_attempt() {
+        // A run that never provisioned a monitor (no vmlinux — e.g. a
+        // distro kernel without debuginfo) keeps the overlay waiting on
+        // guest boundary frames instead of failing at the first tick;
+        // with CPU currency absent the wall net / hard deadline bound it.
+        let tracker = AttachAttemptTracker::default();
+        let ledger = ProgressLedger::default();
+        let mut liveness = watchdog_step::MonitorLiveness::new();
+        observe(
+            &tracker,
+            event(AttachAttemptTransition::Started, AttachAttemptKind::Boot, 1),
+            &ledger,
+            0,
+        );
+
+        ledger.publish_monitor_absent();
+        let absent = tick(&tracker, &ledger, 1, &mut liveness);
+        assert!(absent.attach.active);
+        assert_eq!(absent.attach.decision, AttachWatchdogDecision::None);
+    }
+
+    #[test]
     fn explicit_monitor_terminal_fails_finishing_rendezvous_immediately() {
         let tracker = AttachAttemptTracker::default();
         let ledger = ProgressLedger::default();

@@ -15571,9 +15571,11 @@ impl KtstrVm {
                         // early-boot kill here is Tier-1 / Tier-3 only.
                         eprintln!(
                             "  phase={stage:?} ({:?}), monitor_live={monitor_live}, \
-                             monitor_terminal={}, evidence_channels_live={}",
+                             monitor_terminal={}, monitor_absent={}, \
+                             evidence_channels_live={}",
                             stage.class(),
                             snapshot.monitor_terminal,
+                            snapshot.monitor_absent,
                             snapshot.evidence_channels_live,
                         );
                         if let Some((
@@ -16671,8 +16673,14 @@ impl KtstrVm {
         // cross-process cache wait must never hold an admitted VM or consume
         // its watchdog budget. All products are owned, so this function only
         // clones the pieces its monitor closure needs.
+        // No-monitor early returns publish ABSENT, not terminal: a kernel
+        // without a matching vmlinux (e.g. a distro that ships no
+        // debuginfo, accepted at kernel-acquire time with a warning) runs
+        // in the degraded no-monitor mode, bounded by the wall net and the
+        // hard deadline. Latching terminal here made the attach/readiness
+        // watchdog overlays fail every such cell at their first tick.
         let Some((vmlinux, artifacts)) = prepared_vmlinux else {
-            progress_ledger.publish_monitor_terminal();
+            progress_ledger.publish_monitor_absent();
             return Ok(None);
         };
         // The monitor closure outlives this borrowed run_vm call. Own the
@@ -16685,7 +16693,7 @@ impl KtstrVm {
         // resolving but `monitor` absent is the same "symbols Ok,
         // offsets Err → Ok(None)" the old `(Ok, Ok)` gate produced.
         let Some(mon) = artifacts.monitor.as_ref() else {
-            progress_ledger.publish_monitor_terminal();
+            progress_ledger.publish_monitor_absent();
             return Ok(None);
         };
         let symbols = artifacts.symbols.clone();
@@ -16710,7 +16718,7 @@ impl KtstrVm {
             match cached_vmlinux_bytes(&vmlinux) {
                 Some(data) => Some(data),
                 None => {
-                    progress_ledger.publish_monitor_terminal();
+                    progress_ledger.publish_monitor_absent();
                     return Ok(None);
                 }
             }

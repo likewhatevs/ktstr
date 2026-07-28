@@ -49,8 +49,9 @@ impl<'a> MonitorTerminalGuard<'a> {
     /// Arm the terminal sensor for one monitor thread.
     ///
     /// Construct this as the first local in the spawned monitor closure.
-    /// Monitor setup paths which return without spawning a thread should
-    /// instead call [`ProgressLedger::publish_monitor_terminal`] directly.
+    /// Setup paths that decide no monitor can exist for the run publish
+    /// [`ProgressLedger::publish_monitor_absent`] instead; only a failed
+    /// spawn of a monitor the run counted on publishes terminal directly.
     pub(crate) fn new(ledger: &'a ProgressLedger, kill: &'a AtomicBool) -> Self {
         Self { ledger, kill }
     }

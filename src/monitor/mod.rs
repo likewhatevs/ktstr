@@ -817,16 +817,31 @@ pub(crate) struct ProgressLedger {
     /// (distinct from the guest making no progress), which the watchdog must
     /// not misread as a guest hang. Relaxed.
     pub(crate) monitor_heartbeat: AtomicU64,
-    /// Monotone terminal/unavailable sensor for the host monitor.
+    /// Monotone terminal sensor for the host monitor.
     ///
     /// `false` means a monitor may still publish evidence for this run.
-    /// `true` means no monitor exists, or the monitor thread exited while
-    /// the run kill flag was not set. The monitor thread's RAII terminal
-    /// guard publishes this on both ordinary unexpected return and unwind;
-    /// setup paths publish it directly when no monitor can be created.
-    /// Once true it never clears. Release/Acquire pairs the terminal edge
-    /// with any diagnostics emitted before the monitor stopped.
+    /// `true` means a monitor this run counted on is gone: its thread
+    /// exited while the run kill flag was not set (the RAII terminal
+    /// guard publishes on both ordinary unexpected return and unwind) or
+    /// its spawn failed after artifacts resolved. A run that never had a
+    /// monitor latches [`Self::monitor_absent`] instead — losing a sensor
+    /// mid-run destroys evidence the watchdog was charging against, while
+    /// never having one is the known degraded mode. Once true it never
+    /// clears. Release/Acquire pairs the terminal edge with any
+    /// diagnostics emitted before the monitor stopped.
     pub(crate) monitor_terminal: AtomicBool,
+    /// Monotone "no monitor was ever provisioned for this run" latch.
+    ///
+    /// Set by `start_monitor` when no vmlinux is available or its
+    /// BTF/offset artifacts do not resolve (e.g. distro kernels shipped
+    /// without debuginfo, where running without the monitor is the
+    /// accepted degraded mode). Unlike [`Self::monitor_terminal`], this
+    /// must NOT fail attach/readiness overlays or the Tier-3 deadman:
+    /// guest boundary frames still flow through the freeze coordinator,
+    /// CPU currency simply stays [`CPU_CURRENCY_NONE`], and the
+    /// liveness-independent wall net plus the hard deadline remain the
+    /// terminal bounds. Diagnostic only. Relaxed.
+    pub(crate) monitor_absent: AtomicBool,
     /// Bumped only on a MILESTONE (see the LOAD-BEARING invariant below).
     /// Release store / Acquire load so a reader observing a fresh epoch
     /// also sees the `cpu_ns_at_progress` / `wall_ns_at_progress` payload
@@ -943,13 +958,21 @@ impl ProgressLedger {
         self.record_monitor_heartbeat();
     }
 
-    /// Publish that the host monitor is terminal or unavailable.
+    /// Publish that a host monitor this run counted on is terminal.
     ///
-    /// This is intentionally a one-way latch. Monitor setup calls it when no
-    /// monitor can be created; [`reader::MonitorTerminalGuard`] calls it when
-    /// a live monitor thread leaves unexpectedly.
+    /// This is intentionally a one-way latch. The monitor spawn-failure
+    /// path calls it; [`reader::MonitorTerminalGuard`] calls it when a
+    /// live monitor thread leaves unexpectedly. Setup paths that decide
+    /// no monitor can exist at all call [`Self::publish_monitor_absent`]
+    /// instead.
     pub(crate) fn publish_monitor_terminal(&self) {
         self.monitor_terminal.store(true, Ordering::Release);
+    }
+
+    /// Publish that no monitor was ever provisioned for this run (see
+    /// [`Self::monitor_absent`]). One-way latch.
+    pub(crate) fn publish_monitor_absent(&self) {
+        self.monitor_absent.store(true, Ordering::Relaxed);
     }
 
     /// Record a NEW-WORK observation: publish the payload, then bump
@@ -1133,6 +1156,7 @@ impl ProgressLedger {
                 progress_epoch,
                 monitor_heartbeat: self.monitor_heartbeat.load(Ordering::Relaxed),
                 monitor_terminal: self.monitor_terminal.load(Ordering::Acquire),
+                monitor_absent: self.monitor_absent.load(Ordering::Relaxed),
                 runnable_demand: self.runnable_demand.load(Ordering::Relaxed),
                 cpu_currency: self.cpu_currency.load(Ordering::Relaxed),
                 evidence_channels_live: self.evidence_channels_live.load(Ordering::Relaxed),
@@ -1195,10 +1219,14 @@ pub(crate) struct LedgerSnapshot {
     pub(crate) progress_epoch: u64,
     /// Monitor liveness pulse (bumped every tick and during pre-sample waits).
     pub(crate) monitor_heartbeat: u64,
-    /// True once the host monitor is known to be terminal or unavailable.
+    /// True once a monitor this run counted on is known to be terminal.
     /// Unlike heartbeat-derived liveness, this is an explicit monotone
     /// terminal edge and should wake/abort observers immediately.
     pub(crate) monitor_terminal: bool,
+    /// True when no monitor was ever provisioned for this run (see
+    /// [`ProgressLedger::monitor_absent`]). Diagnostic only — never a
+    /// kill fact.
+    pub(crate) monitor_absent: bool,
     /// The guest had queued work at the latest sample.
     pub(crate) runnable_demand: bool,
     /// Provenance of `cpu_ns_now` ([`CPU_CURRENCY_NONE`]/`PTHREAD`/`PMU`).
@@ -1247,6 +1275,24 @@ mod progress_ledger_tests {
         // Later liveness samples cannot make a terminal monitor live again.
         l.record_liveness(1, 2, 0, false, 3, CPU_CURRENCY_PTHREAD, false, true);
         assert!(l.snapshot().monitor_terminal);
+    }
+
+    #[test]
+    fn monitor_absent_latches_without_touching_terminal() {
+        let l = ProgressLedger::default();
+        assert!(!l.snapshot().monitor_absent);
+
+        l.publish_monitor_absent();
+        let snapshot = l.snapshot();
+        assert!(snapshot.monitor_absent);
+        assert!(
+            !snapshot.monitor_terminal,
+            "a never-provisioned monitor is not a terminal sensor edge"
+        );
+
+        // One-way latch, unaffected by later liveness samples.
+        l.record_liveness(1, 2, 0, false, 3, CPU_CURRENCY_PTHREAD, false, true);
+        assert!(l.snapshot().monitor_absent);
     }
 
     #[test]
