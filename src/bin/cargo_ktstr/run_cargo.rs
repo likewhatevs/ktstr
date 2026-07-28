@@ -5775,12 +5775,17 @@ fn bucket_size_bytes(bucket: &std::path::Path) -> u64 {
 /// unleased bucket remains — regardless of [`SHARED_BUILD_SCRATCH_MAX_IDLE`].
 ///
 /// Installed as the [`ktstr::cache::artifact_tree::BuildSpaceReclaimer`] on the
-/// nextest cold-build cache: when `reserve_cold_build_space` finds the
-/// filesystem below its reserve after lifecycle collection, this frees the
-/// pure-cache Cargo scratch dirs that lifecycle GC never sees (a stale
+/// nextest cold-build cache: when `reserve_cold_build_space` finds measured free
+/// space below the filesystem's own floor after lifecycle collection, this frees
+/// the pure-cache Cargo scratch dirs that lifecycle GC never sees (a stale
 /// GITHUB_SHA-era bucket, a retired toolchain/feature bucket). Worst case is one
 /// cold rebuild of a reclaimed configuration. The 14-day
 /// [`gc_stale_shared_build_scratch`] sweep still covers the no-pressure case.
+///
+/// The concurrent builds' own reservations are deliberately excluded from that
+/// trigger: they forecast space those builds are about to consume, and these
+/// buckets are what keep them incremental, so reacting to the forecast deletes
+/// the very state that would have kept the forecast small.
 ///
 /// `exempt_bucket` is the bucket the pending build is about to lease; it is
 /// never a candidate (the build has not taken its lease yet when the reservation

@@ -1194,20 +1194,19 @@ impl ArtifactTreeCache {
         let (active_reservations, _) = active_build_reservations(&closure.lifecycle_root)?;
         let mut after = lifecycle_filesystem_space(&closure.lifecycle_root)?;
         drop(global);
-        let required = LIFECYCLE_MIN_FREE_RESERVE
-            .max(after.capacity / LIFECYCLE_FREE_RESERVE_DIVISOR)
-            .saturating_add(active_reservations);
+        let pressure = cold_build_space_pressure(after, active_reservations);
+        let required = pressure.required;
         // Lifecycle collection reclaims only the managed closure/content cache.
         // A caller (e.g. the Cargo producer) may own a separate pure-cache
         // scratch space on the same filesystem whose orphans lifecycle GC never
-        // sees. When the reserve is still short after collection, invoke the
-        // caller's reclaimer so this disk-pressure event drives that cleanup at
-        // the same reservation boundary the lifecycle GC uses — rather than
-        // waiting for the scratch's own slow idle timer.
-        if after.available < required
+        // sees. When the filesystem is still below its own free floor after
+        // collection, invoke the caller's reclaimer so this disk-pressure event
+        // drives that cleanup at the same reservation boundary the lifecycle GC
+        // uses — rather than waiting for the scratch's own slow idle timer.
+        if pressure.scratch_shortfall > 0
             && let Some(reclaimer) = &self.build_space_reclaimer
         {
-            let shortfall = required - after.available;
+            let shortfall = pressure.scratch_shortfall;
             let reclaimed = reclaimer(shortfall);
             if reclaimed > 0 {
                 after = lifecycle_filesystem_space(&closure.lifecycle_root)?;
@@ -1834,6 +1833,42 @@ impl ArtifactTreeCache {
 struct LifecycleFilesystemSpace {
     capacity: u64,
     available: u64,
+}
+
+/// Free space the artifact-cache filesystem keeps for itself, independent of
+/// what any build has forecast for its own outputs.
+fn lifecycle_free_floor(capacity: u64) -> u64 {
+    LIFECYCLE_MIN_FREE_RESERVE.max(capacity / LIFECYCLE_FREE_RESERVE_DIVISOR)
+}
+
+/// The two distinct space thresholds a cold-build reservation acts on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ColdBuildSpacePressure {
+    /// The filesystem floor plus every concurrent build's forecast demand:
+    /// the reserve this build may not fit inside, which the short-reserve
+    /// warning reports and which lifecycle collection budgets against.
+    required: u64,
+    /// Bytes the caller's scratch reclaimer is asked to free, measured against
+    /// the filesystem floor alone.
+    scratch_shortfall: u64,
+}
+
+fn cold_build_space_pressure(
+    space: LifecycleFilesystemSpace,
+    active_reservations: u64,
+) -> ColdBuildSpacePressure {
+    let floor = lifecycle_free_floor(space.capacity);
+    ColdBuildSpacePressure {
+        required: floor.saturating_add(active_reservations),
+        // Deliberately not `required`. Peer reservations are a forecast of what
+        // concurrent builds will write, and the caller's shared build scratch
+        // is exactly what keeps those builds incremental — destroying it to
+        // satisfy a forecast makes every lane recompile its whole dependency
+        // graph, which consumes more space and time than the forecast it was
+        // answering. The reclaimer therefore reacts only to measured free space
+        // falling below the floor the filesystem must hold regardless.
+        scratch_shortfall: floor.saturating_sub(space.available),
+    }
 }
 
 struct LifecycleRecordCandidate {
@@ -2553,9 +2588,7 @@ fn collect_artifact_cache(
         active.insert(identity);
         inactive_locks.remove(&identity);
     }
-    let free_reserve = LIFECYCLE_MIN_FREE_RESERVE
-        .max(filesystem.capacity / LIFECYCLE_FREE_RESERVE_DIVISOR)
-        .saturating_add(reservation_bytes);
+    let free_reserve = lifecycle_free_floor(filesystem.capacity).saturating_add(reservation_bytes);
 
     let mut all_objects = BTreeSet::new();
     for candidate in &candidates {

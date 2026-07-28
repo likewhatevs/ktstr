@@ -1,6 +1,7 @@
 use super::*;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 
@@ -1348,6 +1349,146 @@ fn concurrent_build_reservations_sum_observed_namespace_demand() {
     assert_eq!(active_bytes, expected * 2);
     assert!(active_identities.contains(&first_identity));
     assert!(active_identities.contains(&second_identity));
+}
+
+#[test]
+fn cold_build_scratch_reclaim_keys_on_the_filesystem_floor_not_peer_forecasts() {
+    // A CI-shaped runner: 1 TiB, comfortably above its own floor, with a matrix
+    // of concurrent lanes each advertising the minimum build reservation.
+    let runner = LifecycleFilesystemSpace {
+        capacity: 1 << 40,
+        available: 300 << 30,
+    };
+    let floor = lifecycle_free_floor(runner.capacity);
+    assert!(runner.available > floor);
+    let peers = LIFECYCLE_BUILD_RESERVATION_MIN * 16;
+    let pressure = cold_build_space_pressure(runner, peers);
+    assert_eq!(
+        pressure.required,
+        floor + peers,
+        "closure eviction must keep planning against every concurrent build's forecast",
+    );
+    assert!(
+        runner.available < pressure.required,
+        "this case must still be short of the reservation-inflated reserve, or it proves nothing",
+    );
+    assert_eq!(
+        pressure.scratch_shortfall, 0,
+        "peers' forecasts must not destroy the shared build scratch that keeps those builds incremental",
+    );
+
+    // The same runner genuinely below its floor, with no peer at all: the
+    // reclaimer must still fire, for exactly the free space that is missing.
+    let squeezed = LifecycleFilesystemSpace {
+        available: 100 << 30,
+        ..runner
+    };
+    let squeezed_pressure = cold_build_space_pressure(squeezed, 0);
+    assert_eq!(squeezed_pressure.required, floor);
+    assert_eq!(squeezed_pressure.scratch_shortfall, floor - (100 << 30));
+
+    // Exactly at the floor is not pressure; one byte below it is.
+    assert_eq!(
+        cold_build_space_pressure(
+            LifecycleFilesystemSpace {
+                available: floor,
+                ..runner
+            },
+            peers,
+        )
+        .scratch_shortfall,
+        0,
+    );
+    assert_eq!(
+        cold_build_space_pressure(
+            LifecycleFilesystemSpace {
+                available: floor - 1,
+                ..runner
+            },
+            peers,
+        )
+        .scratch_shortfall,
+        1,
+    );
+
+    // A small filesystem takes the absolute minimum reserve, not capacity/5.
+    let small = LifecycleFilesystemSpace {
+        capacity: 64 << 30,
+        available: 8 << 30,
+    };
+    assert_eq!(
+        cold_build_space_pressure(small, 0).scratch_shortfall,
+        LIFECYCLE_MIN_FREE_RESERVE - (8 << 30),
+    );
+
+    // The ENOSPC end of the range: a saturating forecast must not overflow the
+    // reclaim decision away, and a full disk must ask for the whole floor.
+    let full = LifecycleFilesystemSpace {
+        available: 0,
+        ..runner
+    };
+    let full_pressure = cold_build_space_pressure(full, u64::MAX);
+    assert_eq!(full_pressure.required, u64::MAX);
+    assert_eq!(full_pressure.scratch_shortfall, floor);
+}
+
+#[test]
+fn cold_build_reservation_never_asks_its_reclaimer_to_cover_peer_forecasts() {
+    let _environment = lock_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, temp.path().join("cas"));
+    let requests: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&requests);
+    let cache = ArtifactTreeCache::new(temp.path().join("records")).with_build_space_reclaimer(
+        Box::new(move |shortfall| {
+            recorder.lock().unwrap().push(shortfall);
+            0
+        }),
+    );
+
+    let identity = 0xf100_0000_0000_0001;
+    let mut closure = cache.acquire_closure(identity).unwrap();
+    closure.release();
+    let space = lifecycle_filesystem_space(&closure.lifecycle_root).unwrap();
+    let floor = lifecycle_free_floor(space.capacity);
+
+    // A live peer reservation forecasting more than the whole filesystem holds.
+    // Keyed on `required`, the reclaimer would be handed a shortfall larger than
+    // the disk — one no amount of scratch deletion could ever satisfy.
+    let peer_bytes = space.capacity.saturating_add(LIFECYCLE_MIN_FREE_RESERVE);
+    let peer_identity = 0xf100_0000_0000_0002u64;
+    let peer_path = lifecycle_directory(&closure.lifecycle_root)
+        .join(LIFECYCLE_RESERVATION_DIR)
+        .join(format!(
+            "{peer_identity:016x}-{}-0000000000000001.reserve",
+            std::process::id()
+        ));
+    std::fs::write(&peer_path, format!("{peer_bytes}\n")).unwrap();
+    let peer_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&peer_path)
+        .unwrap();
+    rustix::fs::flock(&peer_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+    let reservation = cache.reserve_cold_build_space(&closure).unwrap();
+
+    let (active_bytes, active_identities) =
+        active_build_reservations(&cache.lifecycle_root()).unwrap();
+    assert!(
+        active_identities.contains(&peer_identity) && active_bytes >= peer_bytes,
+        "the peer forecast this test depends on was not counted as an active reservation",
+    );
+    for shortfall in requests.lock().unwrap().iter() {
+        assert!(
+            *shortfall <= floor,
+            "scratch reclaim asked for {shortfall} bytes, more than the {floor}-byte filesystem \
+             floor, so a peer's forecast reached the reclaimer",
+        );
+    }
+
+    drop(reservation);
+    rustix::fs::flock(&peer_file, rustix::fs::FlockOperation::Unlock).unwrap();
 }
 
 #[test]
