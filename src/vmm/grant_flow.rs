@@ -49,6 +49,15 @@
 //!   against `block_park_entry` / `block_park_commit`: a large accumulated
 //!   footprint only matters if granted entrants actually park on it.
 //!
+//! Every `*_mean` field is a PER-PROCESS mean over that process's own sample
+//! count, so it is only meaningful re-weighted by the paired count — reading a
+//! lane by taking the maximum of the per-process means reports whichever
+//! process happened to take two samples, not the lane. Each mean therefore
+//! ships beside its raw `*_sum` and its sample count (`discover_count`,
+//! `changed_scans`, `in_flight_samples`, `callback_count`), so a reader can sum
+//! the numerators and denominators across processes and never has to trust or
+//! re-derive a mean.
+//!
 //! Entirely inert unless `KTSTR_BUILD_DIAGNOSTICS_DIR` is set (CI only): the
 //! `note_*` calls are relaxed atomic updates and the expensive inputs
 //! (distinct-CPU popcount, discover timing) are computed only behind
@@ -489,7 +498,9 @@ fn format_line(pid: u32) -> String {
          granted_in_flight_mean={granted_in_flight_mean} \
          in_flight_samples={in_flight_samples} in_flight_span_ns={in_flight_span_ns} \
          callback_count={callback_count} callback_ns_mean={callback_ns_mean} \
-         callback_ns_max={}{blocks}\n",
+         callback_ns_max={} discover_ns_sum={} changed_cpu_bits_sum={} \
+         changed_permit_bits_sum={} changed_llc_bits_sum={} held_in_flight_sum={} \
+         granted_in_flight_sum={} callback_ns_sum={}{blocks}\n",
         GRANTS_ISSUED.load(Ordering::Relaxed),
         GRANTS_REACHED_HELD.load(Ordering::Relaxed),
         GRANTS_LOST.load(Ordering::Relaxed),
@@ -505,6 +516,13 @@ fn format_line(pid: u32) -> String {
         CHANGED_LLC_BITS_MAX.load(Ordering::Relaxed),
         CHANGED_WATERMARK_SPAN_MAX.load(Ordering::Relaxed),
         CALLBACK_NS_MAX.load(Ordering::Relaxed),
+        DISCOVER_NS_SUM.load(Ordering::Relaxed),
+        CHANGED_CPU_BITS_SUM.load(Ordering::Relaxed),
+        CHANGED_PERMIT_BITS_SUM.load(Ordering::Relaxed),
+        CHANGED_LLC_BITS_SUM.load(Ordering::Relaxed),
+        HELD_IN_FLIGHT_SUM.load(Ordering::Relaxed),
+        GRANTED_IN_FLIGHT_SUM.load(Ordering::Relaxed),
+        CALLBACK_NS_SUM.load(Ordering::Relaxed),
     )
 }
 
@@ -570,6 +588,13 @@ mod tests {
             "callback_count=",
             "callback_ns_mean=",
             "callback_ns_max=",
+            "discover_ns_sum=",
+            "changed_cpu_bits_sum=",
+            "changed_permit_bits_sum=",
+            "changed_llc_bits_sum=",
+            "held_in_flight_sum=",
+            "granted_in_flight_sum=",
+            "callback_ns_sum=",
             "block_unlicensed=",
             "block_permits=",
             "block_no_candidate=",
