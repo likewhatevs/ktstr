@@ -9,6 +9,16 @@
 //!   distinct host CPUs they cover — the ramp indicator. Both fence later
 //!   tickets identically, so the gap between the two is the fenced footprint
 //!   that is not running anything.
+//! - `held_in_flight_mean` / `granted_in_flight_mean` over `in_flight_samples`
+//!   spanning `in_flight_span_ns`: the same two depths averaged rather than
+//!   peaked. Little's law closes the mean life of an issued grant against
+//!   `grants_issued` — `granted_in_flight_mean * in_flight_span_ns /
+//!   grants_issued` — which the peak alone cannot give.
+//! - `callback_count` / `callback_ns_mean` / `callback_ns_max`: wall spent
+//!   inside a licensed grant callback. Subtracted from the residency above it
+//!   leaves the scan-publish-to-owner-wake latency, so the two together say
+//!   whether an unconverted grant is stuck waiting to be woken or stuck doing
+//!   its own probe.
 //! - `discover` count and wall-time: how often the placement contention-bail
 //!   holder diagnostic runs and how long it takes. The bail probes only the
 //!   contended LLC lock files with a non-blocking flock (no host-global
@@ -63,6 +73,14 @@ static GRANTS_LOST: AtomicU64 = AtomicU64::new(0);
 static HELD_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 static GRANTED_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 static DISTINCT_HELD_CPUS_MAX: AtomicU64 = AtomicU64::new(0);
+static HELD_IN_FLIGHT_SUM: AtomicU64 = AtomicU64::new(0);
+static GRANTED_IN_FLIGHT_SUM: AtomicU64 = AtomicU64::new(0);
+static IN_FLIGHT_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static IN_FLIGHT_FIRST_NS: AtomicU64 = AtomicU64::new(0);
+static IN_FLIGHT_LAST_NS: AtomicU64 = AtomicU64::new(0);
+static CALLBACK_NS_SUM: AtomicU64 = AtomicU64::new(0);
+static CALLBACK_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static CALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_COUNT: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_NS_SUM: AtomicU64 = AtomicU64::new(0);
 static DISCOVER_NS_MAX: AtomicU64 = AtomicU64::new(0);
@@ -335,10 +353,41 @@ pub(crate) fn note_grant_lost() {
 /// Deliberately no file IO here — this runs under the registry EX flock; the
 /// coordinator loop persists the image periodically outside the lock (the
 /// atexit line alone is lost when the scan-running orchestrator is killed).
-pub(crate) fn note_held_in_flight(held_records: u64, granted_records: u64, distinct_cpus: u64) {
+pub(crate) fn note_held_in_flight(
+    held_records: u64,
+    granted_records: u64,
+    distinct_cpus: u64,
+    now_ns: u64,
+) {
     bump_max(&HELD_IN_FLIGHT_MAX, held_records);
     bump_max(&GRANTED_IN_FLIGHT_MAX, granted_records);
     bump_max(&DISTINCT_HELD_CPUS_MAX, distinct_cpus);
+    // Mean in-flight depth over the sampled span, against `grants_issued`, is
+    // the only available reading of how long an issued grant survives before
+    // it converts or dies: Little's law closes `residency = mean_granted /
+    // (grants_issued / span)`. The peak alone cannot separate "many grants,
+    // each resolved fast" from "few grants, each stuck for seconds", and that
+    // distinction decides whether the fence a grant holds is a scan-cadence
+    // problem or a wake-path one.
+    HELD_IN_FLIGHT_SUM.fetch_add(held_records, Ordering::Relaxed);
+    GRANTED_IN_FLIGHT_SUM.fetch_add(granted_records, Ordering::Relaxed);
+    IN_FLIGHT_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    let _ = IN_FLIGHT_FIRST_NS.compare_exchange(0, now_ns, Ordering::Relaxed, Ordering::Relaxed);
+    bump_max(&IN_FLIGHT_LAST_NS, now_ns);
+    ensure_atexit();
+}
+
+/// Wall time one licensed grant's callback spent between the owner observing
+/// GRANTED and its terminal outcome. Subtracted from the residency above it
+/// leaves the scan-publish-to-owner-wake latency, which is what says whether
+/// the coordinator rescans faster than owners can answer.
+pub(crate) fn note_grant_callback(elapsed_ns: u64) {
+    if !enabled() {
+        return;
+    }
+    CALLBACK_NS_SUM.fetch_add(elapsed_ns, Ordering::Relaxed);
+    bump_max(&CALLBACK_NS_MAX, elapsed_ns);
+    CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
     ensure_atexit();
 }
 
@@ -401,6 +450,22 @@ fn format_line(pid: u32) -> String {
     let changed_cpu_bits_mean = changed_mean(&CHANGED_CPU_BITS_SUM);
     let changed_permit_bits_mean = changed_mean(&CHANGED_PERMIT_BITS_SUM);
     let changed_llc_bits_mean = changed_mean(&CHANGED_LLC_BITS_SUM);
+    let in_flight_samples = IN_FLIGHT_SAMPLES.load(Ordering::Relaxed);
+    let in_flight_mean = |cell: &AtomicU64| {
+        cell.load(Ordering::Relaxed)
+            .checked_div(in_flight_samples)
+            .unwrap_or(0)
+    };
+    let held_in_flight_mean = in_flight_mean(&HELD_IN_FLIGHT_SUM);
+    let granted_in_flight_mean = in_flight_mean(&GRANTED_IN_FLIGHT_SUM);
+    let in_flight_span_ns = IN_FLIGHT_LAST_NS
+        .load(Ordering::Relaxed)
+        .saturating_sub(IN_FLIGHT_FIRST_NS.load(Ordering::Relaxed));
+    let callback_count = CALLBACK_COUNT.load(Ordering::Relaxed);
+    let callback_ns_mean = CALLBACK_NS_SUM
+        .load(Ordering::Relaxed)
+        .checked_div(callback_count)
+        .unwrap_or(0);
     let blocks = GrantBlock::ALL
         .iter()
         .map(|block| {
@@ -419,7 +484,12 @@ fn format_line(pid: u32) -> String {
          changed_saturated_scans={} changed_cpu_bits_mean={changed_cpu_bits_mean} \
          changed_cpu_bits_max={} changed_permit_bits_mean={changed_permit_bits_mean} \
          changed_permit_bits_max={} changed_llc_bits_mean={changed_llc_bits_mean} \
-         changed_llc_bits_max={} changed_watermark_span_max={}{blocks}\n",
+         changed_llc_bits_max={} changed_watermark_span_max={} \
+         held_in_flight_mean={held_in_flight_mean} \
+         granted_in_flight_mean={granted_in_flight_mean} \
+         in_flight_samples={in_flight_samples} in_flight_span_ns={in_flight_span_ns} \
+         callback_count={callback_count} callback_ns_mean={callback_ns_mean} \
+         callback_ns_max={}{blocks}\n",
         GRANTS_ISSUED.load(Ordering::Relaxed),
         GRANTS_REACHED_HELD.load(Ordering::Relaxed),
         GRANTS_LOST.load(Ordering::Relaxed),
@@ -434,6 +504,7 @@ fn format_line(pid: u32) -> String {
         CHANGED_PERMIT_BITS_MAX.load(Ordering::Relaxed),
         CHANGED_LLC_BITS_MAX.load(Ordering::Relaxed),
         CHANGED_WATERMARK_SPAN_MAX.load(Ordering::Relaxed),
+        CALLBACK_NS_MAX.load(Ordering::Relaxed),
     )
 }
 
@@ -492,6 +563,13 @@ mod tests {
             "changed_llc_bits_mean=",
             "changed_llc_bits_max=",
             "changed_watermark_span_max=",
+            "held_in_flight_mean=",
+            "granted_in_flight_mean=",
+            "in_flight_samples=",
+            "in_flight_span_ns=",
+            "callback_count=",
+            "callback_ns_mean=",
+            "callback_ns_max=",
             "block_unlicensed=",
             "block_permits=",
             "block_no_candidate=",

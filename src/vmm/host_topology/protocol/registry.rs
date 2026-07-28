@@ -19179,6 +19179,7 @@ impl Table {
                 held_in_flight,
                 granted_in_flight,
                 distinct_cpus,
+                now_ns,
             );
             // Sample the accumulator as this scan found it, before the reset
             // below clears it: this is the largest coverage a granted entrant

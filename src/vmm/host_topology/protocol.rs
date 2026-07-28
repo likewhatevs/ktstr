@@ -1194,6 +1194,23 @@ fn check_result<T>(result: Result<T>, cancelled: Option<&AtomicBool>) -> Result<
     }
 }
 
+/// Start the grant-callback clock only when the diagnostics sink is live, so a
+/// production wake pays neither the clock read nor the accounting.
+fn grant_callback_clock() -> Option<std::time::Instant> {
+    crate::vmm::grant_flow::enabled().then(std::time::Instant::now)
+}
+
+/// Charge one licensed grant's callback wall to the grant-flow image. An
+/// unlicensed REPLAN completion never held a grant, so it is excluded here for
+/// the same reason it is excluded from `grants_lost`.
+fn note_grant_callback_elapsed(licensed_grant: bool, started: Option<std::time::Instant>) {
+    if let Some(started) = started.filter(|_| licensed_grant) {
+        crate::vmm::grant_flow::note_grant_callback(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
+}
+
 pub(crate) struct GrantedProbe {
     designated: ClaimSet,
     watch: ClaimSet,
@@ -1766,6 +1783,7 @@ pub(crate) fn register_intent_for_preparation(
         match ticket.state_or_wait(waiter_crash_recovery_fallback(), None)? {
             grant_or_replan @ (registry::State::Granted | registry::State::Replan) => {
                 let licensed_grant = matches!(grant_or_replan, registry::State::Granted);
+                let callback_started = grant_callback_clock();
                 let result = ticket.run_granted(
                     None,
                     |designated, watch, acquisition_allowed, predecessors, availability| {
@@ -1851,6 +1869,7 @@ pub(crate) fn register_intent_for_preparation(
                         })
                     },
                 )?;
+                note_grant_callback_elapsed(licensed_grant, callback_started);
                 match result {
                     registry::GrantResult::Prepared(preparation, pending_claim) => {
                         return pending_admission_from_parts(ticket, preparation, pending_claim);
@@ -2945,6 +2964,7 @@ fn drive_registered_ticket<T>(
                     .map(super::PreparationPermit::clone_permit_fds)
                     .transpose()?
                     .unwrap_or_default();
+                let callback_started = grant_callback_clock();
                 let result = ticket.run_granted(
                     cancelled,
                     |designated, watch, acquisition_allowed, predecessors, availability| {
@@ -2968,6 +2988,7 @@ fn drive_registered_ticket<T>(
                         })
                     },
                 );
+                note_grant_callback_elapsed(licensed_grant, callback_started);
                 let result = match result {
                     Ok(registry::GrantResult::Acquired(acquired, held)) => {
                         // Removing the ticket while publishing the acquired
