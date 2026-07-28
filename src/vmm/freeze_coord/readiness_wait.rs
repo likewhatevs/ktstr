@@ -500,6 +500,43 @@ mod tests {
     }
 
     #[test]
+    fn monitor_absent_defers_while_explicit_terminal_fails_closed() {
+        // Never-provisioned monitor (no vmlinux): the wait keeps running on
+        // blocked-observer/wall bounds. An explicit terminal edge — a
+        // monitor the run counted on died — still fails immediately.
+        let overlay = ReadinessWaitOverlay::default();
+        let ledger = ProgressLedger::default();
+        start(&overlay, &ledger, 5);
+        publish(&ledger, 0);
+        ledger.publish_monitor_absent();
+        assert_eq!(
+            overlay.watchdog_tick(
+                &ledger,
+                1,
+                watchdog_step::DeadmanObserverClock::Reading(1),
+                &[task(0, watchdog_step::HostVcpuRunState::NonRunnable)],
+            ),
+            ReadinessWaitDecision::None
+        );
+        assert!(overlay.active().is_some());
+
+        ledger.publish_monitor_terminal();
+        assert!(matches!(
+            overlay.watchdog_tick(
+                &ledger,
+                2,
+                watchdog_step::DeadmanObserverClock::Reading(2),
+                &[task(0, watchdog_step::HostVcpuRunState::NonRunnable)],
+            ),
+            ReadinessWaitDecision::FailClosed {
+                cause: ReadinessWaitFailureCause::MonitorTerminal,
+                ..
+            }
+        ));
+        assert!(overlay.active().is_none());
+    }
+
+    #[test]
     fn delivered_vcpu_service_exhaustion_fails_closed() {
         let overlay = ReadinessWaitOverlay::default();
         let ledger = ProgressLedger::default();
