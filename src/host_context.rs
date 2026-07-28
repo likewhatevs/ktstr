@@ -1045,27 +1045,6 @@ impl HostContextSnapshots {
     pub fn new(pre: HostContext, post: HostContext) -> Self {
         Self { pre, post }
     }
-
-    /// Capture both endpoints in a single call. Useful for tests
-    /// and callers that don't observe a test body between the two
-    /// snapshots and only want to stamp the pair structurally (both
-    /// endpoints will reflect the same dynamic state because no
-    /// mutation happened in between).
-    ///
-    /// `#[cfg(test)]`-gated so production sidecar writers cannot
-    /// reach it by accident — they need
-    /// [`collect_host_context_pre_run`] before the run and
-    /// [`collect_host_context`] after, which
-    /// [`HostContextSnapshots::new`] then pairs. The compile-time
-    /// gate replaces the earlier doc-only warning.
-    #[cfg(test)]
-    pub fn capture_same_instant() -> Self {
-        let snap = collect_host_context();
-        Self {
-            pre: snap.clone(),
-            post: snap,
-        }
-    }
 }
 
 /// Return the per-CPU `scaling_governor` map, populating the

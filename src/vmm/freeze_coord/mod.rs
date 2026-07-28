@@ -7291,8 +7291,8 @@ impl KtstrVm {
                                             // rebuilding it. The kernel image (symbols,
                                             // TTBR1/TCR/phys_base, page_offset) is identical
                                             // for both accessors — only prog_idr_kva +
-                                            // prog offsets differ. Rebuilding via
-                                            // from_elf_with_symbols re-parsed the full
+                                            // prog offsets differ. Rebuilding the
+                                            // GuestKernel from the ELF re-parsed the full
                                             // vmlinux symtab and re-walked the page tables
                                             // (~7 s on aarch64), which delayed the accessor
                                             // publish past the periodic-capture window so

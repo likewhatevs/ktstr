@@ -187,34 +187,6 @@ pub fn custom_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> 
     execute_scenario(ctx, backdrop, steps)
 }
 
-/// NUMA-scoped cpusets: one cgroup per NUMA node, then swap mid-run.
-///
-/// Requires a 2+ NUMA node topology. Each cgroup is constrained to a
-/// single NUMA node's CPUs, then cpusets are swapped to force cross-NUMA
-/// migration.
-pub fn custom_cgroup_cpuset_numa_swap(ctx: &Ctx) -> Result<AssertResult> {
-    if ctx.topo.num_numa_nodes() < 2 {
-        return Ok(AssertResult::skip("need >=2 NUMA nodes"));
-    }
-
-    let backdrop = Backdrop::new()
-        .push_cgroup(CgroupDef::named("cg_0").cpuset(CpusetSpec::numa(0)))
-        .push_cgroup(CgroupDef::named("cg_1").cpuset(CpusetSpec::numa(1)));
-
-    let steps = vec![
-        Step::new(vec![], ctx.settled_hold(0.5)),
-        Step::new(
-            vec![
-                Op::set_cpuset("cg_0", CpusetSpec::numa(1)),
-                Op::set_cpuset("cg_1", CpusetSpec::numa(0)),
-            ],
-            HoldSpec::frac(0.5),
-        ),
-    ];
-
-    execute_scenario(ctx, backdrop, steps)
-}
-
 /// Disjoint cpusets where a light cgroup gets heavy load added mid-run.
 pub fn custom_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
     let backdrop = Backdrop::new()

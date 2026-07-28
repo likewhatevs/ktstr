@@ -265,33 +265,18 @@ impl GuestKernel {
         Self::from_elf_with_hint(mem, elf, tcr_el1, cr3_pa, 0)
     }
 
-    /// Like [`Self::from_elf_with_hint`] but accepts a pre-built
-    /// `symbols: Arc<HashMap<String, u64>>` map, storing it directly
-    /// instead of parsing the ELF symtab (which
-    /// [`Self::from_elf`]/[`Self::from_elf_with_hint`] do). Also takes
-    /// the `phys_base_hint`: when non-zero, skips the page-table walk
-    /// for `phys_base` and uses the hint directly. The guest-reported
-    /// `phys_base` (from `/proc/iomem`) includes `kaslr_offset`, which
-    /// is what `text_kva_to_pa_with_base` needs for link-time KVAs.
-    pub fn from_elf_with_symbols(
-        mem: Arc<GuestMem>,
-        symbols: Arc<HashMap<String, u64>>,
-        elf: &goblin::elf::Elf<'_>,
-        tcr_el1: u64,
-        cr3_pa: u64,
-        phys_base_hint: u64,
-    ) -> Result<Self> {
-        let kern_syms = super::symbols::KernelSymbols::from_elf(elf)?;
-        Self::from_precomputed(mem, symbols, &kern_syms, tcr_el1, cr3_pa, phys_base_hint)
-    }
-
     /// Construct from the two symbol products already derived by `run_vm`:
     /// the complete name→KVA table and the compact bootstrap subset.
     ///
-    /// This is semantically identical to [`Self::from_elf_with_symbols`] but
-    /// performs no ELF traversal. It exists for live-VM helper threads whose
-    /// lifetime must contain only finite guest-memory reads, not host file
+    /// Like [`Self::from_elf_with_hint`] but performs no ELF traversal: the
+    /// caller supplies both the name→KVA map and the bootstrap symbol subset
+    /// directly. It exists for live-VM helper threads whose lifetime must
+    /// contain only finite guest-memory reads, not host file
     /// parsing/allocation that teardown would otherwise have to join.
+    ///
+    /// `phys_base_hint` behaves as in [`Self::from_elf_with_hint`]: when
+    /// non-zero it skips the page-table walk for `phys_base` and uses the
+    /// hint directly.
     pub(crate) fn from_precomputed(
         mem: Arc<GuestMem>,
         symbols: Arc<HashMap<String, u64>>,
@@ -577,19 +562,6 @@ impl GuestKernel {
         &self.mem
     }
 
-    /// Clone the owning Arc handle to guest memory. Lets a caller
-    /// build a sibling [`GuestKernel`] (or any other consumer that
-    /// expects an `Arc<GuestMem>`) that shares the same backing
-    /// mapping without re-resolving the host pointer through
-    /// [`super::reader::GuestMem::from_layout`].
-    pub fn mem_arc(&self) -> Arc<GuestMem> {
-        self.mem.clone()
-    }
-
-    pub fn symbols_arc(&self) -> Arc<HashMap<String, u64>> {
-        self.symbols.clone()
-    }
-
     /// Runtime PAGE_OFFSET (resolved from guest memory).
     pub fn page_offset(&self) -> u64 {
         self.page_offset
@@ -610,16 +582,6 @@ impl GuestKernel {
     /// granule-agnostic aarch64 page-table walker.
     pub fn tcr_el1(&self) -> u64 {
         self.tcr_el1
-    }
-
-    /// Cached aarch64 page-table walk parameters decoded from
-    /// [`Self::tcr_el1`]. `None` on x86_64 and on aarch64 when the
-    /// TCR decode fails (uninitialised register, reserved
-    /// encoding). Hot-path consumers feed it into
-    /// [`super::reader::GuestMem::translate_kva_with_aarch64_params`]
-    /// to skip the per-call decode.
-    pub fn aarch64_walk_params(&self) -> Option<&Aarch64WalkParams> {
-        self.aarch64_params.as_ref()
     }
 
     /// Bundle of the four paging fields ([`super::reader::WalkContext`])

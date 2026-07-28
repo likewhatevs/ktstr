@@ -506,10 +506,8 @@ pub mod live_host {
         BpfMapAccessor, BpfMapInfo,
     };
     pub use crate::monitor::bpf_syscall::BpfSyscallAccessor;
-    pub use crate::monitor::dmesg_scx::{
-        ScxExitEvent, ScxExitKind, StackSymbol, extract_stack_symbols, parse_kmsg_window,
-    };
-    pub use crate::monitor::live_host_kernel::{KallsymsTable, LiveHostKernelEnv, uname_release};
+    pub use crate::monitor::dmesg_scx::{ScxExitKind, parse_kmsg_window};
+    pub use crate::monitor::live_host_kernel::{KallsymsTable, LiveHostKernelEnv};
     pub use crate::monitor::timeline::{
         TimelineCapture, TimelineEvent, TimelineEventRaw, parse_timeline_buf,
         parse_timeline_record, tl_evt,
