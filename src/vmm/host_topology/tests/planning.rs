@@ -1908,7 +1908,7 @@ fn computed_guest_memory_replaces_fixed_preparation_weight() {
     // A 256 MiB guest needs one chunk, not both chunks in the fixed
     // preparation estimate. The surplus preparation OFD must not leak into
     // the run reservation.
-    let small = select_vm_permits(
+    let small = select_vm_permits_grant_aware(
         PermitAdmission::Cooperative,
         &cpu,
         Some(&memory),
@@ -1920,6 +1920,7 @@ fn computed_guest_memory_replaces_fixed_preparation_weight() {
         &[],
         &preferred_memory,
         |candidate| candidate_ready(candidate, None),
+        |_| Ok(false),
     )
     .expect("select 256 MiB guest permits")
     .expect("256 MiB guest must fit");
@@ -1931,7 +1932,7 @@ fn computed_guest_memory_replaces_fixed_preparation_weight() {
     let full_demand = memory.required_chunks(2048).expect("2 GiB demand");
     assert_eq!(full_demand, 8);
     assert!(
-        select_vm_permits(
+        select_vm_permits_grant_aware(
             PermitAdmission::Cooperative,
             &cpu,
             Some(&memory),
@@ -1943,13 +1944,14 @@ fn computed_guest_memory_replaces_fixed_preparation_weight() {
             &[],
             &preferred_memory,
             |candidate| candidate_ready(candidate, Some(107)),
+            |_| Ok(false),
         )
         .expect("probe partially available 2 GiB demand")
         .is_none(),
         "fixed preparation ownership cannot authorize an under-reserved guest",
     );
 
-    let large = select_vm_permits(
+    let large = select_vm_permits_grant_aware(
         PermitAdmission::Cooperative,
         &cpu,
         Some(&memory),
@@ -1961,6 +1963,7 @@ fn computed_guest_memory_replaces_fixed_preparation_weight() {
         &[],
         &preferred_memory,
         |candidate| candidate_ready(candidate, None),
+        |_| Ok(false),
     )
     .expect("select fully available 2 GiB demand")
     .expect("2 GiB guest must fit once every actual chunk is available");
@@ -1975,7 +1978,7 @@ fn computed_guest_memory_replaces_fixed_preparation_weight() {
 fn owned_or_absent_permits_never_issue_an_empty_registry_query() {
     let pool = AdmissionPermitPool::for_host(1);
     let callback_count = std::cell::Cell::new(0usize);
-    let selection = select_vm_permits(
+    let selection = select_vm_permits_grant_aware(
         PermitAdmission::None,
         &pool,
         None,
@@ -1994,6 +1997,7 @@ fn owned_or_absent_permits_never_issue_an_empty_registry_query() {
             );
             Ok(true)
         },
+        |_| Ok(false),
     )
     .expect("select a permitless admission shape")
     .expect("permitless admission remains available");
@@ -4241,6 +4245,83 @@ fn permit_selection_prefers_grant_free_and_falls_back() {
         fallback.permits.cpu_permits.len(),
         2,
         "under total charge the fallback must restore today's selection",
+    );
+}
+
+/// The registration seed — the exact permit set a waiter publishes when it
+/// joins the registry — is sized exactly, so the grant charge can only reorder
+/// its walk. It must prefer the grant-free permits of each class while any
+/// remain, and must hand back exactly the grant-blind selection (width, class,
+/// and identities) once the charge covers the whole pool: a senior that never
+/// publishes an overlapping claim never triggers the scan's ticket-order
+/// revoke.
+#[test]
+fn registered_permit_seed_prefers_grant_free_permits_without_narrowing() {
+    let pool = VmPermitPool {
+        cpu: AdmissionPermitPool {
+            general: (0..4).collect(),
+            reserved: (4..6).collect(),
+        },
+        memory: MemoryPermitPool {
+            permits: (100..104).collect(),
+            usable_mib: 1024,
+        },
+        cpu_required: 2,
+        memory_required: 1,
+        cpu_rotation: 0,
+        memory_rotation: 0,
+        preferred_cpu: Vec::new(),
+        preferred_memory: Vec::new(),
+    };
+    let charges = |charged: std::collections::BTreeSet<usize>| {
+        move |candidate: &admission_protocol::ClaimSet| {
+            Ok(candidate
+                .permits
+                .iter()
+                .any(|permit| charged.contains(permit)))
+        }
+    };
+    let blind = pool
+        .select(|_| Ok(true))
+        .expect("grant-blind seed")
+        .expect("a free pool must seed a designation");
+    assert_eq!(blind.cpu_permits, vec![0, 1]);
+    assert_eq!(blind.memory_permits, vec![100]);
+
+    let biased = pool
+        .select_grant_aware(|_| Ok(true), charges([0, 1, 100].into_iter().collect()))
+        .expect("grant-aware seed")
+        .expect("a partly charged pool must still seed a designation");
+    assert_eq!(
+        (biased.cpu_permits, biased.memory_permits),
+        (vec![2, 3], vec![101]),
+        "the seed must walk past the permits an in-flight grant counts on",
+    );
+    assert_eq!(biased.admission_class, blind.admission_class);
+
+    let saturated = pool
+        .select_grant_aware(
+            |_| Ok(true),
+            charges(
+                (0..6)
+                    .chain(100..104)
+                    .collect::<std::collections::BTreeSet<_>>(),
+            ),
+        )
+        .expect("grant-aware seed against a fully charged pool")
+        .expect("a fully charged pool must still seed a complete designation");
+    assert_eq!(
+        (
+            saturated.cpu_permits,
+            saturated.memory_permits,
+            saturated.admission_class
+        ),
+        (
+            blind.cpu_permits,
+            blind.memory_permits,
+            blind.admission_class
+        ),
+        "under total charge the bias must restore the grant-blind seed exactly",
     );
 }
 

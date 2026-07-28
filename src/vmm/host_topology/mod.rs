@@ -4668,36 +4668,6 @@ fn select_memory_permits(
     ready(&permit_only_claim(&candidate)).map(|ready| ready.then_some(selected))
 }
 
-#[allow(clippy::too_many_arguments)] // Preserve the CPU/memory admission axes at this selection seam.
-fn select_vm_permits(
-    kind: PermitAdmission,
-    cpu_pool: &AdmissionPermitPool,
-    memory_pool: Option<&MemoryPermitPool>,
-    maximum_cpus: usize,
-    minimum_cpus: usize,
-    required_memory: usize,
-    cpu_rotation: usize,
-    memory_rotation: usize,
-    preferred_cpu: &[usize],
-    preferred_memory: &[usize],
-    ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
-) -> Result<Option<VmPermitSelection>> {
-    select_vm_permits_grant_aware(
-        kind,
-        cpu_pool,
-        memory_pool,
-        maximum_cpus,
-        minimum_cpus,
-        required_memory,
-        cpu_rotation,
-        memory_rotation,
-        preferred_cpu,
-        preferred_memory,
-        ready,
-        |_| Ok(false),
-    )
-}
-
 /// `grant_charged` is the within-class bias documented on
 /// [`select_admission_permits`]. It is deliberately absent from
 /// the whole-selection readiness check below: that check is validity, not
@@ -4845,7 +4815,22 @@ impl VmPermitPool {
         &self,
         ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
     ) -> Result<Option<VmPermitReservation>> {
-        select_vm_permits(
+        self.select_grant_aware(ready, |_| Ok(false))
+    }
+
+    /// `grant_charged` is the within-class bias documented on
+    /// [`select_admission_permits`]: a charged permit stays a candidate and is
+    /// taken as soon as the grant-free permits of its class run out, so the
+    /// selected width and the class each permit comes from match a grant-blind
+    /// walk of the same pool exactly. This request is sized exactly
+    /// (`cpu_required` is both the floor and the ceiling), so the bias can only
+    /// reorder the walk — it can never hand back a short set.
+    pub(crate) fn select_grant_aware(
+        &self,
+        ready: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+        grant_charged: impl FnMut(&protocol::ClaimSet) -> Result<bool>,
+    ) -> Result<Option<VmPermitReservation>> {
+        select_vm_permits_grant_aware(
             PermitAdmission::Cooperative,
             &self.cpu,
             Some(&self.memory),
@@ -4857,6 +4842,7 @@ impl VmPermitPool {
             &self.preferred_cpu,
             &self.preferred_memory,
             ready,
+            grant_charged,
         )
         .map(|selection| {
             selection.map(|selection| VmPermitReservation {
@@ -4872,6 +4858,16 @@ impl VmPermitPool {
     /// remains the first choice even when a wrapper owns reusable preparation
     /// permits in the reserved suffix; that suffix is a soft fallback, not a
     /// hard build/default interoperability fence.
+    ///
+    /// The result seeds the exact claim a waiter publishes when it joins the
+    /// registry — the claim the authoritative scan later hands that ticket as
+    /// its grant, and the fence every junior behind it must clear once the
+    /// grant lands. Naming a permit some junior's in-flight grant is already
+    /// counting on therefore resolves as a ticket-order revocation of that
+    /// junior, exactly as it does for the queued designation
+    /// [`select_plan_permits_grant_aware`] already biases. The charge is read
+    /// from the snapshot this seed already takes: its watch names every pool
+    /// permit, which is what makes the folded permit indices readable from it.
     pub(crate) fn select_registered(&self) -> Result<Option<VmPermitReservation>> {
         let watch = resource_claim_with_permits(
             &[],
@@ -4888,18 +4884,29 @@ impl VmPermitPool {
             .chain(&self.preferred_memory)
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        let selected = self.select(|candidate| {
+        let charged = |candidate: &protocol::ClaimSet| {
             let Some(external) = claim_without_owned_permits(candidate, &owned) else {
-                return Ok(true);
+                return Ok(false);
             };
-            snapshot.conflicts(&external).map(|busy| !busy)
-        })?;
+            snapshot.grant_conflicts(&external)
+        };
+        let selected = self.select_grant_aware(
+            |candidate| {
+                let Some(external) = claim_without_owned_permits(candidate, &owned) else {
+                    return Ok(true);
+                };
+                snapshot.conflicts(&external).map(|busy| !busy)
+            },
+            charged,
+        )?;
         if selected.is_some() {
             Ok(selected)
         } else {
             // A queued exact designation still needs a complete canonical
-            // shape when every compatible permit is currently occupied.
-            self.select(|_| Ok(true))
+            // shape when every compatible permit is currently occupied. The
+            // charge stays a bias here too: it orders a walk that now accepts
+            // every permit rather than fencing any of them off.
+            self.select_grant_aware(|_| Ok(true), charged)
         }
     }
 }
