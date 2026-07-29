@@ -25,9 +25,14 @@ pub struct TopoPreset {
     /// `None` (every stock preset) leaves budget resolution to the
     /// normal path (test's `cpu_budget`, else auto-size to vCPU count plus
     /// one service CPU, clamped to the allowed cpuset).
-    /// `Some(n)` pins the no-perf CPU mask to `n` host CPUs regardless
-    /// of host size, so a preset whose vCPU count exceeds `n` ALWAYS
-    /// time-slices (deliberate, continuous overcommit). Consumed by the
+    /// `Some(n)` pins the no-perf CPU mask to `min(n, allowed host CPUs)`,
+    /// so a preset whose vCPU count exceeds `n` ALWAYS time-slices
+    /// (deliberate, continuous overcommit). On a host with fewer than `n`
+    /// allowed CPUs the budget collapses to the allowed set — deeper
+    /// overcommit, never a skip or hard error (a forced budget exists to
+    /// force overcommit; a smaller host just forces more of it). The
+    /// admission preflight and the verifier cell path apply the same
+    /// clamp. Consumed by the
     /// verifier cell path ([`crate::verifier::collect_verifier_output`]).
     /// The only preset that sets it (192cpu-11llc-smt) is also non-uniform,
     /// hence verifier-only (the gauntlet path skips `llc_cores` presets —
