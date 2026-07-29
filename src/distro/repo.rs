@@ -1220,7 +1220,7 @@ fn resolve_ubuntu(release: Option<&str>, arch: &str) -> Result<ResolvedDistroKer
     };
     let kver = selected.kver.as_str();
     if kver != preferred_kver {
-        eprintln!(
+        crate::ktstr_status!(
             "ktstr: newest HWE kernel {preferred_kver} has no dbgsym ddeb yet \
              (Ubuntu dbgsym publishing can lag by hours); using {kver}, the newest \
              fully-published kernel with debuginfo"

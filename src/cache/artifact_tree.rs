@@ -1469,7 +1469,7 @@ impl ArtifactTreeCache {
         )?;
         touch_closure_access(&result._closure);
         result.elapsed = started.elapsed();
-        eprintln!(
+        crate::ktstr_status!(
             "{progress_label}: artifact-tree {} {identity:016x}; role={}; elapsed={}",
             if result.cache_hit { "hit" } else { "miss" },
             if !result.cache_hit {
@@ -4797,7 +4797,7 @@ where
         }
         let elapsed = started.elapsed();
         if elapsed >= next_heartbeat {
-            eprintln!(
+            crate::ktstr_status!(
                 "{label}: still waiting for artifact-tree {role} {identity:016x}; elapsed={}",
                 humantime::format_duration(elapsed)
             );
@@ -4805,7 +4805,7 @@ where
         }
         std::thread::park_timeout(RETRY.min(next_heartbeat.saturating_sub(elapsed)));
     }
-    eprintln!(
+    crate::ktstr_status!(
         "{label}: acquired artifact-tree {role} {identity:016x}; elapsed={}",
         humantime::format_duration(started.elapsed())
     );
