@@ -2760,3 +2760,38 @@ fn pre_exec_admission_stamp_round_trips_and_fails_closed() {
         );
     }
 }
+
+/// Provenance split at the no-perf admission target: a descriptor-carried
+/// budget (preset `forced_cpu_budget` / author `cpu_budget`) over the host
+/// allowance CLAMPS to the allowed set — the 192cpu-11llc-smt cell on a
+/// 64-CPU host collapses to 64 reserved CPUs (deeper overcommit) instead of
+/// failing pre-admission — while an explicit operator cap keeps its
+/// `CpuBudgetUnsatisfiable` hard error.
+#[test]
+fn no_perf_admission_target_clamps_descriptor_budget_to_allowance() {
+    // 192cpu-11llc-smt's forced budget on a smaller host: collapse, not fail.
+    assert_eq!(
+        no_perf_admission_target(None, Some(96), 64, 192).expect("clamp, not hard-error"),
+        64,
+    );
+    // Within the allowance the descriptor budget stands verbatim.
+    assert_eq!(
+        no_perf_admission_target(None, Some(96), 200, 192).expect("in-range budget stands"),
+        96,
+    );
+    // The operator contract is untouched: an explicit cap over the
+    // allowance still hard-errors.
+    let cap = host_topology::CpuCap::new(96).expect("nonzero cap");
+    let err = no_perf_admission_target(Some(cap), Some(96), 64, 192)
+        .expect_err("operator cap keeps the hard-error contract");
+    assert!(
+        err.downcast_ref::<host_topology::CpuBudgetUnsatisfiable>()
+            .is_some(),
+        "expected CpuBudgetUnsatisfiable, got: {err:#}"
+    );
+    // Absent both, the auto-sized no-perf budget path is unchanged.
+    assert_eq!(
+        no_perf_admission_target(None, None, 64, 4).expect("auto-size"),
+        host_topology::no_perf_cpu_budget(64, 4),
+    );
+}

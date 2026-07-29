@@ -1063,6 +1063,37 @@ fn admission_intent_plan(
     )
 }
 
+/// No-perf admission target: how many host CPUs the intent reserves.
+///
+/// Provenance decides the over-allowance verdict (the same split
+/// [`crate::vmm::builder`]'s `resolve_cpu_budget` documents): an explicit
+/// operator `--cpu-cap` / `KTSTR_CPU_CAP` keeps its hard-error contract
+/// ([`host_topology::CpuCap::effective_count`] — the operator typed a
+/// concrete number the host cannot satisfy), while a descriptor-carried
+/// budget (a preset's `forced_cpu_budget` or an author's
+/// `#[ktstr_test(cpu_budget)]`) CLAMPS to the allowed set. A forced-budget
+/// preset like 192cpu-11llc-smt exists to force overcommit, so a host
+/// smaller than the budget collapses to what is available — deeper
+/// overcommit, mirroring the verifier-side clamp in
+/// [`crate::verifier::collect_verifier_output_with_memory_min`] — instead
+/// of failing the cell before dispatch ever runs. An author budget the
+/// host cannot satisfy still surfaces through the builder's canonical
+/// `TopologyInsufficient` skip; admission only sizes the reservation.
+/// Absent both, auto-size via [`host_topology::no_perf_cpu_budget`].
+/// Pure over its inputs so the policy is unit-testable.
+fn no_perf_admission_target(
+    explicit: Option<host_topology::CpuCap>,
+    cpu_budget: Option<u32>,
+    allowed_cpus: usize,
+    vcpus: usize,
+) -> Result<usize> {
+    match (explicit, cpu_budget) {
+        (Some(cap), _) => cap.effective_count(allowed_cpus),
+        (None, Some(budget)) => Ok((budget as usize).clamp(1, allowed_cpus.max(1))),
+        (None, None) => Ok(host_topology::no_perf_cpu_budget(allowed_cpus, vcpus)),
+    }
+}
+
 fn admission_intent_plan_for(
     topology: &Topology,
     mode: crate::test_support::AdmissionMode,
@@ -1128,15 +1159,12 @@ fn admission_intent_plan_for(
         }
         crate::test_support::AdmissionMode::NoPerf => {
             let explicit = host_topology::CpuCap::resolve(None)?;
-            let target = match (explicit, cpu_budget) {
-                (Some(cap), _) => cap.effective_count(allowed.len())?,
-                (None, Some(budget)) => {
-                    host_topology::CpuCap::new(budget as usize)?.effective_count(allowed.len())?
-                }
-                (None, None) => {
-                    host_topology::no_perf_cpu_budget(allowed.len(), topology.total_cpus() as usize)
-                }
-            };
+            let target = no_perf_admission_target(
+                explicit,
+                cpu_budget,
+                allowed.len(),
+                topology.total_cpus() as usize,
+            )?;
             (
                 shared_intent_candidates(host_topo.as_ref(), &allowed, target),
                 target,
