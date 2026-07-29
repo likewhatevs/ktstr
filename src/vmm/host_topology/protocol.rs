@@ -1727,16 +1727,22 @@ impl PendingAdmission {
         Ok((ticket, preparation, pending_claim))
     }
 
+    /// Reassemble an exec-imported pending admission. The parent widened
+    /// its mask back to the original set before exec
+    /// (`prepare_pending_exec_handoff`), so the pre-import window — where
+    /// the cell resolves CPU budgets from the live thread mask — saw the
+    /// true allowed set. Importing re-pins HERE, giving this process the
+    /// same constrain-prepare-restore lifecycle as a directly registered
+    /// admission: the heavyweight preparation that follows the import
+    /// runs on the single admitted preparation CPU, and
+    /// `finish_preparation` restores the original mask before the run
+    /// claim activates.
     fn from_imported_ticket(
         ticket: registry::Ticket,
         preparation: super::PreparationPermit,
         pending_claim: ClaimSet,
-    ) -> Self {
-        Self {
-            ticket: Some(ticket),
-            preparation: Some(preparation),
-            pending_claim: Some(pending_claim),
-        }
+    ) -> Result<Self> {
+        pending_admission_from_parts(ticket, preparation, pending_claim)
     }
 }
 

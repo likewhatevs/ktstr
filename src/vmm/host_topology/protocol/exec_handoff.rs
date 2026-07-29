@@ -98,7 +98,7 @@ struct Header {
 }
 
 pub(crate) fn prepare_pending_exec_handoff<'a>(
-    pending: &'a PendingAdmission,
+    pending: &'a mut PendingAdmission,
     metadata: &[u8],
 ) -> Result<PreparedPendingExecHandoff<'a>> {
     anyhow::ensure!(
@@ -106,6 +106,22 @@ pub(crate) fn prepare_pending_exec_handoff<'a>(
         "pending admission handoff metadata is {} bytes; maximum is {MAX_METADATA_LEN}",
         metadata.len(),
     );
+    // Widen this process back to its ORIGINAL mask before exec. The
+    // preparation pin is a phase-local detail of whichever process runs
+    // preparation, and it must never leak across exec: the child resolves
+    // its no-perf CPU budget (and validates per-test budgets and
+    // performance placement) from `host_allowed_cpus()` — the calling
+    // thread's live mask — BEFORE it imports this handoff inside
+    // `KtstrVm::run`. A leaked 1-CPU preparation mask collapses that
+    // budget to 1 host CPU for the whole run (every vCPU time-slicing one
+    // CPU), which passes deceptively slowly on an idle host and starves
+    // to a dispatch-progress FAIL on a contended one. The import side
+    // re-pins for the child's own preparation phase
+    // (`PendingAdmission::from_imported_ticket`), so the heavyweight
+    // initramfs/vmlinux staging still runs on the single admitted
+    // preparation CPU.
+    pending.restore_preparation_affinity()?;
+    let pending = &*pending;
     let (slot, ticket, liveness_fd) = pending.exec_handoff_parts()?;
     let (preparation_index, preparation_fds) = pending.preparation_handoff_parts()?;
     let (affinity_cpu, affinity_fd, original_affinity) =
@@ -286,7 +302,7 @@ pub(crate) fn take_pending_exec_handoff() -> Result<Option<ImportedPendingExecHa
     // Establish the physical-first Drop ordering before any further fallible
     // work. The registry ticket owns a duplicate liveness fd, so the inherited
     // descriptor can now close without withdrawing the PENDING publication.
-    let pending = PendingAdmission::from_imported_ticket(ticket, preparation, pending_claim);
+    let pending = PendingAdmission::from_imported_ticket(ticket, preparation, pending_claim)?;
     drop(liveness);
     let metadata_offset = HEADER_LEN
         + header.preparation_fds.len() * 2 * std::mem::size_of::<u32>()

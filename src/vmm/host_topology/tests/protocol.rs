@@ -6498,17 +6498,25 @@ fn pending_exec_v3_export_process_helper() {
     );
     let granted_claim = final_claim.clone();
     let coordinator_claim = final_claim.clone();
-    let pending = protocol::register_intent_for_preparation(
+    let mut pending = protocol::register_intent_for_preparation(
         final_claim.clone(),
         final_claim,
         move |_| Ok(Some(granted_claim.clone())),
         move |_| Ok(Some(coordinator_claim.clone())),
     )
     .expect("register selected-final pending v3 admission");
+    // Registration constrains this process to the single preparation CPU.
+    assert_eq!(
+        host_allowed_cpus(),
+        vec![affinity_cpu],
+        "registered preparation admission must pin the exporter to its \
+         preparation CPU",
+    );
     let (prepared_cpu, _, original_affinity) = pending
         .preparation_affinity_handoff_parts()
         .expect("read pending v3 affinity");
     assert_eq!(prepared_cpu, affinity_cpu);
+    let original_affinity = original_affinity.to_vec();
     let metadata = format!(
         "{prepared_cpu}|{}",
         original_affinity
@@ -6517,8 +6525,17 @@ fn pending_exec_v3_export_process_helper() {
             .collect::<Vec<_>>()
             .join(","),
     );
-    let handoff = protocol::prepare_pending_exec_handoff(&pending, metadata.as_bytes())
+    let handoff = protocol::prepare_pending_exec_handoff(&mut pending, metadata.as_bytes())
         .expect("prepare pending v3 exec handoff");
+    // Preparing the handoff widens the exporter back to its original mask
+    // BEFORE exec: the child resolves CPU budgets from its live thread
+    // mask before importing, so a leaked preparation pin would collapse
+    // every budget to one host CPU.
+    assert_eq!(
+        host_allowed_cpus(),
+        original_affinity,
+        "exec handoff preparation must restore the original mask before exec",
+    );
     let seals = unsafe { libc::fcntl(handoff.descriptor_fd_for_tests(), libc::F_GET_SEALS) };
     assert_eq!(
         seals & (libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE),
@@ -6555,6 +6572,12 @@ fn pending_exec_v3_import_process_helper() {
         }
     });
     barrier.wait();
+    // Regression pin: the pre-import window is where the real cell
+    // resolves its no-perf CPU budget from the live thread mask
+    // (`KtstrVmBuilder::build` runs before `KtstrVm::run` imports the
+    // handoff). The exec must deliver the ORIGINAL mask here, not the
+    // parent's single-CPU preparation pin.
+    let allowed_before_import = host_allowed_cpus();
     let mappings_before_import = protocol::ticket_shared_mapping_build_count_for_tests();
     let imported = protocol::take_pending_exec_handoff()
         .expect("validate pending v3 handoff while another thread reads the environment")
@@ -6580,7 +6603,18 @@ fn pending_exec_v3_import_process_helper() {
         .split(',')
         .map(|cpu| cpu.parse().expect("pending v3 original affinity CPU"))
         .collect::<Vec<usize>>();
-    assert_eq!(host_allowed_cpus(), vec![affinity_cpu]);
+    assert_eq!(
+        allowed_before_import, original,
+        "the exec'd child must arrive with the original mask, not the \
+         parent's preparation pin — budget resolution happens pre-import",
+    );
+    // Importing re-pins for THIS process's preparation phase.
+    assert_eq!(
+        host_allowed_cpus(),
+        vec![affinity_cpu],
+        "importing the handoff must constrain the child to its \
+         preparation CPU",
+    );
 
     let mut pending = imported.pending;
     let (_, imported_watch) = pending
