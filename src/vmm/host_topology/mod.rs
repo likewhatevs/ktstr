@@ -3576,12 +3576,14 @@ impl PreparationPermit {
             .collect()
     }
 
+    /// The thread mask is deliberately NOT required to be constrained
+    /// here: `prepare_pending_exec_handoff` restores the original mask
+    /// before exec (the pin must not leak into the child's pre-import
+    /// budget resolution), and the import side re-pins for the child's
+    /// own preparation phase. Only the physical CPU lock must still be
+    /// held — it is what crosses exec.
     pub(super) fn affinity_handoff_parts(&self) -> Result<(usize, std::os::fd::RawFd, &[usize])> {
         use std::os::fd::AsRawFd;
-        anyhow::ensure!(
-            self.affinity_constrained,
-            "preparation affinity is not active at exec handoff",
-        );
         let fd = self
             .affinity_lock
             .as_ref()
@@ -3685,8 +3687,11 @@ impl PreparationPermit {
             affinity_lock: Some(affinity_lock),
             affinity_cpu,
             original_affinity,
-            // A same-PID exec preserves the calling thread's mask.
-            affinity_constrained: true,
+            // The parent restored the original mask before exec, so the
+            // imported permit arrives UNCONSTRAINED;
+            // `PendingAdmission::from_imported_ticket` re-pins via
+            // `constrain_affinity` for this process's preparation phase.
+            affinity_constrained: false,
         }
     }
 }

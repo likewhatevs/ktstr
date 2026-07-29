@@ -386,7 +386,7 @@ fn poll_clone_tree(
         if non_tty {
             root.sorted_snapshot(&mut snapshot);
             if let Some(line) = reporter.update(&snapshot, Instant::now()) {
-                eprintln!("{label}: {line}");
+                eprintln!("{}", super::util::status_line(&format!("{label}: {line}")));
             }
         } else {
             poll_tick(&root, &bar, &mut determinate, &label, &mut snapshot);
@@ -677,10 +677,13 @@ impl CloneProgress {
         self.shutdown();
         if self.non_tty {
             eprintln!(
-                "{}: {} complete (elapsed {})",
-                self.label,
-                self.completion_noun,
-                human_elapsed(self.started.elapsed())
+                "{}",
+                super::util::status_line(&format!(
+                    "{}: {} complete (elapsed {})",
+                    self.label,
+                    self.completion_noun,
+                    human_elapsed(self.started.elapsed())
+                ))
             );
         }
     }

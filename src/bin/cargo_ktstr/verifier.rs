@@ -2307,7 +2307,7 @@ pub(crate) fn run_verifier(
         ));
     }
     for package in &package_plan.older {
-        eprintln!("{}", format_older_package_skip(package));
+        ktstr::cli::print_status_line(&format_older_package_skip(package));
     }
     // Every verifier-bearing workspace member is old. Excluding those tests is
     // explicitly a non-error, and there is nothing current to ask nextest to

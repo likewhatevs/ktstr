@@ -400,11 +400,22 @@ fn dilation_annotation_fires_on_stuck_for_wall_gap_context() {
     );
 }
 
+/// A p99 threshold over ZERO wake samples records Inconclusive, not a
+/// silent Pass — the same fail-closed shape as the zero-mean CV arm
+/// below. The silent skip let a wake-latency gate look "green" on a
+/// workload that never blocks (the sched_perf_negative vacuity).
 #[test]
-fn assert_benchmarks_no_latencies_skips_p99() {
+fn assert_benchmarks_no_latencies_inconclusive_p99() {
     let reports = [rpt_with_latencies(1, vec![], 10, 5_000_000_000)];
     let r = assert_benchmarks(&reports, Some(1000), None, None);
-    assert!(r.is_pass(), "empty latencies should skip p99 check");
+    assert!(
+        r.is_inconclusive(),
+        "empty latencies with a p99 threshold must be inconclusive, got: {r:?}"
+    );
+    assert!(
+        format!("{r:?}").contains("0 wake samples"),
+        "inconclusive detail must name the zero-sample cause: {r:?}"
+    );
 }
 
 #[test]

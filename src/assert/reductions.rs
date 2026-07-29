@@ -1085,6 +1085,23 @@ pub fn assert_benchmarks(
         .collect();
 
     if let Some(p99_limit) = max_p99_ns
+        && all_latencies.is_empty()
+    {
+        // Fail closed like the migration-ratio zero-denominator arm: a
+        // p99 threshold over zero samples can neither pass nor fail. A
+        // silent pass here let a wake-latency gate look "green" on a
+        // workload that never blocks — the gate asserted nothing.
+        r.record_inconclusive(AssertDetail::new(
+            DetailKind::Benchmark,
+            format!(
+                "p99 wake latency inconclusive: 0 wake samples across {} workers — \
+                 the workload recorded no wakeups; threshold {p99_limit}ns neither \
+                 pass nor fail (does this workload block and wake at all?)",
+                reports.len(),
+            ),
+        ));
+    }
+    if let Some(p99_limit) = max_p99_ns
         && !all_latencies.is_empty()
     {
         let mut sorted = all_latencies.clone();

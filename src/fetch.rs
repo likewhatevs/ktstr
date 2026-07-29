@@ -553,7 +553,7 @@ fn print_download_size(
     // the group is hidden); raw `eprintln!` when no group is present.
     match mp {
         Some(fp) => fp.println(&line),
-        None => eprintln!("{line}"),
+        None => crate::cli::print_status_line(&line),
     }
 }
 
@@ -1654,7 +1654,7 @@ fn download_stable_tarball_from_url(
     // `print_download_size`); `eprintln!` when no group is threaded in.
     let status = |line: &str| match mp {
         Some(fp) => fp.println(line),
-        None => eprintln!("{line}"),
+        None => crate::cli::print_status_line(line),
     };
     status(&format!("{cli_label}: extracting tarball (xz)"));
     // Stage extraction inside `dest_dir` (same filesystem) so the
@@ -1959,7 +1959,7 @@ fn download_rc_tarball(
 
     let status = |line: &str| match mp {
         Some(fp) => fp.println(line),
-        None => eprintln!("{line}"),
+        None => crate::cli::print_status_line(line),
     };
     status(&format!("{cli_label}: extracting tarball (gzip)"));
     // Stage extraction inside `dest_dir` (same filesystem) so the
@@ -2074,7 +2074,7 @@ pub(crate) fn download_github_archive(
 
     let status = |line: &str| match mp {
         Some(fp) => fp.println(line),
-        None => eprintln!("{line}"),
+        None => crate::cli::print_status_line(line),
     };
     status(&format!("{cli_label}: extracting snapshot (gzip)"));
     // Stage extraction inside `dest_dir` (same filesystem) so the final
@@ -2219,7 +2219,7 @@ pub fn download_tarball(
                 );
                 match mp {
                     Some(fp) => fp.println(&msg),
-                    None => eprintln!("{msg}"),
+                    None => crate::cli::print_status_line(&msg),
                 }
                 download_github_archive(
                     client,
@@ -3253,7 +3253,7 @@ fn git_clone_inner_gated<T>(
     let cloning = format!("{cli_label}: cloning {url} (ref: {git_ref}, depth: 1)");
     match mp {
         Some(fp) => fp.println(&cloning),
-        None => eprintln!("{cloning}"),
+        None => crate::cli::print_status_line(&cloning),
     }
 
     let clone_dir = dest_dir.join("linux");

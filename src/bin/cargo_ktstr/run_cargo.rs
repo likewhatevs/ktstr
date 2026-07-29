@@ -5064,8 +5064,9 @@ fn run_cargo_sub(
         // has no entry above. Defer to the nextest summary for the
         // authoritative failed-test set rather than implying the
         // artifact list is exhaustive.
-        eprintln!(
-            "\ncargo ktstr: nextest reported failures (see its summary above); \
+        eprintln!();
+        ktstr::ktstr_status!(
+            "cargo ktstr: nextest reported failures (see its summary above); \
              per-test artifacts for failures that produced them are listed above. \
              Artifacts under {}.",
             runs_root.display(),

@@ -2469,7 +2469,7 @@ pub fn run_shell(
     };
     #[cfg(not(feature = "wprof"))]
     if wprof_args.is_some() {
-        eprintln!(
+        crate::ktstr_status!(
             "ktstr: wprof_args ignored — ktstr was built without the \
              `wprof` cargo feature; /bin/wprof will not be available \
              in the guest"

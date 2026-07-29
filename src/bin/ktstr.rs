@@ -1416,7 +1416,7 @@ fn main() -> Result<()> {
         Command::Ctprof { command } => match command {
             CtprofCommand::Capture { output } => {
                 ctprof::capture_to(&output)?;
-                eprintln!("ktstr: wrote ctprof snapshot to {}", output.display());
+                ktstr::ktstr_status!("ktstr: wrote ctprof snapshot to {}", output.display());
             }
             CtprofCommand::Compare(args) => {
                 let code = ctprof_compare::run_compare(&args)?;

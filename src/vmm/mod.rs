@@ -852,10 +852,10 @@ pub struct AdmissionExecGuard {
 impl AdmissionExecGuard {
     /// Transfer this admission into `command` and replace the wrapper.
     #[doc(hidden)]
-    pub fn exec(self, mut command: std::process::Command) -> Result<()> {
+    pub fn exec(mut self, mut command: std::process::Command) -> Result<()> {
         use std::os::unix::process::CommandExt;
 
-        let Some(pending) = self.pending.as_ref() else {
+        let Some(pending) = self.pending.as_mut() else {
             // Host-only, filtered, overcommit-skipped, and host-classified
             // cells deliberately have no reservation to transfer. Replace
             // this lightweight wrapper directly; metadata is meaningful only

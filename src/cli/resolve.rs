@@ -949,7 +949,7 @@ fn report_git_builder_wait(
     );
     match mp {
         Some(fp) => fp.println(&line),
-        None => eprintln!("{line}"),
+        None => super::print_status_line(&line),
     }
 }
 
@@ -1080,7 +1080,7 @@ pub fn resolve_git_kernel(
                             format!("{cli_label}: git+{url} -> {short} cached; skipping fetch");
                         match mp {
                             Some(fp) => fp.println(&msg),
-                            None => eprintln!("{msg}"),
+                            None => super::print_status_line(&msg),
                         }
                         return Ok(path);
                     }
@@ -1133,7 +1133,7 @@ pub fn resolve_git_kernel(
             );
             match mp {
                 Some(fp) => fp.println(&msg),
-                None => eprintln!("{msg}"),
+                None => super::print_status_line(&msg),
             }
             let mut acquired = crate::fetch::download_github_archive(
                 crate::fetch::shared_client(),
