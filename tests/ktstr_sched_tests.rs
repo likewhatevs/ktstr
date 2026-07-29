@@ -249,9 +249,31 @@ fn sched_perf_positive(ctx: &Ctx) -> Result<AssertResult> {
 
 fn scenario_perf_negative(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertResult> {
     use ktstr::scenario::ops::execute_steps_with;
-    let checks = ktstr::assert::Assert::default_checks().max_gap_ms(50);
+    use ktstr::workload::{WorkSpec, WorkType};
+    // Wake latency, not max_gap_ms: the Stuck gate is CPU-denominated
+    // (compute-without-progress) and deliberately blind to scheduler
+    // starvation — a degraded scheduler starves wall time, and a starved
+    // worker accrues no CPU (see the max_gap_ms section of
+    // tests/assert_gate_matrix.rs). The workload must actually block and
+    // wake for the gate to have samples: a futex ping-pong pair whose
+    // per-turn spin (~tens of ms) is on the order of degrade's ~134ms
+    // dispatch-blackout window, so a large fraction of its hand-off
+    // wakes land inside a blackout and park in SHARED_DSQ — pooled p99
+    // wake latency blows far past 50ms. A healthy scheduler serves the
+    // same hand-offs in microseconds.
+    let checks = ktstr::assert::Assert::default_checks().max_p99_wake_latency_ns(50_000_000);
     let steps = vec![Step {
-        setup: vec![ctx.cgroup_def("cg_0")].into(),
+        setup: vec![
+            ctx.cgroup_def("cg_0")
+                .work(
+                    WorkSpec::default()
+                        .workers(2)
+                        .work_type(WorkType::FutexPingPong {
+                            spin_iters: 20_000_000,
+                        }),
+                ),
+        ]
+        .into(),
         ops: vec![],
         hold: HoldSpec::FULL,
     }];
@@ -626,10 +648,27 @@ fn sched_verifier_stats_populated(ctx: &Ctx) -> Result<AssertResult> {
 
 fn scenario_mid_degrade(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertResult> {
     use ktstr::scenario::ops::execute_steps_with;
-    let checks = ktstr::assert::Assert::default_checks().max_gap_ms(50);
+    use ktstr::workload::{WorkSpec, WorkType};
+    // Wake latency, not max_gap_ms — same rationale and workload as
+    // `scenario_perf_negative`: the CPU-denominated Stuck gate cannot
+    // see scheduler starvation, and only a blocking/waking workload
+    // gives the wake gate samples. The ping-pong pairs run healthy
+    // through the first phase; the post-trigger dispatch blackouts then
+    // balloon their hand-off wake latencies past the 50ms cap.
+    let checks = ktstr::assert::Assert::default_checks().max_p99_wake_latency_ns(50_000_000);
+    let ping_pong = |name: &'static str| {
+        ctx.cgroup_def(name)
+            .work(
+                WorkSpec::default()
+                    .workers(2)
+                    .work_type(WorkType::FutexPingPong {
+                        spin_iters: 20_000_000,
+                    }),
+            )
+    };
     let steps = vec![
         Step {
-            setup: vec![ctx.cgroup_def("cg_0"), ctx.cgroup_def("cg_1")].into(),
+            setup: vec![ping_pong("cg_0"), ping_pong("cg_1")].into(),
             ops: vec![],
             hold: HoldSpec::fixed(std::time::Duration::from_secs(3)),
         },

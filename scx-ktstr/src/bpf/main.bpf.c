@@ -326,10 +326,15 @@ volatile int stall;
  * via BPF map write to the .bss section. */
 volatile int crash;
 
-/* When non-zero, ktstr_enqueue inserts tasks onto a random online
- * CPU's local DSQ and ktstr_dispatch skips every other call.
- * Random placement drives up migrations; skipped dispatches
- * reduce throughput. Slows scheduling without stalling.
+/* When non-zero, workload tasks route through SHARED_DSQ (select_cpu's
+ * idle direct-dispatch fast path is gated, like `stall`) and
+ * ktstr_dispatch alternates ~134ms blackout windows with ~134ms of
+ * normal service. A wakeup that lands in a blackout parks in
+ * SHARED_DSQ until the next service window, so wake latencies
+ * deterministically balloon past the negative-control wake-latency
+ * gates (the CPU-denominated Stuck gate is deliberately blind to
+ * starvation — see tests/assert_gate_matrix.rs). Forward progress
+ * resumes every service window: degraded, never stalled.
  * const volatile (.rodata) so the verifier prunes the path
  * when degrade=0. Set via rodata before load. */
 const volatile int degrade = 0;
@@ -365,8 +370,8 @@ const volatile int verify_loop = 0;
 
 /* Runtime-mutable degrade flag. Set from userspace via .bss map write,
  * --degrade-after timer, or /tmp/ktstr_degrade sentinel. Same behavior
- * as const volatile degrade: random enqueue + skip 1/2 dispatches.
- * volatile (.bss) so the verifier always verifies the path. */
+ * as const volatile degrade: SHARED_DSQ routing + timed dispatch
+ * blackouts. volatile (.bss) so the verifier always verifies the path. */
 volatile int degrade_rt;
 
 /* Skip 3 out of 4 dispatches (mask 0x3 = skip when any of low 2
@@ -422,7 +427,7 @@ s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
 	 * runs the watchdog itself, so parking kthreads would stall the
 	 * watchdog and the stall would never be detected (see ktstr_enqueue).
 	 * Keep them on the fast path so the watchdog kworker keeps running. */
-	if ((!stall || (p->flags & PF_KTHREAD)) && is_idle)
+	if ((!(stall || degrade || degrade_rt) || (p->flags & PF_KTHREAD)) && is_idle)
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 	__sync_fetch_and_add(&nr_select_cpu, 1);
 	return cpu;
@@ -446,7 +451,7 @@ void BPF_STRUCT_OPS(ktstr_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
 		return;
 	}
-	if (scattershot || degrade || degrade_rt) {
+	if (scattershot) {
 		const struct cpumask *online;
 		u32 nr = scx_bpf_nr_cpu_ids();
 		u32 cpu;
@@ -461,6 +466,13 @@ void BPF_STRUCT_OPS(ktstr_enqueue, struct task_struct *p, u64 enq_flags)
 				    SCX_SLICE_DFL, enq_flags);
 		return;
 	}
+	/* Degrade deliberately falls through to SHARED_DSQ: the dispatch
+	 * blackout below can only park tasks that pass through the shared
+	 * queue. Routing degrade tasks to random LOCAL DSQs (the old
+	 * behavior, shared with scattershot) made the dispatch-side logic
+	 * dead code — local DSQs are consumed without ops.dispatch — so a
+	 * degraded scheduler produced no measurable workload gaps at all
+	 * and the expect_err negative controls asserted nothing. */
 	scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
 }
 
@@ -471,12 +483,22 @@ void BPF_STRUCT_OPS(ktstr_dispatch, s32 cpu, struct task_struct *prev)
 	if (stall)
 		return;
 	if (degrade || degrade_rt) {
-		/* Skip half of dispatches. Under degrade, ktstr_enqueue
-		 * inserts to random LOCAL DSQs so this skip is effectively
-		 * dead for those tasks, but slows any tasks that reached
-		 * the shared DSQ via the normal path. */
-		if (++degrade_cnt & 1)
+		/* Alternate ~134ms dispatch blackouts (2^27 ns buckets)
+		 * with ~134ms of normal service. Workload tasks wait out
+		 * each blackout parked in SHARED_DSQ (kthreads bypass via
+		 * SCX_DSQ_LOCAL in ktstr_enqueue, and select_cpu's
+		 * idle fast path is gated like `stall`), so a wake that
+		 * lands in a blackout waits ~the window — far past the
+		 * 50ms wake-latency negative-control gates — while
+		 * forward progress resumes every service window:
+		 * degraded, never stalled. Time-phased rather than
+		 * call-counted: a skip-every-other-call scheme only
+		 * delays a task by one dispatch retry (~one tick), which
+		 * never accumulates a workload-visible delay. */
+		if ((bpf_ktime_get_ns() >> 27) & 1) {
+			degrade_cnt++;
 			return;
+		}
 	}
 	if (verify_loop) {
 		/* Unrolled loop produces 8 copies of the same instruction

@@ -51,8 +51,7 @@ pub struct KtstrStats {
     pub nr_dispatched: u64,
     /// Cumulative count of `ktstr_enqueue` invocations. Bumps on
     /// every callback regardless of which DSQ the task lands in
-    /// (SHARED_DSQ vs. SCX_DSQ_LOCAL_ON | cpu under
-    /// scattershot/degrade).
+    /// (SHARED_DSQ vs. SCX_DSQ_LOCAL_ON | cpu under scattershot).
     #[stat(desc = "Number of enqueue callbacks observed")]
     pub nr_enqueued: u64,
     /// Cumulative count of `ktstr_select_cpu` invocations.
