@@ -6453,7 +6453,7 @@ impl ItemProgress {
                 bar.abandon_with_message(message);
             }
         } else {
-            eprintln!("{message}");
+            ktstr::cli::print_status_line(&message);
         }
         self.terminal = true;
     }

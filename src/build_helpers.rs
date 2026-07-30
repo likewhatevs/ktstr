@@ -620,6 +620,18 @@ fn ficlone_build_blob(
     ))
 }
 
+/// `FICLONE` errors which prove the filesystem pair cannot reflink at all:
+/// `EOPNOTSUPP` (no reflink support — ext4, tmpfs, GitHub-hosted runners),
+/// `EXDEV` (cache and target on different filesystems), and the non-Linux
+/// stub's `Unsupported`. Raw values because build-script context has no libc
+/// dependency; both are invariant across Linux architectures.
+fn ficlone_impossible(error: &std::io::Error) -> bool {
+    const EOPNOTSUPP: i32 = 95;
+    const EXDEV: i32 = 18;
+    matches!(error.raw_os_error(), Some(EOPNOTSUPP) | Some(EXDEV))
+        || error.kind() == std::io::ErrorKind::Unsupported
+}
+
 fn materialize_build_blob_with<Clone>(
     source_path: &std::path::Path,
     destination_path: &std::path::Path,
@@ -628,7 +640,7 @@ fn materialize_build_blob_with<Clone>(
 where
     Clone: FnOnce(&std::fs::File, &std::fs::File) -> std::io::Result<()>,
 {
-    let source = std::fs::File::open(source_path)?;
+    let mut source = std::fs::File::open(source_path)?;
     let metadata = source.metadata()?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err(std::io::Error::new(
@@ -639,26 +651,43 @@ where
             ),
         ));
     }
-    let (temporary, destination) = AtomicSibling::create(destination_path, "reflink")?;
-    clone(&destination, &source).map_err(|error| {
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "FICLONE {} -> {} failed ({error}); place KTSTR_CACHE_DIR and Cargo's target directory on the same reflink-capable filesystem",
-                source_path.display(),
-                temporary.path().display()
-            ),
-        )
-    })?;
+    let (temporary, mut destination) = AtomicSibling::create(destination_path, "reflink")?;
+    if let Err(error) = clone(&destination, &source) {
+        if !ficlone_impossible(&error) {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "FICLONE {} -> {} failed ({error}); place KTSTR_CACHE_DIR and Cargo's target directory on the same reflink-capable filesystem",
+                    source_path.display(),
+                    temporary.path().display()
+                ),
+            ));
+        }
+        // Reflink is impossible here, not broken: fall back to one visible
+        // byte copy per OUT_DIR so non-reflink filesystems can build at all.
+        // Every caller is build-script context, so the warning reaches Cargo.
+        println!(
+            "cargo:warning=FICLONE {} -> {} unsupported ({error}); \
+             byte-copying instead — placing KTSTR_CACHE_DIR and the target \
+             directory on one reflink-capable filesystem shares extents",
+            source_path.display(),
+            temporary.path().display(),
+        );
+        std::io::copy(&mut source, &mut destination)?;
+    }
     destination.set_permissions(metadata.permissions())?;
     destination.sync_all()?;
     drop(destination);
     temporary.publish(destination_path)
 }
 
-/// Materialize an immutable cached blob into one private OUT_DIR inode. This
-/// is intentionally strict: a byte-copy fallback would multiply every large
-/// embedded blob across concurrent Cargo runners and hide a broken COW setup.
+/// Materialize an immutable cached blob into one private OUT_DIR inode.
+/// Reflink-first, and strict about reflink *failures*: a silent byte-copy
+/// fallback would multiply every large embedded blob across concurrent Cargo
+/// runners and hide a broken COW setup. Only errors proving the filesystem
+/// pair cannot reflink at all ([`ficlone_impossible`]) degrade to a byte
+/// copy, behind a `cargo:warning` — without that, any non-reflink filesystem
+/// (ext4 dev hosts, GitHub-hosted runners) cannot build the crate.
 fn materialize_build_blob(
     source_path: &std::path::Path,
     destination_path: &std::path::Path,
@@ -1944,16 +1973,47 @@ mod tests {
     }
 
     #[test]
-    fn build_blob_materialization_never_byte_copies_on_ficlone_failure() {
+    fn build_blob_materialization_byte_copies_when_reflink_is_impossible() {
+        for clone_error in [
+            std::io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+            std::io::Error::from_raw_os_error(libc::EXDEV),
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "no FICLONE on this target"),
+        ] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let source = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            std::fs::write(&source, b"new-cached-content").expect("write source");
+            std::fs::write(&destination, b"old-destination").expect("write old destination");
+            materialize_build_blob_with(&source, &destination, move |_destination, _source| {
+                Err(clone_error)
+            })
+            .expect("a filesystem that cannot reflink at all must fall back to a byte copy");
+            assert_eq!(
+                std::fs::read(&destination).expect("read materialized destination"),
+                b"new-cached-content",
+                "the byte-copy fallback must publish the cached content"
+            );
+            assert_eq!(
+                std::fs::read_dir(temp.path())
+                    .expect("scan materialization directory")
+                    .count(),
+                2,
+                "the fallback must publish through the same atomic temporary"
+            );
+        }
+    }
+
+    #[test]
+    fn build_blob_materialization_never_byte_copies_on_a_reflink_failure() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
         std::fs::write(&source, b"new-cached-content").expect("write source");
         std::fs::write(&destination, b"old-destination").expect("write old destination");
         let error = materialize_build_blob_with(&source, &destination, |_destination, _source| {
-            Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
         })
-        .expect_err("unsupported FICLONE must fail rather than copying bytes");
+        .expect_err("a failure on a reflink-capable pair must fail rather than copy bytes");
         assert!(error.to_string().contains("FICLONE"));
         assert_eq!(
             std::fs::read(&destination).expect("read preserved destination"),
