@@ -1183,29 +1183,27 @@ fn capture_stdout<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
 /// Stub func for the host_only listing-test entry. The listers
 /// (`list_tests_all` / `list_tests_budget`) only iterate
 /// `KTSTR_TESTS` to emit names and never call `func` — but every
-/// `KTSTR_TESTS` entry is ALSO reachable by the run dispatcher: a
-/// full `cargo ktstr test` run executes it, exactly like the sibling
-/// `__unit_test_dummy__` sentinel. So the func must be a harmless
-/// pass, not an error. `host_only = true` runs it on the host with
-/// no VM and it asserts nothing. (An earlier Err-bailing stub
-/// assumed the entry was never dispatched, which made every full
-/// run fail when the dispatcher reached it.)
+/// listed entry is ALSO reachable by the run dispatcher: a full
+/// `cargo ktstr test` run executes it. So the func must be a
+/// harmless pass, not an error. `host_only = true` runs it on the
+/// host with no VM and it asserts nothing. (An earlier Err-bailing
+/// stub assumed the entry was never dispatched, which made every
+/// full run fail when the dispatcher reached it.)
 fn host_only_listing_stub(
     _ctx: &crate::scenario::Ctx,
 ) -> anyhow::Result<crate::assert::AssertResult> {
     Ok(crate::assert::AssertResult::pass())
 }
 
-/// Distinct sentinel name so the listing-output filters in the
-/// tests below match this entry and not the `__unit_test_dummy__`
-/// (also registered in `KTSTR_TESTS` from the
-/// `test_support::tests` module) or any other entry that may be
-/// added later. The `__unit_test_…__` shape collides with
-/// `is_test_sentinel` (see the predicate at the top of this
-/// module) so the `cargo test` harness still classifies it as a
-/// sentinel and the early-dispatch warning logic does not
-/// double-fire.
-const HOST_ONLY_LISTING_NAME: &str = "__unit_test_host_only_listing__";
+/// Distinct name so the listing-output filters in the tests below
+/// match this entry alone. Deliberately NOT `__unit_test_*__`
+/// shaped: the listers exclude sentinel fixtures entirely (see
+/// `is_test_sentinel` in `list_tests_all` / `list_tests_budget`),
+/// so a sentinel-shaped fixture would never appear in the captured
+/// output these tests assert on. A real-named `host_only` probe
+/// follows the `cpu_budget_codegen_probe` precedent: it lists and
+/// runs as one cheap VM-free `host/…` pass in real sweeps.
+const HOST_ONLY_LISTING_NAME: &str = "host_only_listing_probe";
 
 #[crate::ktstr_test_entry]
 static __HOST_ONLY_LISTING_ENTRY: KtstrTestEntry = KtstrTestEntry {
@@ -2920,12 +2918,15 @@ fn list_tests_budget_non_numeric_warns_and_lists_all() {
         !stderr.contains("ktstr budget:"),
         "unparseable budget must NOT route through list_tests_budget; got: {stderr}",
     );
-    // Fell through to list_tests_all: at least one base `ktstr/` line.
+    // Fell through to list_tests_all: the listing probe's base line is
+    // present. (This binary's VM-shaped entries are all `__unit_test_*__`
+    // sentinels, which the listers exclude, so the host probe is the
+    // stable fallthrough witness.)
     assert!(
         stdout
             .lines()
-            .any(|l| l.starts_with("ktstr/") && l.ends_with(": test")),
-        "fallthrough must list base ktstr/ test names; got:\n{stdout}",
+            .any(|l| l == format!("host/{HOST_ONLY_LISTING_NAME}: test")),
+        "fallthrough must list the base host probe name; got:\n{stdout}",
     );
 }
 
@@ -2953,11 +2954,13 @@ fn list_tests_budget_non_positive_warns_and_lists_all() {
         !stderr.contains("ktstr budget:"),
         "non-positive budget must NOT route through list_tests_budget; got: {stderr}",
     );
+    // Same fallthrough witness as the non-numeric sibling: the host
+    // probe's base line, since sentinel entries never list.
     assert!(
         stdout
             .lines()
-            .any(|l| l.starts_with("ktstr/") && l.ends_with(": test")),
-        "fallthrough must list base ktstr/ test names; got:\n{stdout}",
+            .any(|l| l == format!("host/{HOST_ONLY_LISTING_NAME}: test")),
+        "fallthrough must list the base host probe name; got:\n{stdout}",
     );
 }
 

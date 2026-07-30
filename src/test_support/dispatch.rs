@@ -1668,6 +1668,14 @@ fn list_tests_all(ignored_only: bool) {
     };
 
     for entry in KTSTR_TESTS.iter() {
+        // Unit-test sentinel fixtures (`__unit_test_*__`) exist only to be
+        // dispatched directly by lib unit tests (run_named_test / ELF stamp
+        // readers). Listing them would boot real VM cells for stub bodies —
+        // the perf-mode fixtures then face the perf isolation gate on hosts
+        // where nothing meaningful is being measured.
+        if is_test_sentinel(entry.name) {
+            continue;
+        }
         // bpf_map_write tests require vmlinux to resolve BPF map
         // addresses. Don't list them when vmlinux is unavailable —
         // they cannot run and would produce false PASS results.
@@ -2587,6 +2595,11 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     };
 
     for entry in KTSTR_TESTS.iter() {
+        // Same sentinel exclusion as `list_tests_all`: fixtures never
+        // become budget candidates.
+        if is_test_sentinel(entry.name) {
+            continue;
+        }
         if !entry.bpf_map_write.is_empty() && !has_vmlinux {
             continue;
         }
