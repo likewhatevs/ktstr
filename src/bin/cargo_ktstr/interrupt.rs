@@ -130,6 +130,24 @@ const GROUP_TAIL_WALL_BACKSTOP: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const GROUP_TAIL_WALL_BACKSTOP: Duration = Duration::from_secs(3);
 
+/// Wall window a post-leader residual subtree must remain wholly composed of
+/// idle adopted daemons before the runner reclaims it instead of failing the
+/// command. Build tooling can legitimately daemonize a cache server (sccache
+/// auto-starts one when the configured socket has no listener); such a server
+/// is parked infrastructure, not leaked work, and killing the command for it
+/// would fail every build which triggered an auto-start. The window is long
+/// enough for CLK_TCK-granular CPU accounting to expose a subtree which is
+/// merely slow, and short enough not to stall a build epoch noticeably.
+#[cfg(not(test))]
+const GROUP_TAIL_PARKED_DAEMON_WINDOW: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const GROUP_TAIL_PARKED_DAEMON_WINDOW: Duration = Duration::from_millis(250);
+
+/// CPU ticks the parked-daemon window tolerates before restarting. One tick
+/// absorbs an idle event-loop wakeup; anything more is treated as real work
+/// and defers to the ordinary service/wall budgets.
+const GROUP_TAIL_PARKED_IDLE_TICK_TOLERANCE: u64 = 1;
+
 const GROUP_SCAN_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 const FORCED_GROUP_REAP_BACKSTOP: Duration = Duration::from_secs(30);
@@ -3799,6 +3817,7 @@ struct GroupMember {
     identity: ProcessIdentity,
     ppid: libc::pid_t,
     pgrp: libc::pid_t,
+    session: libc::pid_t,
     cpu_ticks: u64,
     state: u8,
 }
@@ -3854,6 +3873,8 @@ fn parse_process_stat(pid: libc::pid_t, stat: &[u8]) -> io::Result<GroupMember> 
         .ok_or_else(|| invalid_proc_stat(pid, "parent pid"))?;
     let pgrp = parse_proc_stat_number::<libc::pid_t>(fields[2])
         .ok_or_else(|| invalid_proc_stat(pid, "process group"))?;
+    let session = parse_proc_stat_number::<libc::pid_t>(fields[3])
+        .ok_or_else(|| invalid_proc_stat(pid, "session"))?;
     let utime =
         parse_proc_stat_number::<u64>(fields[11]).ok_or_else(|| invalid_proc_stat(pid, "utime"))?;
     let stime =
@@ -3867,6 +3888,7 @@ fn parse_process_stat(pid: libc::pid_t, stat: &[u8]) -> io::Result<GroupMember> 
         },
         ppid,
         pgrp,
+        session,
         cpu_ticks: utime.saturating_add(stime),
         state,
     })
@@ -4306,6 +4328,48 @@ fn bounded_diagnostic_field(bytes: &[u8]) -> String {
         rendered.push_str("<truncated>");
     }
     rendered
+}
+
+/// Watches a post-leader residual subtree for the parked-daemon shape.
+///
+/// A residual member is daemon-shaped when it is an adopted direct child in a
+/// session other than this runner's: only deliberate daemonization calls
+/// `setsid`, so every ordinary Cargo helper finishing late still reports the
+/// runner's own session. The escaped session, not session leadership, is the
+/// discriminator, because a classic double-fork daemon (sccache's
+/// auto-started server, for example) deliberately leaves its second fork a
+/// non-leader inside the new session. The probe arms only while every live
+/// residual member is daemon-shaped and concludes once that exact membership
+/// has consumed at most [`GROUP_TAIL_PARKED_IDLE_TICK_TOLERANCE`] CPU ticks
+/// across [`GROUP_TAIL_PARKED_DAEMON_WINDOW`]: the subtree is parked
+/// infrastructure and is reclaimed without failing the command. Membership
+/// churn or CPU consumption restarts the window, deferring to the ordinary
+/// service/wall budgets.
+struct ParkedDaemonProbe {
+    since: Instant,
+    members: Vec<ProcessIdentity>,
+    baseline_ticks: u64,
+}
+
+/// A parked residual subtree after its reclaim edge: SIGTERM was sent to the
+/// exact recorded members, escalating to SIGKILL after the cooperative grace.
+/// The ordinary reap and stable-empty fence then finish the capture; a member
+/// which survives both edges still runs into the wall backstop fail-closed.
+struct ParkedDaemonReclaim {
+    terminated_at: Instant,
+    members: Vec<ProcessIdentity>,
+    killed: bool,
+}
+
+fn daemon_shaped(process: &OwnedProcess, runner_session: libc::pid_t) -> bool {
+    process.direct && process.member.session != runner_session
+}
+
+fn reclaimed_daemon_label(pid: libc::pid_t) -> String {
+    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(comm) => bounded_diagnostic_field(comm.trim_end().as_bytes()),
+        Err(_) => "<unknown>".to_string(),
+    }
 }
 
 struct TaskServiceBudget {
@@ -4930,6 +4994,11 @@ fn drain_group_capture<O: StdoutObserver>(
     let mut next_group_scan = Instant::now();
     let mut empty_since = None::<Instant>;
     let mut descendant_snapshot_persisted = false;
+    let mut parked_probe = None::<ParkedDaemonProbe>;
+    let mut parked_reclaim = None::<ParkedDaemonReclaim>;
+    // SAFETY: getsid(0) reports the calling process's own session and cannot
+    // fail for pid 0.
+    let runner_session = unsafe { libc::getsid(0) };
 
     loop {
         observer.tick();
@@ -4979,6 +5048,77 @@ fn drain_group_capture<O: StdoutObserver>(
                 empty_since = None;
             }
             reap_direct_terminated(&processes)?;
+
+            match &mut parked_reclaim {
+                None => {
+                    let live: Vec<&OwnedProcess> = processes
+                        .iter()
+                        .filter(|process| !matches!(process.member.state, b'Z' | b'X'))
+                        .collect();
+                    if !live.is_empty()
+                        && live
+                            .iter()
+                            .all(|process| daemon_shaped(process, runner_session))
+                    {
+                        let identities: Vec<ProcessIdentity> =
+                            live.iter().map(|process| process.member.identity).collect();
+                        let ticks: u64 = live.iter().map(|process| process.member.cpu_ticks).sum();
+                        let concluded = match &parked_probe {
+                            Some(probe)
+                                if probe.members == identities
+                                    && ticks.saturating_sub(probe.baseline_ticks)
+                                        <= GROUP_TAIL_PARKED_IDLE_TICK_TOLERANCE =>
+                            {
+                                now.saturating_duration_since(probe.since)
+                                    >= GROUP_TAIL_PARKED_DAEMON_WINDOW
+                            }
+                            _ => {
+                                parked_probe = Some(ParkedDaemonProbe {
+                                    since: now,
+                                    members: identities.clone(),
+                                    baseline_ticks: ticks,
+                                });
+                                false
+                            }
+                        };
+                        if concluded {
+                            let mut ordered = live;
+                            ordered.sort_by_key(|process| std::cmp::Reverse(process.depth));
+                            for process in &ordered {
+                                let pid = process.member.identity.pid;
+                                ktstr::ktstr_status!(
+                                    "cargo ktstr: reclaiming idle daemon left behind by \
+                                     the finished command: {} (pid {pid})",
+                                    reclaimed_daemon_label(pid),
+                                );
+                                signal_member_pidfd(&process.pidfd, libc::SIGTERM)?;
+                            }
+                            parked_reclaim = Some(ParkedDaemonReclaim {
+                                terminated_at: now,
+                                members: identities,
+                                killed: false,
+                            });
+                            parked_probe = None;
+                        }
+                    } else {
+                        parked_probe = None;
+                    }
+                }
+                Some(reclaim) => {
+                    if !reclaim.killed
+                        && now.saturating_duration_since(reclaim.terminated_at)
+                            >= ANCHOR_COOPERATIVE_EXIT_GRACE
+                    {
+                        for process in processes
+                            .iter()
+                            .filter(|process| reclaim.members.contains(&process.member.identity))
+                        {
+                            signal_member_pidfd(&process.pidfd, libc::SIGKILL)?;
+                        }
+                        reclaim.killed = true;
+                    }
+                }
+            }
 
             let budget = budget.as_ref().expect("tail budget initialized");
             if budget.service_exhausted() || budget.wall_exhausted(now) {
@@ -7864,6 +8004,8 @@ mod tests {
             },
         );
         assert_eq!(member.ppid, 1);
+        assert_eq!(member.pgrp, 77);
+        assert_eq!(member.session, 1);
         assert_eq!(member.cpu_ticks, 12);
         assert_eq!(member.state, b'R');
     }
@@ -8079,6 +8221,79 @@ mod tests {
                 (unsafe { libc::kill(pid, 0) }) != 0
             }),
             "service-budget teardown reaps the residual setsid child",
+        );
+        assert_eq!(active_group_for_test(), IDLE);
+        drop(guard);
+    }
+
+    #[test]
+    fn parked_idle_setsid_daemons_are_reclaimed_and_the_command_succeeds() {
+        let _serial = test_serial_guard();
+        if !std::path::Path::new("/usr/bin/setsid").exists() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let leader_pid = root.path().join("leader.pid");
+        let orphan_pid = root.path().join("orphan.pid");
+        let guard = install_cleanup_guard();
+        // Two daemon shapes park at once: a live setsid session leader, and a
+        // double-fork daemon which stays a non-leader inside its dead
+        // parent's session (the shape sccache's auto-started server takes).
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(
+                "/usr/bin/setsid /bin/sh -c \
+                   'printf %s \"$$\" > \"$KTSTR_PARKED_LEADER_PID\"; exec sleep 600' & \
+                 /usr/bin/setsid /bin/sh -c \
+                   '/bin/sh -c \"exec sleep 600\" & \
+                    printf %s \"$!\" > \"$KTSTR_PARKED_ORPHAN_PID\"; exit 0' & \
+                 while [ ! -s \"$KTSTR_PARKED_LEADER_PID\" ] || \
+                       [ ! -s \"$KTSTR_PARKED_ORPHAN_PID\" ]; do :; done; \
+                 exit 7",
+            )
+            .env("KTSTR_PARKED_LEADER_PID", &leader_pid)
+            .env("KTSTR_PARKED_ORPHAN_PID", &orphan_pid);
+        let started = Instant::now();
+        let output = run_output(command).expect("a parked daemon must not fail the command");
+        let elapsed = started.elapsed();
+
+        assert_eq!(output.status.code(), Some(7), "leader status is preserved");
+        assert!(
+            elapsed < GROUP_TAIL_WALL_BACKSTOP,
+            "reclaim concludes before the wall backstop: {elapsed:?}",
+        );
+        for (label, path) in [("leader", &leader_pid), ("orphan", &orphan_pid)] {
+            let pid: libc::pid_t = std::fs::read_to_string(path)
+                .expect("read daemon pid")
+                .parse()
+                .expect("parse daemon pid");
+            // SAFETY: signal zero only probes process existence.
+            assert!(
+                (unsafe { libc::kill(pid, 0) }) != 0,
+                "the parked {label} daemon was reclaimed before the capture returned",
+            );
+        }
+        assert_eq!(active_group_for_test(), IDLE);
+        drop(guard);
+    }
+
+    #[test]
+    fn idle_post_leader_orphan_in_the_command_session_still_hits_the_wall_backstop() {
+        let _serial = test_serial_guard();
+        let root = tempfile::tempdir().expect("tempdir");
+        let child_pid = root.path().join("child.pid");
+        let guard = install_cleanup_guard();
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("/bin/sh -c 'printf %s \"$$\" > \"$KTSTR_ORPHAN_PID\"; exec sleep 600' & exit 0")
+            .env("KTSTR_ORPHAN_PID", &child_pid);
+        let error = run_output(command).expect_err("an idle non-daemon orphan remains a failure");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("wall backstop"),
+            "an idle orphan without the daemon shape exhausts the wall backstop: {error}",
         );
         assert_eq!(active_group_for_test(), IDLE);
         drop(guard);
