@@ -1,37 +1,26 @@
 use anyhow::Result;
 use ktstr::WatchdogObservation;
 use ktstr::assert::AssertResult;
-use ktstr::ktstr_test;
 use ktstr::prelude::{VmResult, post_vm_skip};
-use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps};
+use ktstr::scenario::{Ctx, ScenarioDef};
 use ktstr::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
+use ktstr::{ktstr_scenario, ktstr_test};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
-fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step {
-        setup: vec![ctx.cgroup_def("cg_0"), ctx.cgroup_def("cg_1")].into(),
-        ops: vec![],
-        hold: HoldSpec::FULL,
-    }];
-    execute_steps(ctx, steps)
+#[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
+fn sched_basic_proportional() -> ScenarioDef {
+    ScenarioDef::with_defs(vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")])
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
-fn sched_cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step {
-        setup: vec![
-            CgroupDef::named("cg_0").cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
-            CgroupDef::named("cg_1").cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
-        ]
-        .into(),
-        ops: vec![],
-        hold: HoldSpec::FULL,
-    }];
-    execute_steps(ctx, steps)
+#[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
+fn sched_cpuset_split() -> ScenarioDef {
+    ScenarioDef::with_defs(vec![
+        CgroupDef::named("cg_0").cpuset(CpusetSpec::Disjoint { index: 0, of: 2 }),
+        CgroupDef::named("cg_1").cpuset(CpusetSpec::Disjoint { index: 1, of: 2 }),
+    ])
 }
 
 /// Per-cgroup CPU placement is captured and labeled on a PASSING
@@ -102,21 +91,12 @@ fn sched_cgroup_cpus_used_surfaced_on_pass(ctx: &Ctx) -> Result<AssertResult> {
     Ok(result)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
-fn sched_dynamic_add(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![
-        Step {
-            setup: vec![CgroupDef::named("cg_0")].into(),
-            ops: vec![],
-            hold: HoldSpec::frac(0.5),
-        },
-        Step {
-            setup: vec![CgroupDef::named("cg_1")].into(),
-            ops: vec![],
-            hold: HoldSpec::frac(0.5),
-        },
-    ];
-    execute_steps(ctx, steps)
+#[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
+fn sched_dynamic_add() -> ScenarioDef {
+    ScenarioDef::new(vec![
+        Step::with_defs(vec![CgroupDef::named("cg_0")], HoldSpec::frac(0.5)),
+        Step::with_defs(vec![CgroupDef::named("cg_1")], HoldSpec::frac(0.5)),
+    ])
 }
 
 fn bpf_api_scenario(
@@ -224,7 +204,7 @@ static __KTSTR_ENTRY_BPF_HOST_WRITE_STALLS: ktstr::test_support::KtstrTestEntry 
 
 /// Positive benchmarking test: scx-ktstr under performance_mode passes
 /// min_iteration_rate and max_gap_ms gates.
-#[ktstr_test(
+#[ktstr_scenario(
     scheduler = KTSTR_SCHED,
     llcs = 1,
     cores = 2,
@@ -234,17 +214,11 @@ static __KTSTR_ENTRY_BPF_HOST_WRITE_STALLS: ktstr::test_support::KtstrTestEntry 
     sustained_samples = 15,
     watchdog_timeout_s = 15,
 )]
-fn sched_perf_positive(ctx: &Ctx) -> Result<AssertResult> {
-    use ktstr::scenario::ops::execute_steps_with;
+fn sched_perf_positive() -> ScenarioDef {
     let checks = ktstr::assert::Assert::default_checks()
         .min_iteration_rate(5000.0)
         .max_gap_ms(500);
-    let steps = vec![Step {
-        setup: vec![ctx.cgroup_def("cg_0")].into(),
-        ops: vec![],
-        hold: HoldSpec::FULL,
-    }];
-    execute_steps_with(ctx, steps, Some(&checks))
+    ScenarioDef::with_defs(vec![CgroupDef::named("cg_0")]).set_checks(checks)
 }
 
 fn scenario_perf_negative(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertResult> {
@@ -547,9 +521,7 @@ fn check_watchdog_timing(result: &VmResult) -> Result<()> {
 ///
 /// Exposed as a standalone helper so a unit test can pin the
 /// parser against a synthetic input without booting a VM. Unit
-/// tests live in `tests/parse_stall_duration_test.rs` (integration-
-/// test binaries with KtstrTestEntry entries filter out plain
-/// `#[test]` functions).
+/// tests live in `tests/parse_stall_duration_test.rs`.
 fn parse_stall_duration_seconds(kmsg: &str) -> Option<f64> {
     let grok = grok::Grok::with_default_patterns();
     let pattern = grok
@@ -565,12 +537,17 @@ fn parse_stall_duration_seconds(kmsg: &str) -> Option<f64> {
 }
 
 // Unit tests for `parse_stall_duration_seconds` live in
-// `tests/parse_stall_duration_test.rs`. Integration-test binaries
-// that register `KtstrTestEntry` distributed-slice entries go
-// through ktstr's early-dispatch path, which intercepts nextest
-// `--list` / `--exact` and filters out plain `#[test]` functions —
-// so the parser's host-side unit tests cannot coexist in this file
-// without being invisible to the test runner.
+// `tests/parse_stall_duration_test.rs`, for file organisation only.
+//
+// This note used to claim they COULD NOT live here, because a
+// binary registering `KtstrTestEntry` entries filters plain `#[test]`
+// functions out of the runner's view. That is no longer true:
+// `ktstr_main`'s `--list` interception falls through to libtest and
+// `list_plain_tests` re-emits the plain tests (dropping only the
+// per-entry wrappers, matched by name). Verified against this
+// binary's own `NEXTEST=1 --list` output — the scenario-extraction
+// tests at the end of this file are plain `#[test]` functions and
+// they do run.
 
 #[ktstr::ktstr_test_entry]
 static __KTSTR_ENTRY_WATCHDOG_TIMING: ktstr::test_support::KtstrTestEntry =
@@ -636,14 +613,9 @@ static __KTSTR_ENTRY_SCX: ktstr::test_support::KtstrTestEntry =
 /// (`kernel/sched/ext.c:check_rq_for_timeouts`) flags this as
 /// `SCX_EXIT_ERROR_STALL`. 15 s matches `sched_bpf_api` above, which
 /// runs the same scheduler against a similar workload shape.
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, duration_s = 2, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
-fn sched_verifier_stats_populated(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step {
-        setup: vec![ctx.cgroup_def("cg_0")].into(),
-        ops: vec![],
-        hold: HoldSpec::FULL,
-    }];
-    execute_steps(ctx, steps)
+#[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, duration_s = 2, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
+fn sched_verifier_stats_populated() -> ScenarioDef {
+    ScenarioDef::with_defs(vec![CgroupDef::named("cg_0")])
 }
 
 fn scenario_mid_degrade(ctx: &ktstr::scenario::Ctx) -> Result<ktstr::assert::AssertResult> {
@@ -694,3 +666,154 @@ static __KTSTR_ENTRY_MID_DEGRADE: ktstr::test_support::KtstrTestEntry =
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
+
+// ---------------------------------------------------------------------
+// Scenario-extraction checks for the `#[ktstr_scenario]` tests above.
+//
+// These are plain `#[test]` functions, and they DO run: `ktstr_main`
+// intercepts `--list` only to add its own ktstr/gauntlet names, then
+// falls through so libtest lists these too (`list_plain_tests`, which
+// filters out the per-entry wrappers by name). Verified against this
+// binary's nextest listing.
+//
+// They belong in this file rather than a fixture binary of their own
+// because linkme slices are per-binary: the only way to assert on what
+// the ported tests registered is to be linked alongside them. They
+// need no VM — that is the property under test.
+// ---------------------------------------------------------------------
+
+/// The names ported to `#[ktstr_scenario]` in this file. Listed
+/// explicitly rather than derived from the registry so that deleting a
+/// port (or silently losing its registration) fails here instead of
+/// shrinking the checked population to nothing.
+const PORTED_SCENARIOS: &[&str] = &[
+    "sched_basic_proportional",
+    "sched_cpuset_split",
+    "sched_dynamic_add",
+    "sched_verifier_stats_populated",
+    "sched_perf_positive",
+];
+
+/// Every ported test registers an extractable scenario whose builder
+/// runs on the host. This is the property the port exists to create;
+/// without it the DSL is just a different way to spell the same
+/// opaque body.
+#[test]
+fn ported_tests_register_extractable_scenarios() {
+    for name in PORTED_SCENARIOS {
+        let entry = ktstr::test_support::find_scenario(name).unwrap_or_else(|| {
+            let all: Vec<&str> = ktstr::test_support::KTSTR_SCENARIOS
+                .iter()
+                .map(|e| e.name)
+                .collect();
+            panic!("{name} did not register a scenario; registered: {all:?}")
+        });
+        let def = (entry.build)();
+        assert!(
+            !def.steps().is_empty(),
+            "{name} extracted an empty scenario",
+        );
+        assert!(
+            def.is_declarative(),
+            "{name} is not statically inspectable — it contains a \
+             Setup::Factory step",
+        );
+    }
+}
+
+/// Each scenario must also be a registered test, and every registered
+/// scenario in this binary must be one of the ports above. The second
+/// direction is what catches a future port that lands without being
+/// added to `PORTED_SCENARIOS` and therefore never gets its shape
+/// checked below.
+#[test]
+fn scenario_registry_matches_the_ported_set() {
+    let mut registered: Vec<&str> = ktstr::test_support::KTSTR_SCENARIOS
+        .iter()
+        .map(|e| e.name)
+        .collect();
+    registered.sort_unstable();
+    let mut expected: Vec<&str> = PORTED_SCENARIOS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        registered, expected,
+        "the scenario registry must hold exactly the ported tests",
+    );
+
+    let test_names: Vec<&str> = ktstr::test_support::KTSTR_TESTS
+        .iter()
+        .map(|e| e.name)
+        .collect();
+    for name in &registered {
+        assert!(
+            test_names.contains(name),
+            "scenario {name:?} has no KtstrTestEntry — the expansion \
+             registered one slice but not the other",
+        );
+    }
+}
+
+/// The extracted values must be the workloads the bodies declared,
+/// asserted against independently written expectations rather than
+/// against the bodies themselves. A `ScenarioDef` constructor that
+/// quietly dropped a cpuset, collapsed two steps into one, or lost a
+/// per-step hold would pass a round-trip check and fail this one.
+#[test]
+fn extracted_scenarios_have_the_declared_shape() {
+    let build = |name: &str| {
+        (ktstr::test_support::find_scenario(name)
+            .unwrap_or_else(|| panic!("{name} is registered"))
+            .build)()
+    };
+    let cgroup_names = |def: &ktstr::scenario::ScenarioDef| -> Vec<Vec<String>> {
+        def.steps()
+            .iter()
+            .map(|step| match &step.setup {
+                ktstr::scenario::ops::Setup::Defs(defs) => {
+                    defs.iter().map(|d| d.name.to_string()).collect()
+                }
+                ktstr::scenario::ops::Setup::Factory(_) => {
+                    panic!("ported scenarios use static def lists")
+                }
+            })
+            .collect()
+    };
+
+    // Two cgroups, one step, whole run.
+    let basic = build("sched_basic_proportional");
+    assert_eq!(cgroup_names(&basic), vec![vec!["cg_0", "cg_1"]]);
+    assert!(basic.checks().is_none());
+
+    // Disjoint cpuset halves survive extraction.
+    let split = build("sched_cpuset_split");
+    assert_eq!(cgroup_names(&split), vec![vec!["cg_0", "cg_1"]]);
+    let ktstr::scenario::ops::Setup::Defs(defs) = &split.steps()[0].setup else {
+        unreachable!("checked above")
+    };
+    let cpusets: Vec<String> = defs.iter().map(|d| format!("{:?}", d.cpuset)).collect();
+    assert!(
+        cpusets[0].contains("index: 0") && cpusets[1].contains("index: 1"),
+        "each cgroup keeps its own disjoint half: {cpusets:?}",
+    );
+
+    // Two steps, added in order, each holding half the run.
+    let dynamic = build("sched_dynamic_add");
+    assert_eq!(cgroup_names(&dynamic), vec![vec!["cg_0"], vec!["cg_1"]]);
+    for step in dynamic.steps() {
+        assert!(
+            matches!(step.hold, HoldSpec::Frac(f) if (f - 0.5).abs() < f64::EPSILON),
+            "each step holds half the run, got {:?}",
+            step.hold,
+        );
+    }
+
+    // The one port that overrides ctx.assert: its gates must survive
+    // into the extracted value, or the ported test silently runs
+    // ungated.
+    let perf = build("sched_perf_positive");
+    let checks = perf
+        .checks()
+        .expect("sched_perf_positive declares an Assert override");
+    assert_eq!(checks.min_iteration_rate, Some(5000.0));
+    assert_eq!(checks.max_gap_ms, Some(500));
+}

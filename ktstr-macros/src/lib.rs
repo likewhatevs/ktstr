@@ -8,6 +8,7 @@ mod kernel_path;
 mod claim;
 mod common;
 mod json;
+mod ktstr_scenario;
 mod ktstr_test;
 mod payload;
 mod scheduler;
@@ -281,6 +282,70 @@ pub fn ktstr_test_entry(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     match ktstr_test::ktstr_test_impl(attr.into(), item.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Declare a test whose workload is a DECLARATIVE SCENARIO — the
+/// restricted, extractable sibling of [`macro@ktstr_test`].
+///
+/// **The name `ktstr_scenario` is PROVISIONAL** and may change before
+/// this surface is considered stable.
+///
+/// # Syntax
+///
+/// ```rust,ignore
+/// use ktstr::prelude::*;
+/// use ktstr::scenario::ScenarioDef;
+///
+/// #[ktstr_scenario(scheduler = MY_SCHED, llcs = 1, cores = 2, threads = 1)]
+/// fn my_test() -> ScenarioDef {
+///     ScenarioDef::with_defs(vec![CgroupDef::named("cg_0")])
+/// }
+/// ```
+///
+/// The attribute grammar is [`macro@ktstr_test`]'s, unchanged and
+/// undiminished apart from the two rejections below; the *function*
+/// is what is restricted:
+///
+/// - **No arguments** — in particular no `ctx: &Ctx`. The context
+///   exists only inside the running guest, so a body that reads it
+///   cannot be built on the host. Note that most `&Ctx` uses in
+///   existing bodies are not real dependencies:
+///   `ctx.cgroup_def("cg_0")` and `CgroupDef::named("cg_0")` resolve
+///   to the same workload, because the step runner applies
+///   `ctx.workers_per_cgroup` to any `CgroupDef` that leaves its
+///   worker count unset.
+/// - **Returns anything `Into<ScenarioDef>`** — `ScenarioDef`,
+///   `Vec<Step>`, or a bare `Step`.
+/// - **Not `async`, not generic, no `where` clause** — the generated
+///   builder is a plain `fn() -> ScenarioDef`.
+/// - **`post_vm` / `post_vm_unconditional` are rejected** — a
+///   host-side callback is arbitrary Rust, which is what this
+///   entrypoint exists to exclude. Use [`macro@ktstr_test`].
+///
+/// # What it buys
+///
+/// The workload becomes a value. Each scenario registers a
+/// `ScenarioEntry { name, build: fn() -> ScenarioDef }` in the
+/// `KTSTR_SCENARIOS` distributed slice, so every scenario in a test
+/// binary can be enumerated and inspected on the host — no guest, no
+/// kernel, no run.
+///
+/// # Equivalence to the hand-written form
+///
+/// The expansion synthesizes
+/// `fn <name>(ctx: &Ctx) -> Result<AssertResult> { <def>().run(ctx) }`
+/// and passes it to the ordinary `#[ktstr_test]` implementation, so
+/// attribute parsing, cross-attribute validation, and every
+/// registration are literally the same code. `ScenarioDef::run`
+/// dispatches to `execute_steps_with`, which is what a hand-written
+/// body calls. Porting a test between the two forms is therefore a
+/// pure refactor.
+#[proc_macro_attribute]
+pub fn ktstr_scenario(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match ktstr_scenario::ktstr_scenario_impl(attr.into(), item.into()) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }

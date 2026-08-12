@@ -15,6 +15,16 @@
 //! - [`Ctx`] -- runtime context passed to scenario functions
 //! - [`CgroupGroup`] -- RAII guard that removes cgroups on drop
 //!
+//! The [`def`] submodule lifts that step list out of the function
+//! body into a value:
+//! - [`ScenarioDef`] -- a scenario as data (steps + optional
+//!   [`Assert`](crate::assert::Assert) override), buildable and
+//!   inspectable on the host with no `&Ctx` and no VM
+//!
+//! [`ScenarioDef`] is what the [`#[ktstr_scenario]`](crate::ktstr_scenario)
+//! entrypoint registers, and is the reason a scenario can be read as
+//! data rather than only executed.
+//!
 //! The [`scenarios`] submodule provides curated canned scenarios.
 //!
 //! ## Builder method conventions
@@ -54,6 +64,7 @@ pub mod backdrop;
 pub mod basic;
 pub mod bpf_pin;
 pub mod cpuset;
+pub mod def;
 pub mod dynamic;
 pub mod host_stuck;
 pub mod interaction;
@@ -67,6 +78,7 @@ pub mod snapshot;
 pub mod stress;
 
 pub use backdrop::Backdrop;
+pub use def::ScenarioDef;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

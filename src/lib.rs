@@ -708,6 +708,8 @@ pub use ktstr_macros::Claim;
 pub use ktstr_macros::Payload;
 pub use ktstr_macros::declare_scheduler;
 pub use ktstr_macros::json;
+/// The `#[ktstr_scenario]` entrypoint. **Name is PROVISIONAL.**
+pub use ktstr_macros::ktstr_scenario;
 pub use ktstr_macros::ktstr_test;
 pub use ktstr_macros::ktstr_test_entry;
 
@@ -832,8 +834,10 @@ pub mod prelude {
     pub use crate::distributed_slice;
     pub use crate::host_context::HostContext;
     pub use crate::host_heap::HostHeapState;
+    pub use crate::ktstr_scenario;
     pub use crate::ktstr_test;
     pub use crate::ktstr_test_entry;
+    pub use crate::scenario::ScenarioDef;
     pub use crate::scenario::backdrop::Backdrop;
     pub use crate::scenario::ops::{
         CgroupDef, CpusetSpec, HoldSpec, IrqSelector, KernelTarget, KernelValue, KernelValueWidth,

@@ -103,6 +103,8 @@ pub use eval::{
 };
 pub use profraw::current_binary_is_coverage_instrumented;
 pub mod runtime;
+mod scenario_registry;
+pub use scenario_registry::{KTSTR_SCENARIOS, ScenarioEntry, find_scenario};
 mod scheduler_manifest_stamp;
 #[doc(hidden)]
 pub use scheduler_manifest_stamp::{
