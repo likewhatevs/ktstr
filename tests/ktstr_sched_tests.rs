@@ -817,3 +817,68 @@ fn extracted_scenarios_have_the_declared_shape() {
     assert_eq!(checks.min_iteration_rate, Some(5000.0));
     assert_eq!(checks.max_gap_ms, Some(500));
 }
+
+/// Dump every registered scenario as a `SourceScenario`-shaped JSON record,
+/// for the simulator backend to consume.
+///
+/// Writes to `$KTSTR_SCENARIO_EXPORT_DIR` and does nothing when that is unset,
+/// so a normal test run is unaffected. The records are derived from the REAL
+/// registry — `KTSTR_SCENARIOS` for the workload, the paired `KtstrTestEntry`
+/// for the topology and duration — not hand-written, which is the only reason
+/// a simulator run from one of them can be called "the same scenario".
+///
+/// `workers_per_cgroup` is 1: `Ctx::builder` defaults it to 1 and nothing on
+/// the ktstr-test path overrides it. That is asserted below against the value
+/// observed in a real VM run (`num_workers: 1` per cgroup in the stats sidecar
+/// for `sched_basic_proportional` on 6.14.11), so a future change to the
+/// default breaks this rather than silently desynchronising the two backends.
+#[test]
+fn export_registered_scenarios() {
+    const WORKERS_PER_CGROUP: u32 = 1;
+
+    let Some(dir) = std::env::var_os("KTSTR_SCENARIO_EXPORT_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("create export dir");
+
+    let mut written = 0usize;
+    for scenario in ktstr::test_support::KTSTR_SCENARIOS {
+        let entry = ktstr::test_support::find_test(scenario.name)
+            .unwrap_or_else(|| panic!("{} has no KtstrTestEntry", scenario.name));
+        let def = (scenario.build)();
+        let out = ktstr::scenario::export::export_scenario(
+            scenario.name,
+            &def,
+            &entry.topology,
+            entry.duration,
+            WORKERS_PER_CGROUP,
+        );
+        // Gaps are printed, never silently dropped: a record the simulator
+        // consumes must not omit part of the workload without saying so.
+        for gap in &out.gaps {
+            println!(
+                "EXPORT GAP {}: {} at {} — {}",
+                scenario.name, gap.construct, gap.where_, gap.reason,
+            );
+        }
+        let path = dir.join(format!("{}.json", scenario.name));
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&out.record).expect("serialize"),
+        )
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        println!(
+            "exported {} -> {} ({} gap(s))",
+            scenario.name,
+            path.display(),
+            out.gaps.len(),
+        );
+        written += 1;
+    }
+    assert_eq!(
+        written,
+        PORTED_SCENARIOS.len(),
+        "every ported scenario must export",
+    );
+}

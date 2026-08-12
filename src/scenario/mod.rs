@@ -66,6 +66,7 @@ pub mod bpf_pin;
 pub mod cpuset;
 pub mod def;
 pub mod dynamic;
+pub mod export;
 pub mod host_stuck;
 pub mod interaction;
 pub mod nested;
