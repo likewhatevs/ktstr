@@ -1839,6 +1839,66 @@ fn preparation_private_working_set_uses_two_chunks_and_preserves_conversion_head
     );
 }
 
+/// The stacked permit pools (cooperative CPU, memory, preparation, build)
+/// modeled from their pure sizing functions. Kept in lockstep with the real
+/// `permit_namespace_end` by `permit_namespace_end_matches_the_stacked_pool_model`.
+fn modeled_permit_namespace_end(possible_width: usize, memory_chunks: usize) -> usize {
+    let cooperative = AdmissionPermitPool::for_host(possible_width).len();
+    let preparation = preparation_slot_capacity(memory_chunks, cooperative, possible_width);
+    let build = cooperative
+        .saturating_mul(BUILD_RESERVED_PERCENT)
+        .div_ceil(100)
+        .max(1);
+    memory_permit_base_for_possible_width(possible_width) + memory_chunks + preparation + build
+}
+
+#[test]
+fn permit_namespace_end_matches_the_stacked_pool_model() {
+    let Ok(end) = permit_namespace_end() else {
+        // A host too small to fund one preparation slot has no namespace to
+        // check; the registry then falls back to the CPU-only overprovision.
+        return;
+    };
+    let (_, memory_chunks) = memory_capacity_from_total(host_mem_total_mib().unwrap());
+    assert_eq!(
+        end,
+        modeled_permit_namespace_end(possible_cpu_width(), memory_chunks),
+        "the registry creation width would silently stop covering the permit \
+         namespace if the stacked pools grew without permit_namespace_end \
+         following them",
+    );
+}
+
+/// A ~400-possible-CPU host with 1 TiB of RAM is the smallest common server
+/// shape whose widest permit claim overflows the registry's 4096-bit creation
+/// floor. A CPU/LLC-only registrant can create the registry first, so its
+/// creation width must already cover every same-host permit index — with the
+/// old `max(2 * cpus, 4096)` overprovision the file came up 4096 bits wide
+/// and every later run admission bailed against it.
+#[test]
+fn registry_creation_width_covers_the_permit_namespace_on_big_hosts() {
+    let possible_width = 400;
+    let (_, memory_chunks) = memory_capacity_from_total(1024 * 1024);
+    let namespace_end = modeled_permit_namespace_end(possible_width, memory_chunks);
+    let widest_claim_bits = possible_width + namespace_end;
+    assert!(
+        widest_claim_bits > 4096,
+        "fixture host must overflow the creation floor, got {widest_claim_bits} bits",
+    );
+    assert!(
+        admission_protocol::registry_overprovision_bits_for_tests(
+            possible_width,
+            Some(namespace_end),
+        ) >= widest_claim_bits,
+        "a CPU/LLC-only creator must size the registry for the full permit namespace",
+    );
+    assert_eq!(
+        admission_protocol::registry_overprovision_bits_for_tests(possible_width, None),
+        possible_width * 2,
+        "an unresolvable permit namespace must fall back to the CPU-only overprovision",
+    );
+}
+
 /// Preparation and run must derive the CPU-permit pool from the same host
 /// width. Permit identities are one host-wide lockfile namespace, so a run
 /// pool sized from the caller's (cgroup-narrowed) cpuset would stop short of
