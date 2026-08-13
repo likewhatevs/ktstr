@@ -42,7 +42,30 @@ fn sched_basic_proportional() -> ScenarioDef {
 /// `{sidecar_dir}/{test_name}-{variant_hash:016x}.wprof.pb`, next to the stats
 /// JSON that the scx-sim calibration already consumes.
 #[cfg(feature = "wprof")]
-#[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15, wprof)]
+#[ktstr_scenario(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    sustained_samples = 15,
+    watchdog_timeout_s = 15,
+    wprof,
+    // The DEFAULT capture is `-d 500`, i.e. 500 ms, and guest init spawns the
+    // tracer at boot — so a default-args run captures the guest booting and
+    // stops ~11.5 s before the workload starts. Measured: a default run
+    // produced a 0.495 s trace containing init/swapper/rcu/kworker and NOT ONE
+    // workload task. Diffing that against a 12 s simulation would have
+    // "worked" and been meaningless.
+    //
+    // 15 s spans boot plus the whole 12 s hold with margin, while still
+    // finishing inside the ~19 s test so the trace is shipped host-side before
+    // teardown. wprof_args REPLACES the defaults rather than appending, so the
+    // ringbuf flags are restated at their default values
+    // (WPROF_DEFAULT_RINGBUF_SIZE_KB = 16384, WPROF_DEFAULT_RINGBUF_CNT = 1).
+    // Sizing check: 0.495 s of boot — the busiest phase — produced 36 KB, so
+    // 15 s of mostly-steady-state spinning stays far inside the 16 MiB arena.
+    wprof_args = "-d 15000 -e sched --ringbuf-size=16384 --ringbuf-cnt=1"
+)]
 fn sched_basic_proportional_wprof() -> ScenarioDef {
     sched_basic_proportional_scenario()
 }
