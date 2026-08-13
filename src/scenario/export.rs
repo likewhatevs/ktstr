@@ -104,12 +104,33 @@ fn cpuset(spec: &CpusetSpec) -> Option<serde_json::Value> {
 /// a work type collapses onto run/sleep/yield and records the discarded
 /// dimension, and it cannot do that for a construct this function has already
 /// silently rewritten.
+///
+/// # Why this covers the FIELDLESS variants and no others
+///
+/// `SourceWorkType` mirrors this enum — same 45 names — so it is tempting to
+/// map all 45 mechanically. Do not. The mirror is not exact: several variants
+/// carry ktstr fields the IR has no home for, among them
+/// `PriorityInversion::pi_mode`, `ProducerConsumerImbalance::queue_depth_target`
+/// and `Custom::{run, cfg}`. Mapping those by name would drop a tuning knob
+/// silently, which is the one thing this file exists not to do.
+///
+/// The nine fieldless variants have nothing to drop, so they transfer
+/// verbatim and are safe. The remaining 36 want a per-variant mapping that
+/// translates the fields it can and records an [`ExportGap`] for the fields it
+/// cannot — worth doing, but it is a per-variant judgement each time, not a
+/// loop.
 fn work_type(wt: &WorkType) -> Option<serde_json::Value> {
     use serde_json::json;
     Some(match wt {
         WorkType::SpinWait => json!("spin_wait"),
         WorkType::YieldHeavy => json!("yield_heavy"),
         WorkType::Mixed => json!("mixed"),
+        WorkType::IoSyncWrite => json!("io_sync_write"),
+        WorkType::IoRandRead => json!("io_rand_read"),
+        WorkType::IoConvoy => json!("io_convoy"),
+        WorkType::ForkExit => json!("fork_exit"),
+        WorkType::NiceSweep => json!("nice_sweep"),
+        WorkType::SmtSiblingSpin => json!("smt_sibling_spin"),
         _ => return None,
     })
 }
@@ -126,10 +147,54 @@ fn work_spec(w: &WorkSpec, at: &str, gaps: &mut Vec<ExportGap>) -> Option<serde_
         });
         return None;
     };
+    // `nice` used to be hardcoded null here while `WorkSpec` carried one and
+    // `SourceWorkSpec` had a field waiting for it — a silent drop, in the file
+    // whose whole premise is that it is allowed to be wrong but not quietly
+    // wrong. It went unnoticed because every scenario ported so far leaves nice
+    // at the default.
+    //
+    // The widths differ (ktstr i32, IR i8). Linux nice is -20..=19 so every
+    // legal value fits, and an out-of-range one is recorded as a gap rather
+    // than truncated into a different, plausible priority.
+    let nice = match w.nice {
+        None => serde_json::Value::Null,
+        Some(n) => match i8::try_from(n) {
+            Ok(v) => serde_json::json!(v),
+            Err(_) => {
+                gaps.push(ExportGap {
+                    where_: at.to_string(),
+                    construct: format!("WorkSpec::nice = {n}"),
+                    reason: "outside i8, so outside the -20..=19 nice range the \
+                             record can express; truncating would silently \
+                             substitute a different priority"
+                        .to_string(),
+                });
+                serde_json::Value::Null
+            }
+        },
+    };
+
+    // `sched_policy` has no counterpart in `SourceWorkSpec` at all, so this is
+    // a gap in the SCHEMA rather than in this function — but it was previously
+    // not even mentioned, which made a policy-mixing scenario export as though
+    // every worker were SCHED_NORMAL. `custom_sched_mixed` is exactly that
+    // scenario: its point is a Normal/Batch/Idle/FIFO mix.
+    if w.sched_policy != Default::default() {
+        gaps.push(ExportGap {
+            where_: at.to_string(),
+            construct: format!("WorkSpec::sched_policy = {:?}", w.sched_policy),
+            reason: "SourceWorkSpec has no scheduling-policy field, so the \
+                     record cannot distinguish SCHED_NORMAL from BATCH, IDLE, \
+                     FIFO or DEADLINE; a policy-mixing scenario would otherwise \
+                     export as uniformly SCHED_NORMAL"
+                .to_string(),
+        });
+    }
+
     Some(serde_json::json!({
         "workers": w.num_workers.map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
         "work_type": wt,
-        "nice": serde_json::Value::Null,
+        "nice": nice,
     }))
 }
 

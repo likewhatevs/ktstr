@@ -177,3 +177,79 @@ fn assert_override_is_reported_not_encoded() {
     let out = export_scenario("t", &def, &topo(), Duration::from_secs(1), 2);
     assert!(out.gaps.iter().any(|g| g.construct == "Assert override"));
 }
+
+/// `nice` reaches the record.
+///
+/// It did not, for as long as this exporter has existed: the field was
+/// hardcoded null while `WorkSpec` carried a value and `SourceWorkSpec` had a
+/// field waiting for it. Nothing caught it because every scenario ported so far
+/// leaves nice at the default, so the null was always the right answer by
+/// accident.
+#[test]
+fn nice_is_carried_rather_than_nulled() {
+    let def = ScenarioDef::with_defs(vec![
+        CgroupDef::named("cg_0").work(WorkSpec::default().work_type(WorkType::SpinWait).nice(-5))
+    ]);
+    let out = export_scenario("nice", &def, &topo(), Duration::from_secs(1), 1);
+    let works = &out.record["steps"][0]["setup"][0]["works"][0];
+    assert_eq!(
+        works["nice"], -5,
+        "nice must reach the record; got {:#?}",
+        out.record["steps"][0]["setup"][0]
+    );
+    assert!(out.is_complete(), "unexpected gaps: {:#?}", out.gaps);
+}
+
+/// A non-default scheduling policy is REPORTED as a gap, not dropped in
+/// silence.
+///
+/// Unlike `nice`, this one cannot be fixed by carrying it: `SourceWorkSpec` has
+/// no policy field, so the record genuinely cannot distinguish SCHED_NORMAL
+/// from BATCH/IDLE/FIFO. The requirement is therefore that the loss is
+/// VISIBLE. Without this, `custom_sched_mixed` — whose entire point is a
+/// Normal/Batch/Idle/FIFO mix — would export as uniformly SCHED_NORMAL and
+/// look complete.
+#[test]
+fn a_non_default_sched_policy_is_a_recorded_gap() {
+    use crate::workload::SchedPolicy;
+    let def = ScenarioDef::with_defs(vec![
+        CgroupDef::named("cg_0")
+            .work(WorkSpec::default().work_type(WorkType::SpinWait).sched_policy(SchedPolicy::Batch))
+    ]);
+    let out = export_scenario("policy", &def, &topo(), Duration::from_secs(1), 1);
+    assert!(
+        !out.is_complete(),
+        "a Batch policy must surface as a gap, not vanish"
+    );
+    assert!(
+        out.gaps.iter().any(|g| g.construct.contains("sched_policy")),
+        "the gap must name sched_policy; got {:#?}",
+        out.gaps
+    );
+}
+
+/// The fieldless work types transfer verbatim.
+///
+/// `IoSyncWrite` is the one that matters today — it is what
+/// `custom_cgroup_io_compute_imbalance` needs, and it was previously refused by
+/// this exporter even though the IR has lowered it all along.
+#[test]
+fn fieldless_work_types_are_mapped() {
+    for (wt, expected) in [
+        (WorkType::IoSyncWrite, "io_sync_write"),
+        (WorkType::IoRandRead, "io_rand_read"),
+        (WorkType::IoConvoy, "io_convoy"),
+        (WorkType::ForkExit, "fork_exit"),
+        (WorkType::NiceSweep, "nice_sweep"),
+        (WorkType::SmtSiblingSpin, "smt_sibling_spin"),
+    ] {
+        let def =
+            ScenarioDef::with_defs(vec![CgroupDef::named("cg_0").work(WorkSpec::default().work_type(wt.clone()))]);
+        let out = export_scenario("wt", &def, &topo(), Duration::from_secs(1), 1);
+        assert_eq!(
+            out.record["steps"][0]["setup"][0]["works"][0]["work_type"], expected,
+            "WorkType::{wt:?} must export as {expected:?}"
+        );
+        assert!(out.is_complete(), "unexpected gaps for {wt:?}: {:#?}", out.gaps);
+    }
+}
