@@ -64,7 +64,7 @@ fn sched_basic_proportional() -> ScenarioDef {
     // (WPROF_DEFAULT_RINGBUF_SIZE_KB = 16384, WPROF_DEFAULT_RINGBUF_CNT = 1).
     // Sizing check: 0.495 s of boot — the busiest phase — produced 36 KB, so
     // 15 s of mostly-steady-state spinning stays far inside the 16 MiB arena.
-    wprof_args = "-d 15000 -e sched --ringbuf-size=16384 --ringbuf-cnt=1"
+    wprof_args = "-d 15000 -e sched --kthread --idle --ringbuf-size=16384 --ringbuf-cnt=1"
 )]
 fn sched_basic_proportional_wprof() -> ScenarioDef {
     sched_basic_proportional_scenario()
