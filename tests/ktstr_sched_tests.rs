@@ -64,7 +64,16 @@ fn sched_basic_proportional() -> ScenarioDef {
     // (WPROF_DEFAULT_RINGBUF_SIZE_KB = 16384, WPROF_DEFAULT_RINGBUF_CNT = 1).
     // Sizing check: 0.495 s of boot — the busiest phase — produced 36 KB, so
     // 15 s of mostly-steady-state spinning stays far inside the 16 MiB arena.
-    wprof_args = "-d 15000 -e sched --kthread --idle --ringbuf-size=16384 --ringbuf-cnt=1"
+    //
+    // DO NOT ADD `--kthread --idle`. Their help text reads "Allow kernel
+    // tasks" / "Allow idle tasks", which sounds purely additive. It is not:
+    // measured on this exact scenario, adding them DROPPED THE USERSPACE
+    // WORKLOAD ENTIRELY — 24.0 s of `init` on-CPU time vanished, the trace
+    // went 587 KB -> 189 KB and 10777 -> 3034 packets, and kthread time went
+    // DOWN (4.080 ms -> 2.745 ms) rather than up. Whatever the mechanism, the
+    // flags change which tasks are traced rather than widening the set, and
+    // the configuration below is the one that contains the workload.
+    wprof_args = "-d 15000 -e sched --ringbuf-size=16384 --ringbuf-cnt=1"
 )]
 fn sched_basic_proportional_wprof() -> ScenarioDef {
     sched_basic_proportional_scenario()
