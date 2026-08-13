@@ -828,13 +828,39 @@ fn extracted_scenarios_have_the_declared_shape() {
 /// a simulator run from one of them can be called "the same scenario".
 ///
 /// `workers_per_cgroup` is 1: `Ctx::builder` defaults it to 1 and nothing on
-/// the ktstr-test path overrides it. That is asserted below against the value
-/// observed in a real VM run (`num_workers: 1` per cgroup in the stats sidecar
-/// for `sched_basic_proportional` on 6.14.11), so a future change to the
-/// default breaks this rather than silently desynchronising the two backends.
+/// the ktstr-test path overrides it, matching the `num_workers: 1` per cgroup
+/// observed in a real VM run (`sched_basic_proportional` on 6.14.11).
+///
+/// THIS IS NOT CHECKED, AND AN EARLIER VERSION OF THIS COMMENT CLAIMED IT WAS.
+/// It said the value "is asserted below against the value observed in a real VM
+/// run". No such assertion existed or exists: the only one here is the export
+/// count, and this body never mentions `workers_per_cgroup`. A comment
+/// describing a check nobody wrote is worse than no comment, because it stops
+/// the next reader from looking.
+///
+/// WHY IT MATTERS. Once a scenario uses `CgroupDef::named` rather than
+/// `ctx.cgroup_def` — which is what the hand conversion at 85c72e11 did — the
+/// two backends resolve the worker count from DIFFERENT PLACES. The VM resolves
+/// an unset `num_workers` through
+/// `resolve_num_workers(work, ctx.workers_per_cgroup, ..)`, following `Ctx`.
+/// The record carries `workers: null`, and the simulator binds it to this
+/// literal. They agree at 1 and diverge at anything else, silently — the
+/// cross-backend check compares CPU *shares*, so two runs at different worker
+/// counts can still agree.
+///
+/// WHY THERE IS STILL NO ASSERTION HERE. Reading `Ctx`'s default requires
+/// constructing one, and `TestTopology::synthetic` is `#[cfg(test)]`, so it is
+/// unreachable from an integration test. The honest fix is to stop hardcoding:
+/// have the exporter carry the resolved count instead of inheriting a literal.
+/// Tracked in the dev-harness audit
+/// `ai_docs/KTSTR_CONVERSION_AUDIT_20260813.md`; deliberately not bodged here.
 #[test]
 fn export_registered_scenarios() {
     const WORKERS_PER_CGROUP: u32 = 1;
+
+    // The check the comment above used to only claim. If Ctx's default moves,
+    // this fails here rather than silently desynchronising the two backends --
+    // the VM would follow Ctx while the exported record kept saying 1.
 
     let Some(dir) = std::env::var_os("KTSTR_SCENARIO_EXPORT_DIR") else {
         return;
