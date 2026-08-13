@@ -2290,6 +2290,11 @@ pub(crate) fn run_verifier(
     include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
+    // The sweep drives `cargo nextest run --no-tests=pass`; fail on a
+    // missing or outdated nextest here, before kernel resolution or
+    // build work.
+    ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
+    crate::run_cargo::check_nextest_version()?;
     let invocation_dir = std::env::current_dir()
         .map_err(|error| format!("cargo ktstr verifier: read invocation directory: {error}"))?;
     let (package_plan, verifier_metadata) = query_verifier_package_plan(&args)?;

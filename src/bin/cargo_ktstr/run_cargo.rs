@@ -7404,6 +7404,70 @@ fn apply_cpu_cap(cpu_cap: Option<usize>) -> Result<(), String> {
     Ok(())
 }
 
+/// Minimum cargo-nextest version the orchestrated routes support.
+///
+/// Binding constraints, oldest first: the injected `--tool-config-file`
+/// flag needs 0.9.27; the embedded tool config's `[test-groups]` +
+/// `@tool:` namespace + `max-threads = "num-cpus"` need 0.9.48 — and
+/// BELOW that, nextest warn-and-ignores the unknown keys, silently
+/// deleting the ordinary-host concurrency cap while the deliberately
+/// unbounded `test-threads` admission budget stays in force
+/// (run-everything-at-once oversubscription, not an error); the
+/// config-side `nextest-version` self-enforcement key is honored from
+/// tool configs since 0.9.55; the verifier route's `--no-tests=pass`
+/// needs 0.9.75. The wrapper preflight below is the primary gate
+/// because versions predating 0.9.55 cannot self-enforce a floor;
+/// `nextest-tool.toml` carries the same floor as defense in depth
+/// (pinned equal by `embedded_config_pins_the_wrapper_version_floor`).
+pub(crate) const MIN_NEXTEST_VERSION: Version = Version::new(0, 9, 75);
+
+/// Parse the version out of `cargo nextest --version` stdout, shaped
+/// `cargo-nextest 0.9.98 (hash date)`.
+fn parse_nextest_version(stdout: &str) -> Result<Version, String> {
+    let first_line = stdout.lines().next().unwrap_or_default().trim();
+    let token = first_line.split_whitespace().nth(1).ok_or_else(|| {
+        format!("cargo ktstr: unrecognized `cargo nextest --version` output {first_line:?}")
+    })?;
+    Version::parse(token)
+        .map_err(|error| format!("cargo ktstr: parse cargo-nextest version {token:?}: {error}"))
+}
+
+fn nextest_version_floor_error(found: &Version) -> Option<String> {
+    (*found < MIN_NEXTEST_VERSION).then(|| {
+        format!(
+            "cargo ktstr: cargo-nextest {found} is older than the minimum supported \
+             {MIN_NEXTEST_VERSION}. ktstr's generated nextest tool config and CLI shape \
+             rely on features this version lacks (an older nextest silently ignores the \
+             tool config's concurrency caps and oversubscribes the host). Update with \
+             `cargo install --locked cargo-nextest` or `cargo nextest self update`."
+        )
+    })
+}
+
+/// Enforce [`MIN_NEXTEST_VERSION`] against the installed cargo-nextest.
+/// Runs on every nextest-backed route (test, coverage, `llvm-cov
+/// nextest`, verifier, replay `--exec`) after that route's
+/// cargo-nextest PATH-presence check, before any build work.
+pub(crate) fn check_nextest_version() -> Result<(), String> {
+    let output = Command::new("cargo")
+        .args(["nextest", "--version"])
+        .output()
+        .map_err(|error| format!("cargo ktstr: run `cargo nextest --version`: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo ktstr: `cargo nextest --version` failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = parse_nextest_version(&stdout)?;
+    match nextest_version_floor_error(&version) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_test(
     kernel: Vec<String>,
@@ -7424,6 +7488,7 @@ pub(crate) fn run_test(
     nextest_archive_reuse(TEST_SUB_ARGV, &args)?;
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
+    check_nextest_version()?;
     // Smart feature inference must precede registry discovery: `--relevant`
     // probes the exact feature/package/target/profile selection the eventual
     // nextest run will build, rather than a second workspace-wide default.
@@ -7489,6 +7554,7 @@ pub(crate) fn run_coverage(
     nextest_archive_reuse(COVERAGE_SUB_ARGV, &args)?;
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest", "cargo-llvm-cov"]).map_err(|e| format!("{e:#}"))?;
+    check_nextest_version()?;
     // `coverage` runs the same suite through `cargo llvm-cov nextest`, so use
     // the same version guard and targeted feature inference as `test`.
     let prepared = if llvm_cov_reuses_archive(COVERAGE_SUB_ARGV, &args) {
@@ -7543,6 +7609,15 @@ pub(crate) fn run_llvm_cov(
         );
     }
     nextest_archive_reuse(LLVM_COV_SUB_ARGV, &args)?;
+    // `llvm-cov nextest` is the same nextest-backed suite as `coverage`
+    // (identical tool-config injection and forced admission), so it needs
+    // the same preflights; report/clean/show-env passthrough modes invoke
+    // no nextest and keep their exact pre-existing behavior.
+    if llvm_cov_uses_nextest(&args) {
+        ktstr::cli::check_tools(&["cargo-nextest", "cargo-llvm-cov"])
+            .map_err(|e| format!("{e:#}"))?;
+        check_nextest_version()?;
+    }
     // `llvm-cov` is raw passthrough — the user supplies every
     // argument after the subcommand name, including any profile
     // selection. `release: false` / `profile: None` / `nextest_profile:
@@ -8205,6 +8280,37 @@ mod tests {
             ),
         ))
         .expect("raw llvm-cov feature metadata fixture deserializes")
+    }
+
+    #[test]
+    fn parse_nextest_version_extracts_the_semver_token() {
+        assert_eq!(
+            parse_nextest_version("cargo-nextest 0.9.98 (fc97e97bb 2026-06-21)\nrelease\n")
+                .unwrap(),
+            Version::new(0, 9, 98),
+        );
+    }
+
+    #[test]
+    fn parse_nextest_version_rejects_malformed_output() {
+        for output in ["", "garbage", "cargo-nextest not-a-version"] {
+            let error = parse_nextest_version(output).unwrap_err();
+            assert!(error.contains("cargo ktstr:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn nextest_version_floor_names_versions_and_remedy() {
+        let error =
+            nextest_version_floor_error(&Version::new(0, 9, 48)).expect("below floor must error");
+        assert!(error.contains("0.9.48"), "{error}");
+        assert!(error.contains(&MIN_NEXTEST_VERSION.to_string()), "{error}");
+        assert!(
+            error.contains("cargo install --locked cargo-nextest"),
+            "{error}"
+        );
+        assert!(nextest_version_floor_error(&MIN_NEXTEST_VERSION).is_none());
+        assert!(nextest_version_floor_error(&Version::new(0, 9, 98)).is_none());
     }
 
     #[test]
