@@ -429,6 +429,7 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             kernel,
             no_perf_mode,
             no_skip_mode,
+            cpu_cap,
             release,
             profile,
             nextest_profile,
@@ -450,6 +451,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 !no_skip_mode,
                 "bare `--` passthrough must not spuriously set --no-skip-mode",
+            );
+            assert!(
+                cpu_cap.is_none(),
+                "bare `--` passthrough must not spuriously set --cpu-cap",
             );
             assert!(
                 !release,
@@ -477,6 +482,7 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             kernel,
             no_perf_mode,
             no_skip_mode,
+            cpu_cap,
             release,
             profile,
             nextest_profile,
@@ -498,6 +504,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 !no_skip_mode,
                 "bare `--` passthrough must not spuriously set --no-skip-mode",
+            );
+            assert!(
+                cpu_cap.is_none(),
+                "bare `--` passthrough must not spuriously set --cpu-cap",
             );
             assert!(
                 !release,
@@ -525,6 +535,7 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             kernel,
             no_perf_mode,
             no_skip_mode,
+            cpu_cap,
             include_eol,
             args,
         } => {
@@ -539,6 +550,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 !no_skip_mode,
                 "bare `--` passthrough must not spuriously set --no-skip-mode",
+            );
+            assert!(
+                cpu_cap.is_none(),
+                "bare `--` passthrough must not spuriously set --cpu-cap",
             );
             assert!(
                 !include_eol,
@@ -1084,12 +1099,17 @@ fn parse_llvm_cov_with_kernel_and_no_perf_mode() {
         kernel,
         no_perf_mode,
         no_skip_mode,
+        cpu_cap,
         include_eol,
         args,
     } = k.command
     else {
         panic!("expected LlvmCov");
     };
+    assert!(
+        cpu_cap.is_none(),
+        "bare invocation must default --cpu-cap to None"
+    );
     assert_eq!(kernel, vec!["6.14.2".to_string()]);
     assert!(no_perf_mode);
     assert!(!no_skip_mode);
@@ -3561,6 +3581,103 @@ fn parse_shell_no_perf_mode_without_cpu_cap_succeeds() {
     };
     assert_eq!(cpu_cap, None, "no --cpu-cap must produce None");
     assert!(no_perf_mode);
+}
+
+/// `cargo ktstr test --cpu-cap 4 --no-perf-mode` parses through the
+/// production argsplit rewrite with both flags landing on the Test
+/// variant. Regression pin for the routing bug: before Test declared
+/// the flag, argsplit sent `--cpu-cap` into the nextest passthrough
+/// bucket (its value token became a bare positional test filter) and
+/// the run died much later with a misleading "cannot safely project
+/// unknown post-nextest option" error.
+#[test]
+fn parse_test_cpu_cap_with_no_perf_mode_succeeds() {
+    let KtstrCommand::Test {
+        cpu_cap,
+        no_perf_mode,
+        args,
+        ..
+    } = parse_via_split(&["cargo", "ktstr", "test", "--cpu-cap", "4", "--no-perf-mode"])
+    else {
+        panic!("expected Test");
+    };
+    assert_eq!(cpu_cap, Some(4));
+    assert!(no_perf_mode, "--no-perf-mode must be set");
+    assert!(
+        args.is_empty(),
+        "--cpu-cap and its value must parse natively, not fall into the \
+         nextest passthrough: {args:?}",
+    );
+}
+
+/// `cargo ktstr test --cpu-cap 4` without `--no-perf-mode` must FAIL
+/// at parse time on the `requires = "no_perf_mode"` constraint — the
+/// same contract the Shell variant pins — instead of forwarding the
+/// flag toward nextest.
+#[test]
+fn parse_test_cpu_cap_without_no_perf_mode_fails() {
+    let raw: Vec<std::ffi::OsString> = ["cargo", "ktstr", "test", "--cpu-cap", "4"]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect();
+    let rewritten = crate::argsplit::rewrite(&Cargo::command(), &raw);
+    let msg = match Cargo::try_parse_from(&rewritten) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("--cpu-cap without --no-perf-mode must fail the parse"),
+    };
+    assert!(
+        msg.to_ascii_lowercase().contains("no-perf-mode")
+            || msg.to_ascii_lowercase().contains("no_perf_mode"),
+        "clap error must name the missing --no-perf-mode flag, got: {msg}",
+    );
+}
+
+/// Nextest passthrough tokens keep flowing around a native `--cpu-cap`.
+#[test]
+fn parse_test_cpu_cap_preserves_passthrough() {
+    let KtstrCommand::Test { cpu_cap, args, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "test",
+        "--cpu-cap",
+        "4",
+        "--no-perf-mode",
+        "-E",
+        "test(foo)",
+    ]) else {
+        panic!("expected Test");
+    };
+    assert_eq!(cpu_cap, Some(4));
+    assert_eq!(args, ["-E", "test(foo)"]);
+}
+
+/// Coverage and LlvmCov carry the same flag with the same constraint,
+/// so the docs' uniform treatment of the test family holds.
+#[test]
+fn parse_coverage_and_llvm_cov_accept_cpu_cap() {
+    let KtstrCommand::Coverage { cpu_cap, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "coverage",
+        "--cpu-cap",
+        "6",
+        "--no-perf-mode",
+    ]) else {
+        panic!("expected Coverage");
+    };
+    assert_eq!(cpu_cap, Some(6));
+    let KtstrCommand::LlvmCov { cpu_cap, .. } = parse_via_split(&[
+        "cargo",
+        "ktstr",
+        "llvm-cov",
+        "--cpu-cap",
+        "6",
+        "--no-perf-mode",
+        "report",
+    ]) else {
+        panic!("expected LlvmCov");
+    };
+    assert_eq!(cpu_cap, Some(6));
 }
 
 // ---------------------------------------------------------------

@@ -7375,11 +7375,41 @@ fn apply_relevant_narrowing(
     }
 }
 
+/// Validate and export an operator `--cpu-cap` for a test-family run.
+///
+/// Mirrors the `shell --cpu-cap` propagation (`misc/shell.rs::run_shell`):
+/// validate eagerly, then export `KTSTR_CPU_CAP` so the harness-prebuild
+/// LLC reservation, every nextest child test process (env inheritance),
+/// and each per-test no-perf VM budget re-resolve the same cap. The
+/// clap-level `requires = "no_perf_mode"` rule enforces the mode contract
+/// before this runs; the on-miss auto kernel build stays uncapped by
+/// design (`cli::resolve` passes a typed `None`).
+fn apply_cpu_cap(cpu_cap: Option<usize>) -> Result<(), String> {
+    let Some(cap) = cpu_cap else {
+        return Ok(());
+    };
+    if ktstr::bypass_llc_locks_active() {
+        return Err(
+            "--cpu-cap conflicts with KTSTR_BYPASS_LLC_LOCKS=1; unset one of them. \
+             --cpu-cap is a resource contract; bypass disables the contract entirely."
+                .to_string(),
+        );
+    }
+    // Validate early so a bad cap surfaces at CLI-parse time.
+    ktstr::cli::CpuCap::new(cap).map_err(|e| format!("{e:#}"))?;
+    // SAFETY: reached from `dispatch_run_command` before any helper on
+    // this chain spawns a thread — the same single-threaded position the
+    // Shell arm's `set_var` relies on (see misc/shell.rs::run_shell).
+    unsafe { std::env::set_var(ktstr::KTSTR_CPU_CAP_ENV, cap.to_string()) };
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_test(
     kernel: Vec<String>,
     no_perf_mode: bool,
     no_skip_mode: bool,
+    cpu_cap: Option<usize>,
     release: bool,
     profile: Option<String>,
     nextest_profile: Option<String>,
@@ -7390,6 +7420,7 @@ pub(crate) fn run_test(
     default_branch: String,
     args: Vec<String>,
 ) -> Result<(), String> {
+    apply_cpu_cap(cpu_cap)?;
     nextest_archive_reuse(TEST_SUB_ARGV, &args)?;
     ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
     ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
@@ -7432,6 +7463,7 @@ pub(crate) fn run_coverage(
     kernel: Vec<String>,
     no_perf_mode: bool,
     no_skip_mode: bool,
+    cpu_cap: Option<usize>,
     release: bool,
     profile: Option<String>,
     nextest_profile: Option<String>,
@@ -7442,6 +7474,7 @@ pub(crate) fn run_coverage(
     default_branch: String,
     args: Vec<String>,
 ) -> Result<(), String> {
+    apply_cpu_cap(cpu_cap)?;
     if llvm_cov_has_lifecycle_flag(&args, "--no-run") {
         return run_llvm_cov_report_only(
             COVERAGE_SUB_ARGV,
@@ -7493,9 +7526,11 @@ pub(crate) fn run_llvm_cov(
     kernel: Vec<String>,
     no_perf_mode: bool,
     no_skip_mode: bool,
+    cpu_cap: Option<usize>,
     include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
+    apply_cpu_cap(cpu_cap)?;
     if llvm_cov_has_lifecycle_flag(&args, "--no-run") {
         return run_llvm_cov_report_only(
             LLVM_COV_SUB_ARGV,
