@@ -337,6 +337,16 @@ pub(crate) fn cell_parent_path_is_valid(path: &str) -> bool {
 /// agnostic, accepting the false-positive risk for arg shapes that
 /// the in-tree schedulers don't currently produce. The combined-form
 /// branch (`--cell-parent-cgroup=...`) is unambiguous and unaffected.
+/// Iterate the arguments framed in a packed `/sched_args` (or `/args`)
+/// file: one argument per line, matching the `join("\n")` producer in
+/// `vmm::initramfs::build_dynamic_tail`. Whitespace inside a line belongs to
+/// that argument — a JSON layer config passed as a single argv element
+/// contains spaces — so consumers must never re-tokenize on whitespace.
+/// Empty lines carry no argument.
+pub(crate) fn parse_line_framed_args(content: &str) -> impl Iterator<Item = &str> {
+    content.lines().filter(|line| !line.is_empty())
+}
+
 pub(crate) fn parse_cell_parent_cgroup<'a>(
     args: impl IntoIterator<Item = &'a str>,
 ) -> CellParentCgroupArg<'a> {
@@ -400,7 +410,7 @@ pub(crate) fn resolve_cgroup_root(args: &[String]) -> String {
     // `Scheduler::cgroup_parent`.
     let sched_args = std::fs::read_to_string("/sched_args").unwrap_or_default();
     if let Some(path) = absolute_cell_parent_value(
-        parse_cell_parent_cgroup(sched_args.split_whitespace()),
+        parse_cell_parent_cgroup(parse_line_framed_args(&sched_args)),
         "/sched_args",
     ) {
         return format!("/sys/fs/cgroup{path}");
@@ -682,6 +692,38 @@ mod tests {
     fn extract_export_output_arg_empty_value() {
         let args = vec!["test_bin".into(), "--ktstr-export-output=".into()];
         assert!(extract_export_output_arg(&args).is_none());
+    }
+
+    // -- parse_line_framed_args --
+
+    #[test]
+    fn parse_line_framed_args_keeps_whitespace_inside_an_argument() {
+        // A JSON layer config declared as ONE sched_args element must
+        // arrive as ONE argv entry — whitespace-tokenizing it was the
+        // bug that shattered layer configs into fragments and killed
+        // the scheduler before sched_ext attach.
+        let content = "--verbose\n[{\"name\": \"batch\", \"util_range\": [0.8, 0.9]}]";
+        assert_eq!(
+            parse_line_framed_args(content).collect::<Vec<_>>(),
+            [
+                "--verbose",
+                "[{\"name\": \"batch\", \"util_range\": [0.8, 0.9]}]"
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_line_framed_args_empty_content_yields_no_arguments() {
+        assert_eq!(parse_line_framed_args("").count(), 0);
+        assert_eq!(parse_line_framed_args("\n\n").count(), 0);
+    }
+
+    #[test]
+    fn parse_line_framed_args_skips_empty_lines_between_arguments() {
+        assert_eq!(
+            parse_line_framed_args("a\n\nb\n").collect::<Vec<_>>(),
+            ["a", "b"],
+        );
     }
 
     // -- parse_cell_parent_cgroup --

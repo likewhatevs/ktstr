@@ -1,0 +1,5 @@
+error: sched_args element must not contain a line break
+ --> tests/compile_fail/declare_scheduler_sched_args_line_break.rs:9:19
+  |
+9 |     sched_args = ["--flag\nvalue"],
+  |                   ^^^^^^^^^^^^^^^

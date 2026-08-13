@@ -182,7 +182,7 @@ pub(crate) use args::{
     CellParentCgroupArg, VERIFIER_WORKLOAD_FLAG, cell_parent_path_is_valid,
     extract_export_check_test_arg, extract_export_test_arg, extract_probe_stack_arg,
     extract_shell_test_arg, extract_test_fn_arg, extract_topo_arg, extract_work_type_arg,
-    is_verifier_workload, parse_cell_parent_cgroup,
+    is_verifier_workload, parse_cell_parent_cgroup, parse_line_framed_args,
 };
 #[allow(unused_imports)]
 pub(crate) use runtime::{append_base_sched_args, content_hash, scratch_dir, sys_rdy_budget_ms};

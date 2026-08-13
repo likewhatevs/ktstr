@@ -2015,15 +2015,11 @@ pub(crate) fn try_spawn_scheduler(
         return Ok(None);
     }
 
-    let sched_args = fs::read_to_string(args_path)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let args: Vec<&str> = if sched_args.is_empty() {
-        vec![]
-    } else {
-        sched_args.split_whitespace().collect()
-    };
+    // One argument per line — never whitespace-tokenized: a single declared
+    // argument (a JSON layer config, say) legitimately contains spaces, and
+    // re-splitting it here would hand the scheduler shattered argv fragments.
+    let sched_args = fs::read_to_string(args_path).unwrap_or_default();
+    let args: Vec<&str> = crate::test_support::parse_line_framed_args(&sched_args).collect();
 
     let log_file = fs::File::create(log_path).ok();
     // Wire the child's stdout/stderr through bulk-port forwarder threads
