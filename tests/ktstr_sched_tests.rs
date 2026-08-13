@@ -10,9 +10,41 @@ use ktstr::{ktstr_scenario, ktstr_test};
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
+/// The two-cgroup workload, in one place.
+///
+/// Shared by `sched_basic_proportional` and its wprof-capturing sibling so the
+/// traced run and the calibrated run cannot drift apart.
+fn sched_basic_proportional_scenario() -> ScenarioDef {
+    ScenarioDef::with_defs(vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")])
+}
+
 #[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
 fn sched_basic_proportional() -> ScenarioDef {
-    ScenarioDef::with_defs(vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")])
+    sched_basic_proportional_scenario()
+}
+
+/// `sched_basic_proportional` with wprof capture attached.
+///
+/// Same `ScenarioDef` as the test above, deliberately built by calling it
+/// rather than restating it — a copy would drift, and the whole point is that
+/// the traced workload IS the calibrated one.
+///
+/// # Why this is a separate test rather than `wprof` on the original
+///
+/// `wprof` requires the `wprof` cargo feature: the macro rejects the attribute
+/// at parse time when the feature is off, so adding it to
+/// `sched_basic_proportional` would make the default build of this test file
+/// fail to compile. A `cfg`-gated sibling keeps `cargo test` working for
+/// everyone who does not have the feature (and does not want a build that
+/// clones and compiles wprof from GitHub) while still producing the trace.
+///
+/// Capture is not failure-only: a PASSING run writes
+/// `{sidecar_dir}/{test_name}-{variant_hash:016x}.wprof.pb`, next to the stats
+/// JSON that the scx-sim calibration already consumes.
+#[cfg(feature = "wprof")]
+#[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15, wprof)]
+fn sched_basic_proportional_wprof() -> ScenarioDef {
+    sched_basic_proportional_scenario()
 }
 
 #[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
