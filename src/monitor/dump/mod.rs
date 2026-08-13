@@ -943,6 +943,61 @@ pub struct ProbeBssCounters {
     pub trigger_count: u64,
 }
 
+/// Host-side context for a failure that struck before the freeze
+/// coordinator could capture any BPF state — the guest booted but cgroup
+/// or scheduler setup failed, so the payload never ran and only a
+/// placeholder report exists. Everything here was already in the host's
+/// hands (`vmm::VmResult`) at placeholder-write time; embedding it makes
+/// the artifact diagnosable instead of rendering `<unavailable>` for
+/// every section. All fields optional so the shape is purely additive.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GuestSetupFailureContext {
+    /// Stage label from `classify_init_stage` — the deepest lifecycle
+    /// phase the guest reached before failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_stage: Option<String>,
+    /// Final guest lifecycle stage per the host progress ledger
+    /// (`VmResult::final_guest_phase`), Debug-rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_guest_phase: Option<String>,
+    /// Guest exit code surfaced through the SHM ring or COM2 sentinel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_exit_code: Option<i32>,
+    /// Scheduler attach outcome decoded from the lifecycle frames
+    /// (`verifier::attach_outcome_from_messages`), including the guest's
+    /// not-attached reason suffix when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_attach_outcome: Option<String>,
+    /// Bounded tail of the guest console / kernel log (COM1,
+    /// `VmResult::stderr`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_tail: Option<String>,
+    /// Bounded tail of the guest stdout / init log (COM2,
+    /// `VmResult::output`) — carries the `ktstr-init:` setup errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_log_tail: Option<String>,
+    /// Bounded tail of the scheduler's own merged stdout/stderr shipped
+    /// over the bulk port (`SCHED_LOG` chunks) — carries the
+    /// scheduler's argv/config parse errors when it died pre-attach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_log_tail: Option<String>,
+}
+
+impl GuestSetupFailureContext {
+    /// True when no field carries data — the Display impl and the
+    /// empty-report guard treat such a context as absent.
+    pub fn is_empty(&self) -> bool {
+        self.init_stage.is_none()
+            && self.final_guest_phase.is_none()
+            && self.guest_exit_code.is_none()
+            && self.scheduler_attach_outcome.is_none()
+            && self.console_tail.is_none()
+            && self.init_log_tail.is_none()
+            && self.scheduler_log_tail.is_none()
+    }
+}
+
 /// Top-level failure-dump report. One per freeze trigger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1307,6 +1362,12 @@ pub struct FailureDumpReport {
     /// observing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_counters: Option<ProbeBssCounters>,
+    /// Host-side setup-failure evidence embedded when this report is a
+    /// placeholder written for a pre-capture guest failure (payload
+    /// never ran). `None` on real captures and on placeholders written
+    /// where no `VmResult` exists (build/run errors before a VM ran).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_setup_failure: Option<GuestSetupFailureContext>,
     /// `true` when this report was produced by
     /// [`Self::placeholder`] — i.e. the capture pipeline could
     /// not produce real data (typical cause: freeze rendezvous
@@ -1354,6 +1415,7 @@ impl Default for FailureDumpReport {
             dump_truncated_at_us: None,
             maps_truncated: 0,
             probe_counters: None,
+            guest_setup_failure: None,
             is_placeholder: false,
             active_obj_name: None,
         }

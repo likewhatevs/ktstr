@@ -311,6 +311,15 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
         maps_truncated: 0,
         probe_counters: Some(ProbeBssCounters::default()),
         scx_static_ranges: Default::default(),
+        guest_setup_failure: Some(GuestSetupFailureContext {
+            init_stage: Some("synthetic stage".into()),
+            final_guest_phase: Some("Attach".into()),
+            guest_exit_code: Some(i32::MIN),
+            scheduler_attach_outcome: Some("synthetic attach outcome".into()),
+            console_tail: Some("console line\n".repeat(64)),
+            init_log_tail: Some("ktstr-init: synthetic error\n".repeat(64)),
+            scheduler_log_tail: Some("sched line \u{fffd}\n".repeat(64)),
+        }),
         is_placeholder: false,
         active_obj_name: None,
     };
