@@ -1841,12 +1841,11 @@ pub(crate) fn open_pinned_file(path: &Path) -> Result<(File, StableFileIdentity)
 
 /// Create and pin generated artifact bytes on the content-CAS filesystem.
 ///
-/// Artifact-tree publication requires FICLONE without a byte-copy fallback.
-/// Staging generated metadata in the process-global temporary directory would
-/// therefore fail with EXDEV whenever `/tmp` and `KTSTR_CACHE_DIR` are on
-/// different mounts. The bytes originate in memory, so write them once into an
-/// unlinked staging inode beside the CAS objects; publication can then clone
-/// that inode through the same strict path as every other artifact input.
+/// Staging beside the CAS objects keeps publication on the FICLONE fast
+/// path: the bytes originate in memory, so writing them once into an
+/// unlinked in-cache staging inode lets publication clone rather than
+/// re-copy them (the cross-mount byte-copy fallback exists but there is no
+/// reason to take it for bytes this function itself places).
 pub(crate) fn open_pinned_generated_artifact(
     bytes: &[u8],
     mode: u32,
@@ -2110,10 +2109,15 @@ pub(crate) fn open_content_object(content_hash: u64, expected_len: u64) -> Resul
 
 /// Publish a pinned input as one immutable content object.
 ///
-/// Every publication uses FICLONE so all consumers share one backing extent
-/// and retain private/COW semantics across processes. There is deliberately no
-/// byte-copy fallback. Publication is descriptor-relative and atomic, and the
-/// pinned source revision is checked on both sides of the clone.
+/// Publication prefers FICLONE so an in-cache source shares one backing
+/// extent with the object, and falls back to a byte copy when the source
+/// lives on a filesystem the cache cannot reflink with (a snapshot source in
+/// a project checkout on another mount, say). The fallback affects only this
+/// one-time publish: consumer-side materialization still reflinks strictly
+/// out of the cache, so the cross-process extent/page-cache sharing contract
+/// is untouched, and integrity is unchanged because the source revision is
+/// checked on both sides of the transfer with a content re-hash whenever it
+/// moved. Publication is descriptor-relative and atomic.
 fn publish_content_object(
     dirs: &ContentCacheDirs,
     expected_hash: u64,
@@ -2121,6 +2125,40 @@ fn publish_content_object(
     source_identity: StableFileIdentity,
 ) -> Result<File> {
     publish_content_object_with_post_rename(dirs, expected_hash, source, source_identity, || Ok(()))
+}
+
+/// Clone `source` into the staging temporary, falling back to an
+/// offset-stable byte copy on the reflink-unsupported errnos (EXDEV /
+/// EOPNOTSUPP / ENOTTY). `read_at`/`write_all_at` leave both descriptors'
+/// cursors untouched — the caller re-hashes through the same descriptors
+/// when the source revision moved mid-publication, and that guard covers
+/// the byte-copy path exactly as it covers the clone.
+fn clone_or_copy_content_object(temporary: &File, source: &File) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    match crate::reflink::ficlone(temporary, source) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .raw_os_error()
+                .is_some_and(crate::reflink::is_fallback_errno) =>
+        {
+            let mut offset: u64 = 0;
+            let mut buffer = vec![0u8; 128 * 1024];
+            loop {
+                let read = source
+                    .read_at(&mut buffer, offset)
+                    .context("read pinned content source for byte-copy publication")?;
+                if read == 0 {
+                    return Ok(());
+                }
+                temporary
+                    .write_all_at(&buffer[..read], offset)
+                    .context("write pinned content byte-copy staging temporary")?;
+                offset += read as u64;
+            }
+        }
+        Err(error) => Err(error).context("FICLONE pinned content object"),
+    }
 }
 
 fn publish_content_object_with_post_rename<F>(
@@ -2147,7 +2185,7 @@ where
     )?;
     let final_name = OsString::from(format!("{expected_hash:016x}.object"));
     let result: Result<File> = (|| {
-        crate::reflink::ficlone(&temporary, source).context("FICLONE pinned content object")?;
+        clone_or_copy_content_object(&temporary, source)?;
         let after_copy = StableFileIdentity::from_file(source)?;
         anyhow::ensure!(
             after_copy.same_open_content_version(source_identity),
