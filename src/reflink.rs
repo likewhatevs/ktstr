@@ -58,7 +58,7 @@ pub(crate) fn ficlone(dest: &File, src: &File) -> io::Result<()> {
 /// Everything else (`EBADF`, `EINVAL`, `EISDIR`, `EPERM`, `ENOSPC`,
 /// `EDQUOT`, ...) is a genuine failure a copy would MASK, so it propagates.
 /// Whitelist, not blacklist: an unknown errno defaults to propagate.
-fn is_fallback_errno(errno: i32) -> bool {
+pub(crate) fn is_fallback_errno(errno: i32) -> bool {
     matches!(errno, libc::EXDEV | libc::EOPNOTSUPP | libc::ENOTTY)
 }
 

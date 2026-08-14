@@ -252,6 +252,11 @@ pub(crate) fn run_replay(
     // post-exec re-scan that builds a fresh pool Vec.
     let queued: BTreeSet<String> = failed_names.iter().map(|s| s.to_string()).collect();
 
+    // Only the --exec path invokes nextest; the dry-run above just prints
+    // a filter expression, so the presence check and version floor gate
+    // here, before any build work.
+    ktstr::cli::check_tools(&["cargo-nextest"])?;
+    crate::run_cargo::check_nextest_version().map_err(|error| anyhow::anyhow!(error))?;
     // Only the --exec path builds test binaries. Use the exact shared nextest
     // preflight: target-aware narrow feature inference, selected resolved-graph
     // version compatibility, and best-effort forwarding on metadata failures.

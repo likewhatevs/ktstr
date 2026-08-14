@@ -5,6 +5,13 @@
 # run-slot flags, so every orchestrated route has one scheduler: ktstr's
 # machine-wide topology queue.
 
+# Self-enforced floor (honored from tool configs since nextest 0.9.55;
+# older nextest exits 92 below it instead of silently ignoring the
+# test-groups cap). Defense in depth behind cargo-ktstr's own preflight —
+# keep equal to run_cargo::MIN_NEXTEST_VERSION, pinned by
+# `embedded_config_pins_the_wrapper_version_floor`.
+nextest-version = "0.9.75"
+
 [profile.default]
 # This is an admission budget, not a native-thread count. Resource-taking
 # ktstr cells park in ktstr's cheap cross-process topology queue before VM

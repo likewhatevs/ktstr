@@ -1366,12 +1366,45 @@ pub struct Scheduler {
     /// workspace.
     ///
     /// `declare_scheduler!` fills this automatically with the invoking
-    /// crate's `CARGO_MANIFEST_DIR`. Direct [`Scheduler::named`] builder
-    /// users default to ktstr's own crate dir (the workspace root in
-    /// this repo); a direct builder user OUTSIDE the ktstr tree whose
-    /// scheduler lives in another workspace should pass their own
-    /// `env!("CARGO_MANIFEST_DIR")` via [`Self::manifest_dir`].
+    /// crate's `CARGO_MANIFEST_DIR`. Direct [`Scheduler::named`] /
+    /// [`Scheduler::EEVDF`] construction leaves the empty sentinel,
+    /// which [`Self::effective_manifest_dir`] resolves at runtime from
+    /// the CONSUMING process (its `CARGO_MANIFEST_DIR`, then the current
+    /// directory) — a compile-time `env!` here in the ktstr library
+    /// would bake ktstr's own package dir (the registry checkout for a
+    /// downstream user), a workspace the consumer's scheduler is not a
+    /// member of. Read through [`Self::effective_manifest_dir`], not
+    /// this field; override for non-cargo launch contexts via
+    /// [`Self::manifest_dir`] with `env!("CARGO_MANIFEST_DIR")`.
     pub manifest_dir: &'static str,
+}
+
+/// Runtime resolution for the empty [`Scheduler::manifest_dir`] sentinel:
+/// the orchestrator-pinned fallback when present
+/// ([`crate::KTSTR_MANIFEST_DIR_FALLBACK_ENV`], exported by `cargo ktstr`
+/// so its ELF-stamp requirements and every descendant resolve to one exact
+/// string), else the consuming process's own `CARGO_MANIFEST_DIR`, else
+/// the current directory. Resolved once per process.
+#[doc(hidden)]
+pub fn runtime_manifest_dir() -> &'static str {
+    static RUNTIME_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUNTIME_DIR
+        .get_or_init(|| {
+            std::env::var(crate::KTSTR_MANIFEST_DIR_FALLBACK_ENV)
+                .ok()
+                .filter(|dir| !dir.is_empty())
+                .or_else(|| {
+                    std::env::var("CARGO_MANIFEST_DIR")
+                        .ok()
+                        .filter(|dir| !dir.is_empty())
+                })
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .map(|dir| dir.display().to_string())
+                        .unwrap_or_else(|_| ".".to_string())
+                })
+        })
+        .as_str()
 }
 
 impl Scheduler {
@@ -1423,7 +1456,7 @@ impl Scheduler {
         config_file_def: None,
         kernels: &[],
         verifier_exclude_topologies: &[],
-        manifest_dir: env!("CARGO_MANIFEST_DIR"),
+        manifest_dir: "",
     };
 
     /// Const constructor for defining schedulers in static context.
@@ -1460,11 +1493,13 @@ impl Scheduler {
     ///   filter).
     /// - `verifier_exclude_topologies`: empty slice — no named
     ///   verifier-only topology exclusions.
-    /// - `manifest_dir`: ktstr's own `CARGO_MANIFEST_DIR` (the
-    ///   workspace root in this repo). `declare_scheduler!` overrides
-    ///   this with the invoking crate's dir; a direct builder user
-    ///   whose scheduler lives in a different workspace overrides via
-    ///   [`Self::manifest_dir`].
+    /// - `manifest_dir`: the empty sentinel — resolved at runtime by
+    ///   [`Self::effective_manifest_dir`] from the consuming process
+    ///   (`CARGO_MANIFEST_DIR`, then the current directory), which
+    ///   under cargo test / nextest is the consumer package's own dir.
+    ///   `declare_scheduler!` captures the invoking crate's dir at
+    ///   compile time instead; override explicitly via
+    ///   [`Self::manifest_dir`] for non-cargo launch contexts.
     pub const fn named(name: &'static str) -> Scheduler {
         Scheduler {
             name,
@@ -1488,8 +1523,27 @@ impl Scheduler {
             config_file_def: None,
             kernels: &[],
             verifier_exclude_topologies: &[],
-            manifest_dir: env!("CARGO_MANIFEST_DIR"),
+            manifest_dir: "",
         }
+    }
+
+    /// The scheduler's build/resolution workspace: [`Self::manifest_dir`]
+    /// when the declaration carried one (`declare_scheduler!`, explicit
+    /// [`Self::manifest_dir`] builder), otherwise resolved ONCE at
+    /// runtime from the consuming process — `CARGO_MANIFEST_DIR` (cargo
+    /// test / nextest set it to the running test target's package dir,
+    /// exactly the workspace whose `cargo build -p <pkg>` can see the
+    /// consumer's scheduler package), falling back to the current
+    /// directory for non-cargo launches. Mirrors the sidecar's
+    /// runtime-over-`env!` project resolution
+    /// (`sidecar::detect_project_commit`): a compile-time `env!` in this
+    /// library bakes ktstr's OWN package dir, which downstream is the
+    /// read-only cargo registry checkout.
+    pub fn effective_manifest_dir(&self) -> &'static str {
+        if !self.manifest_dir.is_empty() {
+            return self.manifest_dir;
+        }
+        runtime_manifest_dir()
     }
 
     /// Set the binary spec. Returns self for const chaining.
@@ -3114,6 +3168,11 @@ fn collect_scheduler_artifact_requirements<'a>(
             }
             SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => continue,
         };
+        // Keep the empty runtime sentinel VERBATIM in requirement identities:
+        // probe output can be persisted into the machine-shared artifact
+        // cache, and an eagerly resolved absolute path would poison it for
+        // every other checkout. The orchestrator resolves at per-run
+        // consumption (`prepare_scheduler_artifacts_from_requirements`).
         let manifest_dir = scheduler.manifest_dir.to_string();
         let accumulator = requirements
             .entry((kind_order, value, manifest_dir.clone()))
@@ -3408,7 +3467,11 @@ impl SchedulerJson {
         };
         Self {
             name: s.name.to_string(),
-            manifest_dir: s.manifest_dir.to_string(),
+            // The effective (never-empty) dir: wire consumers
+            // (`scheduler_artifact`, the verifier planner) reject an
+            // empty manifest_dir, so the runtime sentinel must not
+            // escape the process.
+            manifest_dir: s.effective_manifest_dir().to_string(),
             binary_kind,
             topology: TopologyJson {
                 num_numa_nodes: s.topology.num_numa_nodes(),
@@ -7168,11 +7231,46 @@ mod tests {
     /// and the constraints to `TopologyConstraints::DEFAULT`. Pins
     /// every projected field so a mis-mapped dimension (e.g. swapping
     /// llcs and cores) surfaces.
+    /// The consuming-process resolution the runtime sentinel must yield
+    /// in this test process: an orchestrator-pinned fallback when one is
+    /// present (an outer `cargo ktstr` run), else cargo's own
+    /// `CARGO_MANIFEST_DIR` for the test target's package.
+    fn expected_runtime_manifest_dir() -> String {
+        std::env::var(crate::KTSTR_MANIFEST_DIR_FALLBACK_ENV)
+            .ok()
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or_else(|| {
+                std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR")
+            })
+    }
+
+    #[test]
+    fn effective_manifest_dir_prefers_explicit_then_runtime() {
+        // An explicit declaration (declare_scheduler! or the const
+        // builder) always wins over the runtime fallback.
+        const EXPLICIT: Scheduler = Scheduler::named("explicit").manifest_dir("/declared/dir");
+        assert_eq!(EXPLICIT.effective_manifest_dir(), "/declared/dir");
+        // The direct-builder default is the empty sentinel — NOT a
+        // compile-time env! baking ktstr's own package dir (downstream
+        // that dir is the read-only cargo registry checkout, whose
+        // workspace does not contain the consumer's scheduler).
+        const NAMED: Scheduler = Scheduler::named("runtime");
+        assert_eq!(NAMED.manifest_dir, "");
+        assert_eq!(
+            NAMED.effective_manifest_dir(),
+            expected_runtime_manifest_dir(),
+        );
+    }
+
     #[test]
     fn from_scheduler_copies_name_topology_args_kernels_constraints() {
         let json = SchedulerJson::from_scheduler(&Scheduler::EEVDF);
         assert_eq!(json.name, "eevdf");
-        assert_eq!(json.manifest_dir, env!("CARGO_MANIFEST_DIR"));
+        // EEVDF carries the empty manifest_dir sentinel, so the JSON
+        // projection resolves it at runtime. In-repo under bare cargo
+        // test / nextest that value is this crate's own dir —
+        // byte-identical to the pre-sentinel compile-time `env!` baking.
+        assert_eq!(json.manifest_dir, expected_runtime_manifest_dir());
         // EEVDF topology baseline.
         assert_eq!(json.topology.num_numa_nodes, 1);
         assert_eq!(json.topology.num_llcs, 1);

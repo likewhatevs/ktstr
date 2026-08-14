@@ -11509,6 +11509,7 @@ impl KtstrVm {
                                     maps_truncated: 0,
                                     probe_counters: None,
                                     scx_static_ranges: Default::default(),
+                                    guest_setup_failure: None,
                                     is_placeholder: false,
                                     sdt_alloc_unavailable: Some(
                                         "dump prerequisites unavailable".to_string(),

@@ -1857,6 +1857,55 @@ pub(crate) fn prepare_scheduler_artifacts_from_cached_manifests(
     )
 }
 
+/// Resolve the empty runtime-sentinel `manifest_dir` on every requirement
+/// and re-merge by exact identity.
+///
+/// Direct-builder declarations reach the orchestrator with the sentinel
+/// preserved verbatim — through const ELF use stamps AND the persisted,
+/// machine-shared nextest artifact cache — so no seeding checkout's
+/// absolute path is ever baked into shared state. Resolution therefore
+/// happens exactly once per run, here: this orchestrator pinned the same
+/// fallback into the environment its children inherit, so the artifact
+/// identities published below and every child's own lookup agree
+/// byte-for-byte. Resolution can collide a sentinel requirement with an
+/// explicitly declared one naming the same workspace, so requirements are
+/// re-merged by `(binary, manifest_dir)` afterwards — the downstream
+/// name-registration map keeps only one entry per identity.
+fn resolve_and_merge_requirement_sentinels(
+    requirements: Vec<ktstr::test_support::SchedulerArtifactRequirement>,
+) -> Vec<ktstr::test_support::SchedulerArtifactRequirement> {
+    use std::collections::btree_map::Entry;
+
+    let mut merged: BTreeMap<
+        (u8, String, String),
+        ktstr::test_support::SchedulerArtifactRequirement,
+    > = BTreeMap::new();
+    for mut requirement in requirements {
+        if requirement.manifest_dir.is_empty() {
+            requirement.manifest_dir = ktstr::test_support::runtime_manifest_dir().to_string();
+        }
+        let (kind_order, value) = match &requirement.binary_kind {
+            ktstr::test_support::BinaryKindJson::Discover(value) => (0u8, value.clone()),
+            ktstr::test_support::BinaryKindJson::Path(value) => (1u8, value.clone()),
+            ktstr::test_support::BinaryKindJson::Eevdf
+            | ktstr::test_support::BinaryKindJson::KernelBuiltin => (2u8, String::new()),
+        };
+        match merged.entry((kind_order, value, requirement.manifest_dir.clone())) {
+            Entry::Vacant(slot) => {
+                slot.insert(requirement);
+            }
+            Entry::Occupied(mut slot) => {
+                let existing = slot.get_mut();
+                existing.schedulers.extend(requirement.schedulers);
+                existing.schedulers.sort();
+                existing.schedulers.dedup();
+                existing.use_count = existing.use_count.saturating_add(requirement.use_count);
+            }
+        }
+    }
+    merged.into_values().collect()
+}
+
 fn prepare_scheduler_artifacts_from_requirements(
     requirements: Vec<ktstr::test_support::SchedulerArtifactRequirement>,
     cli_profile: Option<&str>,
@@ -1869,6 +1918,7 @@ fn prepare_scheduler_artifacts_from_requirements(
         SchedulerArtifactSpec,
     };
 
+    let requirements = resolve_and_merge_requirement_sentinels(requirements);
     let profile = scheduler_profile_for_run(cli_profile);
     let metadata_options = declaring_metadata_options(cargo_args, invocation_dir);
     let build_options = scheduler_build_options(cargo_args, invocation_dir);
@@ -2290,6 +2340,11 @@ pub(crate) fn run_verifier(
     include_eol: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
+    // The sweep drives `cargo nextest run --no-tests=pass`; fail on a
+    // missing or outdated nextest here, before kernel resolution or
+    // build work.
+    ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
+    crate::run_cargo::check_nextest_version()?;
     let invocation_dir = std::env::current_dir()
         .map_err(|error| format!("cargo ktstr verifier: read invocation directory: {error}"))?;
     let (package_plan, verifier_metadata) = query_verifier_package_plan(&args)?;
@@ -2670,6 +2725,51 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// Requirements carrying the empty runtime-sentinel manifest_dir (a
+    /// direct-builder const, preserved verbatim through stamps and the
+    /// shared artifact cache) resolve at per-run consumption to this
+    /// process's own runtime dir — and a sentinel requirement that then
+    /// collides with an explicitly declared requirement for the same
+    /// workspace merges into one identity instead of overwriting the
+    /// downstream per-identity scheduler-name registration.
+    #[test]
+    fn requirement_sentinels_resolve_and_merge_with_explicit_twins() {
+        let runtime = ktstr::test_support::runtime_manifest_dir().to_string();
+        let sentinel = ktstr::test_support::SchedulerArtifactRequirement {
+            binary_kind: ktstr::test_support::BinaryKindJson::Discover("scx-a".to_string()),
+            manifest_dir: String::new(),
+            schedulers: strings(&["direct"]),
+            use_count: 2,
+        };
+        let explicit_twin = ktstr::test_support::SchedulerArtifactRequirement {
+            binary_kind: ktstr::test_support::BinaryKindJson::Discover("scx-a".to_string()),
+            manifest_dir: runtime.clone(),
+            schedulers: strings(&["declared"]),
+            use_count: 3,
+        };
+        let other_workspace = ktstr::test_support::SchedulerArtifactRequirement {
+            binary_kind: ktstr::test_support::BinaryKindJson::Discover("scx-a".to_string()),
+            manifest_dir: "/elsewhere".to_string(),
+            schedulers: strings(&["foreign"]),
+            use_count: 1,
+        };
+        let resolved =
+            resolve_and_merge_requirement_sentinels(vec![sentinel, explicit_twin, other_workspace]);
+        assert_eq!(resolved.len(), 2, "twins merge, foreign workspace stays");
+        let twin = resolved
+            .iter()
+            .find(|requirement| requirement.manifest_dir == runtime)
+            .expect("sentinel must resolve to the runtime dir");
+        assert_eq!(twin.schedulers, strings(&["declared", "direct"]));
+        assert_eq!(twin.use_count, 5);
+        assert!(
+            resolved
+                .iter()
+                .any(|requirement| requirement.manifest_dir == "/elsewhere"),
+            "distinct workspaces must remain distinct identities",
+        );
     }
 
     /// The plan `query_verifier_package_plan` produces once

@@ -189,8 +189,11 @@ pub(crate) fn validate_export_entry(entry: &KtstrTestEntry) -> Result<()> {
 /// rather than packaging a possibly-stale binary; there is no pre-built
 /// fallback.
 fn resolve_scheduler_for_export(entry: &KtstrTestEntry) -> Result<Option<PathBuf>> {
-    let (path, _source) = resolve_scheduler(&entry.scheduler.binary, entry.scheduler.manifest_dir)
-        .with_context(|| format!("resolve scheduler binary for test '{}'", entry.name))?;
+    let (path, _source) = resolve_scheduler(
+        &entry.scheduler.binary,
+        entry.scheduler.effective_manifest_dir(),
+    )
+    .with_context(|| format!("resolve scheduler binary for test '{}'", entry.name))?;
     Ok(path)
 }
 

@@ -3860,6 +3860,15 @@ fn build_permit_range(cpu_count: usize) -> Result<std::ops::Range<usize>> {
     Ok(base..end)
 }
 
+/// One past the highest permit index any same-host participant can claim.
+/// Cooperative CPU permits, memory permits, preparation tokens, and build
+/// permits stack in that order, so the build range's end bounds them all.
+/// The registry derives its creation width from this so the first creator —
+/// whatever it claims itself — sizes the file for every later claim.
+pub(super) fn permit_namespace_end() -> Result<usize> {
+    build_permit_range(possible_cpu_width()).map(|range| range.end)
+}
+
 /// Choose and physically hold the CPU on which immutable preparation runs.
 /// CPU-EX claims/holders are excluded. Among the remaining SH-compatible
 /// CPUs, prefer the complement of live Build-class claims, then the lowest

@@ -75,6 +75,14 @@ pub(crate) enum KtstrCommand {
         /// is inapplicable. Exports `KTSTR_NO_SKIP_MODE=1`.
         #[arg(long)]
         no_skip_mode: bool,
+        /// Reserve only N host CPUs for each test VM. Requires
+        /// `--no-perf-mode` — perf-mode already holds every LLC
+        /// exclusively, so capping under perf-mode would
+        /// double-reserve. Exports `KTSTR_CPU_CAP=N`; an on-miss
+        /// auto kernel build stays uncapped by design. See
+        /// `ktstr::cli::CPU_CAP_HELP` for the full contract.
+        #[arg(long, requires = "no_perf_mode", help = ktstr::cli::CPU_CAP_HELP)]
+        cpu_cap: Option<usize>,
         /// Build and run tests with the release profile
         /// (`--cargo-profile release` to nextest).
         ///
@@ -167,6 +175,11 @@ pub(crate) enum KtstrCommand {
         /// contract. Exports `KTSTR_NO_SKIP_MODE=1`.
         #[arg(long)]
         no_skip_mode: bool,
+        /// Reserve only N host CPUs for each test VM. Requires
+        /// `--no-perf-mode`; same contract as `cargo ktstr test
+        /// --cpu-cap`. Exports `KTSTR_CPU_CAP=N`.
+        #[arg(long, requires = "no_perf_mode", help = ktstr::cli::CPU_CAP_HELP)]
+        cpu_cap: Option<usize>,
         /// Build and collect coverage with the release profile
         /// (`--cargo-profile release` to llvm-cov nextest).
         ///
@@ -251,6 +264,11 @@ pub(crate) enum KtstrCommand {
         /// contract. Exports `KTSTR_NO_SKIP_MODE=1`.
         #[arg(long)]
         no_skip_mode: bool,
+        /// Reserve only N host CPUs for each test VM. Requires
+        /// `--no-perf-mode`; same contract as `cargo ktstr test
+        /// --cpu-cap`. Exports `KTSTR_CPU_CAP=N`.
+        #[arg(long, requires = "no_perf_mode", help = ktstr::cli::CPU_CAP_HELP)]
+        cpu_cap: Option<usize>,
         /// Include EOL stable series in a `--kernel START..END` range
         /// expansion (shared `INCLUDE_EOL_HELP`). No effect on a single
         /// `--kernel`, a path, a cache key, or a git source.

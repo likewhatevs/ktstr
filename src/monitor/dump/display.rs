@@ -346,6 +346,54 @@ impl std::fmt::Display for DegradedFailureDumpReport {
 impl FailureDumpReport {
     /// Renders the scx walker section: per-CPU rq->scx / DSQ / scx_sched
     /// counts, then the walker-unavailable reason when the walk failed.
+    /// Renders the pre-capture guest-setup-failure evidence: stage,
+    /// final phase, exit code, attach outcome, then the embedded log
+    /// tails (scheduler log first — it carries the proximate error when
+    /// the scheduler died on its own argv/config).
+    fn fmt_guest_setup_failure(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        first: &mut bool,
+    ) -> std::fmt::Result {
+        let Some(context) = self
+            .guest_setup_failure
+            .as_ref()
+            .filter(|context| !context.is_empty())
+        else {
+            return Ok(());
+        };
+        if !*first {
+            f.write_str("\n\n")?;
+        }
+        *first = false;
+        f.write_str("guest setup failure:")?;
+        if let Some(stage) = &context.init_stage {
+            write!(f, "\n  stage: {stage}")?;
+        }
+        if let Some(phase) = &context.final_guest_phase {
+            write!(f, "\n  final_guest_phase: {phase}")?;
+        }
+        if let Some(code) = context.guest_exit_code {
+            write!(f, "\n  guest_exit_code: {code}")?;
+        }
+        if let Some(attach) = &context.scheduler_attach_outcome {
+            write!(f, "\n  scheduler_attach: {attach}")?;
+        }
+        for (label, tail) in [
+            ("scheduler log tail", &context.scheduler_log_tail),
+            ("init log tail (COM2)", &context.init_log_tail),
+            ("console tail (COM1)", &context.console_tail),
+        ] {
+            if let Some(tail) = tail {
+                write!(f, "\n  {label}:")?;
+                for line in tail.lines() {
+                    write!(f, "\n    {line}")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn fmt_scx_walker(
         &self,
         f: &mut std::fmt::Formatter<'_>,
@@ -375,7 +423,9 @@ impl FailureDumpReport {
                 },
             )?;
         }
-        if let Some(reason) = &self.scx_walker_unavailable {
+        if !self.is_placeholder
+            && let Some(reason) = &self.scx_walker_unavailable
+        {
             if !*first {
                 f.write_str("\n\n")?;
             }
@@ -517,6 +567,11 @@ impl std::fmt::Display for FailureDumpReport {
             && self.vcpu_perf_at_freeze.is_empty()
             && self.dump_truncated_at_us.is_none()
             && self.maps_truncated == 0
+            && self.sdt_alloc_unavailable.is_none()
+            && self
+                .guest_setup_failure
+                .as_ref()
+                .is_none_or(|context| context.is_empty())
         {
             return f.write_str("(empty failure dump)");
         }
@@ -529,6 +584,26 @@ impl std::fmt::Display for FailureDumpReport {
         // vector preserves the prior byte output and write/error boundary.
         let rendered_maps: Vec<String> = self.maps.iter().map(|m| format!("{m}")).collect();
         let mut first = true;
+        self.fmt_guest_setup_failure(f, &mut first)?;
+        // A placeholder duplicates one reason string across every
+        // `*_unavailable` field; render it once here and skip the
+        // per-section `<unavailable: ...>` repeats below.
+        if self.is_placeholder {
+            let reason = self
+                .prog_runtime_stats_unavailable
+                .as_deref()
+                .or(self.per_node_numa_unavailable.as_deref())
+                .or(self.task_enrichments_unavailable.as_deref())
+                .or(self.scx_walker_unavailable.as_deref())
+                .or(self.sdt_alloc_unavailable.as_deref());
+            if let Some(reason) = reason {
+                if !first {
+                    f.write_str("\n\n")?;
+                }
+                first = false;
+                write!(f, "capture unavailable: {reason}")?;
+            }
+        }
         for s in &rendered_maps {
             if !first {
                 f.write_str("\n\n")?;
@@ -557,6 +632,15 @@ impl std::fmt::Display for FailureDumpReport {
             first = false;
             std::fmt::Display::fmt(snap, f)?;
         }
+        if !self.is_placeholder
+            && let Some(reason) = &self.sdt_alloc_unavailable
+        {
+            if !first {
+                f.write_str("\n\n")?;
+            }
+            first = false;
+            write!(f, "sdt_allocations: <unavailable: {reason}>")?;
+        }
         if !self.scx_static_ranges.is_empty() {
             if !first {
                 f.write_str("\n\n")?;
@@ -575,7 +659,9 @@ impl std::fmt::Display for FailureDumpReport {
                 std::fmt::Display::fmt(stats, f)?;
             }
         }
-        if let Some(reason) = &self.prog_runtime_stats_unavailable {
+        if !self.is_placeholder
+            && let Some(reason) = &self.prog_runtime_stats_unavailable
+        {
             if !first {
                 f.write_str("\n\n")?;
             }
@@ -604,7 +690,9 @@ impl std::fmt::Display for FailureDumpReport {
                 self.per_node_numa.len()
             )?;
         }
-        if let Some(reason) = &self.per_node_numa_unavailable {
+        if !self.is_placeholder
+            && let Some(reason) = &self.per_node_numa_unavailable
+        {
             if !first {
                 f.write_str("\n\n")?;
             }
@@ -622,7 +710,9 @@ impl std::fmt::Display for FailureDumpReport {
                 self.task_enrichments.len(),
             )?;
         }
-        if let Some(reason) = &self.task_enrichments_unavailable {
+        if !self.is_placeholder
+            && let Some(reason) = &self.task_enrichments_unavailable
+        {
             if !first {
                 f.write_str("\n\n")?;
             }

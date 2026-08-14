@@ -499,7 +499,83 @@ fn write_placeholder_failure_dump_if_missing(path: &std::path::Path, result: &vm
         reason.push_str(". RUNTIME DIAGNOSTIC: ");
         reason.push_str(&diagnostic);
     }
-    write_placeholder_failure_dump_reason_if_missing(path, reason);
+    let context = guest_setup_failure_context(result, stage_label, &sched_log_merged);
+    write_placeholder_failure_dump_stub_if_missing(path, reason, Some(context));
+}
+
+/// Everything a pre-capture failure dump can say about WHY setup failed is
+/// already on the [`vmm::VmResult`] when the placeholder is written: the
+/// guest console and init log, the scheduler's own shipped log, the attach
+/// outcome, and the exit code. Embed bounded tails of each so the artifact
+/// diagnoses the failure instead of rendering `<unavailable>` everywhere.
+fn guest_setup_failure_context(
+    result: &vmm::VmResult,
+    stage_label: &str,
+    sched_log_merged: &str,
+) -> crate::monitor::dump::GuestSetupFailureContext {
+    let attach = match crate::verifier::attach_outcome_from_messages(result.guest_messages.as_ref())
+    {
+        crate::verifier::AttachOutcome::Attached => "attached".to_string(),
+        crate::verifier::AttachOutcome::Died => {
+            "scheduler process died before sched_ext attach".to_string()
+        }
+        crate::verifier::AttachOutcome::NotAttached(reason) if reason.trim().is_empty() => {
+            "scheduler never attached to sched_ext".to_string()
+        }
+        crate::verifier::AttachOutcome::NotAttached(reason) => {
+            format!("scheduler never attached to sched_ext: {reason}")
+        }
+        crate::verifier::AttachOutcome::Unconfirmed => {
+            "unconfirmed (no attach lifecycle frames)".to_string()
+        }
+    };
+    // The teardown-merged scheduler log is absent when the run died
+    // before `dump_sched_output` (watchdog kill); the live per-read
+    // stdout/stderr chunks survive that, so fall back to them.
+    let live_sched_log;
+    let sched_log = if sched_log_merged.is_empty() {
+        live_sched_log = format!(
+            "{}{}",
+            crate::verifier::concat_sched_stdout_chunks(result.guest_messages.as_ref()),
+            crate::verifier::concat_sched_stderr_chunks(result.guest_messages.as_ref()),
+        );
+        live_sched_log.as_str()
+    } else {
+        sched_log_merged
+    };
+    crate::monitor::dump::GuestSetupFailureContext {
+        init_stage: Some(stage_label.to_string()),
+        final_guest_phase: Some(format!("{:?}", result.final_guest_phase)),
+        guest_exit_code: Some(result.exit_code),
+        scheduler_attach_outcome: Some(attach),
+        console_tail: bounded_failure_dump_log_tail(&result.stderr),
+        init_log_tail: bounded_failure_dump_log_tail(&result.output),
+        scheduler_log_tail: bounded_failure_dump_log_tail(sched_log),
+    }
+}
+
+/// Byte budget for each embedded log tail in a placeholder failure dump.
+/// Generous relative to `MAX_FAILURE_DUMP_DIAGNOSTIC_BYTES` because these
+/// are the only diagnosis surface a pre-capture failure has, yet still
+/// bounded so the JSON artifact cannot inherit an unbounded console spew.
+const MAX_FAILURE_DUMP_LOG_TAIL_BYTES: usize = 16 * 1024;
+
+/// Keep the LAST bytes of a log — failures sit at the end of consoles and
+/// scheduler logs, unlike `bounded_failure_dump_diagnostic` which keeps
+/// the head of an already-selected diagnostic.
+fn bounded_failure_dump_log_tail(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= MAX_FAILURE_DUMP_LOG_TAIL_BYTES {
+        return Some(trimmed.to_string());
+    }
+    let mut start = trimmed.len() - MAX_FAILURE_DUMP_LOG_TAIL_BYTES;
+    while !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(format!("[truncated]…{}", &trimmed[start..]))
 }
 
 const MAX_FAILURE_DUMP_DIAGNOSTIC_BYTES: usize = 4096;
@@ -561,10 +637,19 @@ fn write_placeholder_failure_dump_reason_if_missing(
     path: &std::path::Path,
     reason: impl Into<String>,
 ) {
+    write_placeholder_failure_dump_stub_if_missing(path, reason, None);
+}
+
+fn write_placeholder_failure_dump_stub_if_missing(
+    path: &std::path::Path,
+    reason: impl Into<String>,
+    guest_setup_failure: Option<crate::monitor::dump::GuestSetupFailureContext>,
+) {
     if path.exists() {
         return;
     }
-    let stub = crate::monitor::dump::FailureDumpReport::placeholder(reason);
+    let mut stub = crate::monitor::dump::FailureDumpReport::placeholder(reason);
+    stub.guest_setup_failure = guest_setup_failure.filter(|context| !context.is_empty());
     let json = match serde_json::to_string_pretty(&stub) {
         Ok(j) => j,
         Err(e) => {
@@ -837,10 +922,12 @@ fn run_ktstr_test_inner_impl(
     // stamps it into SidecarResult::resolve_source below. The downstream
     // sites (VM builder, auto_repro) take only the PathBuf; the source is
     // a Copy enum that rides to the sidecar write unchanged.
-    let (scheduler, scheduler_resolve_source) =
-        resolve_scheduler(&entry.scheduler.binary, entry.scheduler.manifest_dir)?;
+    let (scheduler, scheduler_resolve_source) = resolve_scheduler(
+        &entry.scheduler.binary,
+        entry.scheduler.effective_manifest_dir(),
+    )?;
     let resolved_staged = resolve_staged_schedulers_strict(entry, |staged| {
-        resolve_scheduler(&staged.binary, staged.manifest_dir).map(|(opt, _src)| opt)
+        resolve_scheduler(&staged.binary, staged.effective_manifest_dir()).map(|(opt, _src)| opt)
     })?;
     let ktstr_bin = crate::resolve_current_exe()?;
 

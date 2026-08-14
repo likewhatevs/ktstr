@@ -109,6 +109,7 @@ pub(crate) use registry::{
     initializer_temp_count_for_tests as registry_initializer_temp_count_for_tests,
     missing_liveness_probe_does_not_create_for_tests,
     observer_preserves_uninitialized_header_for_tests,
+    overprovision_bits_for as registry_overprovision_bits_for_tests,
     prepare_zeroed_uninitialized_header_for_tests, registry_ex_acquisition_count_for_tests,
     resource_epoch_for_tests, round_trip_claim_modes_for_tests, shared_state_read_count_for_tests,
     snapshot as ticket_registry_snapshot_for_tests, ticket_blocked_at_current_serial_for_tests,

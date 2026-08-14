@@ -1291,6 +1291,22 @@ pub(crate) fn build_modules_part_from_pinned(modules: &[(String, PathBuf)]) -> R
     Ok(part)
 }
 
+/// The guest reads `/args` and `/sched_args` one argument per line
+/// (`test_support::parse_line_framed_args`), so an argument containing a
+/// line break would silently re-split into separate arguments after the
+/// `join("\n")` below. The declaration macros reject such literals at
+/// compile time; this gate catches every non-literal route.
+fn reject_unframable_args(kind: &str, args: &[String]) -> Result<()> {
+    for argument in args {
+        anyhow::ensure!(
+            !argument.contains(['\n', '\r']),
+            "{kind} element {argument:?} contains a line break, which would \
+             split it into separate guest argv entries",
+        );
+    }
+    Ok(())
+}
+
 /// Build the tiny per-cell tail that closes the cpio archive.
 ///
 /// This contains every invocation-varying byte, the completion sentinel,
@@ -1300,11 +1316,13 @@ pub(crate) fn build_dynamic_tail(prefix_len: usize, params: &SuffixParams<'_>) -
     let mut suffix = Vec::new();
 
     // Args file
+    reject_unframable_args("args", params.args)?;
     let args_data = params.args.join("\n");
     write_entry(&mut suffix, "args", args_data.as_bytes(), 0o100644)?;
 
     // Scheduler args file
     if !params.sched_args.is_empty() {
+        reject_unframable_args("sched_args", params.sched_args)?;
         let sched_args_data = params.sched_args.join("\n");
         write_entry(
             &mut suffix,
@@ -1376,6 +1394,7 @@ pub(crate) fn build_dynamic_tail(prefix_len: usize, params: &SuffixParams<'_>) -
         if args.is_empty() {
             continue;
         }
+        reject_unframable_args("staged sched_args", args)?;
         let archive_path = format!(
             "{}/sched_args",
             crate::test_support::staged::staged_scheduler_archive_dir(name)
