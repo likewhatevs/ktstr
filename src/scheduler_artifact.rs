@@ -946,6 +946,42 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_publishes_across_filesystems_via_byte_copy() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+
+        let _environment = lock_env();
+        // /dev/shm is tmpfs on every supported host: it can never reflink
+        // (no remap_file_range) and is a different mount from the cache
+        // tempdir below, so publication from here always exercises the
+        // cross-filesystem byte-copy fallback — the shape a user hits when
+        // their project checkout and KTSTR_CACHE_DIR live on different
+        // mounts.
+        let source_dir = tempfile::tempdir_in("/dev/shm").expect("tmpfs source tempdir");
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let _cache = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, cache_dir.path());
+        let source = source_dir.path().join("scheduler");
+        std::fs::write(&source, b"cross-fs scheduler bytes").expect("write source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod source");
+
+        let snapshot = snapshot_scheduler_artifact(&source).expect("snapshot across filesystems");
+        assert_eq!(
+            std::fs::read(snapshot.path()).expect("read snapshot"),
+            b"cross-fs scheduler bytes",
+        );
+        assert_eq!(
+            std::fs::metadata(snapshot.path())
+                .expect("stat snapshot")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o555,
+            "byte-copied publication must land with the same immutable mode \
+             as a reflinked one",
+        );
+    }
+
+    #[test]
     fn snapshot_pins_bytes_and_inode_across_source_replacement() {
         use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
 

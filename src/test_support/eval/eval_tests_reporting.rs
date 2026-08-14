@@ -220,6 +220,103 @@ fn placeholder_dump_reason_includes_lifecycle_stage_label() {
     );
 }
 
+/// A pre-capture setup failure embeds the host-side evidence in the
+/// placeholder artifact: stage, exit code, attach outcome, and bounded
+/// tails of the console, init log, and scheduler log — all of which sat
+/// on the `VmResult` at write time. Regression pin: the artifact used to
+/// duplicate one reason string across five `*_unavailable` fields and
+/// discard everything else the host already knew.
+#[test]
+fn placeholder_dump_embeds_guest_setup_failure_context() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test_context.failure-dump.json");
+    let mut not_attached =
+        vec![crate::vmm::wire::LifecyclePhase::SchedulerNotAttached.wire_value()];
+    not_attached.extend_from_slice(b"verifier reject");
+    let entries = vec![
+        crate::vmm::wire::ShmEntry {
+            msg_type: crate::vmm::wire::MSG_TYPE_LIFECYCLE,
+            payload: vec![crate::vmm::wire::LifecyclePhase::InitStarted.wire_value()],
+            crc_ok: true,
+        },
+        crate::vmm::wire::ShmEntry {
+            msg_type: crate::vmm::wire::MSG_TYPE_SCHED_LOG,
+            payload: b"scheduler argv parse error: unexpected token".to_vec(),
+            crc_ok: true,
+        },
+        crate::vmm::wire::ShmEntry {
+            msg_type: crate::vmm::wire::MSG_TYPE_LIFECYCLE,
+            payload: not_attached,
+            crc_ok: true,
+        },
+    ];
+    let result = vmm::VmResult {
+        success: false,
+        exit_code: 1,
+        output: "ktstr-init: cgroup setup failed: read-only file system".into(),
+        stderr: "guest kernel console line".into(),
+        guest_messages: Some(crate::vmm::host_comms::BulkDrainResult { entries }),
+        ..vmm::VmResult::test_fixture()
+    };
+    write_placeholder_failure_dump_if_missing(&path, &result);
+    let body = std::fs::read_to_string(&path).unwrap();
+    let report: crate::monitor::dump::FailureDumpReport = serde_json::from_str(&body).unwrap();
+    let context = report
+        .guest_setup_failure
+        .as_ref()
+        .expect("placeholder must embed the guest setup failure context");
+    assert_eq!(
+        context.init_stage.as_deref(),
+        Some(crate::test_support::output::STAGE_SCHEDULER_NOT_ATTACHED),
+    );
+    assert_eq!(context.guest_exit_code, Some(1));
+    assert!(
+        context
+            .scheduler_attach_outcome
+            .as_deref()
+            .unwrap()
+            .contains("verifier reject"),
+        "attach outcome must carry the guest's not-attached reason: {context:?}",
+    );
+    assert!(
+        context
+            .scheduler_log_tail
+            .as_deref()
+            .unwrap()
+            .contains("argv parse error"),
+        "scheduler log tail must carry the scheduler's own error: {context:?}",
+    );
+    assert!(
+        context
+            .init_log_tail
+            .as_deref()
+            .unwrap()
+            .contains("cgroup setup failed"),
+        "init log tail must carry the ktstr-init error: {context:?}",
+    );
+    assert!(
+        context
+            .console_tail
+            .as_deref()
+            .unwrap()
+            .contains("kernel console line"),
+        "console tail must carry the guest console: {context:?}",
+    );
+    // The human rendering leads with the setup-failure section and
+    // renders the duplicated placeholder reason exactly once.
+    let rendered = format!("{report}");
+    assert!(rendered.contains("guest setup failure:"), "{rendered}");
+    assert_eq!(
+        rendered.matches("capture unavailable:").count(),
+        1,
+        "placeholder reason must render once, not per section: {rendered}",
+    );
+    assert!(
+        !rendered.contains("<unavailable:"),
+        "per-section unavailable repeats must be collapsed: {rendered}",
+    );
+}
+
 /// Reason folds the `BUG SUMMARY` extraction (per the design
 /// intent) so the on-disk artifact matches the
 /// stderr summary instead of being less informative. Synthesize a

@@ -1602,13 +1602,23 @@ pub(crate) fn ktstr_test_impl(
                         }
                     }
                     "extra_sched_args" => {
-                        attrs
-                            .extra_sched_args
-                            .extend(expect_array_of_string_literals(
+                        let entries = expect_array_of_string_literals(
+                            value,
+                            "expected array of string literals for extra_sched_args",
+                            "expected string literal in extra_sched_args",
+                        )?;
+                        // `/sched_args` frames one argument per line; a line
+                        // break inside an element would re-split it into
+                        // separate scheduler argv entries in the guest.
+                        if let Some(bad) = entries.iter().find(|e| e.contains(['\n', '\r'])) {
+                            return Err(syn::Error::new_spanned(
                                 value,
-                                "expected array of string literals for extra_sched_args",
-                                "expected string literal in extra_sched_args",
-                            )?);
+                                format!(
+                                    "extra_sched_args element {bad:?} must not contain a line break"
+                                ),
+                            ));
+                        }
+                        attrs.extra_sched_args.extend(entries);
                     }
                     "extra_include_files" => {
                         attrs

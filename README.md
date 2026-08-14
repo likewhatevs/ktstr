@@ -127,7 +127,7 @@ ktstr = "0.26.0"
 ```
 
 ```sh
-cargo install --locked cargo-nextest
+cargo install --locked cargo-nextest   # 0.9.75 or newer
 cargo install --locked ktstr
 ```
 

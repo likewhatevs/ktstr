@@ -1826,6 +1826,15 @@ fn reconstruct_manifest(
                 BinaryKindJson::Path(value) => (1, value.clone()),
                 BinaryKindJson::Eevdf | BinaryKindJson::KernelBuiltin => continue,
             };
+            // A use stamp is const-built from the raw `Scheduler::manifest_dir`
+            // field, so direct-builder declarations carry the empty runtime
+            // sentinel here. Keep it VERBATIM: this probe is persisted into
+            // the machine-shared nextest artifact cache, and resolving the
+            // sentinel now would bake the reconstructing invocation's
+            // absolute checkout path into shared state that other checkouts
+            // consume. The per-run consumer
+            // (`prepare_scheduler_artifacts_from_requirements`) resolves it
+            // with its own pinned fallback instead.
             let key = (kind_order, value, scheduler.manifest_dir.clone());
             let requirement = requirements
                 .entry(key)
@@ -2392,6 +2401,44 @@ mod tests {
         assert!(
             reader.exceptional_pointer_relocations.get().is_some(),
             "binary-search miss must initialize the exceptional index"
+        );
+    }
+
+    #[test]
+    fn reconstructed_requirements_preserve_the_runtime_manifest_dir_sentinel() {
+        // A direct-builder const without an explicit manifest_dir stamps
+        // the empty runtime sentinel into the ELF (the use stamp is
+        // const-built from the raw field). Reconstruction must preserve
+        // the sentinel VERBATIM: this probe is persisted into the
+        // machine-shared nextest artifact cache, and an eagerly resolved
+        // absolute checkout path would poison the cache for every other
+        // checkout consuming the same fingerprint (per-run resolution
+        // happens in `prepare_scheduler_artifacts_from_requirements`).
+        let scheduler =
+            Scheduler::named("sentinel").binary(SchedulerSpec::Discover("scx-sentinel"));
+        assert_eq!(scheduler.manifest_dir, "");
+        let parsed = reconstruct_manifest(
+            Vec::new(),
+            vec![ParsedTestStamp {
+                test: "uses_sentinel".to_string(),
+                schedulers: vec![ParsedSchedulerUse {
+                    name: scheduler.name.to_string(),
+                    manifest_dir: scheduler.manifest_dir.to_string(),
+                    binary_kind: BinaryKindJson::Discover("scx-sentinel".to_string()),
+                }],
+                legacy_entry: 0,
+            }],
+        )
+        .expect("reconstruct");
+        assert_eq!(
+            parsed.artifact_requirements,
+            vec![SchedulerArtifactRequirement {
+                binary_kind: BinaryKindJson::Discover("scx-sentinel".to_string()),
+                manifest_dir: String::new(),
+                schedulers: vec!["sentinel".to_string()],
+                use_count: 1,
+            }],
+            "the sentinel must survive reconstruction unresolved",
         );
     }
 

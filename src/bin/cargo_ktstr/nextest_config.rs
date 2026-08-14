@@ -387,6 +387,18 @@ mod tests {
     }
 
     #[test]
+    fn embedded_config_pins_the_wrapper_version_floor() {
+        assert!(
+            TOOL_CONFIG.contains(&format!(
+                "nextest-version = \"{}\"",
+                crate::run_cargo::MIN_NEXTEST_VERSION
+            )),
+            "the tool config's self-enforced floor must equal \
+             run_cargo::MIN_NEXTEST_VERSION so the two floors cannot drift",
+        );
+    }
+
+    #[test]
     fn embedded_config_encodes_exact_generated_admission_namespaces() {
         assert!(TOOL_CONFIG.contains("test-threads = 1_000_000"));
         assert!(TOOL_CONFIG.contains("[test-groups.\"@tool:ktstr:host-tests\"]"));

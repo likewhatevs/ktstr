@@ -387,6 +387,20 @@ pub(crate) const STAGE_INIT_NOT_STARTED: &str =
 pub(crate) const STAGE_INIT_STARTED_NO_PAYLOAD: &str =
     "init started but payload never ran (cgroup/scheduler setup failed)";
 
+/// Stage label when the deepest lifecycle frame is `SchedulerDied` — the
+/// scheduler process exited before sched_ext attach, so its own log carries
+/// the proximate error (bad argv, config parse failure, missing kfuncs).
+/// Pinned by `classify_scheduler_died` (output.rs).
+pub(crate) const STAGE_SCHEDULER_DIED: &str =
+    "init started but the scheduler died before sched_ext attach (see scheduler log)";
+
+/// Stage label when the deepest lifecycle frame is `SchedulerNotAttached` —
+/// the scheduler process stayed alive but sched_ext never reported it
+/// enabled (BPF verifier reject, ops mismatch). Pinned by
+/// `classify_scheduler_not_attached` (output.rs).
+pub(crate) const STAGE_SCHEDULER_NOT_ATTACHED: &str =
+    "init started but the scheduler never attached to sched_ext";
+
 /// Stage label when `KTSTR_PAYLOAD_STARTING` was written but no
 /// AssertResult JSON followed — the test function entered and then
 /// crashed, hung, or produced no output. Pinned by
@@ -443,6 +457,8 @@ pub(crate) fn classify_init_stage(
         return STAGE_PAYLOAD_STARTED_NO_RESULT;
     }
     match latest {
+        Some(LifecyclePhase::SchedulerDied) => STAGE_SCHEDULER_DIED,
+        Some(LifecyclePhase::SchedulerNotAttached) => STAGE_SCHEDULER_NOT_ATTACHED,
         Some(_) => STAGE_INIT_STARTED_NO_PAYLOAD,
         None => STAGE_INIT_NOT_STARTED,
     }
@@ -1609,34 +1625,34 @@ ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
     }
 
     #[test]
-    fn classify_scheduler_died_without_payload_starting_is_init_no_payload() {
-        // SchedulerDied / SchedulerNotAttached without a preceding
-        // PayloadStarting frame mean init ran but the workload was
-        // never entered — the scheduler-setup phase failed before
-        // PayloadStarting could fire (the SchedulerDied /
-        // SchedulerNotAttached arms in rust_init/scheduler.rs
-        // send the lifecycle frame then force-reboot, so they
-        // never reach the workload-launch site; force_reboot
-        // itself is defined in rust_init/process.rs). The stage is
-        // STAGE_INIT_STARTED_NO_PAYLOAD, not the deeper
-        // PAYLOAD_STARTED_NO_RESULT bucket — lumping these into
-        // the payload bucket misleads operators into thinking the
-        // workload ran and failed mid-test.
+    fn classify_scheduler_died() {
+        // SchedulerDied without a preceding PayloadStarting frame means
+        // init ran but the scheduler process exited before sched_ext
+        // attach (the SchedulerDied arm in rust_init/scheduler.rs sends
+        // the lifecycle frame then force-reboots, so it never reaches
+        // the workload-launch site). The stage names the scheduler
+        // death outright — neither the deeper PAYLOAD_STARTED_NO_RESULT
+        // bucket (the workload never ran) nor the generic
+        // INIT_STARTED_NO_PAYLOAD bucket (which hides that the
+        // scheduler's own log carries the proximate error).
         let died = lifecycle_only_drain(&[
             crate::vmm::wire::LifecyclePhase::InitStarted,
             crate::vmm::wire::LifecyclePhase::SchedulerDied,
         ]);
-        assert_eq!(
-            classify_init_stage(Some(&died)),
-            STAGE_INIT_STARTED_NO_PAYLOAD,
-        );
+        assert_eq!(classify_init_stage(Some(&died)), STAGE_SCHEDULER_DIED);
+    }
+
+    #[test]
+    fn classify_scheduler_not_attached() {
+        // Same shape as classify_scheduler_died, for the
+        // scheduler-alive-but-never-attached lifecycle frame.
         let not_attached = lifecycle_only_drain(&[
             crate::vmm::wire::LifecyclePhase::InitStarted,
             crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
         ]);
         assert_eq!(
             classify_init_stage(Some(&not_attached)),
-            STAGE_INIT_STARTED_NO_PAYLOAD,
+            STAGE_SCHEDULER_NOT_ATTACHED,
         );
     }
 

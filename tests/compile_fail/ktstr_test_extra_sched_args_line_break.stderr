@@ -1,0 +1,5 @@
+error: extra_sched_args element "--flag\nvalue" must not contain a line break
+ --> tests/compile_fail/ktstr_test_extra_sched_args_line_break.rs:6:33
+  |
+6 | #[ktstr_test(extra_sched_args = ["--flag\nvalue"])]
+  |                                 ^^^^^^^^^^^^^^^^^

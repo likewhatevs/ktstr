@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ27");
-const VERSION: u32 = 27;
+const MAGIC: u64 = u64::from_be_bytes(*b"KTSTRQ28");
+const VERSION: u32 = 28;
 #[cfg(test)]
 const RETAINED_FUTEX_WAIT_MARKER_ENV: &str = "KTSTR_TEST_RETAINED_FUTEX_WAIT_MARKER";
 #[cfg(test)]
@@ -43,8 +43,8 @@ const RECORDS_PER_CHUNK: usize = 64;
 const NONE_SLOT: u64 = u64::MAX;
 const MAX_RESOURCE_BITS: usize = 1 << 20;
 const MAX_REGISTRY_SLOTS: u64 = 1 << 16;
-const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v27-init-";
-const LIVENESS_PREFIX: &str = "ktstr-acquire-v27-slot-";
+const INITIALIZER_PREFIX: &str = ".ktstr-acquire-registry-v28-init-";
+const LIVENESS_PREFIX: &str = "ktstr-acquire-v28-slot-";
 const LIVENESS_SEPARATOR: &str = "-ticket-";
 const LIVENESS_SUFFIX: &str = ".live";
 const WAIT_DIAGNOSTIC_BUCKET_SECS: u64 = 30;
@@ -15447,17 +15447,15 @@ fn required_resource_bits(claim: &ClaimSet) -> usize {
                 .saturating_add(1)
         })
         .unwrap_or(0);
-    // The v27 mapping is deliberately overprovisioned once. It never needs a
-    // migration/grow protocol when the first low-index ticket is followed by a
-    // valid sparse CPU/LLC/permit index on the same host. Permit indices occupy
-    // a disjoint internal bit range immediately after possible host CPUs.
+    // The v28 mapping is deliberately overprovisioned once. The registry is
+    // created by whichever same-host participant arrives first and there is
+    // no migration/grow protocol afterwards, so the creation width must
+    // already cover the widest same-host claim: the complete permit
+    // namespace stacked immediately after possible host CPUs, not merely the
+    // CPU/LLC range the creator itself happens to touch.
     physical_bits
         .max(permit_bits)
-        .max(
-            host_cpu_resource_bits()
-                .saturating_mul(2)
-                .min(MAX_RESOURCE_BITS),
-        )
+        .max(host_overprovision_bits())
         .max(4096)
 }
 
@@ -15469,12 +15467,37 @@ pub(super) fn required_bits_for_permit_index(max_permit: usize) -> usize {
     host_cpu_resource_bits()
         .saturating_add(max_permit)
         .saturating_add(1)
-        .max(
-            host_cpu_resource_bits()
-                .saturating_mul(2)
-                .min(MAX_RESOURCE_BITS),
-        )
+        .max(host_overprovision_bits())
         .clamp(4096, MAX_RESOURCE_BITS)
+}
+
+/// Registry creation width shared by every same-host participant.
+///
+/// A CPU/LLC-only registrant can be the first process to create the registry
+/// file, so its width must already cover the highest permit index the host
+/// can hand out (`permit_resource_index` of the build-permit range end). When
+/// the permit namespace cannot be resolved, fall back to twice the
+/// possible-CPU width; the fallback never narrows a claim-derived width
+/// because both width functions still take the max with their own claim.
+fn host_overprovision_bits() -> usize {
+    static BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        overprovision_bits_for(
+            host_cpu_resource_bits(),
+            super::super::permit_namespace_end().ok(),
+        )
+    })
+}
+
+pub(crate) fn overprovision_bits_for(
+    host_cpu_bits: usize,
+    permit_namespace_end: Option<usize>,
+) -> usize {
+    let cpu_only = host_cpu_bits.saturating_mul(2);
+    permit_namespace_end
+        .map(|end| host_cpu_bits.saturating_add(end).max(cpu_only))
+        .unwrap_or(cpu_only)
+        .min(MAX_RESOURCE_BITS)
 }
 
 fn permit_resource_index(permit: usize) -> Result<usize> {
@@ -15563,11 +15586,11 @@ fn notify_path() -> PathBuf {
 }
 
 fn registry_data_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-registry-v27")
+    active_protocol_dir().join("ktstr-acquire-registry-v28")
 }
 
 pub(super) fn event_dir() -> PathBuf {
-    active_protocol_dir().join("ktstr-acquire-events-v27")
+    active_protocol_dir().join("ktstr-acquire-events-v28")
 }
 
 #[cfg(test)]
@@ -15793,7 +15816,7 @@ fn lock_registry_for_initialization() -> Result<RegistryLock> {
     std::fs::create_dir_all(registry_data_dir())?;
     std::fs::create_dir_all(event_dir())?;
     // Materialization order is protocol: once registry.lock is nameable, every
-    // v27 entrant must also be able to join the writer-intent gate ahead of it.
+    // v28 entrant must also be able to join the writer-intent gate ahead of it.
     let writer_intent = block_flock(registry_writer_intent_path(), FlockMode::Shared)?;
     let registry = block_flock(registry_lock_path(), FlockMode::Exclusive)?;
     let lock = finish_registry_lock(registry, writer_intent, FlockMode::Exclusive);
@@ -19398,7 +19421,7 @@ impl Table {
             // The record table is authoritative. A clean header/record
             // mismatch must not permanently poison admission, so defensively
             // rebuild the active/free lists, aggregates, coordinator header,
-            // and record states together. Current v27 publication validates
+            // and record states together. Current v28 publication validates
             // this pair before clearing the dirty bit.
             self.repair_consistency()?;
             coordinator = self.coordinator_ticket();

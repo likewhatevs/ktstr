@@ -278,10 +278,13 @@ wins over both.
   `shell`, and `ktstr shell`. `KTSTR_NO_PERF_MODE` (any non-empty
   value) works everywhere.
 - `--cpu-cap N`: `ktstr shell`, `ktstr kernel build`,
-  `cargo ktstr shell`, `cargo ktstr kernel build` — and it requires
-  `--no-perf-mode` (perf mode already holds whole LLCs exclusively,
-  so a cap would double-reserve). For `cargo ktstr test` /
-  `coverage` / `llvm-cov` set `KTSTR_CPU_CAP=N` instead.
+  `cargo ktstr test` / `coverage` / `llvm-cov` / `shell`, and
+  `cargo ktstr kernel build` — and it requires `--no-perf-mode`
+  (perf mode already holds whole LLCs exclusively, so a cap would
+  double-reserve). `KTSTR_CPU_CAP=N` works everywhere; the flag
+  wins over the env var. On the test-family commands the cap binds
+  the harness prebuild and every test VM, but an on-miss auto
+  kernel build stays uncapped by design.
 
 ## How a reservation is planned
 

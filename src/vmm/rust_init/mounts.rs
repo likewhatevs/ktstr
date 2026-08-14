@@ -278,7 +278,9 @@ pub(crate) fn create_cgroup_parent_from_sched_args() {
     // was bypassed (operator hand-edited an exported `.run` script,
     // ad-hoc argv injection); log to COM2 and skip the cgroup-tree
     // setup rather than mkdir on the host cgroup root.
-    let path = match crate::test_support::parse_cell_parent_cgroup(sched_args.split_whitespace()) {
+    let path = match crate::test_support::parse_cell_parent_cgroup(
+        crate::test_support::parse_line_framed_args(&sched_args),
+    ) {
         crate::test_support::CellParentCgroupArg::Value(p)
             if crate::test_support::cell_parent_path_is_valid(p) =>
         {

@@ -1985,8 +1985,10 @@ pub fn build_nextest_args(nextest_profile: Option<&str>, forward: &[String]) -> 
         "run".to_string(),
         "--run-ignored".to_string(),
         "all".to_string(),
-        "--no-tests".to_string(),
-        "pass".to_string(),
+        // The `=` spelling is the one accepted across every supported
+        // nextest: the flag landed in 0.9.75 with `require_equals`, and
+        // the space-separated form only parses from 0.9.89.
+        "--no-tests=pass".to_string(),
         "-E".to_string(),
         "test(/^verifier/) & !test(/^verifier::/)".to_string(),
     ];
@@ -3146,11 +3148,11 @@ mod tests {
             .position(|a| a == "--run-ignored")
             .expect("--run-ignored present");
         assert_eq!(args[ri + 1], "all", "--run-ignored all");
-        let nt = args
-            .iter()
-            .position(|a| a == "--no-tests")
-            .expect("--no-tests present");
-        assert_eq!(args[nt + 1], "pass", "--no-tests pass");
+        assert!(
+            args.iter().any(|a| a == "--no-tests=pass"),
+            "--no-tests=pass present as a single `=` token (the only \
+             spelling every supported nextest parses): {args:?}",
+        );
         assert!(
             args.iter()
                 .any(|a| a == "test(/^verifier/) & !test(/^verifier::/)"),

@@ -1117,11 +1117,14 @@ fn validate_kernel_builtin_cmd(elem: &syn::Expr, cmd: &str, slot: &str) -> syn::
 
 /// Append every string-literal element of an array-literal-typed
 /// `declare_scheduler!` field into `out`. The `sched_args` and
-/// `kargs` arms both use this exact loop with no per-element
-/// validation beyond `expect_str_lit_element`; collapsing them into
-/// one helper keeps the two arms one line apiece. Fields that need
-/// per-element gates (`kernels`, `kernel_builtin_{enable,disable}`)
-/// keep their own loop with the additional checks.
+/// `kargs` arms both use this exact loop; collapsing them into one
+/// helper keeps the two arms one line apiece. Besides
+/// `expect_str_lit_element`, the loop carries the one per-element gate
+/// the two fields share: rejecting line breaks, which would re-split an
+/// element in the guest's one-argument-per-line `/sched_args` framing
+/// or corrupt the single-line kernel cmdline `kargs` joins into. Fields
+/// that need additional field-specific gates (`kernels`,
+/// `kernel_builtin_{enable,disable}`) keep their own loop.
 fn append_str_array_into(
     value: &syn::Expr,
     key: &syn::Ident,
@@ -1130,7 +1133,17 @@ fn append_str_array_into(
 ) -> syn::Result<()> {
     let arr = expect_array(value, key, field)?;
     for elem in &arr.elems {
-        out.push(expect_str_lit_element(elem, field)?);
+        let entry = expect_str_lit_element(elem, field)?;
+        // `sched_args` is framed one argument per line in the guest and
+        // `kargs` joins into the single-line kernel cmdline; a line break in
+        // either would silently re-split the element downstream.
+        if entry.contains(['\n', '\r']) {
+            return Err(syn::Error::new_spanned(
+                elem,
+                format!("{field} element must not contain a line break"),
+            ));
+        }
+        out.push(entry);
     }
     Ok(())
 }
