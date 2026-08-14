@@ -1490,6 +1490,18 @@ pub const KTSTR_BYPASS_LLC_LOCKS_ENV: &str = "KTSTR_BYPASS_LLC_LOCKS";
 /// observed count.
 pub const KTSTR_CPU_CAP_ENV: &str = "KTSTR_CPU_CAP";
 
+/// Name of the environment variable carrying the orchestrator-resolved
+/// fallback for `Scheduler` declarations whose `manifest_dir` is the empty
+/// runtime sentinel. `cargo ktstr` pins its own resolution once in `main`
+/// and every descendant (nextest children, admission re-execs, verifier
+/// cells) inherits it, so the parent's ELF-stamp requirements and each
+/// child's `Scheduler::effective_manifest_dir` resolve to one exact string
+/// — scheduler-artifact manifest identities match byte-for-byte. Takes
+/// precedence over `CARGO_MANIFEST_DIR` in
+/// `test_support::runtime_manifest_dir`; a nested `cargo ktstr` (the
+/// recursive verifier fixture) re-pins its own value for its own subtree.
+pub const KTSTR_MANIFEST_DIR_FALLBACK_ENV: &str = "KTSTR_MANIFEST_DIR_FALLBACK";
+
 /// Name of the environment variable that bypasses the contention
 /// guard at scenario setup. Strict `v == "1"` semantics (only
 /// the literal `"1"` enables; everything else disables). Used

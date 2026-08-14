@@ -139,6 +139,19 @@ manual const is not registered in `KTSTR_SCHEDULERS`, so the verifier
 sweep does not see it; use `declare_scheduler!` for anything that
 should participate in `cargo ktstr verifier`.
 
+A manual const resolves its build workspace at runtime from the
+consuming process (`CARGO_MANIFEST_DIR`, which cargo test / nextest
+set to your test package's directory), so on-demand `Discover` builds
+run in *your* workspace — no extra configuration needed under cargo.
+Under `cargo ktstr test` / `coverage` / `llvm-cov` the orchestrator
+pins the resolution to its own invocation workspace for the entire
+run, so its pre-built scheduler artifacts and each test's own
+resolution name the same workspace. Launching the test binary outside
+cargo (a bare binary, a container entrypoint), pin the workspace
+explicitly at the declaration:
+`.manifest_dir(env!("CARGO_MANIFEST_DIR"))`. `declare_scheduler!`
+always captures the declaring crate's directory at compile time.
+
 ## SchedulerSpec
 
 ```rust,ignore

@@ -212,7 +212,7 @@ pub use entry::{
     SCHEDULER_MANIFEST_PROBE_ARG, Scheduler, SchedulerArtifactRequirement, SchedulerJson,
     SchedulerListEntry, SchedulerManifestProbe, SchedulerSpec, SchedulerTestJson, Sysctl,
     SysctlJson, Topology, TopologyConstraints, TopologyConstraintsJson, TopologyJson, WatchBpfMap,
-    default_post_vm_periodic_fired, find_scheduler, find_test,
+    default_post_vm_periodic_fired, find_scheduler, find_test, runtime_manifest_dir,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};

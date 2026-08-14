@@ -148,6 +148,37 @@ fn install_project_commit_env() {
     }
 }
 
+/// Pin the runtime manifest-dir fallback for this invocation and export it
+/// to every descendant. A `Scheduler` declared without an explicit
+/// `manifest_dir` resolves its build workspace at runtime; this parent
+/// reads such declarations from const ELF use stamps while each nextest
+/// child re-resolves them in its own process (where nextest sets
+/// `CARGO_MANIFEST_DIR` to the test package dir). Scheduler-artifact
+/// identities match on the exact string, so parent and children must
+/// resolve the sentinel identically — the export makes this orchestrator's
+/// resolution authoritative for its whole process tree. Set
+/// unconditionally: a nested `cargo ktstr` (the recursive verifier
+/// fixture) must re-pin its OWN workspace for its own subtree rather than
+/// inherit the outer orchestrator's.
+///
+/// SAFETY: `main` calls this before tracing initialization, signal-handler
+/// installation, or any other persistent thread spawn — the same
+/// environment-safety contract as [`install_project_commit_env`].
+fn install_manifest_dir_fallback_env() {
+    let resolved = std::env::var("CARGO_MANIFEST_DIR")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        });
+    // SAFETY: see the function doc — startup is single-threaded.
+    unsafe {
+        std::env::set_var(ktstr::KTSTR_MANIFEST_DIR_FALLBACK_ENV, resolved);
+    }
+}
+
 fn main() {
     // Cargo/nextest re-enters this executable as a hidden target runner. That
     // mode must remain a tiny admission+exec path: no startup supervisor,
@@ -189,6 +220,7 @@ fn main() {
     // This must stay before tracing/thread initialization; see the installer's
     // environment-safety contract.
     install_project_commit_env();
+    install_manifest_dir_fallback_env();
     // Pin KTSTR_RUNS_ROOT to the absolute cargo target dir's ktstr
     // subdir so this orchestrator's footer / stats / replay reads and
     // the child test processes' sidecar writes resolve the SAME dir
