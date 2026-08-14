@@ -110,6 +110,15 @@ fn work_type(wt: &WorkType) -> Option<serde_json::Value> {
         WorkType::SpinWait => json!("spin_wait"),
         WorkType::YieldHeavy => json!("yield_heavy"),
         WorkType::Mixed => json!("mixed"),
+        // Verbatim, and only verbatim: `SourceWorkType::IoSyncWrite` is the
+        // same variant carrying no fields, so nothing is rewritten here. What
+        // the simulator cannot model about it -- block device, queue depth,
+        // byte counts -- is discarded one layer down by the lowering, which
+        // records `Cause::IoMechanism` when it does. That is the division of
+        // labour this function's doc comment describes, so mapping it is
+        // completing an intended mapping rather than widening the exporter's
+        // remit.
+        WorkType::IoSyncWrite => json!("io_sync_write"),
         _ => return None,
     })
 }

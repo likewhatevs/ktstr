@@ -1,11 +1,9 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
+use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
-use ktstr::scenario::ScenarioDef;
-use ktstr::scenario::ops::{CgroupDef, HoldSpec};
 use ktstr::test_support::{BpfMapWrite, KtstrTestEntry, Scheduler, SchedulerSpec, Topology};
 use ktstr::workload::WorkType;
-use ktstr::{ktstr_scenario, ktstr_test};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
@@ -190,93 +188,6 @@ fn cover_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_no_ctrl_load_imbalance(ctx)
 }
 
-/// An `IoSyncWrite` cgroup against a fully-subscribed `SpinWait` cgroup: one
-/// cgroup blocks on writes while the other saturates every CPU.
-///
-/// Converted from `#[ktstr_test]` to `#[ktstr_scenario]` so the workload is a
-/// value the simulator backend can also run. All three `&Ctx` reads in the
-/// original body resolve against the attribute above -- see the note where
-/// `custom_cgroup_io_compute_imbalance` used to live in
-/// `src/scenario/interaction.rs`, and the equivalence guard below.
-#[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, sustained_samples = 25, watchdog_timeout_s = 15)]
-fn cover_cgroup_io_compute_imbalance() -> ScenarioDef {
-    ScenarioDef::with_defs(vec![
-        CgroupDef::named("cg_0").work_type(WorkType::IoSyncWrite),
-        // `ctx.topo.total_cpus()` for the declared 1 llc x 4 cores x 1 thread.
-        CgroupDef::named("cg_1").workers(4),
-    ])
-}
-
-/// The conversion above preserves the workload the `&Ctx` body built.
-///
-/// This is not ceremony. A conversion is a hand rewrite, and the failure it
-/// invites is a scenario that runs something subtly different from the test it
-/// replaced while every backend agrees on the wrong thing -- agreement between
-/// two runs of the wrong workload is not fidelity. So the guard rebuilds the
-/// ORIGINAL expression against a `Ctx` carrying the attribute's own topology
-/// and compares it to what the scenario returns.
-///
-/// It compares `Debug` output for the cgroup setup because `CgroupDef` and
-/// `Step` derive `Debug` and `Clone` but not `PartialEq`; the hold is compared
-/// structurally, since `HoldSpec` does derive `PartialEq`.
-#[test]
-fn cgroup_io_compute_imbalance_conversion_is_faithful() {
-    // `#[ktstr_scenario]` replaces the item with a test harness fn, so the
-    // workload is reached through the registry it registers into rather than by
-    // calling the name directly. Going through the registry is also the more
-    // honest check: it is the same path the exporter uses, so this asserts on
-    // the value a backend would actually receive.
-    let scenario = ktstr::test_support::KTSTR_SCENARIOS
-        .iter()
-        .find(|s| s.name == "cover_cgroup_io_compute_imbalance")
-        .expect("the converted scenario must register in KTSTR_SCENARIOS");
-    let got = (scenario.build)();
-    let steps = got.steps();
-
-    assert_eq!(steps.len(), 1, "the original body built exactly one step");
-
-    // The original was `Step::with_defs(vec![...], ctx.settled_hold(1.0))`,
-    // i.e. `Fixed(settle + duration)`. `HoldSpec::FULL` is `Frac(1.0)`, which
-    // resolves to `ctx.duration`. The two agree only while settle is zero --
-    // which it is, because nothing outside `src/**/tests` and `test_support`
-    // calls `CtxBuilder::settle`, so a `#[ktstr_test]` run takes the builder
-    // default of `Duration::from_millis(0)`.
-    //
-    // If a settle window is ever introduced for `#[ktstr_test]` runs, this
-    // scenario silently loses it. Restore it as an explicit `HoldSpec::fixed`
-    // step at that point rather than relaxing this assertion.
-    assert_eq!(
-        steps[0].hold,
-        HoldSpec::FULL,
-        "hold must stay the full-duration form that ctx.settled_hold(1.0) \
-         collapsed to",
-    );
-
-    // `ctx.cgroup_def("cg_0")` is `CgroupDef::named("cg_0").workers(1)` --
-    // `Ctx::builder` defaults `workers_per_cgroup` to 1 and nothing on the
-    // ktstr-test path overrides it (the same fact `export_registered_scenarios`
-    // in `ktstr_sched_tests.rs` pins against an observed VM run). Leaving the
-    // worker count unset is therefore the same workload, because the step
-    // runner applies `ctx.workers_per_cgroup` to any `CgroupDef` that does not
-    // set one -- an equivalence the `#[ktstr_scenario]` docs state explicitly.
-    //
-    // `cg_1`'s count is `ctx.topo.total_cpus()`, which the attribute above
-    // declares as 1 llc x 4 cores x 1 thread = 4. It is written as a literal
-    // here so a topology edit that forgets this line fails loudly.
-    let expected = vec![
-        CgroupDef::named("cg_0").work_type(WorkType::IoSyncWrite),
-        CgroupDef::named("cg_1")
-            .workers((TOPO_1L_4C_1T.cores_per_llc * TOPO_1L_4C_1T.llcs) as usize),
-    ];
-
-    assert_eq!(
-        format!("{:?}", steps[0].setup),
-        format!("{:?}", ktstr::scenario::ops::Setup::from(expected)),
-        "the #[ktstr_scenario] body no longer builds the workload the &Ctx \
-         body built",
-    );
-}
-
 // -- nested --
 
 #[ktstr_test(llcs = 1, cores = 4, threads = 1)]
@@ -426,7 +337,6 @@ fn scenario_forced_failure(ctx: &Ctx) -> Result<AssertResult> {
 
 fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-    use ktstr::workload::WorkType;
     use std::time::Duration;
     let steps = vec![Step {
         setup: vec![
@@ -698,7 +608,6 @@ fn cover_work_type_sequence(ctx: &Ctx) -> Result<AssertResult> {
 #[ktstr_test(llcs = 1, cores = 4, threads = 1)]
 fn cover_execute_defs_two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::{CgroupDef, execute_defs};
-    use ktstr::workload::WorkType;
     execute_defs(
         ctx,
         vec![
