@@ -750,6 +750,11 @@ static __KTSTR_ENTRY_MID_DEGRADE: ktstr::test_support::KtstrTestEntry =
 /// explicitly rather than derived from the registry so that deleting a
 /// port (or silently losing its registration) fails here instead of
 /// shrinking the checked population to nothing.
+///
+/// Scoped to THIS binary. `KTSTR_SCENARIOS` is a linkme distributed slice and a
+/// distributed slice is per link unit, so a scenario declared in another
+/// `tests/*.rs` is not in this binary's slice and must not be listed here.
+/// `every_scenario_binary_exports` below is what covers those.
 const PORTED_SCENARIOS: &[&str] = &[
     "sched_basic_proportional",
     "sched_cpuset_split",

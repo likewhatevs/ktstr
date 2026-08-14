@@ -117,16 +117,21 @@ fn cpuset(spec: &CpusetSpec) -> Option<serde_json::Value> {
 /// The nine fieldless variants have nothing to drop, so they transfer
 /// verbatim and are safe. Two field-carrying variants are also mapped --
 /// `FutexPingPong` and `CrossAffinityChurn` -- each checked field-by-field
-/// against the IR first; both carry only `spin_iters: u64` on both sides. The remaining 36 want a per-variant mapping that
-/// translates the fields it can and records an [`ExportGap`] for the fields it
-/// cannot — worth doing, but it is a per-variant judgement each time, not a
-/// loop.
+/// against the IR first; both carry only `spin_iters: u64` on both sides. The
+/// remaining 34 want a per-variant mapping that translates the fields it can
+/// and records an [`ExportGap`] for the fields it cannot — worth doing, but it
+/// is a per-variant judgement each time, not a loop.
 fn work_type(wt: &WorkType) -> Option<serde_json::Value> {
     use serde_json::json;
     Some(match wt {
         WorkType::SpinWait => json!("spin_wait"),
         WorkType::YieldHeavy => json!("yield_heavy"),
         WorkType::Mixed => json!("mixed"),
+        // FIELDLESS variants, verbatim and only verbatim: each names the same
+        // fieldless `SourceWorkType`, so nothing is rewritten here. What the
+        // simulator cannot model about them -- for `IoSyncWrite`, the block
+        // device, queue depth and byte counts -- is discarded one layer down by
+        // the lowering, which records the cause when it does.
         WorkType::IoSyncWrite => json!("io_sync_write"),
         WorkType::IoRandRead => json!("io_rand_read"),
         WorkType::IoConvoy => json!("io_convoy"),

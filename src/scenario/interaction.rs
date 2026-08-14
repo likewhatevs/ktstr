@@ -297,15 +297,25 @@ pub fn custom_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-/// IoSyncWrite cgroup vs fully-subscribed SpinWait cgroup.
-pub fn custom_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
-    let steps = vec![Step::with_defs(
-        vec![
-            ctx.cgroup_def("cg_0").work_type(WorkType::IoSyncWrite),
-            CgroupDef::named("cg_1").workers(ctx.topo.total_cpus()),
-        ],
-        ctx.settled_hold(1.0),
-    )];
-
-    execute_steps(ctx, steps)
-}
+// `custom_cgroup_io_compute_imbalance` was here. Its sole caller,
+// `cover_cgroup_io_compute_imbalance` in `tests/scenario_coverage.rs`, is now a
+// `#[ktstr_scenario]` and carries the workload as a `ScenarioDef` value
+// instead. Keeping this helper as well would leave two copies of one workload
+// free to drift, and the copy nothing calls is the one that drifts unnoticed.
+//
+// The three `&Ctx` reads it made are all resolvable against the test's declared
+// attribute, which is why this body was the one picked to convert first:
+//
+//   ctx.cgroup_def("cg_0")       -> CgroupDef::named("cg_0")
+//   ctx.topo.total_cpus()        -> 4          (llcs = 1, cores = 4, threads = 1)
+//   ctx.settled_hold(1.0)        -> HoldSpec::FULL
+//
+// The first is the documented no-op the `#[ktstr_scenario]` docs call out: the
+// step runner applies `ctx.workers_per_cgroup` to any `CgroupDef` that leaves
+// its worker count unset, so naming it and defaulting it are the same workload.
+// The third holds only because `Ctx::settle` is never set outside tests, so it
+// is zero in a real run and `Fixed(settle + duration)` collapses to
+// `Frac(1.0)`. If a settle window is ever introduced for `#[ktstr_test]` runs,
+// that equivalence breaks and the scenario silently loses the window --
+// `cgroup_io_compute_imbalance_conversion_is_faithful` in
+// `tests/scenario_coverage.rs` is the guard that catches it.
