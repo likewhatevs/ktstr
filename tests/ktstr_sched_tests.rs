@@ -10,9 +10,73 @@ use ktstr::{ktstr_scenario, ktstr_test};
 const KTSTR_SCHED: Scheduler =
     Scheduler::named("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 
+/// The two-cgroup workload, in one place.
+///
+/// Shared by `sched_basic_proportional` and its wprof-capturing sibling so the
+/// traced run and the calibrated run cannot drift apart.
+fn sched_basic_proportional_scenario() -> ScenarioDef {
+    ScenarioDef::with_defs(vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")])
+}
+
 #[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
 fn sched_basic_proportional() -> ScenarioDef {
-    ScenarioDef::with_defs(vec![CgroupDef::named("cg_0"), CgroupDef::named("cg_1")])
+    sched_basic_proportional_scenario()
+}
+
+/// `sched_basic_proportional` with wprof capture attached.
+///
+/// Same `ScenarioDef` as the test above, deliberately built by calling it
+/// rather than restating it — a copy would drift, and the whole point is that
+/// the traced workload IS the calibrated one.
+///
+/// # Why this is a separate test rather than `wprof` on the original
+///
+/// `wprof` requires the `wprof` cargo feature: the macro rejects the attribute
+/// at parse time when the feature is off, so adding it to
+/// `sched_basic_proportional` would make the default build of this test file
+/// fail to compile. A `cfg`-gated sibling keeps `cargo test` working for
+/// everyone who does not have the feature (and does not want a build that
+/// clones and compiles wprof from GitHub) while still producing the trace.
+///
+/// Capture is not failure-only: a PASSING run writes
+/// `{sidecar_dir}/{test_name}-{variant_hash:016x}.wprof.pb`, next to the stats
+/// JSON that the scx-sim calibration already consumes.
+#[cfg(feature = "wprof")]
+#[ktstr_scenario(
+    scheduler = KTSTR_SCHED,
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    sustained_samples = 15,
+    watchdog_timeout_s = 15,
+    wprof,
+    // The DEFAULT capture is `-d 500`, i.e. 500 ms, and guest init spawns the
+    // tracer at boot — so a default-args run captures the guest booting and
+    // stops ~11.5 s before the workload starts. Measured: a default run
+    // produced a 0.495 s trace containing init/swapper/rcu/kworker and NOT ONE
+    // workload task. Diffing that against a 12 s simulation would have
+    // "worked" and been meaningless.
+    //
+    // 15 s spans boot plus the whole 12 s hold with margin, while still
+    // finishing inside the ~19 s test so the trace is shipped host-side before
+    // teardown. wprof_args REPLACES the defaults rather than appending, so the
+    // ringbuf flags are restated at their default values
+    // (WPROF_DEFAULT_RINGBUF_SIZE_KB = 16384, WPROF_DEFAULT_RINGBUF_CNT = 1).
+    // Sizing check: 0.495 s of boot — the busiest phase — produced 36 KB, so
+    // 15 s of mostly-steady-state spinning stays far inside the 16 MiB arena.
+    //
+    // DO NOT ADD `--kthread --idle`. Their help text reads "Allow kernel
+    // tasks" / "Allow idle tasks", which sounds purely additive. It is not:
+    // measured on this exact scenario, adding them DROPPED THE USERSPACE
+    // WORKLOAD ENTIRELY — 24.0 s of `init` on-CPU time vanished, the trace
+    // went 587 KB -> 189 KB and 10777 -> 3034 packets, and kthread time went
+    // DOWN (4.080 ms -> 2.745 ms) rather than up. Whatever the mechanism, the
+    // flags change which tasks are traced rather than widening the set, and
+    // the configuration below is the one that contains the workload.
+    wprof_args = "-d 15000 -e sched --ringbuf-size=16384 --ringbuf-cnt=1"
+)]
+fn sched_basic_proportional_wprof() -> ScenarioDef {
+    sched_basic_proportional_scenario()
 }
 
 #[ktstr_scenario(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
