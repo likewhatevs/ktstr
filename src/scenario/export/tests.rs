@@ -117,9 +117,15 @@ fn fixed_hold_exports_nanoseconds() {
 /// than the test declares while looking like a faithful reading of it.
 #[test]
 fn unmapped_work_type_is_a_gap_not_a_substitution() {
+    // Uses a variant that is still unmapped. This test previously used
+    // FutexPingPong and failed the moment that was mapped -- which is the test
+    // working, not breaking: it detects when its own example stops being an
+    // example. Pick another unmapped variant if this one is ever mapped too.
     let def = ScenarioDef::with_defs(vec![CgroupDef::named("cg_0").work(
-        WorkSpec::default().work_type(WorkType::FutexPingPong {
-            spin_iters: 20_000_000,
+        WorkSpec::default().work_type(WorkType::MutexContention {
+            contenders: 4,
+            hold_iters: 100,
+            work_iters: 100,
         }),
     )]);
     let out = export_scenario("t", &def, &topo(), Duration::from_secs(1), 2);
@@ -127,7 +133,7 @@ fn unmapped_work_type_is_a_gap_not_a_substitution() {
     assert!(
         out.gaps
             .iter()
-            .any(|g| g.construct.contains("FutexPingPong")),
+            .any(|g| g.construct.contains("MutexContention")),
         "the gap must name the construct: {:#?}",
         out.gaps,
     );

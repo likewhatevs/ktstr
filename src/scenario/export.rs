@@ -115,7 +115,9 @@ fn cpuset(spec: &CpusetSpec) -> Option<serde_json::Value> {
 /// silently, which is the one thing this file exists not to do.
 ///
 /// The nine fieldless variants have nothing to drop, so they transfer
-/// verbatim and are safe. The remaining 36 want a per-variant mapping that
+/// verbatim and are safe. Two field-carrying variants are also mapped --
+/// `FutexPingPong` and `CrossAffinityChurn` -- each checked field-by-field
+/// against the IR first; both carry only `spin_iters: u64` on both sides. The remaining 36 want a per-variant mapping that
 /// translates the fields it can and records an [`ExportGap`] for the fields it
 /// cannot — worth doing, but it is a per-variant judgement each time, not a
 /// loop.
@@ -131,6 +133,21 @@ fn work_type(wt: &WorkType) -> Option<serde_json::Value> {
         WorkType::ForkExit => json!("fork_exit"),
         WorkType::NiceSweep => json!("nice_sweep"),
         WorkType::SmtSiblingSpin => json!("smt_sibling_spin"),
+
+        // FIELD-CARRYING variants, mapped one at a time with their fields
+        // checked against the IR rather than by name. Both of these carry a
+        // single `spin_iters: u64` on BOTH sides, so nothing is dropped and no
+        // gap is recorded -- which is the bar a field-carrying mapping has to
+        // meet before it belongs here. A variant whose ktstr fields have no IR
+        // home must record an ExportGap instead; see the note above about
+        // PriorityInversion::pi_mode and friends.
+        WorkType::FutexPingPong { spin_iters } => {
+            json!({ "futex_ping_pong": { "spin_iters": spin_iters } })
+        }
+        WorkType::CrossAffinityChurn { spin_iters } => {
+            json!({ "cross_affinity_churn": { "spin_iters": spin_iters } })
+        }
+
         _ => return None,
     })
 }
