@@ -188,7 +188,7 @@ fn assert_override_is_reported_not_encoded() {
 #[test]
 fn nice_is_carried_rather_than_nulled() {
     let def = ScenarioDef::with_defs(vec![
-        CgroupDef::named("cg_0").work(WorkSpec::default().work_type(WorkType::SpinWait).nice(-5))
+        CgroupDef::named("cg_0").work(WorkSpec::default().work_type(WorkType::SpinWait).nice(-5)),
     ]);
     let out = export_scenario("nice", &def, &topo(), Duration::from_secs(1), 1);
     let works = &out.record["steps"][0]["setup"][0]["works"][0];
@@ -213,8 +213,11 @@ fn nice_is_carried_rather_than_nulled() {
 fn a_non_default_sched_policy_is_a_recorded_gap() {
     use crate::workload::SchedPolicy;
     let def = ScenarioDef::with_defs(vec![
-        CgroupDef::named("cg_0")
-            .work(WorkSpec::default().work_type(WorkType::SpinWait).sched_policy(SchedPolicy::Batch))
+        CgroupDef::named("cg_0").work(
+            WorkSpec::default()
+                .work_type(WorkType::SpinWait)
+                .sched_policy(SchedPolicy::Batch),
+        ),
     ]);
     let out = export_scenario("policy", &def, &topo(), Duration::from_secs(1), 1);
     assert!(
@@ -222,7 +225,9 @@ fn a_non_default_sched_policy_is_a_recorded_gap() {
         "a Batch policy must surface as a gap, not vanish"
     );
     assert!(
-        out.gaps.iter().any(|g| g.construct.contains("sched_policy")),
+        out.gaps
+            .iter()
+            .any(|g| g.construct.contains("sched_policy")),
         "the gap must name sched_policy; got {:#?}",
         out.gaps
     );
@@ -243,13 +248,18 @@ fn fieldless_work_types_are_mapped() {
         (WorkType::NiceSweep, "nice_sweep"),
         (WorkType::SmtSiblingSpin, "smt_sibling_spin"),
     ] {
-        let def =
-            ScenarioDef::with_defs(vec![CgroupDef::named("cg_0").work(WorkSpec::default().work_type(wt.clone()))]);
+        let def = ScenarioDef::with_defs(vec![
+            CgroupDef::named("cg_0").work(WorkSpec::default().work_type(wt.clone())),
+        ]);
         let out = export_scenario("wt", &def, &topo(), Duration::from_secs(1), 1);
         assert_eq!(
             out.record["steps"][0]["setup"][0]["works"][0]["work_type"], expected,
             "WorkType::{wt:?} must export as {expected:?}"
         );
-        assert!(out.is_complete(), "unexpected gaps for {wt:?}: {:#?}", out.gaps);
+        assert!(
+            out.is_complete(),
+            "unexpected gaps for {wt:?}: {:#?}",
+            out.gaps
+        );
     }
 }
