@@ -920,55 +920,49 @@ fn extracted_scenarios_have_the_declared_shape() {
 /// `ai_docs/KTSTR_CONVERSION_AUDIT_20260813.md`; deliberately not bodged here.
 #[test]
 fn export_registered_scenarios() {
-    const WORKERS_PER_CGROUP: u32 = 1;
+    // One shared constant rather than a copy per binary -- see its doc comment
+    // for the cross-backend coupling that makes duplicating it a hazard.
+    let workers = ktstr::test_support::DEFAULT_WORKERS_PER_CGROUP;
 
-    // The check the comment above used to only claim. If Ctx's default moves,
-    // this fails here rather than silently desynchronising the two backends --
-    // the VM would follow Ctx while the exported record kept saying 1.
-
-    let Some(dir) = std::env::var_os("KTSTR_SCENARIO_EXPORT_DIR") else {
-        return;
+    let Some(out) = ktstr::test_support::export_registered_scenarios(workers) else {
+        return; // KTSTR_SCENARIO_EXPORT_DIR unset: a normal run writes nothing.
     };
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::create_dir_all(&dir).expect("create export dir");
-
-    let mut written = 0usize;
-    for scenario in ktstr::test_support::KTSTR_SCENARIOS {
-        let entry = ktstr::test_support::find_test(scenario.name)
-            .unwrap_or_else(|| panic!("{} has no KtstrTestEntry", scenario.name));
-        let def = (scenario.build)();
-        let out = ktstr::scenario::export::export_scenario(
-            scenario.name,
-            &def,
-            &entry.topology,
-            entry.duration,
-            WORKERS_PER_CGROUP,
-        );
-        // Gaps are printed, never silently dropped: a record the simulator
-        // consumes must not omit part of the workload without saying so.
-        for gap in &out.gaps {
-            println!(
-                "EXPORT GAP {}: {} at {} — {}",
-                scenario.name, gap.construct, gap.where_, gap.reason,
-            );
-        }
-        let path = dir.join(format!("{}.json", scenario.name));
-        std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&out.record).expect("serialize"),
-        )
-        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-        println!(
-            "exported {} -> {} ({} gap(s))",
-            scenario.name,
-            path.display(),
-            out.gaps.len(),
-        );
-        written += 1;
-    }
     assert_eq!(
-        written,
+        out.written.len(),
         PORTED_SCENARIOS.len(),
-        "every ported scenario must export",
+        "every ported scenario in THIS binary must export; wrote {:?}",
+        out.written,
+    );
+}
+
+/// No scenario may be declared in a test binary that never exports.
+///
+/// THIS IS THE GUARD FOR THE DEFECT, and it is worth more than the refactor it
+/// accompanies. `KTSTR_SCENARIOS` is a linkme distributed slice, which is
+/// per-link-unit: each `tests/*.rs` is its own binary with its own slice. The
+/// exporter used to live in this file and iterate this binary's slice, so a
+/// scenario declared in any OTHER test file was invisible to it — the
+/// conversion compiled, its own tests passed, and no record was ever written.
+///
+/// It refused SILENTLY. That is the failure mode: not a wrong record, an absent
+/// one, with nothing anywhere reporting the absence. Eight conversions were
+/// planned against candidates that all live in other binaries before anyone
+/// noticed.
+///
+/// This check reads the test sources rather than the registry, and it has to.
+/// The property is "this binary calls the exporter", and a binary that does not
+/// call it cannot report that — the missing call is exactly the code that isn't
+/// there to run. The source tree is the only place the absence is visible.
+#[test]
+fn every_scenario_binary_exports() {
+    let tests_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let missing = ktstr::test_support::scenario_binaries_missing_export(&tests_dir);
+    assert!(
+        missing.is_empty(),
+        "these test binaries declare a #[ktstr_scenario] but never call \
+         ktstr::test_support::export_registered_scenarios, so their scenarios \
+         are silently absent from every export and never reach a second \
+         backend: {missing:?}. Add an export test to each -- see \
+         export_registered_scenarios in this file for the three-line shape.",
     );
 }

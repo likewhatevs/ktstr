@@ -626,3 +626,14 @@ fn cover_execute_defs_two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
         ],
     )
 }
+
+/// Export this binary's scenarios. Required of every test binary that declares
+/// one -- `every_scenario_binary_exports` in `ktstr_sched_tests.rs` fails by
+/// name if it is missing, because a distributed slice is per link unit and a
+/// scenario here is invisible to any other binary's exporter.
+#[test]
+fn export_registered_scenarios() {
+    let _ = ktstr::test_support::export_registered_scenarios(
+        ktstr::test_support::DEFAULT_WORKERS_PER_CGROUP,
+    );
+}

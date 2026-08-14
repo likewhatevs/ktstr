@@ -103,6 +103,11 @@ pub use eval::{
 };
 pub use profraw::current_binary_is_coverage_instrumented;
 pub mod runtime;
+mod scenario_export;
+pub use scenario_export::{
+    DEFAULT_WORKERS_PER_CGROUP, EXPORT_DIR_ENV, ExportOutcome, export_registered_scenarios,
+    scenario_binaries_missing_export,
+};
 mod scenario_registry;
 pub use scenario_registry::{KTSTR_SCENARIOS, ScenarioEntry, find_scenario};
 mod scheduler_manifest_stamp;
