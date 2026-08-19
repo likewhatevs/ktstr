@@ -23,7 +23,8 @@
 //!
 //! Anything the record cannot represent faithfully is omitted with a recorded
 //! reason rather than approximated here. Approximation is the *lowering's* job,
-//! where it is classified and reported ([`FidelityReport`] on the IR side); an
+//! where it is classified and reported (`FidelityReport` on the IR side, which
+//! is a type in a different crate in a different repository, hence no link); an
 //! approximation invented at export time would be invisible to that machinery
 //! and would reach the simulator disguised as an exact reading of the test.
 
