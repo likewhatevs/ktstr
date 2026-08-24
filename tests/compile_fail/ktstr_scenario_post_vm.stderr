@@ -1,0 +1,5 @@
+error: `post_vm` is not available on `#[ktstr_scenario]` — a host-side callback is arbitrary Rust, which is what `#[ktstr_scenario]` exists to exclude. Write the test with `#[ktstr_test]` instead: take a `ctx: &Ctx`, build the same `ScenarioDef`, and run it with `.run(ctx)`.
+ --> tests/compile_fail/ktstr_scenario_post_vm.rs:7:52
+  |
+7 | #[ktstr_scenario(llcs = 1, cores = 2, threads = 1, post_vm = check)]
+  |                                                    ^^^^^^^

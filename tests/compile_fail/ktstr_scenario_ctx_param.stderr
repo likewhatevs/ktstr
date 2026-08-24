@@ -1,0 +1,9 @@
+error: a `#[ktstr_scenario]` function takes no arguments — in particular no `ctx: &Ctx`. The context exists only inside the running guest, so a body that reads it cannot be built on the host, which is the property this entrypoint provides.
+
+       Most `&Ctx` uses in scenario bodies do not need it: `ctx.cgroup_def("cg_0")` is `CgroupDef::named("cg_0")` with the worker count bound eagerly, and the step runner already applies that same default to a `CgroupDef` that leaves it unset — so `CgroupDef::named("cg_0")` resolves to an identical workload.
+
+       If the body genuinely needs runtime topology, use `#[ktstr_test]`.
+ --> tests/compile_fail/ktstr_scenario_ctx_param.rs:4:8
+  |
+4 | fn bad(ctx: &ktstr::scenario::Ctx) -> ktstr::scenario::ScenarioDef {
+  |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
