@@ -755,8 +755,18 @@ static __KTSTR_ENTRY_MID_DEGRADE: ktstr::test_support::KtstrTestEntry =
 /// distributed slice is per link unit, so a scenario declared in another
 /// `tests/*.rs` is not in this binary's slice and must not be listed here.
 /// `every_scenario_binary_exports` below is what covers those.
+///
+/// Entries are gated by the SAME `cfg` as the scenario they name.
+/// `scenario_registry_matches_the_ported_set` asserts set equality in both
+/// directions, so a cfg-gated scenario that is listed unconditionally fails the
+/// default build and one that is omitted fails the gated build. The list is not
+/// "the ports that exist somewhere", it is "the ports linked into THIS build".
 const PORTED_SCENARIOS: &[&str] = &[
     "sched_basic_proportional",
+    // Only linked on the wprof legs of the CI matrix — see the
+    // `#[cfg(feature = "wprof")]` on `sched_basic_proportional_wprof` itself.
+    #[cfg(feature = "wprof")]
+    "sched_basic_proportional_wprof",
     "sched_cpuset_split",
     "sched_dynamic_add",
     "sched_verifier_stats_populated",
@@ -852,6 +862,23 @@ fn extracted_scenarios_have_the_declared_shape() {
     let basic = build("sched_basic_proportional");
     assert_eq!(cgroup_names(&basic), vec![vec!["cg_0", "cg_1"]]);
     assert!(basic.checks().is_none());
+
+    // The wprof sibling must extract the SAME workload as the test above. That
+    // identity is why it calls `sched_basic_proportional_scenario()` instead of
+    // restating the defs, and it is the whole basis for treating the traced run
+    // as the calibrated one; a drift here would make the trace describe a
+    // workload nothing else ran. Gated because the scenario is.
+    #[cfg(feature = "wprof")]
+    {
+        let wprof = build("sched_basic_proportional_wprof");
+        assert_eq!(
+            cgroup_names(&wprof),
+            cgroup_names(&basic),
+            "the wprof capture must trace the calibrated workload, not a copy \
+             of it that has drifted",
+        );
+        assert!(wprof.checks().is_none());
+    }
 
     // Disjoint cpuset halves survive extraction.
     let split = build("sched_cpuset_split");
